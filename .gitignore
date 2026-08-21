@@ -2,3 +2,7 @@
 /target
 config.toml
 docs/
+!docs/
+docs/*
+!docs/swmi-architecture-plan.md
+!docs/test-infrastructure-access.md

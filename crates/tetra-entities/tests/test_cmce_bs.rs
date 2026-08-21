@@ -7,6 +7,7 @@ use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::control::call_control::CallControl;
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
@@ -120,6 +121,63 @@ fn count_d_setups(msgs: &[SapMsg]) -> usize {
                     if prim.chan_alloc.as_ref().is_some_and(|ca| ca.usage.is_some()))
         })
         .count()
+}
+
+fn count_circuit_opens(msgs: &[SapMsg]) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::Open(_))
+            )
+        })
+        .count()
+}
+
+fn count_group_d_setups(msgs: &[SapMsg], gssi: u32) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == TetraEntity::Mle
+                && matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == gssi
+                        && prim.chan_alloc.as_ref().is_some_and(|ca| ca.usage.is_some()))
+        })
+        .count()
+}
+
+#[test]
+fn test_group_setup_joins_existing_circuit() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    // The first terminal creates the local group-call circuit.
+    test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(count_circuit_opens(&first_msgs), 1);
+
+    // A second terminal joins the same group call.  It must receive an
+    // individual D-CONNECT, but must not create another local circuit or
+    // another group D-SETUP on a different traffic timeslot.
+    test.submit_message(build_u_setup_msg(TEST_ISSI + 1, TEST_GSSI));
+    test.run_stack(Some(1));
+    let join_msgs = test.dump_sinks();
+    assert_eq!(count_circuit_opens(&join_msgs), 0);
+    assert_eq!(count_group_d_setups(&join_msgs, TEST_GSSI), 0);
+    assert!(
+        join_msgs.iter().any(|msg| {
+            msg.dest == TetraEntity::Mle
+                && matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == TEST_ISSI + 1
+                        && prim.chan_alloc.as_ref().is_some_and(|ca| ca.usage.is_some()))
+        }),
+        "expected an individually addressed D-CONNECT for the joining terminal"
+    );
 }
 
 /// Test that late-entry D-SETUP re-sends are throttled when the previous

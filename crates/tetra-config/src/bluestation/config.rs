@@ -5,6 +5,7 @@ use tetra_core::freqs::FreqInfo;
 use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
+use super::sec_swmi::CfgSwmi;
 use super::sec_telemetry::CfgTelemetry;
 
 /// Wrapper for a string that should be treated as a secret. Display and Debug will redact the actual value,
@@ -63,6 +64,9 @@ pub struct StackConfig {
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,
+
+    /// Native central SwMI connection. This supersedes Brew for new deployments.
+    pub swmi: Option<CfgSwmi>,
 
     /// Telemetry endpoint configuration
     pub telemetry: Option<CfgTelemetry>,

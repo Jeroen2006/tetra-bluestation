@@ -200,6 +200,37 @@ impl CircuitMgr {
         Ok(self.open_circuit(dir, circuit)?)
     }
 
+    /// Allocate using a call identifier chosen by the central SwMI.  The
+    /// timeslot/usage remain local radio resources, but every BS participating
+    /// in the same call must put the identical 14-bit id on the air interface.
+    pub fn allocate_circuit_with_allocator_and_call_id(
+        &mut self,
+        dir: Direction,
+        comm_type: CommunicationType,
+        timeslot_alloc: &mut TimeslotAllocator,
+        owner: TimeslotOwner,
+        call_id: CallId,
+    ) -> Result<&CmceCircuit, CircuitErr> {
+        if call_id == 0 || call_id > 0x3fff {
+            return Err(CircuitErr::CircuitAlreadyInUse);
+        }
+        let ts = timeslot_alloc.allocate_any(owner).ok_or(CircuitErr::NoCircuitFree)?;
+        let usage = self.get_next_usage_number();
+        let circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: dir,
+            ts,
+            call_id,
+            usage,
+            circuit_mode: CircuitModeType::TchS,
+            comm_type,
+            simplex_duplex: false,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        };
+        Ok(self.open_circuit(dir, circuit)?)
+    }
+
     /// Closes any active circuits for given timeslot and direction.
     /// Returns the CmceCircuit
     /// When direction is Both, closes both directions

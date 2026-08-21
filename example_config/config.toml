@@ -155,37 +155,19 @@ local_ssi_ranges = [
 
 ###############################################################################
 
-# Brew protocol: Connect to TetraPack/BrandMeister server via TETRA Homebrew Protocol.
-# All groups that radios attach to are forwarded to Brew as affiliations.
-# Uncomment this section to automatically load and use Brew entity
-# See: https://wiki.tetrapack.online/books/tetra/page/brew
+# Native central SwMI connection. MCC, MNC and location area are centrally
+# owned. The existing net_info and cell_info.location_area values are a
+# bootstrap/LST cache until the air-interface stack reads CellConfig at runtime.
 
-# [brew]
-
-# Server address
-# host = "core.tetrapack.online"
-# port = 443
-
-# Use TLS (wss:// / https://)
-# tls = true
-
-# HTTP Digest auth credentials, as registered in BrandMeister
-# Username should be your SSID (DMR ID + 2-digit suffix).
-# Password is your BrandMeister hotspot password.
-# username = 123456700
-# password = "012345"
-
-# Reconnection delay (seconds)
-# reconnect_delay_secs = 15
-
-# Optional: additional initial latency compensation in frames for inbound Brew jitter playout.
-# Adaptive jitter buffering is always enabled; this adds fixed startup delay if needed.
-# jitter_initial_latency_frames = 0
-
-# Enable SDS forwarding between local and Brew clients. Enabled by default.
-# feature_sds_enabled = true
-
-# Uncomment to allow only calls for select SSIs to be transmitted over Brew
-# SDS works for all SSIs, currently, but the SDS over Brew feature may be fully disabled.
-# If left commented, all (outside of local_ssi_ranges) calls are allowed over Brew
-# whitelisted_ssis = [91]
+[swmi]
+host = "swmi.example.net"
+port = 443
+tls = true
+# Explicit trust anchor for a self-signed SwMI certificate. Omit to use the
+# normal operating-system trust store.
+# ca_certificate = "/etc/tetra-swmi/swmi-ca.pem"
+username = "bs-example"
+password = "replace-before-use"
+reconnect_delay_secs = 5
+heartbeat_interval_secs = 2
+heartbeat_timeout_secs = 10

@@ -9,7 +9,8 @@ use toml::Value;
 use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
 
 use super::config::{StackConfig, StackMode};
-use super::sec_brew::{CfgBrewDto, apply_brew_patch};
+use super::sec_brew::CfgBrewDto;
+use super::sec_swmi::{CfgSwmiDto, apply_swmi_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
@@ -50,10 +51,18 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&root.cell_info.extra)).into());
     }
 
-    // Optional brew section
+    // The old Brew configuration is retained as an internal compatibility type
+    // while the entities are being migrated, but new BlueStation configs must
+    // use the native SwMI section.
     if let Some(ref brew) = root.brew {
         if !brew.extra.is_empty() {
             return Err(format!("Unrecognized fields in brew config: {:?}", sorted_keys(&brew.extra)).into());
+        }
+        return Err("[brew] has been removed; configure the central connection with [swmi]".into());
+    }
+    if let Some(ref swmi) = root.swmi {
+        if !swmi.extra.is_empty() {
+            return Err(format!("Unrecognized fields in swmi config: {:?}", sorted_keys(&swmi.extra)).into());
         }
     }
 
@@ -72,12 +81,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         net: net_dto_to_cfg(root.net_info),
         cell: cell_dto_to_cfg(root.cell_info),
         brew: None,
+        swmi: None,
         telemetry: None,
         control: None,
     };
 
-    if let Some(brew) = root.brew {
-        cfg.brew = Some(apply_brew_patch(brew));
+    if let Some(swmi) = root.swmi {
+        cfg.swmi = Some(apply_swmi_patch(swmi)?);
     }
 
     if let Some(telemetry) = root.telemetry {
@@ -126,6 +136,7 @@ struct TomlConfigRoot {
     cell_info: CellInfoDto,
 
     brew: Option<CfgBrewDto>,
+    swmi: Option<CfgSwmiDto>,
     telemetry: Option<CfgTelemetryDto>,
     command: Option<CfgControlDto>,
 

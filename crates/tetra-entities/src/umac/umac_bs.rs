@@ -210,7 +210,7 @@ impl UmacBs {
     /// Otherwise, value from config is used.
     fn get_system_wide_services_state(config: &SharedConfig) -> bool {
         let cfg = config.config();
-        if cfg.brew.is_some() {
+        if cfg.swmi.is_some() {
             config.state_read().network_connected
         } else {
             cfg.cell.system_wide_services
@@ -1279,7 +1279,9 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
 
-                // Forward UL voice to Brew (User plane) if loaded
+                // Forward UL voice to configured network user-plane bridges.
+                // SwMI receives the native TMD boundary and authorizes it
+                // against its central call/floor state before redistribution.
                 if self.config.config().brew.is_some() {
                     if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
                         let msg = SapMsg {
@@ -1291,6 +1293,17 @@ impl UmacBs {
                         queue.push_back(msg);
                     } else {
                         tracing::trace!("rx_tmd_prim: no active UL circuit on ts={}, dropping UL voice to Brew", ts);
+                    }
+                }
+
+                if self.config.config().swmi.is_some() {
+                    if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                        queue.push_back(SapMsg {
+                            sap: Sap::TmdSap,
+                            src: TetraEntity::Umac,
+                            dest: TetraEntity::Swmi,
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                        });
                     }
                 }
 

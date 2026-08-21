@@ -12,8 +12,8 @@ use tetra_entities::net_control::{
 use tetra_config::bluestation::{PhyBackend, SharedConfig, StackConfig, parsing};
 use tetra_core::{TdmaTime, debug};
 use tetra_entities::MessageRouter;
-use tetra_entities::net_brew::entity::BrewEntity;
-use tetra_entities::net_brew::new_websocket_transport;
+use tetra_entities::net_swmi;
+use tetra_entities::net_swmi::entity::SwmiMediaEntity;
 use tetra_entities::net_telemetry::worker::TelemetryWorker;
 use tetra_entities::net_telemetry::{
     TELEMETRY_HEARTBEAT_INTERVAL, TELEMETRY_HEARTBEAT_TIMEOUT, TELEMETRY_PROTOCOL_VERSION, TelemetrySource, telemetry_channel,
@@ -110,7 +110,12 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 }
 
 /// Start base station stack
-fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
+fn build_bs_stack(
+    cfg: &mut SharedConfig,
+    swmi_mm: Option<net_swmi::SwmiMmEndpoint>,
+    swmi_cmce: Option<net_swmi::SwmiCmceEndpoint>,
+    swmi_media: Option<net_swmi::SwmiMediaEndpoint>,
+) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
     let mut router = MessageRouter::new(cfg.clone());
 
     // Add suitable Phy component based on PhyIo type
@@ -145,9 +150,9 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     let umac = UmacBs::new(cfg.clone());
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
-    let mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
+    let mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm), swmi_mm);
     let sndcp = Sndcp::new(cfg.clone());
-    let cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
+    let cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce), swmi_cmce);
     router.register_entity(Box::new(lmac));
     router.register_entity(Box::new(umac));
     router.register_entity(Box::new(llc));
@@ -155,19 +160,14 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     router.register_entity(Box::new(mm));
     router.register_entity(Box::new(sndcp));
     router.register_entity(Box::new(cmce));
+    if let Some(swmi_media) = swmi_media {
+        router.register_entity(Box::new(SwmiMediaEntity::new(swmi_media)));
+    }
 
     // Drop all command links that were not given to a TetraEntity
     for (entity, dispatcher) in c_e.into_iter() {
         drop(dispatcher);
         c_d.remove(&entity);
-    }
-
-    // Register Brew entity if enabled
-    if let Some(ref brew_cfg) = cfg.config().brew {
-        let transport = new_websocket_transport(brew_cfg);
-        let brew_entity = BrewEntity::new(cfg.clone(), transport);
-        router.register_entity(Box::new(brew_entity));
-        eprintln!(" -> Brew/TetraPack integration enabled");
     }
 
     // Init network time
@@ -206,7 +206,13 @@ fn main() {
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
-    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);
+    let (swmi_worker, swmi_mm, _swmi_cmce, swmi_media) = if cfg.config().swmi.is_some() {
+        let (worker, mm, cmce, media) = net_swmi::channel();
+        (Some(worker), Some(mm), Some(cmce), Some(media))
+    } else {
+        (None, None, None, None)
+    };
+    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, swmi_mm, _swmi_cmce, swmi_media);
 
     // Start Telemetry and Control threads, if enabled
     if let Some(telemetry_source) = tsource {
@@ -214,6 +220,9 @@ fn main() {
     };
     if cfg.config().control.is_some() {
         start_control_worker(cfg.clone(), cdispatchers);
+    };
+    if let Some(swmi_worker) = swmi_worker {
+        net_swmi::start(cfg.clone(), swmi_worker);
     };
 
     // Set up Ctrl+C handler for graceful shutdown

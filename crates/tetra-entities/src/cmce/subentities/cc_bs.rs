@@ -12,8 +12,8 @@ use tetra_pdus::cmce::{
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
         d_call_proceeding::DCallProceeding, d_connect::DConnect, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased,
-        d_tx_granted::DTxGranted, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
-        u_tx_demand::UTxDemand,
+        d_tx_granted::DTxGranted, d_tx_wait::DTxWait, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup,
+        u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };
@@ -32,10 +32,12 @@ use tetra_saps::{
 };
 
 use crate::net_brew;
+use crate::net_swmi::SwmiCmceEndpoint;
 use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
 };
+use tetra_swmi_protocol::SwmiMessage;
 
 /// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {
@@ -53,6 +55,16 @@ pub struct CcBsSubentity {
     /// Calls whose D-RELEASE has been sent and whose circuit teardown is deferred a few
     /// frames so the stolen D-RELEASE transmits. These are no longer in active_calls.
     releasing_calls: Vec<ReleasingCall>,
+    /// Central SwMI control endpoint; absence or disconnection selects LST.
+    swmi: Option<SwmiCmceEndpoint>,
+    pending_swmi_setups: HashMap<(u32, u32), SapMsg>,
+    central_setup_call_ids: HashMap<(u32, u32), u16>,
+    central_setup_call_floors: HashMap<(u32, u32), u32>,
+    /// GroupCallStart may arrive at CMCE before MM has applied the matching
+    /// attachment decision because the SwMI worker fans messages out to two
+    /// independent queues. Keep it until the local listener exists.
+    pending_remote_swmi_calls: HashMap<u16, (u32, u32, u32)>,
+    next_swmi_command: u64,
 }
 
 /// Origin of a group call
@@ -66,6 +78,8 @@ enum CallOrigin {
     Network {
         brew_uuid: uuid::Uuid, // For Brew tracking
     },
+    /// A call whose identifier and authority originate at the central SwMI.
+    Swmi,
 }
 
 /// A call being released. The call is removed from active_calls when this is created, so
@@ -100,7 +114,7 @@ struct ActiveCall {
 }
 
 impl CcBsSubentity {
-    pub fn new(config: SharedConfig) -> Self {
+    pub fn new(config: SharedConfig, swmi: Option<SwmiCmceEndpoint>) -> Self {
         CcBsSubentity {
             config,
             dltime: TdmaTime::default(),
@@ -110,6 +124,12 @@ impl CcBsSubentity {
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
             releasing_calls: Vec::new(),
+            swmi,
+            pending_swmi_setups: HashMap::new(),
+            central_setup_call_ids: HashMap::new(),
+            central_setup_call_floors: HashMap::new(),
+            pending_remote_swmi_calls: HashMap::new(),
+            next_swmi_command: 1,
         }
     }
 
@@ -234,6 +254,19 @@ impl CcBsSubentity {
         }
     }
 
+    fn activate_pending_remote_swmi_calls(&mut self, queue: &mut MessageQueue, groups: &[u32]) {
+        let pending: Vec<_> = self
+            .pending_remote_swmi_calls
+            .iter()
+            .filter(|(_, (_, gssi, _))| groups.contains(gssi) && self.has_listener(*gssi))
+            .map(|(call_id, (owner_itsi, gssi, floor_itsi))| (*call_id, *owner_itsi, *gssi, *floor_itsi))
+            .collect();
+        for (call_id, owner_itsi, gssi, floor_itsi) in pending {
+            self.pending_remote_swmi_calls.remove(&call_id);
+            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, floor_itsi);
+        }
+    }
+
     fn drop_group_calls_if_unlistened(&mut self, queue: &mut MessageQueue, gssi: u32) {
         if self.has_listener(gssi) {
             return;
@@ -294,6 +327,7 @@ impl CcBsSubentity {
                 for gssi in &new_groups {
                     self.inc_group_listener(*gssi);
                 }
+                self.activate_pending_remote_swmi_calls(queue, &new_groups);
 
                 if new_groups.is_empty() {
                     tracing::debug!("CMCE: affiliate ignored (no new groups) issi={}", issi);
@@ -379,6 +413,174 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
+    /// Complete a U-SETUP for a circuit that is already active locally.
+    ///
+    /// A terminal may join a group call after the central SwMI call has
+    /// already created the local radio circuit.  In that case the terminal
+    /// needs an individually addressed D-CALL-PROCEEDING/D-CONNECT, but it
+    /// must not cause another CMCE circuit or another D-SETUP to be created.
+    fn connect_u_setup_to_existing_call(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: &SapMsg,
+        pdu: &USetup,
+        calling_party: TetraAddress,
+        call_id: u16,
+        ts: u8,
+        usage: u8,
+        transmission_grant: TransmissionGrant,
+        call_ownership: bool,
+    ) {
+        self.send_d_call_proceeding(queue, message, pdu, call_id);
+
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            panic!()
+        };
+
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: pdu.hook_method_selection,
+            simplex_duplex_selection: pdu.simplex_duplex_selection,
+            transmission_grant,
+            transmission_request_permission: false,
+            call_ownership,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+        tracing::info!(
+            ?d_connect,
+            itsi = calling_party.ssi,
+            ts,
+            usage,
+            "connecting U-SETUP to existing group call"
+        );
+
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(CmceChanAllocReq {
+                    usage: Some(usage),
+                    alloc_type: ChanAllocType::Replace,
+                    carrier: None,
+                    timeslots,
+                    ul_dl_assigned: UlDlAssignment::Both,
+                }),
+                main_address: calling_party,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    fn next_swmi_command_id(&mut self) -> u64 {
+        let value = self.next_swmi_command;
+        self.next_swmi_command = self.next_swmi_command.wrapping_add(1).max(1);
+        value
+    }
+
+    /// A rejected U-SETUP has no assigned call identifier yet, so the
+    /// standardized dummy all-zero call identifier is used in D-RELEASE.
+    fn send_d_release_for_setup_reject(&mut self, queue: &mut MessageQueue, message: &SapMsg, cause: DisconnectCause) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            panic!()
+        };
+        let pdu = DRelease {
+            call_identifier: 0,
+            disconnect_cause: cause,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("serialize setup rejection D-RELEASE");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                main_address: prim.received_tetra_address,
+                tx_reporter: None,
+            }),
+        });
+        tracing::info!(issi = prim.received_tetra_address.ssi, ?cause, "rejected U-SETUP sent as D-RELEASE");
+    }
+
+    /// D-TX WAIT is the explicit response to a floor request while another
+    /// user transmits.  Dropping U-TX DEMAND makes the PTT appear dead.
+    fn send_d_tx_wait(&mut self, queue: &mut MessageQueue, message: &SapMsg, call_id: u16) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            panic!()
+        };
+        let pdu = DTxWait {
+            call_identifier: call_id,
+            transmission_request_permission: true,
+            notification_indicator: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(24);
+        pdu.to_bitbuf(&mut sdu).expect("serialize D-TX WAIT");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                main_address: prim.received_tetra_address,
+                tx_reporter: None,
+            }),
+        });
+        tracing::info!(
+            issi = prim.received_tetra_address.ssi,
+            call_id,
+            "U-TX DEMAND deferred with D-TX WAIT"
+        );
+    }
+
     fn signal_umac_circuit_open(queue: &mut MessageQueue, call: &CmceCircuit) {
         let circuit = Circuit {
             direction: call.direction,
@@ -409,6 +611,10 @@ impl CcBsSubentity {
 
     fn rx_u_setup(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_u_setup: {:?}", message);
+        // `USetup::from_bitbuf` consumes the PDU cursor.  In network mode the
+        // request is resumed only after the SwMI allocated a call id, so retain
+        // an untouched copy for that asynchronous continuation.
+        let original_message = message.clone();
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
@@ -445,18 +651,102 @@ impl CcBsSubentity {
                 calling_party.ssi,
                 dest_gssi
             );
+            // TS 100 392-2 §14.5.1.3.2: do not leave a caller waiting for a
+            // setup timer when the requested group cannot be served.
+            self.send_d_release_for_setup_reject(queue, &message, DisconnectCause::RequestedServiceNotAvailable);
             return;
+        }
+
+        let setup_key = (calling_party.ssi, dest_gssi);
+        let central_call_id = self.central_setup_call_ids.remove(&setup_key);
+        let central_floor_itsi = self.central_setup_call_floors.remove(&setup_key);
+        // A new central call grants its initial floor to the setup caller. A
+        // setup resumed for an existing call uses the floor state carried by
+        // the SwMI; the joining MS must not transmit while another MS owns it.
+        let caller_has_central_floor = central_call_id.is_none() || central_floor_itsi == Some(calling_party.ssi);
+        let another_central_speaker = central_floor_itsi.is_some_and(|floor_itsi| floor_itsi != 0 && floor_itsi != calling_party.ssi);
+
+        // The SwMI may accept this request while this BS already has the
+        // group's central circuit open.  The first implementation allocated
+        // a second circuit here, then overwrote active_calls[call_id] while
+        // leaving the original circuit (and its timeslot) in CircuitMgr.
+        // Reuse the existing circuit instead.
+        let existing_call = self
+            .active_calls
+            .iter()
+            .find(|(_, call)| call.dest_gssi == dest_gssi)
+            .map(|(&call_id, call)| (call_id, call.clone()));
+        if let Some((existing_call_id, existing_call)) = existing_call {
+            let central_call_matches = central_call_id.is_none_or(|call_id| call_id == existing_call_id);
+            if central_call_matches && (central_call_id.is_some() || self.swmi.as_ref().is_none_or(|swmi| !swmi.is_online())) {
+                let floor_itsi = central_floor_itsi.unwrap_or_else(|| if existing_call.tx_active { existing_call.source_issi } else { 0 });
+                let caller_has_floor = floor_itsi == 0 || floor_itsi == calling_party.ssi;
+                let grant = if caller_has_floor {
+                    TransmissionGrant::Granted
+                } else {
+                    TransmissionGrant::GrantedToOtherUser
+                };
+                self.connect_u_setup_to_existing_call(
+                    queue,
+                    &message,
+                    &pdu,
+                    calling_party,
+                    existing_call_id,
+                    existing_call.ts,
+                    existing_call.usage,
+                    grant,
+                    caller_has_floor,
+                );
+                return;
+            }
+        }
+
+        if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) && central_call_id.is_none() {
+            let command_id = self.next_swmi_command_id();
+            let submitted = self.swmi.as_ref().expect("checked above").submit(SwmiMessage::GroupCallRequest {
+                command_id,
+                itsi: calling_party.ssi as u64,
+                gssi: dest_gssi,
+                priority: pdu.call_priority,
+            });
+            if submitted.is_ok() {
+                // The SwMI allocates the one shared 14-bit call id.  Retain
+                // the original RF request so D-CALL-PROCEEDING/D-CONNECT can
+                // be emitted only after that decision returns.
+                self.pending_swmi_setups.insert(setup_key, original_message);
+                tracing::info!(
+                    itsi = calling_party.ssi,
+                    gssi = dest_gssi,
+                    command_id,
+                    "group call request forwarded to SwMI"
+                );
+                return;
+            }
+            tracing::warn!(
+                itsi = calling_party.ssi,
+                gssi = dest_gssi,
+                "SwMI request queue unavailable; retaining local-site trunking"
+            );
         }
 
         // Allocate circuit (DL+UL for group call)
         let circuit = match {
             let mut state = self.config.state_write();
-            self.circuits.allocate_circuit_with_allocator(
-                Direction::Both,
-                pdu.basic_service_information.communication_type,
-                &mut state.timeslot_alloc,
-                TimeslotOwner::Cmce,
-            )
+            match central_call_id {
+                Some(call_id) => self.circuits.allocate_circuit_with_allocator_and_call_id(
+                    Direction::Both,
+                    pdu.basic_service_information.communication_type,
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                    call_id,
+                ),
+                None => self.circuits.allocate_circuit_with_allocator(
+                    Direction::Both,
+                    pdu.basic_service_information.communication_type,
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                ),
+            }
         } {
             Ok(circuit) => circuit.clone(),
             Err(e) => {
@@ -477,75 +767,26 @@ impl CcBsSubentity {
         // Signal UMAC to open DL+UL circuits
         Self::signal_umac_circuit_open(queue, &circuit);
 
-        // Build channel allocation timeslot mask for this call
-        let mut timeslots = [false; 4];
-        timeslots[circuit.ts as usize - 1] = true;
-
-        // Extract UL message routing info (handle, link_id, endpoint_id) for
-        // individually-addressed responses. These are needed so MLE can route
-        // the response back to the correct radio via the established LLC link.
-        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
-            panic!()
-        };
-        let ul_handle = prim.handle;
-        let ul_link_id = prim.link_id;
-        let ul_endpoint_id = prim.endpoint_id;
-
-        // === 1) Send D-CALL-PROCEEDING to the calling MS (individually addressed) ===
-        // This acknowledges the U-SETUP and keeps the radio from timing out.
-        self.send_d_call_proceeding(queue, &message, &pdu, circuit.call_id);
-
-        // === 2) Send D-CONNECT to the calling MS with Granted + channel allocation ===
-        // This transitions the calling MS from "Call Setup" to "Active".
-        // MUST be sent BEFORE the group D-SETUP so the radio receives it on MCCH.
-        // Uses the correct MLE handle (not 0) so MLE routes it properly.
-        let d_connect = DConnect {
-            call_identifier: circuit.call_id,
-            call_time_out: CallTimeout::T5m,
-            hook_method_selection: pdu.hook_method_selection,
-            simplex_duplex_selection: pdu.simplex_duplex_selection,
-            transmission_grant: TransmissionGrant::Granted,
-            transmission_request_permission: false,
-            call_ownership: true, // Calling MS is the call owner (ETSI 14.8.4)
-            call_priority: None,
-            basic_service_information: None,
-            temporary_address: None,
-            notification_indicator: None,
-            facility: None,
-            proprietary: None,
-        };
-
-        let mut connect_sdu = BitBuffer::new_autoexpand(30);
-        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
-        connect_sdu.seek(0);
-        tracing::info!("-> {:?} sdu {}", d_connect, connect_sdu.dump_bin());
-
-        let connect_msg = SapMsg {
-            sap: Sap::LcmcSap,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                sdu: connect_sdu,
-                handle: ul_handle,
-                endpoint_id: ul_endpoint_id,
-                link_id: ul_link_id,
-                layer2service: Layer2Service::Unacknowledged,
-                pdu_prio: 0,
-                layer2_qos: 0,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                chan_alloc: Some(CmceChanAllocReq {
-                    usage: Some(circuit.usage),
-                    alloc_type: ChanAllocType::Replace,
-                    carrier: None,
-                    timeslots,
-                    ul_dl_assigned: UlDlAssignment::Both,
-                }),
-                main_address: calling_party,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(connect_msg);
+        // === 1) Send D-CALL-PROCEEDING and D-CONNECT to the calling MS ===
+        // This acknowledges the U-SETUP and keeps the radio on the existing
+        // call before the group D-SETUP is sent.
+        self.connect_u_setup_to_existing_call(
+            queue,
+            &message,
+            &pdu,
+            calling_party,
+            circuit.call_id,
+            circuit.ts,
+            circuit.usage,
+            if caller_has_central_floor {
+                TransmissionGrant::Granted
+            } else if another_central_speaker {
+                TransmissionGrant::GrantedToOtherUser
+            } else {
+                TransmissionGrant::NotGranted
+            },
+            caller_has_central_floor,
+        );
 
         // === 3) Send D-SETUP to group (broadcast on MCCH with channel allocation) ===
         // GrantedToOtherUser tells other group members that someone else has the floor.
@@ -582,14 +823,18 @@ impl CcBsSubentity {
         self.active_calls.insert(
             circuit.call_id,
             ActiveCall {
-                origin: CallOrigin::Local {
-                    caller_addr: calling_party,
+                origin: if central_call_id.is_some() {
+                    CallOrigin::Swmi
+                } else {
+                    CallOrigin::Local {
+                        caller_addr: calling_party,
+                    }
                 },
                 dest_gssi,
                 source_issi: calling_party.ssi,
                 ts: circuit.ts,
                 usage: circuit.usage,
-                tx_active: true,
+                tx_active: caller_has_central_floor || another_central_speaker,
                 hangtime_start: None,
                 brew_uuid: None,
             },
@@ -610,6 +855,20 @@ impl CcBsSubentity {
                 }),
             };
             queue.push_back(msg);
+        }
+
+        if central_call_id.is_some() && caller_has_central_floor {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Swmi,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id: circuit.call_id,
+                    source_issi: calling_party.ssi,
+                    dest_gssi,
+                    ts: circuit.ts,
+                }),
+            });
         }
     }
 
@@ -650,6 +909,18 @@ impl CcBsSubentity {
 
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
+
+        // Central decisions are applied on the radio/router thread, never on
+        // the WSS worker.  Drain all pending control actions before TDMA work.
+        let mut swmi_actions = Vec::new();
+        if let Some(endpoint) = &self.swmi {
+            while let Some(action) = endpoint.try_recv() {
+                swmi_actions.push(action);
+            }
+        }
+        for action in swmi_actions {
+            self.handle_swmi_action(queue, action);
+        }
 
         // Check hangtime expiry for active local calls
         self.check_hangtime_expiry(queue);
@@ -745,10 +1016,17 @@ impl CcBsSubentity {
         // Hangtime: 5 multiframes = ~5 seconds
         const HANGTIME_FRAMES: i32 = 5 * 18 * 4;
 
+        let central_online = self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online);
         let expired: Vec<u16> = self
             .active_calls
             .iter()
             .filter_map(|(&call_id, call)| {
+                // While the SwMI link is alive, only the SwMI's configured
+                // hangtime can end a central call.  LST recovery falls back
+                // to this local timeout after the link disappears.
+                if central_online && matches!(call.origin, CallOrigin::Swmi) {
+                    return None;
+                }
                 if let Some(hangtime_start) = call.hangtime_start {
                     if hangtime_start.age(self.dltime) > HANGTIME_FRAMES {
                         return Some(call_id);
@@ -762,6 +1040,233 @@ impl CcBsSubentity {
             tracing::info!("Hangtime expired for call_id={}, releasing", call_id);
             self.release_call(queue, call_id, DisconnectCause::ExpiryOfTimer);
         }
+    }
+
+    /// Apply a central call/floor decision received over the SwMI WSS link.
+    fn handle_swmi_action(&mut self, queue: &mut MessageQueue, action: SwmiMessage) {
+        match action {
+            SwmiMessage::GroupCallStart {
+                call_id,
+                owner_itsi,
+                gssi,
+                floor_itsi,
+                ..
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else {
+                    tracing::warn!(call_id, "SwMI supplied call id outside TETRA range");
+                    return;
+                };
+                // For a join, GroupCallStart carries the actual central
+                // owner, while the pending U-SETUP belongs to the joining
+                // terminal. Match that pending setup by GSSI as a fallback.
+                let key = (owner_itsi as u32, gssi);
+                let pending_key = self.pending_swmi_setups.contains_key(&key).then_some(key).or_else(|| {
+                    self.pending_swmi_setups
+                        .keys()
+                        .find(|(_, pending_gssi)| *pending_gssi == gssi)
+                        .copied()
+                });
+                if let Some(pending_key) = pending_key {
+                    let request = self
+                        .pending_swmi_setups
+                        .remove(&pending_key)
+                        .expect("pending setup key found immediately above");
+                    self.central_setup_call_ids.insert(pending_key, call_id);
+                    self.central_setup_call_floors.insert(pending_key, floor_itsi as u32);
+                    self.rx_u_setup(queue, request);
+                } else if !self.has_listener(gssi) {
+                    self.pending_remote_swmi_calls
+                        .insert(call_id, (owner_itsi as u32, gssi, floor_itsi as u32));
+                    tracing::debug!(
+                        call_id,
+                        owner_itsi,
+                        gssi,
+                        "deferring SwMI group call until local attachment is active"
+                    );
+                } else {
+                    self.start_remote_swmi_call(queue, call_id, owner_itsi as u32, gssi, floor_itsi as u32);
+                }
+            }
+            SwmiMessage::FloorGranted { call_id, itsi } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let (dest_gssi, ts) = {
+                    let Some(call) = self.active_calls.get_mut(&call_id) else { return };
+                    call.source_issi = itsi as u32;
+                    call.tx_active = true;
+                    call.hangtime_start = None;
+                    (call.dest_gssi, call.ts)
+                };
+                // The group indication is intentionally "granted to other
+                // user".  The granted MS itself additionally requires the
+                // individual "granted" indication; without it its PTT UI
+                // remains rejected even while listeners show its ISSI.
+                self.send_d_tx_granted_individual_facch(queue, call_id, itsi as u32, ts);
+                self.send_d_tx_granted_facch(queue, call_id, itsi as u32, dest_gssi, ts);
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: itsi as u32,
+                        dest_gssi,
+                        ts,
+                    }),
+                });
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Swmi,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: itsi as u32,
+                        dest_gssi,
+                        ts,
+                    }),
+                });
+            }
+            SwmiMessage::FloorReleased { call_id, .. } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                if let Some(call) = self.active_calls.get_mut(&call_id) {
+                    call.tx_active = false;
+                    call.hangtime_start = Some(self.dltime);
+                    let ts = call.ts;
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Umac,
+                        msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
+                    });
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Swmi,
+                        msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
+                    });
+                }
+            }
+            SwmiMessage::CallRelease { call_id, cause } => {
+                self.pending_remote_swmi_calls.remove(&(call_id as u16));
+                if let Ok(call_id) = u16::try_from(call_id) {
+                    let cause = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+                    self.release_call(queue, call_id, cause);
+                }
+            }
+            // Compatibility with an older SwMI that emitted CallDisconnect.
+            // ETSI TS 100 392-2 clause 14.5.2.3 requires D-RELEASE for a
+            // group-call disconnect, so treat it exactly like CallRelease.
+            SwmiMessage::CallDisconnect { call_id, cause } => {
+                self.pending_remote_swmi_calls.remove(&(call_id as u16));
+                if let Ok(call_id) = u16::try_from(call_id) {
+                    let cause = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+                    self.release_call(queue, call_id, cause);
+                }
+            }
+            SwmiMessage::CallReject { call_id, itsi, .. } => {
+                if call_id == 0 {
+                    let request_key = self
+                        .pending_swmi_setups
+                        .keys()
+                        .find(|(pending_itsi, _)| *pending_itsi == itsi as u32)
+                        .copied();
+                    if let Some(request) = request_key.and_then(|key| self.pending_swmi_setups.remove(&key)) {
+                        self.send_d_release_for_setup_reject(queue, &request, DisconnectCause::RequestedServiceNotAvailable);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Allocate the local radio circuit for a centrally-started group call at
+    /// a non-originating BS.  Its call identifier is *not* locally generated.
+    fn start_remote_swmi_call(&mut self, queue: &mut MessageQueue, call_id: u16, owner_itsi: u32, gssi: u32, floor_itsi: u32) {
+        if !self.has_listener(gssi) || self.active_calls.contains_key(&call_id) {
+            return;
+        }
+        let circuit = match {
+            let mut state = self.config.state_write();
+            self.circuits.allocate_circuit_with_allocator_and_call_id(
+                Direction::Both,
+                CommunicationType::P2Mp,
+                &mut state.timeslot_alloc,
+                TimeslotOwner::Cmce,
+                call_id,
+            )
+        } {
+            Ok(circuit) => circuit.clone(),
+            Err(error) => {
+                tracing::warn!(call_id, gssi, ?error, "unable to allocate local circuit for SwMI call");
+                return;
+            }
+        };
+        Self::signal_umac_circuit_open(queue, &circuit);
+        let d_setup = DSetup {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: false,
+            basic_service_information: BasicServiceInformation {
+                circuit_mode_type: CircuitModeType::TchS,
+                encryption_flag: false,
+                communication_type: CommunicationType::P2Mp,
+                slots_per_frame: None,
+                speech_service: Some(0),
+            },
+            transmission_grant: if floor_itsi == 0 {
+                TransmissionGrant::NotGranted
+            } else {
+                TransmissionGrant::GrantedToOtherUser
+            },
+            transmission_request_permission: false,
+            call_priority: 0,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(owner_itsi),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let dest_addr = TetraAddress::new(gssi, SsiType::Gssi);
+        self.cached_setups.insert(call_id, (d_setup, dest_addr, None));
+        let (pdu, _, _) = self.cached_setups.get(&call_id).expect("inserted above");
+        let (sdu, allocation) = Self::build_d_setup_prim(pdu, circuit.usage, circuit.ts, UlDlAssignment::Both);
+        queue.push_back(Self::build_sapmsg(
+            sdu,
+            Some(allocation),
+            dest_addr,
+            Layer2Service::Unacknowledged,
+            None,
+        ));
+        self.active_calls.insert(
+            call_id,
+            ActiveCall {
+                origin: CallOrigin::Swmi,
+                dest_gssi: gssi,
+                source_issi: floor_itsi,
+                ts: circuit.ts,
+                usage: circuit.usage,
+                tx_active: floor_itsi != 0,
+                hangtime_start: None,
+                brew_uuid: None,
+            },
+        );
+        if floor_itsi != 0 {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Swmi,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: floor_itsi,
+                    dest_gssi: gssi,
+                    ts: circuit.ts,
+                }),
+            });
+        }
+        tracing::info!(call_id, gssi, ts = circuit.ts, "central SwMI group call activated at serving BS");
     }
 
     fn release_timeslot(&mut self, ts: u8) {
@@ -788,7 +1293,7 @@ impl CcBsSubentity {
         // for a Network call in hangtime, where rx_network_call_end cleared the field.
         let brew_uuid = call.brew_uuid.or(match call.origin {
             CallOrigin::Network { brew_uuid } => Some(brew_uuid),
-            CallOrigin::Local { .. } => None,
+            CallOrigin::Local { .. } | CallOrigin::Swmi => None,
         });
 
         match self.cached_setups.remove(&call_id) {
@@ -852,6 +1357,18 @@ impl CcBsSubentity {
             dest: TetraEntity::Umac,
             msg: SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }),
         });
+
+        // Clear the native SwMI user-plane mapping as well.  Without this a
+        // later, recycled radio timeslot could be incorrectly associated with
+        // the released central call.
+        if self.swmi.is_some() {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Swmi,
+                msg: SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }),
+            });
+        }
 
         self.release_timeslot(ts);
 
@@ -945,6 +1462,25 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
 
+        if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
+            let itsi = prim.received_tetra_address.ssi;
+            let command_id = self.next_swmi_command_id();
+            if self
+                .swmi
+                .as_ref()
+                .expect("checked above")
+                .submit(SwmiMessage::FloorReleaseRequest {
+                    command_id,
+                    call_id: call_id as u64,
+                    itsi: itsi as u64,
+                })
+                .is_ok()
+            {
+                tracing::info!(call_id, itsi, command_id, "U-TX CEASED forwarded to central SwMI");
+                return;
+            }
+        }
+
         // Look up the active call
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             tracing::warn!("U-TX CEASED for unknown call_id={}", call_id);
@@ -1030,6 +1566,33 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
 
+        if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
+            // The asynchronous central decision must not leave the MS with a
+            // silent PTT press.  D-TX WAIT is the immediate ETSI response;
+            // a later FloorGranted changes the floor network-wide.
+            self.send_d_tx_wait(queue, &message, call_id);
+            let command_id = self.next_swmi_command_id();
+            if self
+                .swmi
+                .as_ref()
+                .expect("checked above")
+                .submit(SwmiMessage::FloorRequest {
+                    command_id,
+                    call_id: call_id as u64,
+                    itsi: requesting_party.ssi as u64,
+                })
+                .is_ok()
+            {
+                tracing::info!(
+                    call_id,
+                    itsi = requesting_party.ssi,
+                    command_id,
+                    "U-TX DEMAND forwarded to central SwMI"
+                );
+                return;
+            }
+        }
+
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             tracing::warn!("U-TX DEMAND for unknown call_id={}", call_id);
             return;
@@ -1046,6 +1609,7 @@ impl CcBsSubentity {
                 call.source_issi,
                 call_id
             );
+            self.send_d_tx_wait(queue, &message, call_id);
             return;
         }
 
@@ -1174,6 +1738,24 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
+
+        if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
+            let command_id = self.next_swmi_command_id();
+            if self
+                .swmi
+                .as_ref()
+                .expect("checked above")
+                .submit(SwmiMessage::CallDisconnectRequest {
+                    command_id,
+                    call_id: call_id as u64,
+                    itsi: sender.ssi as u64,
+                })
+                .is_ok()
+            {
+                tracing::info!(call_id, itsi = sender.ssi, command_id, "U-DISCONNECT forwarded to central SwMI");
+                return;
+            }
+        }
 
         let Some(call) = self.active_calls.get(&call_id) else {
             tracing::debug!("U-DISCONNECT for unknown call_id={} (likely duplicate)", call_id);
@@ -1580,6 +2162,29 @@ impl CcBsSubentity {
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         let msg = Self::build_sapmsg_stealing(sdu, dest_addr, ts);
         queue.push_back(msg);
+    }
+
+    fn send_d_tx_granted_individual_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, ts: u8) {
+        let pdu = DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1),
+            transmitting_party_address_ssi: Some(source_issi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("serialize individual D-TX GRANTED");
+        sdu.seek(0);
+        tracing::info!(issi = source_issi, call_id, "-> individual FACCH D-TX GRANTED");
+        queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(source_issi, SsiType::Issi), ts));
     }
 
     /// Handle UL inactivity timeout from UMAC: a radio disappeared mid-transmission.

@@ -29,6 +29,7 @@ tetra-config = { path = "crates/tetra-config" }
 tetra-saps = { path = "crates/tetra-saps" }
 tetra-pdus = { path = "crates/tetra-pdus" }
 tetra-entities = { path = "crates/tetra-entities" }
+tetra-swmi-protocol = { path = "../tetra-network-domain/crates/tetra-swmi-protocol" }
 
 # External dependencies
 as-any = "0.3.2"

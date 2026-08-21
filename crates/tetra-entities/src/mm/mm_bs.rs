@@ -1,5 +1,8 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
+use std::collections::HashMap;
+
+use crate::net_swmi::SwmiMmEndpoint;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -7,6 +10,7 @@ use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_w
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
+use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, SwmiMessage};
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
@@ -36,17 +40,63 @@ pub struct MmBs {
     telemetry: Option<TelemetrySink>,
     control: Option<ControlEndpoint>,
     client_mgr: MmClientMgr,
+    swmi: Option<SwmiMmEndpoint>,
+    next_swmi_command_id: u64,
+    pending_registrations: HashMap<u64, PendingRegistration>,
+    pending_attachments: HashMap<u64, PendingAttachment>,
+    pending_location_attachments: HashMap<u64, PendingLocationAttachment>,
+}
+
+struct PendingRegistration {
+    itsi: u32,
+    air_handle: u32,
+    location_update_type: LocationUpdateType,
+    address_extension: Option<u64>,
+    energy_saving_information: Option<EnergySavingInformation>,
+    has_group_identity_location_demand: bool,
+    location_attachment: Option<PendingAttachment>,
+}
+
+struct PendingAttachment {
+    itsi: u32,
+    air_handle: u32,
+    replace_all: bool,
+    operations: Vec<GroupIdentityUplink>,
+}
+
+/// A group operation carried inside U-LOCATION UPDATE DEMAND.  Its result is
+/// encoded in D-LOCATION UPDATE ACCEPT, never as a separate D-ATTACH/DETACH
+/// acknowledgement.
+struct PendingLocationAttachment {
+    registration: PendingRegistration,
+    attachment: PendingAttachment,
 }
 
 impl MmBs {
-    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+    pub fn new(
+        config: SharedConfig,
+        telemetry: Option<TelemetrySink>,
+        control: Option<ControlEndpoint>,
+        swmi: Option<SwmiMmEndpoint>,
+    ) -> Self {
         let client_mgr = MmClientMgr::new(telemetry.clone());
         Self {
             config,
             telemetry,
             control,
             client_mgr,
+            swmi,
+            next_swmi_command_id: 1,
+            pending_registrations: HashMap::new(),
+            pending_attachments: HashMap::new(),
+            pending_location_attachments: HashMap::new(),
         }
+    }
+
+    fn next_swmi_command_id(&mut self) -> u64 {
+        let command_id = self.next_swmi_command_id;
+        self.next_swmi_command_id = self.next_swmi_command_id.wrapping_add(1).max(1);
+        command_id
     }
 
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
@@ -116,6 +166,27 @@ impl MmBs {
         }
 
         let ssi = prim.received_address.ssi;
+        if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
+            let command_id = self.next_swmi_command_id();
+            if self
+                .swmi
+                .as_ref()
+                .expect("SwMI checked above")
+                .submit(SwmiMessage::DeregistrationNotice {
+                    command_id,
+                    itsi: ssi as u64,
+                })
+                .is_ok()
+            {
+                tracing::info!(command_id, itsi = ssi, "deregistration forwarded to SwMI");
+            } else {
+                tracing::warn!(
+                    command_id,
+                    itsi = ssi,
+                    "SwMI deregistration queue unavailable; applying local-site trunking"
+                );
+            }
+        }
         let detached_client = self.client_mgr.remove_client(ssi);
         if let Some(client) = detached_client {
             self.config.state_write().subscribers.deregister(ssi);
@@ -195,6 +266,51 @@ impl MmBs {
         } else {
             None
         };
+
+        // In network mode the SwMI owns registration policy. The air handle
+        // stays at the BS and is echoed by the SwMI decision, so this router
+        // thread never waits on WSS. Group operations are handled after the
+        // registration decision; they must never make the registration itself
+        // silently fall back to LST.
+        let issi = prim.received_address.ssi;
+        let has_group_identity_location_demand = pdu.group_identity_location_demand.is_some();
+        let location_attachment = pdu.group_identity_location_demand.as_ref().and_then(|demand| {
+            let operations = demand.group_identity_uplink.clone()?;
+            let valid = operations.iter().all(|group| group.gssi.is_some());
+            valid.then_some(PendingAttachment {
+                itsi: issi,
+                air_handle: prim.handle,
+                replace_all: demand.group_identity_attach_detach_mode == 1,
+                operations,
+            })
+        });
+        if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
+            let command_id = self.next_swmi_command_id();
+            let request = SwmiMessage::RegistrationAttempt {
+                command_id,
+                itsi: issi as u64,
+                air_handle: prim.handle,
+                location_update_type: u64::from(pdu.location_update_type) as u8,
+                address_extension: pdu.address_extension,
+            };
+            if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                self.pending_registrations.insert(
+                    command_id,
+                    PendingRegistration {
+                        itsi: issi,
+                        air_handle: prim.handle,
+                        location_update_type: pdu.location_update_type,
+                        address_extension: pdu.address_extension,
+                        energy_saving_information: esi,
+                        has_group_identity_location_demand,
+                        location_attachment,
+                    },
+                );
+                tracing::info!(command_id, issi, "location update forwarded to SwMI");
+                return;
+            }
+            tracing::warn!(command_id, issi, "SwMI request queue unavailable; using local-site trunking");
+        }
 
         // Try to register the client
         let issi = prim.received_address.ssi;
@@ -460,6 +576,47 @@ impl MmBs {
             return;
         }
 
+        let requested_operations = pdu
+            .group_identity_uplink
+            .as_ref()
+            .expect("checked by feature_check")
+            .iter()
+            .map(|group| {
+                Some(AttachmentOperation {
+                    gssi: group.gssi?,
+                    detach: group.group_identity_detachment_uplink.is_some(),
+                    class_of_usage: group.class_of_usage.unwrap_or(0),
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(operations) = requested_operations
+            && self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online)
+        {
+            let command_id = self.next_swmi_command_id();
+            let replace_all = pdu.group_identity_attach_detach_mode;
+            let request = SwmiMessage::AttachmentAttempt {
+                command_id,
+                itsi: issi as u64,
+                air_handle: prim.handle,
+                replace_all,
+                operations,
+            };
+            if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                self.pending_attachments.insert(
+                    command_id,
+                    PendingAttachment {
+                        itsi: issi,
+                        air_handle: prim.handle,
+                        replace_all,
+                        operations: pdu.group_identity_uplink.clone().expect("checked above"),
+                    },
+                );
+                tracing::info!(command_id, issi, "group attachment forwarded to SwMI");
+                return;
+            }
+            tracing::warn!(command_id, issi, "SwMI attachment queue unavailable; using local-site trunking");
+        }
+
         // If group_identity_attach_detach_mode == 1, we first detach all groups
         if pdu.group_identity_attach_detach_mode == true {
             if !self.client_mgr.client_is_known(issi) {
@@ -648,6 +805,441 @@ impl MmBs {
         accepted_groups
     }
 
+    fn apply_swmi_registration_decision(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        itsi: u64,
+        air_handle: u32,
+        accepted: bool,
+        cause: u16,
+    ) {
+        let Some(mut pending) = self.pending_registrations.remove(&command_id) else {
+            tracing::warn!(command_id, itsi, "received SwMI registration decision without pending air request");
+            return;
+        };
+        if pending.itsi as u64 != itsi || pending.air_handle != air_handle {
+            tracing::warn!(
+                command_id,
+                expected_itsi = pending.itsi,
+                itsi,
+                expected_air_handle = pending.air_handle,
+                air_handle,
+                "discarding mismatched SwMI registration decision"
+            );
+            return;
+        }
+        if !accepted {
+            tracing::info!(command_id, itsi, cause, "SwMI rejected location update");
+            Self::send_d_location_update_reject_with_cause(
+                queue,
+                pending.itsi,
+                pending.air_handle,
+                pending.location_update_type,
+                pending.address_extension,
+                cause as u8,
+            );
+            return;
+        }
+
+        let is_new = !self.client_mgr.client_is_known(pending.itsi);
+        if is_new {
+            if let Err(error) = self.client_mgr.try_register_client(pending.itsi, true) {
+                tracing::warn!(
+                    command_id,
+                    itsi,
+                    ?error,
+                    "SwMI accepted registration but local client state could not be created"
+                );
+                Self::send_d_location_update_reject_with_cause(
+                    queue,
+                    pending.itsi,
+                    pending.air_handle,
+                    pending.location_update_type,
+                    pending.address_extension,
+                    RejectCause::NetworkFailure as u8,
+                );
+                return;
+            }
+            self.config.state_write().subscribers.register(pending.itsi);
+            self.emit_subscriber_update(queue, pending.itsi, Vec::new(), BrewSubscriberAction::Register);
+        } else if let Err(error) = self.client_mgr.set_client_state(pending.itsi, MmClientState::Attached) {
+            tracing::warn!(
+                command_id,
+                itsi,
+                ?error,
+                "SwMI accepted registration but local client state could not be updated"
+            );
+            Self::send_d_location_update_reject_with_cause(
+                queue,
+                pending.itsi,
+                pending.air_handle,
+                pending.location_update_type,
+                pending.address_extension,
+                RejectCause::NetworkFailure as u8,
+            );
+            return;
+        }
+        let energy_saving_mode = pending
+            .energy_saving_information
+            .as_ref()
+            .map(|info| info.energy_saving_mode)
+            .unwrap_or(EnergySavingMode::StayAlive);
+        let _ = self.client_mgr.set_client_energy_saving_mode(pending.itsi, energy_saving_mode);
+
+        // A location update can atomically contain group attachment changes.
+        // The SwMI must decide those as well, but the resulting elements belong
+        // in D-LOCATION UPDATE ACCEPT.  Retain the air request until the
+        // attachment decision arrives instead of sending a second MM response.
+        if let Some(attachment) = pending.location_attachment.take() {
+            let operations = attachment
+                .operations
+                .iter()
+                .map(|group| AttachmentOperation {
+                    gssi: group.gssi.expect("validated before SwMI registration"),
+                    detach: group.group_identity_detachment_uplink.is_some(),
+                    class_of_usage: group.class_of_usage.unwrap_or(0),
+                })
+                .collect();
+            if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
+                let attachment_command_id = self.next_swmi_command_id();
+                let request = SwmiMessage::AttachmentAttempt {
+                    command_id: attachment_command_id,
+                    itsi,
+                    air_handle: pending.air_handle,
+                    replace_all: attachment.replace_all,
+                    operations,
+                };
+                if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                    self.pending_location_attachments.insert(
+                        attachment_command_id,
+                        PendingLocationAttachment {
+                            registration: pending,
+                            attachment,
+                        },
+                    );
+                    tracing::info!(
+                        registration_command_id = command_id,
+                        attachment_command_id,
+                        itsi,
+                        "location-update group attachment forwarded to SwMI"
+                    );
+                    return;
+                }
+            }
+            tracing::warn!(
+                command_id,
+                itsi,
+                "SwMI unavailable while deciding location-update group attachment; using local-site trunking"
+            );
+            let local_results = Self::local_attachment_results(&attachment);
+            let (had_rejection, groups) = self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
+            Self::send_d_location_update_accept(
+                queue,
+                pending.itsi,
+                pending.air_handle,
+                pending.location_update_type,
+                pending.energy_saving_information,
+                Some(GroupIdentityLocationAccept {
+                    group_identity_accept_reject: u8::from(had_rejection),
+                    group_identity_downlink: Some(groups),
+                }),
+            );
+            return;
+        }
+        Self::send_d_location_update_accept(
+            queue,
+            pending.itsi,
+            pending.air_handle,
+            pending.location_update_type,
+            pending.energy_saving_information,
+            pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
+                group_identity_accept_reject: 0,
+                group_identity_downlink: None,
+            }),
+        );
+        tracing::info!(command_id, itsi, "SwMI location update accepted and sent on air interface");
+    }
+
+    fn apply_swmi_attachment_decision(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        itsi: u64,
+        air_handle: u32,
+        has_rejection: bool,
+        results: Vec<AttachmentResult>,
+    ) {
+        let Some(pending) = self.pending_attachments.remove(&command_id) else {
+            tracing::warn!(command_id, itsi, "received SwMI attachment decision without pending air request");
+            return;
+        };
+        if pending.itsi as u64 != itsi || pending.air_handle != air_handle || pending.operations.len() != results.len() {
+            tracing::warn!(
+                command_id,
+                expected_itsi = pending.itsi,
+                itsi,
+                "discarding mismatched SwMI attachment decision"
+            );
+            return;
+        }
+
+        let (had_rejection, accepted_downlink) =
+            self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending, results);
+        Self::send_d_attachment_acknowledgement(queue, pending.itsi, pending.air_handle, had_rejection, accepted_downlink);
+        tracing::info!(
+            command_id,
+            itsi,
+            rejected = had_rejection,
+            "SwMI attachment decision sent on air interface"
+        );
+    }
+
+    fn apply_swmi_attachment_state(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        itsi: u64,
+        has_rejection: bool,
+        pending: &PendingAttachment,
+        results: Vec<AttachmentResult>,
+    ) -> (bool, Vec<GroupIdentityDownlink>) {
+        let accepted_attachment = results.iter().any(|result| result.accepted && !result.operation.detach);
+        let mut had_rejection = has_rejection;
+        if pending.replace_all && accepted_attachment {
+            let prior_groups = self
+                .client_mgr
+                .get_client_by_issi(pending.itsi)
+                .map(|client| client.groups.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if self.client_mgr.client_detach_all_groups(pending.itsi).is_ok() && !prior_groups.is_empty() {
+                {
+                    let mut state = self.config.state_write();
+                    for gssi in &prior_groups {
+                        state.subscribers.deaffiliate(pending.itsi, *gssi);
+                    }
+                }
+                self.emit_subscriber_update(queue, pending.itsi, prior_groups, BrewSubscriberAction::Deaffiliate);
+            }
+        }
+
+        let mut accepted_downlink = Vec::new();
+        let mut affiliated = Vec::new();
+        let mut deaffiliated = Vec::new();
+        for (result, original) in results.into_iter().zip(&pending.operations) {
+            if !result.accepted {
+                had_rejection = true;
+                // TS 100 392-2 §16.8.2 requires every rejected MS-initiated
+                // attachment to be named in a Group Identity Detachment
+                // Downlink element.  Omitting it makes an MS treat the group
+                // as accepted (or leaves its UI state stale), even though the
+                // aggregate accept/reject bit is set.
+                //
+                // Cause 1 is the SwMI's "unknown group" policy outcome and
+                // maps to detachment-downlink value 00.  The remaining policy
+                // failures deliberately use the same safe, non-attaching
+                // reason until richer per-policy air causes are modelled.
+                accepted_downlink.push(GroupIdentityDownlink {
+                    group_identity_attachment: None,
+                    group_identity_detachment_uplink: Some(0),
+                    gssi: Some(result.operation.gssi),
+                    address_extension: None,
+                    vgssi: None,
+                });
+                continue;
+            }
+            let gssi = result.operation.gssi;
+            let detach = result.operation.detach;
+            match self.client_mgr.client_group_attach(pending.itsi, gssi, !detach) {
+                Ok(changed) => {
+                    if changed {
+                        if detach {
+                            self.config.state_write().subscribers.deaffiliate(pending.itsi, gssi);
+                            deaffiliated.push(gssi);
+                        } else {
+                            self.config.state_write().subscribers.affiliate(pending.itsi, gssi);
+                            affiliated.push(gssi);
+                        }
+                    }
+                    accepted_downlink.push(GroupIdentityDownlink {
+                        group_identity_attachment: (!detach).then_some(GroupIdentityAttachment {
+                            group_identity_attachment_lifetime: 1,
+                            class_of_usage: result.operation.class_of_usage,
+                        }),
+                        group_identity_detachment_uplink: detach.then_some(original.group_identity_detachment_uplink.unwrap_or(0)),
+                        gssi: Some(gssi),
+                        address_extension: None,
+                        vgssi: None,
+                    });
+                }
+                Err(error) => {
+                    had_rejection = true;
+                    tracing::warn!(
+                        command_id,
+                        itsi,
+                        gssi,
+                        ?error,
+                        "SwMI accepted attachment but BS local state update failed"
+                    );
+                }
+            }
+        }
+        if !affiliated.is_empty() {
+            self.emit_subscriber_update(queue, pending.itsi, affiliated, BrewSubscriberAction::Affiliate);
+        }
+        if !deaffiliated.is_empty() {
+            self.emit_subscriber_update(queue, pending.itsi, deaffiliated, BrewSubscriberAction::Deaffiliate);
+        }
+        (had_rejection, accepted_downlink)
+    }
+
+    fn local_attachment_results(pending: &PendingAttachment) -> Vec<AttachmentResult> {
+        pending
+            .operations
+            .iter()
+            .map(|group| AttachmentResult {
+                operation: AttachmentOperation {
+                    gssi: group.gssi.expect("validated before attachment decision"),
+                    detach: group.group_identity_detachment_uplink.is_some(),
+                    class_of_usage: group.class_of_usage.unwrap_or(0),
+                },
+                accepted: true,
+                cause: 0,
+            })
+            .collect()
+    }
+
+    fn apply_swmi_location_attachment_decision(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        itsi: u64,
+        air_handle: u32,
+        has_rejection: bool,
+        results: Vec<AttachmentResult>,
+    ) {
+        let Some(pending) = self.pending_location_attachments.remove(&command_id) else {
+            tracing::warn!(
+                command_id,
+                itsi,
+                "received SwMI location attachment decision without pending air request"
+            );
+            return;
+        };
+        if pending.registration.itsi as u64 != itsi
+            || pending.registration.air_handle != air_handle
+            || pending.attachment.operations.len() != results.len()
+        {
+            tracing::warn!(
+                command_id,
+                expected_itsi = pending.registration.itsi,
+                itsi,
+                "discarding mismatched SwMI location attachment decision"
+            );
+            return;
+        }
+        let (had_rejection, groups) =
+            self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
+        let registration = pending.registration;
+        Self::send_d_location_update_accept(
+            queue,
+            registration.itsi,
+            registration.air_handle,
+            registration.location_update_type,
+            registration.energy_saving_information,
+            Some(GroupIdentityLocationAccept {
+                group_identity_accept_reject: u8::from(had_rejection),
+                group_identity_downlink: Some(groups),
+            }),
+        );
+        tracing::info!(
+            command_id,
+            itsi,
+            rejected = had_rejection,
+            "SwMI location update and group attachment accepted on air interface"
+        );
+    }
+
+    fn send_d_attachment_acknowledgement(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        has_rejection: bool,
+        groups: Vec<GroupIdentityDownlink>,
+    ) {
+        let pdu = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject: u8::from(has_rejection),
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink: Some(groups),
+            group_identity_security_related_information: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-ATTACH/DETACH acknowledgement");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    fn send_d_location_update_accept(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        energy_saving_information: Option<EnergySavingInformation>,
+        group_identity_location_accept: Option<GroupIdentityLocationAccept>,
+    ) {
+        let pdu = DLocationUpdateAccept {
+            location_update_accept_type: location_update_type,
+            ssi: Some(issi as u64),
+            address_extension: None,
+            subscriber_class: None,
+            energy_saving_information,
+            scch_information_and_distribution_on_18th_frame: None,
+            new_registered_area: None,
+            security_downlink: None,
+            group_identity_location_accept,
+            default_group_attachment_lifetime: None,
+            authentication_downlink: None,
+            group_identity_security_related_information: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-LOCATION UPDATE ACCEPT");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        });
+    }
+
     /// Sends a D-LOCATION UPDATE COMMAND to force the radio to re-register
     /// with full group identity report
     fn send_d_location_update_command(queue: &mut MessageQueue, issi: u32, handle: u32) {
@@ -692,9 +1284,27 @@ impl MmBs {
         location_update_type: LocationUpdateType,
         address_extension: Option<u64>,
     ) {
+        Self::send_d_location_update_reject_with_cause(
+            queue,
+            issi,
+            handle,
+            location_update_type,
+            address_extension,
+            RejectCause::MigrationNotSupported as u8,
+        );
+    }
+
+    fn send_d_location_update_reject_with_cause(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+        reject_cause: u8,
+    ) {
         let pdu = DLocationUpdateReject {
             location_update_type,
-            reject_cause: RejectCause::MigrationNotSupported as u8,
+            reject_cause,
             cipher_control: false,
             ciphering_parameters: None,
             // Echo back MNI if present, required for case b) per ETSI 16.4.1.1
@@ -845,7 +1455,91 @@ impl TetraEntityTrait for MmBs {
         self.config = config;
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
+    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+        while let Some(message) = self.swmi.as_ref().and_then(SwmiMmEndpoint::try_recv) {
+            match message {
+                SwmiMessage::RegistrationDecision {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    accepted,
+                    cause,
+                    ..
+                } => self.apply_swmi_registration_decision(queue, command_id, itsi, air_handle, accepted, cause),
+                SwmiMessage::AttachmentDecision {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    has_rejection,
+                    results,
+                } => {
+                    if self.pending_location_attachments.contains_key(&command_id) {
+                        self.apply_swmi_location_attachment_decision(queue, command_id, itsi, air_handle, has_rejection, results);
+                    } else {
+                        self.apply_swmi_attachment_decision(queue, command_id, itsi, air_handle, has_rejection, results);
+                    }
+                }
+                message => tracing::warn!(?message, "unexpected non-MM SwMI message on MM endpoint"),
+            }
+        }
+        // A decision that was in flight when the SwMI link failed becomes an
+        // LST decision. This preserves service locally instead of leaving a
+        // terminal indefinitely waiting for an acknowledged response.
+        if self.swmi.as_ref().is_some_and(|endpoint| !endpoint.is_online()) {
+            let recover: Vec<(u64, u32, u32)> = self
+                .pending_registrations
+                .iter()
+                .map(|(command_id, pending)| (*command_id, pending.itsi, pending.air_handle))
+                .collect();
+            for (command_id, itsi, air_handle) in recover {
+                tracing::warn!(
+                    command_id,
+                    itsi,
+                    "SwMI link unavailable; completing pending location update in local-site trunking"
+                );
+                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0);
+            }
+            let recover_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
+                .pending_attachments
+                .iter()
+                .map(|(command_id, pending)| {
+                    (
+                        *command_id,
+                        pending.itsi,
+                        pending.air_handle,
+                        Self::local_attachment_results(pending),
+                    )
+                })
+                .collect();
+            for (command_id, itsi, air_handle, results) in recover_attachments {
+                tracing::warn!(
+                    command_id,
+                    itsi,
+                    "SwMI link unavailable; completing pending group operation in local-site trunking"
+                );
+                self.apply_swmi_attachment_decision(queue, command_id, itsi as u64, air_handle, false, results);
+            }
+            let recover_location_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
+                .pending_location_attachments
+                .iter()
+                .map(|(command_id, pending)| {
+                    (
+                        *command_id,
+                        pending.registration.itsi,
+                        pending.registration.air_handle,
+                        Self::local_attachment_results(&pending.attachment),
+                    )
+                })
+                .collect();
+            for (command_id, itsi, air_handle, results) in recover_location_attachments {
+                tracing::warn!(
+                    command_id,
+                    itsi,
+                    "SwMI link unavailable; completing location-update group operation in local-site trunking"
+                );
+                self.apply_swmi_location_attachment_decision(queue, command_id, itsi as u64, air_handle, false, results);
+            }
+        }
         if let Some(cep) = &self.control {
             while let Some(cmd) = cep.try_recv() {
                 match cmd {

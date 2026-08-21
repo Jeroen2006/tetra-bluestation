@@ -1,4 +1,5 @@
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
+use crate::net_swmi::SwmiCmceEndpoint;
 use crate::net_telemetry::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
@@ -23,13 +24,18 @@ pub struct CmceBs {
 }
 
 impl CmceBs {
-    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+    pub fn new(
+        config: SharedConfig,
+        telemetry: Option<TelemetrySink>,
+        control: Option<ControlEndpoint>,
+        swmi: Option<SwmiCmceEndpoint>,
+    ) -> Self {
         Self {
             config: config.clone(),
             telemetry,
             control,
             sds: SdsBsSubentity::new(config.clone()),
-            cc: CcBsSubentity::new(config.clone()),
+            cc: CcBsSubentity::new(config.clone(), swmi),
             ss: SsBsSubentity::new(),
         }
     }

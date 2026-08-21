@@ -19,6 +19,9 @@ pub use sec_phy_soapy::*;
 pub mod sec_brew;
 pub use sec_brew::*;
 
+pub mod sec_swmi;
+pub use sec_swmi::*;
+
 pub mod sec_telemetry;
 pub use sec_telemetry::*;
 

@@ -26,4 +26,6 @@ pub enum TetraEntity {
 
     /// Brew protocol bridge (TetraPack/BrandMeister integration)
     Brew,
+    /// Native central SwMI user-plane bridge.
+    Swmi,
 }
