@@ -94,6 +94,9 @@ pub struct StackState {
     pub timeslot_alloc: TimeslotAllocator,
     /// Backhaul/network connection to SwMI (e.g., Brew/TetraPack). False -> fallback mode.
     pub network_connected: bool,
+    /// Authentication policy advertised by the currently connected SwMI cell.
+    /// This is mutable because the central SwMI sends it after the BS starts.
+    pub authentication_required: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
 }
@@ -172,6 +175,7 @@ impl Default for StackState {
         Self {
             timeslot_alloc: TimeslotAllocator::default(),
             network_connected: false,
+            authentication_required: false,
             subscribers: SubscriberRegistry::new(),
         }
     }

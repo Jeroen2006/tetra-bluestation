@@ -1,11 +1,12 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::net_swmi::SwmiMmEndpoint;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::LmmMleUnitdataReq;
@@ -20,17 +21,22 @@ use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
 use tetra_pdus::mm::enums::reject_cause::RejectCause;
 use tetra_pdus::mm::enums::status_downlink::StatusDownlink;
 use tetra_pdus::mm::enums::status_uplink::StatusUplink;
+use tetra_pdus::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 use tetra_pdus::mm::fields::energy_saving_information::EnergySavingInformation;
 use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::d_authentication_demand::DAuthenticationDemand;
+use tetra_pdus::mm::pdus::d_authentication_response::DAuthenticationResponse;
+use tetra_pdus::mm::pdus::d_authentication_result::DAuthenticationResult;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
@@ -45,6 +51,11 @@ pub struct MmBs {
     pending_registrations: HashMap<u64, PendingRegistration>,
     pending_attachments: HashMap<u64, PendingAttachment>,
     pending_location_attachments: HashMap<u64, PendingLocationAttachment>,
+    pending_auth_commands: HashMap<u32, u64>,
+    /// Registration command IDs for which the SwMI has completed successful
+    /// authentication.  The final D-LOCATION UPDATE ACCEPT carries the
+    /// Authentication Downlink only for these registrations.
+    authenticated_registrations: HashSet<u64>,
 }
 
 struct PendingRegistration {
@@ -55,6 +66,7 @@ struct PendingRegistration {
     energy_saving_information: Option<EnergySavingInformation>,
     has_group_identity_location_demand: bool,
     location_attachment: Option<PendingAttachment>,
+    authentication_successful: bool,
 }
 
 struct PendingAttachment {
@@ -73,6 +85,27 @@ struct PendingLocationAttachment {
 }
 
 impl MmBs {
+    fn authentication_uplink(field: &Type3FieldGeneric) -> Option<([u8; 10], bool)> {
+        // Authentication uplink is CK-request (one bit) followed by optional
+        // RAND2.  Decode the final 80 bits without truncating the type-3 IE.
+        if field.len < 80 {
+            return None;
+        }
+        let start = field.len - 80;
+        let mut rand = [0u8; 10];
+        for i in 0..80 {
+            let bit_index = start + i;
+            let bit = if bit_index < 64 {
+                (field.data >> (63 - bit_index)) & 1
+            } else {
+                let p = bit_index - 64;
+                field.raw.get(p / 8).map(|b| u64::from((b >> (7 - (p % 8))) & 1)).unwrap_or(0)
+            };
+            rand[i / 8] = (rand[i / 8] << 1) | bit as u8;
+        }
+        Some((rand, true))
+    }
+
     pub fn new(
         config: SharedConfig,
         telemetry: Option<TelemetrySink>,
@@ -90,6 +123,8 @@ impl MmBs {
             pending_registrations: HashMap::new(),
             pending_attachments: HashMap::new(),
             pending_location_attachments: HashMap::new(),
+            pending_auth_commands: HashMap::new(),
+            authenticated_registrations: HashSet::new(),
         }
     }
 
@@ -286,12 +321,26 @@ impl MmBs {
         });
         if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
             let command_id = self.next_swmi_command_id();
+            let authentication = pdu.authentication_uplink.as_ref().and_then(|field| {
+                Self::authentication_uplink(field).map(|(rand_2, mutual)| tetra_swmi_protocol::AuthenticationResponse {
+                    command_id,
+                    itsi: issi as u64,
+                    air_handle: prim.handle,
+                    response_1: None,
+                    response_2: None,
+                    rand_2: Some(rand_2),
+                    random_seed: None,
+                    mutual,
+                    authentication_result: None,
+                })
+            });
             let request = SwmiMessage::RegistrationAttempt {
                 command_id,
                 itsi: issi as u64,
                 air_handle: prim.handle,
                 location_update_type: u64::from(pdu.location_update_type) as u8,
                 address_extension: pdu.address_extension,
+                authentication,
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
                 self.pending_registrations.insert(
@@ -304,6 +353,7 @@ impl MmBs {
                         energy_saving_information: esi,
                         has_group_identity_location_demand,
                         location_attachment,
+                        authentication_successful: false,
                     },
                 );
                 tracing::info!(command_id, issi, "location update forwarded to SwMI");
@@ -714,7 +764,7 @@ impl MmBs {
         };
 
         match pdu_type {
-            MmPduTypeUl::UAuthentication => unimplemented_log!("UAuthentication"),
+            MmPduTypeUl::UAuthentication => self.rx_u_authentication(queue, message),
             MmPduTypeUl::UItsiDetach => self.rx_u_itsi_detach(queue, message),
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
@@ -727,6 +777,67 @@ impl MmBs {
             MmPduTypeUl::UDisableStatus => unimplemented_log!("UDisableStatus"),
             MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
         };
+    }
+
+    fn rx_u_authentication(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let pdu = match UAuthentication::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                // Keep the raw SDU in the log.  This is especially useful for
+                // distinguishing a terminal that ignores D-AUTHENTICATION
+                // DEMAND from one that answers with a malformed/unsupported
+                // subtype or Type-3 RAND2 element.
+                tracing::warn!(
+                    error = ?error,
+                    sdu = %prim.sdu.dump_bin(),
+                    "invalid U-AUTHENTICATION"
+                );
+                return;
+            }
+        };
+        let command_id = self
+            .pending_auth_commands
+            .get(&prim.handle)
+            .copied()
+            .unwrap_or_else(|| self.next_swmi_command_id());
+        let Some(swmi) = self.swmi.as_ref() else {
+            return;
+        };
+        let _ = swmi.submit(SwmiMessage::AuthenticationResponse(tetra_swmi_protocol::AuthenticationResponse {
+            command_id,
+            itsi: prim.received_address.ssi as u64,
+            air_handle: prim.handle,
+            response_1: pdu.response_1,
+            response_2: None,
+            rand_2: pdu.rand_2,
+            random_seed: None,
+            mutual: pdu.mutual,
+            authentication_result: pdu.authentication_result,
+        }));
+        if let Some(authentication_result) = pdu.authentication_result {
+            if authentication_result {
+                self.authenticated_registrations.insert(command_id);
+            } else {
+                self.authenticated_registrations.remove(&command_id);
+            }
+            tracing::info!(
+                command_id,
+                itsi = prim.received_address.ssi,
+                authentication_result,
+                mutual = pdu.mutual,
+                "U-AUTHENTICATION RESULT forwarded to SwMI"
+            );
+        } else {
+            tracing::info!(
+                command_id,
+                itsi = prim.received_address.ssi,
+                mutual = pdu.mutual,
+                "U-AUTHENTICATION RESPONSE forwarded to SwMI"
+            );
+        }
     }
 
     fn try_attach_detach_groups(
@@ -818,6 +929,7 @@ impl MmBs {
             tracing::warn!(command_id, itsi, "received SwMI registration decision without pending air request");
             return;
         };
+        pending.authentication_successful = self.authenticated_registrations.remove(&command_id).unwrap_or(false);
         if pending.itsi as u64 != itsi || pending.air_handle != air_handle {
             tracing::warn!(
                 command_id,
@@ -940,6 +1052,7 @@ impl MmBs {
                 pending.air_handle,
                 pending.location_update_type,
                 pending.energy_saving_information,
+                pending.authentication_successful,
                 Some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: u8::from(had_rejection),
                     group_identity_downlink: Some(groups),
@@ -953,12 +1066,18 @@ impl MmBs {
             pending.air_handle,
             pending.location_update_type,
             pending.energy_saving_information,
+            pending.authentication_successful,
             pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
             }),
         );
-        tracing::info!(command_id, itsi, "SwMI location update accepted and sent on air interface");
+        tracing::info!(
+            command_id,
+            itsi,
+            authentication_successful = pending.authentication_successful,
+            "SwMI location update accepted; awaiting/processing group attachment"
+        );
     }
 
     fn apply_swmi_attachment_decision(
@@ -1147,6 +1266,7 @@ impl MmBs {
             registration.air_handle,
             registration.location_update_type,
             registration.energy_saving_information,
+            registration.authentication_successful,
             Some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: u8::from(had_rejection),
                 group_identity_downlink: Some(groups),
@@ -1156,6 +1276,7 @@ impl MmBs {
             command_id,
             itsi,
             rejected = had_rejection,
+            authentication_downlink = registration.authentication_successful,
             "SwMI location update and group attachment accepted on air interface"
         );
     }
@@ -1201,6 +1322,7 @@ impl MmBs {
         handle: u32,
         location_update_type: LocationUpdateType,
         energy_saving_information: Option<EnergySavingInformation>,
+        authentication_successful: bool,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
     ) {
         let pdu = DLocationUpdateAccept {
@@ -1214,7 +1336,13 @@ impl MmBs {
             security_downlink: None,
             group_identity_location_accept,
             default_group_attachment_lifetime: None,
-            authentication_downlink: None,
+            authentication_downlink: authentication_successful.then(|| Type3FieldGeneric {
+                field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                len: 2,
+                // Authentication successful, do not supply TEI.
+                data: 0b10,
+                raw: Vec::new(),
+            }),
             group_identity_security_related_information: None,
             cell_type_control: None,
             proprietary: None,
@@ -1222,6 +1350,11 @@ impl MmBs {
         let mut sdu = BitBuffer::new_autoexpand(32);
         pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-LOCATION UPDATE ACCEPT");
         sdu.seek(0);
+        tracing::debug!(
+            itsi,
+            authentication_downlink = authentication_successful,
+            "sending D-LOCATION UPDATE ACCEPT"
+        );
         queue.push_back(SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -1412,7 +1545,7 @@ impl MmBs {
             unimplemented_log!("Unsupported group_report_response present");
         }
         if pdu.authentication_uplink.is_some() {
-            unimplemented_log!("Unsupported authentication_uplink present");
+            tracing::debug!("authentication_uplink is handled by the SwMI authentication state machine");
         }
         if pdu.extended_capabilities.is_some() {
             unimplemented_log!("Unsupported extended_capabilities present");
@@ -1466,6 +1599,123 @@ impl TetraEntityTrait for MmBs {
                     cause,
                     ..
                 } => self.apply_swmi_registration_decision(queue, command_id, itsi, air_handle, accepted, cause),
+                SwmiMessage::AuthenticationChallenge {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    rand_1,
+                    random_seed,
+                    mutual,
+                } => {
+                    self.pending_auth_commands.insert(air_handle, command_id);
+                    let pdu = DAuthenticationDemand { rand_1, random_seed };
+                    let mut sdu = BitBuffer::new_autoexpand(24);
+                    pdu.to_bitbuf(&mut sdu).unwrap();
+                    sdu.seek(0);
+                    queue.push_back(SapMsg {
+                        sap: Sap::LmmSap,
+                        src: TetraEntity::Mm,
+                        dest: TetraEntity::Mle,
+                        msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                            sdu,
+                            handle: air_handle,
+                            address: TetraAddress::issi(itsi as u32),
+                            layer2service: Layer2Service::Acknowledged,
+                            stealing_permission: false,
+                            stealing_repeats_flag: false,
+                            encryption_flag: false,
+                            is_null_pdu: false,
+                            tx_reporter: None,
+                        }),
+                    });
+                    tracing::debug!(command_id, itsi, mutual, "sent D-AUTHENTICATION DEMAND");
+                }
+                SwmiMessage::AuthenticationResult {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    success,
+                    response_2,
+                } => {
+                    if success {
+                        self.authenticated_registrations.insert(command_id);
+                    } else {
+                        self.authenticated_registrations.remove(&command_id);
+                    }
+                    let pdu = DAuthenticationResult {
+                        success,
+                        mutual: response_2.is_some(),
+                        response_2,
+                    };
+                    let mut sdu = BitBuffer::new_autoexpand(16);
+                    if pdu.to_bitbuf(&mut sdu).is_ok() {
+                        sdu.seek(0);
+                        queue.push_back(SapMsg {
+                            sap: Sap::LmmSap,
+                            src: TetraEntity::Mm,
+                            dest: TetraEntity::Mle,
+                            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                                sdu,
+                                handle: air_handle,
+                                address: TetraAddress::issi(itsi as u32),
+                                layer2service: Layer2Service::Acknowledged,
+                                stealing_permission: false,
+                                stealing_repeats_flag: false,
+                                encryption_flag: false,
+                                is_null_pdu: false,
+                                tx_reporter: None,
+                            }),
+                        });
+                    }
+                    if !success {
+                        Self::send_d_location_update_reject_with_cause(
+                            queue,
+                            itsi as u32,
+                            air_handle,
+                            LocationUpdateType::ItsiAttach,
+                            None,
+                            RejectCause::AuthenticationFailure as u8,
+                        );
+                    }
+                    tracing::debug!(command_id, itsi, response_2 = ?response_2, "received D-AUTHENTICATION RESULT");
+                }
+                SwmiMessage::AuthenticationResponseDemand {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    random_seed,
+                    response_2,
+                    mutual,
+                    rand_1,
+                } => {
+                    let pdu = DAuthenticationResponse {
+                        random_seed,
+                        response_2,
+                        mutual,
+                        rand_1,
+                    };
+                    let mut sdu = BitBuffer::new_autoexpand(24);
+                    if pdu.to_bitbuf(&mut sdu).is_ok() {
+                        sdu.seek(0);
+                        queue.push_back(SapMsg {
+                            sap: Sap::LmmSap,
+                            src: TetraEntity::Mm,
+                            dest: TetraEntity::Mle,
+                            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                                sdu,
+                                handle: air_handle,
+                                address: TetraAddress::issi(itsi as u32),
+                                layer2service: Layer2Service::Acknowledged,
+                                stealing_permission: false,
+                                stealing_repeats_flag: false,
+                                encryption_flag: false,
+                                is_null_pdu: false,
+                                tx_reporter: None,
+                            }),
+                        });
+                    }
+                    self.pending_auth_commands.insert(air_handle, command_id);
+                }
                 SwmiMessage::AttachmentDecision {
                     command_id,
                     itsi,

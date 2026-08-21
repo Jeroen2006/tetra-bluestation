@@ -13,6 +13,8 @@ pub struct Type3FieldGeneric {
     pub len: usize,
     /// Up to 64 bits of data (later bits are discarded)
     pub data: u64,
+    /// Complete payload for fields longer than 64 bits (e.g. RAND2).
+    pub raw: Vec<u8>,
 }
 
 /// Helper functions for dealing with type2, type3 and type4 fields for MLE, CMCE, MM and SNDCP PDUs.
@@ -233,16 +235,28 @@ pub mod typed {
             }
         };
 
-        // Seek forward to end of element, if larger than 64 bits
+        let mut raw = Vec::new();
         if len_bits > 64 {
-            tracing::warn!("Type3 element {} length {} exceeds 64 bits, data truncated", id, len_bits);
-            buffer.seek_rel(len_bits as isize - 64);
+            let bytes = (len_bits + 7) / 8;
+            raw.resize(bytes, 0);
+            // The first 64 bits were consumed above; retain them in the same
+            // MSB-first representation as BitBuffer for callers that need the
+            // complete field.
+            let first = data.to_be_bytes();
+            raw[..8].copy_from_slice(&first);
+            buffer
+                .read_bits_into_slice(len_bits - 64, &mut raw[8..])
+                .ok_or(PduParseErr::BufferEnded {
+                    field: Some("parse_type3_generic raw"),
+                })?;
         }
+        // Seek forward to end of element, if larger than 64 bits
 
         Ok(Some(Type3FieldGeneric {
             field_id: id,
             len: len_bits,
             data,
+            raw,
         }))
     }
 
@@ -387,7 +401,26 @@ pub mod typed {
             // Write mbit and 4-bit field ID, then write length, then the element itself
             write_type34_header_generic(buffer, id);
             buffer.write_bits(elem.len as u64, 11);
-            buffer.write_bits(elem.data, elem.len);
+            if elem.raw.is_empty() {
+                buffer.write_bits(elem.data, elem.len);
+            } else {
+                buffer.write_bits(elem.data, 64.min(elem.len));
+                let remaining = elem.len - 64;
+                let mut bits_left = remaining;
+                let mut offset = 8;
+                while bits_left > 0 {
+                    let n = bits_left.min(64);
+                    let mut value = 0u64;
+                    for byte in &elem.raw[offset..offset + ((n + 7) / 8)] {
+                        value = (value << 8) | u64::from(*byte);
+                    }
+                    let padding = ((n + 7) / 8) * 8 - n;
+                    value >>= padding;
+                    buffer.write_bits(value, n);
+                    bits_left -= n;
+                    offset += (n + 7) / 8;
+                }
+            }
         } else {
             // Don't write anything (no mbit)
             tracing::trace!("write_type3_generic no_field {}", buffer.dump_bin());

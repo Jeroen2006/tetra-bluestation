@@ -28,6 +28,8 @@ pub struct CfgCellInfo {
 
     // 14 bits, from 18.4.2.2 D-MLE-SYSINFO
     pub location_area: u16,
+    /// Advertise that authentication is required on this serving cell.
+    pub authentication_required: bool,
     // 16 bits, from 18.4.2.2 D-MLE-SYSINFO
     pub subscriber_class: u16,
 
@@ -71,6 +73,7 @@ pub struct CellInfoDto {
     pub custom_duplex_spacing: Option<u32>,
 
     pub location_area: u16,
+    pub authentication_required: Option<bool>,
 
     pub neighbor_cell_broadcast: Option<u8>,
     pub late_entry_supported: Option<bool>,
@@ -113,6 +116,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         reverse_operation: ci.reverse_operation,
         custom_duplex_spacing: ci.custom_duplex_spacing,
         location_area: ci.location_area,
+        authentication_required: ci.authentication_required.unwrap_or(false),
         neighbor_cell_broadcast: ci.neighbor_cell_broadcast.unwrap_or(0),
         late_entry_supported: ci.late_entry_supported.unwrap_or(false),
         subscriber_class: ci.subscriber_class.unwrap_or(65535), // All subscriber classes allowed

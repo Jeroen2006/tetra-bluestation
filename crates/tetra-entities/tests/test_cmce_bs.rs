@@ -125,12 +125,7 @@ fn count_d_setups(msgs: &[SapMsg]) -> usize {
 
 fn count_circuit_opens(msgs: &[SapMsg]) -> usize {
     msgs.iter()
-        .filter(|msg| {
-            matches!(
-                &msg.msg,
-                SapMsgInner::CmceCallControl(CallControl::Open(_))
-            )
-        })
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::Open(_))))
         .count()
 }
 
@@ -151,7 +146,10 @@ fn test_group_setup_joins_existing_circuit() {
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
-    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
 

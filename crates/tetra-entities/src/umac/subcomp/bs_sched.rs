@@ -213,6 +213,19 @@ impl BsChannelScheduler {
         }
     }
 
+    /// Update the authentication-required bit in the broadcast Extended
+    /// Services information element.
+    pub fn set_authentication_required(&mut self, required: bool) {
+        let Some(ext_services) = self.precomps.mac_sysinfo2.ext_services.as_mut() else {
+            tracing::warn!(required, "cannot update authentication policy: Extended Services is not present");
+            return;
+        };
+        if ext_services.auth_required != required {
+            ext_services.auth_required = required;
+            tracing::info!(required, "BS SYSINFO authentication policy updated");
+        }
+    }
+
     /// Fully wipe the schedule
     pub fn purge_schedule(&mut self) {
         self.dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];

@@ -43,6 +43,7 @@ pub struct UmacBs {
     config: SharedConfig,
     dltime: TdmaTime,
     system_wide_services: bool,
+    authentication_required: bool,
 
     /// This MAC's endpoint ID, for addressing by the higher layers
     /// When using only a single base radio, we can set this to a fixed value
@@ -79,12 +80,14 @@ impl UmacBs {
         let c = config.config();
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
+        let authentication_required = Self::get_authentication_required_state(&config);
         let precomps = Self::generate_precomps(&config);
         Self {
             self_component: TetraEntity::Umac,
             config,
             dltime: TdmaTime::default(),
             system_wide_services,
+            authentication_required,
             endpoint_id: 1,
             defrag: BsDefrag::new(),
             pending_stch: None,
@@ -103,7 +106,7 @@ impl UmacBs {
 
         // TODO FIXME make more/all parameters configurable
         let ext_services = SysinfoExtendedServices {
-            auth_required: false,
+            auth_required: c.cell.authentication_required,
             class1_supported: true,
             class2_supported: true,
             class3_supported: false,
@@ -222,6 +225,22 @@ impl UmacBs {
         }
     }
 
+    /// Retrieve the effective authentication policy.  A connected SwMI cell
+    /// overrides the local fallback configuration at runtime.
+    fn get_authentication_required_state(config: &SharedConfig) -> bool {
+        let cfg = config.config();
+        if cfg.swmi.is_some() {
+            let state = config.state_read();
+            if state.network_connected {
+                state.authentication_required
+            } else {
+                cfg.cell.authentication_required
+            }
+        } else {
+            cfg.cell.authentication_required
+        }
+    }
+
     fn refresh_system_wide_services(&mut self) {
         let is_effective = Self::get_system_wide_services_state(&self.config);
         if is_effective != self.system_wide_services {
@@ -230,6 +249,14 @@ impl UmacBs {
 
             // Should already be signalled at SwMI interface level
             tracing::debug!("UmacBs: system_wide_services {}", if is_effective { "ENABLED" } else { "DISABLED" });
+        }
+    }
+
+    fn refresh_authentication_required(&mut self) {
+        let required = Self::get_authentication_required_state(&self.config);
+        if required != self.authentication_required {
+            self.authentication_required = required;
+            self.channel_scheduler.set_authentication_required(required);
         }
     }
 
@@ -1618,6 +1645,7 @@ impl TetraEntityTrait for UmacBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
         self.refresh_system_wide_services();
+        self.refresh_authentication_required();
 
         if self.channel_scheduler.cur_dltime != ts && self.channel_scheduler.cur_dltime == (TdmaTime { t: 0, f: 0, m: 0, h: 0 }) {
             // Upon start of the system, we need to set the dl time for the channel scheduler

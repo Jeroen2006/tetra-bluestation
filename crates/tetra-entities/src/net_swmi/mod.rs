@@ -302,8 +302,13 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 mcc = cell.mcc,
                                 mnc = cell.mnc,
                                 location_area = cell.location_area,
+                                authentication_required = cell.authentication_required,
                                 "SwMI cell configuration received"
                             );
+                            // The central SwMI is authoritative for the serving
+                            // cell policy.  UMAC reads this mutable value and
+                            // updates the broadcast Extended Services field.
+                            self.stack_config.state_write().authentication_required = cell.authentication_required;
                             let report_command_id = self.next_command_id();
                             let accepted = self.send(SwmiMessage::SystemInfoReport {
                                 command_id: report_command_id,
@@ -327,7 +332,13 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             accepted,
                             code,
                         }) => tracing::debug!(command_id, accepted, code, "SwMI command receipt"),
-                        Ok(message @ (SwmiMessage::RegistrationDecision { .. } | SwmiMessage::AttachmentDecision { .. })) => {
+                        Ok(
+                            message @ (SwmiMessage::RegistrationDecision { .. }
+                            | SwmiMessage::AttachmentDecision { .. }
+                            | SwmiMessage::AuthenticationChallenge { .. }
+                            | SwmiMessage::AuthenticationResponseDemand { .. }
+                            | SwmiMessage::AuthenticationResult { .. }),
+                        ) => {
                             if self.endpoint.mm_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI MM endpoint closed; dropping central decision");
                             }

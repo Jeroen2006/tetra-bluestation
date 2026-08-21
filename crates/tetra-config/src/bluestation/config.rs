@@ -155,9 +155,15 @@ impl SharedConfig {
             Err(e) => panic!("Invalid stack configuration: {}", e),
         }
 
+        let mut state = state.unwrap_or_default();
+        // Use the local value until a connected SwMI provides the authoritative
+        // serving-cell policy.  The SwMI worker overwrites this when CellConfig
+        // arrives, so SYSINFO can follow central policy at runtime.
+        state.authentication_required = cfg.cell.authentication_required;
+
         Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(RwLock::new(state.unwrap_or_default())),
+            state: Arc::new(RwLock::new(state)),
         }
     }
 
