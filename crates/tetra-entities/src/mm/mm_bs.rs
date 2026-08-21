@@ -51,7 +51,10 @@ pub struct MmBs {
     pending_registrations: HashMap<u64, PendingRegistration>,
     pending_attachments: HashMap<u64, PendingAttachment>,
     pending_location_attachments: HashMap<u64, PendingLocationAttachment>,
-    pending_auth_commands: HashMap<u32, u64>,
+    /// SwMI authentication correlation per terminal and air-interface handle.
+    /// MLE reuses handle 0 for concurrent registrations, so a handle alone is
+    /// not a unique key.
+    pending_auth_commands: HashMap<(u32, u32), u64>,
     /// Registration command IDs for which the SwMI has completed successful
     /// authentication.  The final D-LOCATION UPDATE ACCEPT carries the
     /// Authentication Downlink only for these registrations.
@@ -132,6 +135,10 @@ impl MmBs {
         let command_id = self.next_swmi_command_id;
         self.next_swmi_command_id = self.next_swmi_command_id.wrapping_add(1).max(1);
         command_id
+    }
+
+    fn authentication_correlation_key(issi: u32, air_handle: u32) -> (u32, u32) {
+        (issi, air_handle)
     }
 
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
@@ -343,6 +350,7 @@ impl MmBs {
                 authentication,
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                self.config.state_write().subscribers.set_registration_delivery_pending(issi, true);
                 self.pending_registrations.insert(
                     command_id,
                     PendingRegistration {
@@ -382,6 +390,7 @@ impl MmBs {
             tracing::warn!("Failed updating roaming MS {}: {:?}", issi, e);
             return;
         }
+        self.config.state_write().subscribers.set_registration_delivery_pending(issi, true);
 
         // Store energy saving mode in client state
         let esm = esi.as_ref().map(|e| e.energy_saving_mode).unwrap_or(EnergySavingMode::StayAlive);
@@ -478,6 +487,10 @@ impl MmBs {
             }),
         };
         queue.push_back(msg);
+        // The current stack has no lower-layer delivery callback for this
+        // acknowledged MM primitive. Queue admission is therefore the local
+        // confirmation point; retries before this point still count as RA load.
+        self.config.state_write().subscribers.mark_active(issi);
 
         // If this is an unknown returning radio (not ITSI attach) that didn't
         // include groups in the registration, force a full group report via
@@ -800,7 +813,7 @@ impl MmBs {
         };
         let command_id = self
             .pending_auth_commands
-            .get(&prim.handle)
+            .get(&Self::authentication_correlation_key(prim.received_address.ssi, prim.handle))
             .copied()
             .unwrap_or_else(|| self.next_swmi_command_id());
         let Some(swmi) = self.swmi.as_ref() else {
@@ -925,11 +938,10 @@ impl MmBs {
         accepted: bool,
         cause: u16,
     ) {
-        let Some(mut pending) = self.pending_registrations.remove(&command_id) else {
+        let Some(pending) = self.pending_registrations.get(&command_id) else {
             tracing::warn!(command_id, itsi, "received SwMI registration decision without pending air request");
             return;
         };
-        pending.authentication_successful = self.authenticated_registrations.remove(&command_id).unwrap_or(false);
         if pending.itsi as u64 != itsi || pending.air_handle != air_handle {
             tracing::warn!(
                 command_id,
@@ -941,7 +953,27 @@ impl MmBs {
             );
             return;
         }
+        // Keep a pending registration intact unless the decision correlates
+        // with it. A delayed or malformed SwMI response must not make the
+        // legitimate terminal impossible to complete later.
+        let mut pending = self
+            .pending_registrations
+            .remove(&command_id)
+            .expect("pending registration was checked above");
+        pending.authentication_successful = self.authenticated_registrations.remove(&command_id);
+        let auth_key = Self::authentication_correlation_key(pending.itsi, pending.air_handle);
+        if self
+            .pending_auth_commands
+            .get(&auth_key)
+            .is_some_and(|current_command_id| *current_command_id == command_id)
+        {
+            self.pending_auth_commands.remove(&auth_key);
+        }
         if !accepted {
+            self.config
+                .state_write()
+                .subscribers
+                .set_registration_delivery_pending(pending.itsi, false);
             tracing::info!(command_id, itsi, cause, "SwMI rejected location update");
             Self::send_d_location_update_reject_with_cause(
                 queue,
@@ -992,6 +1024,10 @@ impl MmBs {
             );
             return;
         }
+        self.config
+            .state_write()
+            .subscribers
+            .set_registration_delivery_pending(pending.itsi, true);
         let energy_saving_mode = pending
             .energy_saving_information
             .as_ref()
@@ -1058,6 +1094,7 @@ impl MmBs {
                     group_identity_downlink: Some(groups),
                 }),
             );
+            self.config.state_write().subscribers.mark_active(pending.itsi);
             return;
         }
         Self::send_d_location_update_accept(
@@ -1072,6 +1109,7 @@ impl MmBs {
                 group_identity_downlink: None,
             }),
         );
+        self.config.state_write().subscribers.mark_active(pending.itsi);
         tracing::info!(
             command_id,
             itsi,
@@ -1272,6 +1310,7 @@ impl MmBs {
                 group_identity_downlink: Some(groups),
             }),
         );
+        self.config.state_write().subscribers.mark_active(registration.itsi);
         tracing::info!(
             command_id,
             itsi,
@@ -1338,9 +1377,12 @@ impl MmBs {
             default_group_attachment_lifetime: None,
             authentication_downlink: authentication_successful.then(|| Type3FieldGeneric {
                 field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
-                len: 2,
-                // Authentication successful, do not supply TEI.
-                data: 0b10,
+                // Authentication Downlink has three mandatory bits:
+                // authentication result, TEI request, and CK provisioning.
+                // Accept the authentication without requesting a TEI or
+                // provisioning a cipher key.
+                len: 3,
+                data: 0b100,
                 raw: Vec::new(),
             }),
             group_identity_security_related_information: None,
@@ -1351,7 +1393,7 @@ impl MmBs {
         pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-LOCATION UPDATE ACCEPT");
         sdu.seek(0);
         tracing::debug!(
-            itsi,
+            issi,
             authentication_downlink = authentication_successful,
             "sending D-LOCATION UPDATE ACCEPT"
         );
@@ -1607,7 +1649,8 @@ impl TetraEntityTrait for MmBs {
                     random_seed,
                     mutual,
                 } => {
-                    self.pending_auth_commands.insert(air_handle, command_id);
+                    self.pending_auth_commands
+                        .insert(Self::authentication_correlation_key(itsi as u32, air_handle), command_id);
                     let pdu = DAuthenticationDemand { rand_1, random_seed };
                     let mut sdu = BitBuffer::new_autoexpand(24);
                     pdu.to_bitbuf(&mut sdu).unwrap();
@@ -1714,7 +1757,8 @@ impl TetraEntityTrait for MmBs {
                             }),
                         });
                     }
-                    self.pending_auth_commands.insert(air_handle, command_id);
+                    self.pending_auth_commands
+                        .insert(Self::authentication_correlation_key(itsi as u32, air_handle), command_id);
                 }
                 SwmiMessage::AttachmentDecision {
                     command_id,
@@ -1819,5 +1863,18 @@ impl TetraEntityTrait for MmBs {
                 panic!();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MmBs;
+
+    #[test]
+    fn authentication_correlation_distinguishes_terminals_with_handle_zero() {
+        assert_ne!(
+            MmBs::authentication_correlation_key(77491, 0),
+            MmBs::authentication_correlation_key(77492, 0)
+        );
     }
 }

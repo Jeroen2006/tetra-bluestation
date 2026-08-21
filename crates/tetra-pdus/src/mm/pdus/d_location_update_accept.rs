@@ -277,4 +277,39 @@ mod tests {
         tracing::info!("Serialized: {}", buf_out.dump_bin());
         assert_eq!(buf_out.to_bitstr(), test_vec);
     }
+
+    #[test]
+    fn authentication_downlink_success_is_three_bits() {
+        let pdu = DLocationUpdateAccept {
+            location_update_accept_type: LocationUpdateType::RoamingLocationUpdating,
+            ssi: Some(77468),
+            address_extension: None,
+            subscriber_class: None,
+            energy_saving_information: None,
+            scch_information_and_distribution_on_18th_frame: None,
+            new_registered_area: None,
+            security_downlink: None,
+            group_identity_location_accept: None,
+            default_group_attachment_lifetime: None,
+            authentication_downlink: Some(Type3FieldGeneric {
+                field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                len: 3,
+                // authentication_result=1, tei_request=0, ck_provision=0
+                data: 0b100,
+                raw: Vec::new(),
+            }),
+            group_identity_security_related_information: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+
+        let mut encoded = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut encoded).expect("serialize D-LOCATION UPDATE ACCEPT");
+        encoded.seek(0);
+        let decoded = DLocationUpdateAccept::from_bitbuf(&mut encoded).expect("parse D-LOCATION UPDATE ACCEPT");
+        let auth = decoded.authentication_downlink.expect("authentication downlink present");
+        assert_eq!(auth.len, 3);
+        assert_eq!(auth.data, 0b100);
+        assert_eq!(encoded.get_len_remaining(), 0);
+    }
 }

@@ -36,6 +36,7 @@ pub enum SapMsgInner {
     // TMV-SAP
     TmvUnitdataReq(TmvUnitdataReqSlot),
     TmvUnitdataInd(TmvUnitdataInd),
+    TmvCrcInd(TmvCrcInd),
     TmvConfigureReq(TmvConfigureReq),
     TmvConfigureConf(TmvConfigureConf),
 
@@ -98,6 +99,7 @@ impl Display for SapMsgInner {
             // SapMsgInner::TpUnitdataInd(_) => write!(f, "TpUnitdataInd"),
 
             // TMV-SAP
+            SapMsgInner::TmvCrcInd(_) => write!(f, "TmvCrcInd"),
             SapMsgInner::TmvUnitdataReq(_) => write!(f, "TmvUnitdataReq"),
             SapMsgInner::TmvUnitdataInd(_) => write!(f, "TmvUnitdataInd"),
             SapMsgInner::TmvConfigureReq(_) => write!(f, "TmvConfigureReq"),

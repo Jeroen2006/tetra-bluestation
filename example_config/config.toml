@@ -101,6 +101,10 @@ colour_code = 1
 # Cell load (Channel Allocation) - current load
 # cell_load_ca = 0
 
+# Dynamic common random access for access code A on the MCCH. SYSINFO keeps the
+# bootstrap values; ACCESS-DEFINE updates these parameters once per interval.
+# random_access = { enabled = true, update_interval_multiframes = 1, startup_grace_multiframes = 5, recovery_step_multiframes = 3, low_load_threshold = 2, high_load_threshold = 8, imm_min = 0, imm_max = 15, wt_min = 3, wt_max = 8, nu_min = 3, nu_max = 5, frame_len_min = 2, frame_len_max = 8, retry_window_multiframes = 30, retry_weight_percent = 33, ewma_alpha_percent = 50, frame_factor_activation_windows = 3, frame_factor_release_windows = 3 }
+
 # Late entry support - allows joining ongoing group calls
 # late_entry_supported = true
 
@@ -137,8 +141,13 @@ voice_service = true
 # Frame 18 extension support
 # frame_18_ext = false
 
-# Max MS TX power in cell: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
+# Open-loop power control broadcast parameters.
+# MS_TXPWR_MAX_CELL: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
 # ms_txpwr_max_cell = 4
+# RXLEV_ACCESS_MIN: 0=-116 dBm, 1=-114 dBm, ... 15=-86 dBm
+# rxlev_access_min = 3
+# ACCESS_PARAMETER: 0=-53 dBm, 1=-51 dBm, ... 15=-23 dBm
+# access_parameter = 7
 
 # IANA timezone for D-NWRK-BROADCAST time broadcasting. When set, the BS will
 # broadcast UTC time and local time offset once per hyperframe (~61s) so MSs

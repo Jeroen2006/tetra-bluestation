@@ -12,6 +12,7 @@ use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
 use tetra_pdus::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
+use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
@@ -34,6 +35,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use crate::lmac::components::scrambler;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
+use crate::umac::subcomp::random_access::RandomAccessController;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
@@ -44,6 +46,7 @@ pub struct UmacBs {
     dltime: TdmaTime,
     system_wide_services: bool,
     authentication_required: bool,
+    random_access: RandomAccessController,
 
     /// This MAC's endpoint ID, for addressing by the higher layers
     /// When using only a single base radio, we can set this to a fixed value
@@ -81,6 +84,7 @@ impl UmacBs {
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
         let authentication_required = Self::get_authentication_required_state(&config);
+        let random_access = RandomAccessController::new(c.cell.random_access.clone());
         let precomps = Self::generate_precomps(&config);
         Self {
             self_component: TetraEntity::Umac,
@@ -88,6 +92,7 @@ impl UmacBs {
             dltime: TdmaTime::default(),
             system_wide_services,
             authentication_required,
+            random_access,
             endpoint_id: 1,
             defrag: BsDefrag::new(),
             pending_stch: None,
@@ -130,6 +135,20 @@ impl UmacBs {
             min_pdu_prio: 0,
         };
 
+        let access_define = c.cell.random_access.enabled.then(|| AccessDefine {
+            common_or_assigned_control: false,
+            access_code: 0,
+            imm: def_access.imm,
+            wt: def_access.wt,
+            nu: def_access.nu,
+            frame_len_factor: def_access.fl_factor,
+            ts_pointer: def_access.ts_ptr,
+            min_pdu_prio: def_access.min_pdu_prio,
+            opt_field_flag: 0,
+            subscriber_class: None,
+            gssi: None,
+        });
+
         let sysinfo1 = MacSysinfo {
             main_carrier: c.cell.main_carrier,
             freq_band: c.cell.freq_band,
@@ -138,8 +157,8 @@ impl UmacBs {
             reverse_operation: c.cell.reverse_operation,
             num_of_csch: 0, // Common secondary control channels
             ms_txpwr_max_cell: c.cell.ms_txpwr_max_cell,
-            rxlev_access_min: 3, // -110 dBm (permissive, suitable for single-cell)
-            access_parameter: 7, // -39 dBm (MS open-loop power control setpoint)
+            rxlev_access_min: c.cell.rxlev_access_min,
+            access_parameter: c.cell.access_parameter,
             radio_dl_timeout: 3, // 432 timeslots (~6s radio link timeout)
             cck_id: None,
             hyperframe_number: Some(0), // Updated dynamically in scheduler
@@ -208,6 +227,8 @@ impl UmacBs {
         PrecomputedUmacPdus {
             mac_sysinfo1: sysinfo1,
             mac_sysinfo2: sysinfo2,
+            access_define,
+            access_define_interval_multiframes: c.cell.random_access.update_interval_multiframes,
             mle_sysinfo: mle_sysinfo_pdu,
             mac_sync: mac_sync_pdu,
             mle_sync: mle_sync_pdu,
@@ -239,6 +260,25 @@ impl UmacBs {
         } else {
             cfg.cell.authentication_required
         }
+    }
+
+    fn refresh_random_access_control(&mut self, ts: TdmaTime) {
+        let (pending_registrations, registration_delivery_failures) = {
+            let mut state = self.config.state_write();
+            (
+                state.subscribers.pending_registration_count(),
+                state.subscribers.take_registration_delivery_failures(),
+            )
+        };
+        self.random_access.set_pending_registrations(pending_registrations);
+        self.random_access
+            .observe_registration_delivery_failures(registration_delivery_failures);
+        let Some(update) = self.random_access.maybe_update(ts) else {
+            return;
+        };
+        self.channel_scheduler
+            .set_random_access_definition(update.parameters, update.frame_len);
+        tracing::info!("UmacBs: updated common random-access parameters at {} after measured load", ts);
     }
 
     fn refresh_system_wide_services(&mut self) {
@@ -297,6 +337,12 @@ impl UmacBs {
         match message.msg {
             SapMsgInner::TmvUnitdataInd(_) => {
                 self.rx_tmv_unitdata_ind(queue, message);
+            }
+            SapMsgInner::TmvCrcInd(ind) => {
+                if ind.common_control && ind.logical_channel == LogicalChannel::SchHu {
+                    self.random_access.observe_crc_failure();
+                    tracing::debug!("UmacBs: common random-access CRC failure block={:?}", ind.block_num);
+                }
             }
             _ => {
                 panic!();
@@ -620,6 +666,7 @@ impl UmacBs {
                 pdu
             }
             Err(e) => {
+                self.random_access.observe_invalid_mac_access();
                 tracing::warn!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
                 return;
             }
@@ -634,6 +681,16 @@ impl UmacBs {
         } else {
             panic!()
         };
+
+        let msg_dltime = self.dltime.add_timeslots(-2);
+        let issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+        let (active, registration_pending) = issi
+            .map(|issi| {
+                let state = self.config.state_read();
+                (state.subscribers.is_active(issi), state.subscribers.is_registration_pending(issi))
+            })
+            .unwrap_or((false, false));
+        self.random_access.observe_access(issi, msg_dltime, active, registration_pending);
 
         // Compute len and extract flags
         let mut pdu_len_bits;
@@ -687,7 +744,7 @@ impl UmacBs {
         // traffic the uplink is reserved (ETSI 23.5.1.3), so the talker is not on random
         // access and acking it would steal an extra MAC-RESOURCE onto the traffic channel.
         // Hangtime and control-channel access (floor requests) are still acked.
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        // Message on uplink was sent two timeslots ago.
         let in_active_over =
             self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
         if !in_active_over {
@@ -1646,6 +1703,7 @@ impl TetraEntityTrait for UmacBs {
         self.dltime = ts;
         self.refresh_system_wide_services();
         self.refresh_authentication_required();
+        self.refresh_random_access_control(ts);
 
         if self.channel_scheduler.cur_dltime != ts && self.channel_scheduler.cur_dltime == (TdmaTime { t: 0, f: 0, m: 0, h: 0 }) {
             // Upon start of the system, we need to set the dl time for the channel scheduler

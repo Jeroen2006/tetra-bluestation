@@ -126,6 +126,54 @@ impl StackConfig {
         if self.cell.ms_txpwr_max_cell > 7 {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
         }
+        if self.cell.rxlev_access_min > 15 {
+            return Err("rxlev_access_min must be 0-15 (4 bits)");
+        }
+        if self.cell.access_parameter > 15 {
+            return Err("access_parameter must be 0-15 (4 bits)");
+        }
+
+        let random_access = &self.cell.random_access;
+        if !(1..=60).contains(&random_access.update_interval_multiframes) {
+            return Err("cell.random_access.update_interval_multiframes must be 1-60");
+        }
+        if random_access.startup_grace_multiframes > 60 {
+            return Err("cell.random_access.startup_grace_multiframes must be 0-60");
+        }
+        if !(1..=60).contains(&random_access.recovery_step_multiframes) {
+            return Err("cell.random_access.recovery_step_multiframes must be 1-60");
+        }
+        if random_access.low_load_threshold >= random_access.high_load_threshold {
+            return Err("cell.random_access.low_load_threshold must be lower than high_load_threshold");
+        }
+        if random_access.imm_min > random_access.imm_max || random_access.imm_max > 15 {
+            return Err("cell.random_access IMM limits must be ordered and 0-15");
+        }
+        if random_access.wt_min == 0 || random_access.wt_min > random_access.wt_max || random_access.wt_max > 15 {
+            return Err("cell.random_access WT limits must be ordered and 1-15");
+        }
+        if random_access.nu_min == 0 || random_access.nu_min > random_access.nu_max || random_access.nu_max > 15 {
+            return Err("cell.random_access Nu limits must be ordered and 1-15");
+        }
+        if random_access.frame_len_min == 0 || random_access.frame_len_min > random_access.frame_len_max || random_access.frame_len_max > 15
+        {
+            return Err("cell.random_access frame length limits must be ordered and 1-15");
+        }
+        if !(1..=60).contains(&random_access.retry_window_multiframes) {
+            return Err("cell.random_access.retry_window_multiframes must be 1-60");
+        }
+        if !(1..=100).contains(&random_access.retry_weight_percent) {
+            return Err("cell.random_access.retry_weight_percent must be 1-100");
+        }
+        if !(1..=100).contains(&random_access.ewma_alpha_percent) {
+            return Err("cell.random_access.ewma_alpha_percent must be 1-100");
+        }
+        if !(1..=60).contains(&random_access.frame_factor_activation_windows) {
+            return Err("cell.random_access.frame_factor_activation_windows must be 1-60");
+        }
+        if !(1..=60).contains(&random_access.frame_factor_release_windows) {
+            return Err("cell.random_access.frame_factor_release_windows must be 1-60");
+        }
 
         // Validate timezone if configured
         if let Some(ref tz) = self.cell.timezone {

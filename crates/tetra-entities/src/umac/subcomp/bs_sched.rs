@@ -21,11 +21,13 @@ use tetra_pdus::{
         },
         fields::basic_slotgrant::BasicSlotgrant,
         pdus::{
-            access_assign::AccessAssign, access_assign_fr18::AccessAssignFr18, mac_resource::MacResource, mac_sync::MacSync,
-            mac_sysinfo::MacSysinfo,
+            access_assign::AccessAssign, access_assign_fr18::AccessAssignFr18, access_define::AccessDefine, mac_resource::MacResource,
+            mac_sync::MacSync, mac_sysinfo::MacSysinfo,
         },
     },
 };
+
+use crate::umac::subcomp::random_access::RandomAccessParameters;
 
 /// We submit this many TX timeslots ahead of the current time
 pub const MACSCHED_TX_AHEAD: usize = 1;
@@ -49,6 +51,8 @@ pub const NUM_TIMESLOTS: usize = 4;
 pub struct PrecomputedUmacPdus {
     pub mac_sysinfo1: MacSysinfo,
     pub mac_sysinfo2: MacSysinfo,
+    pub access_define: Option<AccessDefine>,
+    pub access_define_interval_multiframes: u8,
     pub mle_sysinfo: DMleSysinfo,
     pub mac_sync: MacSync,
     pub mle_sync: DMleSync,
@@ -84,6 +88,8 @@ pub struct BsChannelScheduler {
     /// The next STCH built for a matching SSI should carry random_access_flag=true to properly
     /// acknowledge the random access per ETSI 21.4.3.1.
     pending_ra_acks: [Vec<u32>; 4],
+    /// Raw base-frame-length encoding for unreserved common access fields.
+    random_access_frame_len: u8,
 }
 
 #[derive(Debug)]
@@ -130,6 +136,7 @@ impl BsChannelScheduler {
             circuits: CircuitMgr::new(),
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            random_access_frame_len: 4,
         }
     }
 
@@ -895,6 +902,35 @@ impl BsChannelScheduler {
         );
     }
 
+    pub fn set_random_access_definition(&mut self, parameters: RandomAccessParameters, frame_len: u8) {
+        if let Some(access_define) = self.precomps.access_define.as_mut() {
+            access_define.imm = parameters.imm;
+            access_define.wt = parameters.wt;
+            access_define.nu = parameters.nu;
+            access_define.frame_len_factor = parameters.frame_len_factor;
+            access_define.ts_pointer = parameters.ts_pointer;
+            access_define.min_pdu_prio = parameters.min_pdu_prio;
+        }
+        self.random_access_frame_len = frame_len.clamp(1, 15);
+        tracing::info!(
+            "BsChannelScheduler: common random-access definition IMM={} WT={} Nu={} FL={} frame_len={}",
+            parameters.imm,
+            parameters.wt,
+            parameters.nu,
+            parameters.frame_len_factor,
+            self.random_access_frame_len
+        );
+    }
+
+    fn should_emit_access_define(&self, ts: TdmaTime) -> bool {
+        let interval = self.precomps.access_define_interval_multiframes.max(1);
+        self.precomps.access_define.is_some() && ts.t == 1 && ts.f == 2 && (ts.m - 1) % interval == 0
+    }
+
+    fn common_access_frame_len(&self) -> BaseFrameLength {
+        BaseFrameLength::try_from(self.random_access_frame_len as u64).unwrap_or(DEFAULT_ACCESS_FRAME_MARKER)
+    }
+
     /// Prepares a scheduled FUTURE timeslot for transfer to lmac and transmission
     /// Generates BBK block
     /// If the timeslot is not full, generates SYNC SB1/SB2 blocks.
@@ -1133,7 +1169,7 @@ impl BsChannelScheduler {
                             base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
                                 BaseFrameLength::ReservedSubslot
                             } else {
-                                DEFAULT_ACCESS_FRAME_MARKER
+                                self.common_access_frame_len()
                             },
                         },
                         access_field_2: AccessField {
@@ -1141,7 +1177,7 @@ impl BsChannelScheduler {
                             base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
                                 BaseFrameLength::ReservedSubslot
                             } else {
-                                DEFAULT_ACCESS_FRAME_MARKER
+                                self.common_access_frame_len()
                             },
                         },
                     }
@@ -1196,7 +1232,7 @@ impl BsChannelScheduler {
                         // CLCH opportunity (which is always in SSN1, see EN 300 392 §9.5.1 Table 9.27)
                         BaseFrameLength::CLCHSubslot
                     } else {
-                        DEFAULT_ACCESS_FRAME_MARKER
+                        self.common_access_frame_len()
                     },
                 },
                 access_field_2: AccessField {
@@ -1204,7 +1240,7 @@ impl BsChannelScheduler {
                     base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
                         BaseFrameLength::ReservedSubslot
                     } else {
-                        DEFAULT_ACCESS_FRAME_MARKER
+                        self.common_access_frame_len()
                     },
                 },
             };
@@ -1226,10 +1262,14 @@ impl BsChannelScheduler {
                 // Alternate every frame
                 match ts.f % 2 {
                     0 => {
-                        // Half-slot Null PDU on SCH/HD, SYSINFO gets added later as BNCH blk2
+                        // ACCESS-DEFINE shares the SCH/HD half-slot with the normal
+                        // SYSINFO BNCH block at the stable MCCH position.
                         let mut buf1 = BitBuffer::new(SCH_HD_CAP);
-                        let blk1 = MacResource::null_pdu();
-                        blk1.to_bitbuf(&mut buf1);
+                        if self.should_emit_access_define(ts) {
+                            self.precomps.access_define.as_ref().expect("checked above").to_bitbuf(&mut buf1);
+                        } else {
+                            MacResource::null_pdu().to_bitbuf(&mut buf1);
+                        }
                         TmvUnitdataReq {
                             logical_channel: LogicalChannel::SchHd,
                             mac_block: buf1,
@@ -1450,6 +1490,8 @@ mod tests {
         let precomps = PrecomputedUmacPdus {
             mac_sysinfo1: sysinfo1,
             mac_sysinfo2: sysinfo2,
+            access_define: None,
+            access_define_interval_multiframes: 1,
             mle_sysinfo: mle_sysinfo_pdu,
             mac_sync: mac_sync_pdu,
             mle_sync: mle_sync_pdu,

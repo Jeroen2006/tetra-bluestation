@@ -4,6 +4,56 @@ use std::collections::HashMap;
 use tetra_core::ranges::{SortedDisjointSsiRanges, SsiRange};
 use toml::Value;
 
+/// Dynamic common-channel random-access control for access code A.
+#[derive(Debug, Clone)]
+pub struct CfgRandomAccess {
+    pub enabled: bool,
+    pub update_interval_multiframes: u8,
+    pub startup_grace_multiframes: u8,
+    pub recovery_step_multiframes: u8,
+    pub low_load_threshold: u8,
+    pub high_load_threshold: u8,
+    pub imm_min: u8,
+    pub imm_max: u8,
+    pub wt_min: u8,
+    pub wt_max: u8,
+    pub nu_min: u8,
+    pub nu_max: u8,
+    pub frame_len_min: u8,
+    pub frame_len_max: u8,
+    pub retry_window_multiframes: u8,
+    pub retry_weight_percent: u8,
+    pub ewma_alpha_percent: u8,
+    pub frame_factor_activation_windows: u8,
+    pub frame_factor_release_windows: u8,
+}
+
+impl Default for CfgRandomAccess {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            update_interval_multiframes: 1,
+            startup_grace_multiframes: 5,
+            recovery_step_multiframes: 3,
+            low_load_threshold: 2,
+            high_load_threshold: 8,
+            imm_min: 0,
+            imm_max: 15,
+            wt_min: 3,
+            wt_max: 8,
+            nu_min: 3,
+            nu_max: 5,
+            frame_len_min: 2,
+            frame_len_max: 8,
+            retry_window_multiframes: 30,
+            retry_weight_percent: 33,
+            ewma_alpha_percent: 50,
+            frame_factor_activation_windows: 3,
+            frame_factor_release_windows: 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CfgCellInfo {
     // 2 bits, from 18.4.2.1 D-MLE-SYNC
@@ -56,6 +106,11 @@ pub struct CfgCellInfo {
 
     pub ms_txpwr_max_cell: u8,
 
+    pub rxlev_access_min: u8,
+    pub access_parameter: u8,
+
+    pub random_access: CfgRandomAccess,
+
     pub local_ssi_ranges: SortedDisjointSsiRanges,
 
     /// IANA timezone name (e.g. "Europe/Amsterdam"). When set, enables D-NWRK-BROADCAST
@@ -98,6 +153,11 @@ pub struct CellInfoDto {
     pub frame_18_ext: Option<bool>,
 
     pub ms_txpwr_max_cell: Option<u8>,
+    pub rxlev_access_min: Option<u8>,
+    pub access_parameter: Option<u8>,
+
+    #[serde(default)]
+    pub random_access: Option<RandomAccessDto>,
 
     pub local_ssi_ranges: Option<Vec<(u32, u32)>>,
 
@@ -107,7 +167,55 @@ pub struct CellInfoDto {
     pub extra: HashMap<String, Value>,
 }
 
+#[derive(Default, Deserialize)]
+pub struct RandomAccessDto {
+    pub enabled: Option<bool>,
+    pub update_interval_multiframes: Option<u8>,
+    pub startup_grace_multiframes: Option<u8>,
+    pub recovery_step_multiframes: Option<u8>,
+    pub low_load_threshold: Option<u8>,
+    pub high_load_threshold: Option<u8>,
+    pub imm_min: Option<u8>,
+    pub imm_max: Option<u8>,
+    pub wt_min: Option<u8>,
+    pub wt_max: Option<u8>,
+    pub nu_min: Option<u8>,
+    pub nu_max: Option<u8>,
+    pub frame_len_min: Option<u8>,
+    pub frame_len_max: Option<u8>,
+    pub retry_window_multiframes: Option<u8>,
+    pub retry_weight_percent: Option<u8>,
+    pub ewma_alpha_percent: Option<u8>,
+    pub frame_factor_activation_windows: Option<u8>,
+    pub frame_factor_release_windows: Option<u8>,
+}
+
 pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
+    let random_access = ci
+        .random_access
+        .map(|dto| CfgRandomAccess {
+            enabled: dto.enabled.unwrap_or(true),
+            update_interval_multiframes: dto.update_interval_multiframes.unwrap_or(1),
+            startup_grace_multiframes: dto.startup_grace_multiframes.unwrap_or(5),
+            recovery_step_multiframes: dto.recovery_step_multiframes.unwrap_or(3),
+            low_load_threshold: dto.low_load_threshold.unwrap_or(2),
+            high_load_threshold: dto.high_load_threshold.unwrap_or(8),
+            imm_min: dto.imm_min.unwrap_or(0),
+            imm_max: dto.imm_max.unwrap_or(15),
+            wt_min: dto.wt_min.unwrap_or(3),
+            wt_max: dto.wt_max.unwrap_or(8),
+            nu_min: dto.nu_min.unwrap_or(3),
+            nu_max: dto.nu_max.unwrap_or(5),
+            frame_len_min: dto.frame_len_min.unwrap_or(2),
+            frame_len_max: dto.frame_len_max.unwrap_or(8),
+            retry_window_multiframes: dto.retry_window_multiframes.unwrap_or(30),
+            retry_weight_percent: dto.retry_weight_percent.unwrap_or(33),
+            ewma_alpha_percent: dto.ewma_alpha_percent.unwrap_or(50),
+            frame_factor_activation_windows: dto.frame_factor_activation_windows.unwrap_or(3),
+            frame_factor_release_windows: dto.frame_factor_release_windows.unwrap_or(3),
+        })
+        .unwrap_or_default();
+
     CfgCellInfo {
         main_carrier: ci.main_carrier,
         freq_band: ci.freq_band,
@@ -138,6 +246,9 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         u_plane_dtx: ci.u_plane_dtx.unwrap_or(false),
         frame_18_ext: ci.frame_18_ext.unwrap_or(false),
         ms_txpwr_max_cell: ci.ms_txpwr_max_cell.unwrap_or(4), // 30 dBm (1W), Table 18.57
+        rxlev_access_min: ci.rxlev_access_min.unwrap_or(3),   // -110 dBm, Table 21.64
+        access_parameter: ci.access_parameter.unwrap_or(7),   // -39 dBm, Table 21.65
+        random_access,
         local_ssi_ranges: ci
             .local_ssi_ranges
             .map(SortedDisjointSsiRanges::from_vec_tuple)

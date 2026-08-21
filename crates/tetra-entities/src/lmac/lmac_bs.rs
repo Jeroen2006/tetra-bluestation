@@ -1,8 +1,8 @@
 use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BurstType, PhyBlockNum, PhysicalChannel, Sap, TdmaTime, TrainingSequence};
-use tetra_saps::tmv::TmvUnitdataInd;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+use tetra_saps::tmv::{TmvCrcInd, TmvUnitdataInd};
 use tetra_saps::tp::{TpUnitdataInd, TpUnitdataReqSlot};
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -53,6 +53,8 @@ pub struct LmacBs {
 
     /// Signalled by Umac per timeslot. Set to true when in a traffic burst, the 1st stolen block shows that the 2nd slot is also stolen
     blk2_stolen: bool,
+    /// Common SCH/HU CRC failures already forwarded for a physical block.
+    recent_common_crc_failures: VecDeque<(TdmaTime, PhyBlockNum)>,
     // Details about current burst, parsed from BBK broadcast block
     // cur_burst: CurBurst,
 }
@@ -83,6 +85,7 @@ impl LmacBs {
             dltime: TdmaTime::default(),
             uplink_phy_chan: [PhysicalChannel::Unallocated; 4],
             blk2_stolen: false,
+            recent_common_crc_failures: VecDeque::with_capacity(32),
         }
     }
 
@@ -210,7 +213,14 @@ impl LmacBs {
         queue.push_back(msg);
     }
 
-    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
+    fn rx_blk_control(
+        &mut self,
+        queue: &mut MessageQueue,
+        blk: TpUnitdataInd,
+        lchan: LogicalChannel,
+        ul_time: TdmaTime,
+        common_control: bool,
+    ) {
         assert!(
             lchan.is_control_channel(),
             "rx_blk_cp: lchan {:?} is not a signalling channel",
@@ -219,7 +229,6 @@ impl LmacBs {
 
         let block_num = blk.block_num;
         let (type1bits, crc_pass) = errorcontrol::decode_cp(lchan, blk, Some(self.scrambling_code));
-        let type1bits = type1bits.unwrap(); // Guaranteed since scramb code set
 
         // tracing::debug!("rx_blk_cp {:?} CRC: {} type1 {:?}",
         //     lchan,
@@ -228,11 +237,43 @@ impl LmacBs {
         // );
         tracing::debug!("rx_blk_cp {:?} CRC: {}", lchan, if crc_pass { "ok" } else { "WRONG" });
 
-        // TODO FIXME, for now, we're not passing broken CRC msgs up to Lmac
-        // If we see purpose, we may pass it up in the future
+        if !crc_pass && common_control && lchan == LogicalChannel::SchHu {
+            let key = (ul_time, block_num);
+            if self.recent_common_crc_failures.contains(&key) {
+                tracing::debug!(
+                    "rx_blk_control: suppressing duplicate common SCH/HU CRC failure at {} block={:?}",
+                    ul_time,
+                    block_num
+                );
+                return;
+            }
+            self.recent_common_crc_failures.push_back(key);
+            if self.recent_common_crc_failures.len() > 32 {
+                self.recent_common_crc_failures.pop_front();
+            }
+            queue.push_prio(
+                SapMsg {
+                    sap: Sap::TmvSap,
+                    src: TetraEntity::Lmac,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmvCrcInd(TmvCrcInd {
+                        logical_channel: lchan,
+                        block_num,
+                        common_control,
+                    }),
+                },
+                MessagePrio::Immediate,
+            );
+        }
+
+        // CRC-failed blocks are intentionally not delivered as MAC PDUs.
         if !crc_pass {
             return;
         }
+        let Some(type1bits) = type1bits else {
+            tracing::warn!("rx_blk_control: decoder returned no type-1 bits for a CRC-valid block");
+            return;
+        };
 
         // Pass block to the upper mac
         let m = SapMsg {
@@ -280,7 +321,7 @@ impl LmacBs {
                 self.rx_blk_traffic(queue, prim, lchan, msg_dltime)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
-                self.rx_blk_control(queue, prim, lchan);
+                self.rx_blk_control(queue, prim, lchan, msg_dltime, pchan == PhysicalChannel::Cp && msg_dltime.t == 1);
             }
             _ => {
                 panic!()
@@ -444,3 +485,4 @@ impl TetraEntityTrait for LmacBs {
         self.blk2_stolen = false; // reset in case it was set during this tick
     }
 }
+use std::collections::VecDeque;

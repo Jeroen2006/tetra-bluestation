@@ -48,6 +48,15 @@ pub struct TmvUnitdataInd {
     pub scrambling_code: u32,
 }
 
+/// Indicates a CRC-failed uplink control block that LMAC discarded.
+/// UMAC uses common-channel SCH/HU failures for random-access load estimation.
+#[derive(Debug, Clone, Copy)]
+pub struct TmvCrcInd {
+    pub logical_channel: LogicalChannel,
+    pub block_num: PhyBlockNum,
+    pub common_control: bool,
+}
+
 /// Clause 23.2.1
 /// The TMV-CONFIGURE primitive shall be used to provide the lower MAC with information about the configuration
 /// of the channel or about the format of a received slot.
