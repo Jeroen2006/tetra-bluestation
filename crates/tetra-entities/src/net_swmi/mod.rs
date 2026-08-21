@@ -338,13 +338,22 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::FloorReleased { .. }
                             | SwmiMessage::CallDisconnect { .. }
                             | SwmiMessage::CallRelease { .. }
-                            | SwmiMessage::CallReject { .. }),
+                            | SwmiMessage::CallReject { .. }
+                            | SwmiMessage::PrivateCallProceeding { .. }
+                            | SwmiMessage::PrivateCallOffer { .. }
+                            | SwmiMessage::PrivateCallAlert { .. }
+                            | SwmiMessage::PrivateCallReserve { .. }
+                            | SwmiMessage::PrivateCallConnected { .. }
+                            | SwmiMessage::PrivateCallRelease { .. }
+                            | SwmiMessage::PrivateFloorGranted { .. }
+                            | SwmiMessage::PrivateFloorReleased { .. }
+                            | SwmiMessage::PrivateCallKeepalive { .. }),
                         ) => {
                             if self.endpoint.cmce_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI CMCE endpoint closed; dropping central call action");
                             }
                         }
-                        Ok(message @ SwmiMessage::VoiceFrame { .. }) => {
+                        Ok(message @ (SwmiMessage::VoiceFrame { .. } | SwmiMessage::PrivateVoiceFrame { .. })) => {
                             if self.endpoint.media_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI media endpoint closed; dropping voice frame");
                             }

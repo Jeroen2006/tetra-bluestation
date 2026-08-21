@@ -48,10 +48,28 @@ pub enum CallControl {
     },
     /// Floor released: speaker stopped transmitting (entering hangtime).
     /// Sent to UMAC to enter hangtime signalling mode and to Brew to stop forwarding audio.
-    FloorReleased { call_id: u16, ts: u8 },
+    FloorReleased {
+        call_id: u16,
+        ts: u8,
+    },
     /// Call ended: the call is being torn down.
     /// Sent to UMAC to clear hangtime state and to Brew to clean up call tracking.
-    CallEnded { call_id: u16, ts: u8 },
+    CallEnded {
+        call_id: u16,
+        ts: u8,
+    },
+    /// Private-call media mapping.  Unlike group calls the destination is a
+    /// single ISSI and a duplex call may have two simultaneous mappings.
+    PrivateMediaStart {
+        call_id: u16,
+        source_issi: u32,
+        destination_issi: u32,
+        ts: u8,
+    },
+    PrivateMediaStop {
+        call_id: u16,
+        ts: u8,
+    },
     /// Request CMCE to start a network-initiated group call
     /// Sent by Brew when TetraPack sends GROUP_TX
     NetworkCallStart {
@@ -75,5 +93,7 @@ pub enum CallControl {
     },
     /// UL inactivity detected on a traffic timeslot — no voice frames received
     /// for the timeout period. Sent by UMAC to CMCE.
-    UlInactivityTimeout { ts: u8 },
+    UlInactivityTimeout {
+        ts: u8,
+    },
 }

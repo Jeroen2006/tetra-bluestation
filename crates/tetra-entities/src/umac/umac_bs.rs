@@ -1,4 +1,4 @@
-use std::panic;
+use std::{collections::HashSet, panic};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
@@ -60,6 +60,10 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: [Option<TdmaTime>; 4],
+    /// P2P media is individually routed by SwmiMediaEntity.  Do not use the
+    /// group-call same-timeslot UL loopback for these circuits: it returns a
+    /// speaker's audio to the speaker instead of their private peer.
+    private_media_timeslots: HashSet<u8>,
 }
 
 struct PendingStch {
@@ -87,6 +91,7 @@ impl UmacBs {
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             last_ul_voice: [None; 4],
+            private_media_timeslots: HashSet::new(),
         }
     }
 
@@ -1308,7 +1313,7 @@ impl UmacBs {
                 }
 
                 // Loopback only if there's an active DL circuit on this timeslot
-                if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
+                if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) && !self.private_media_timeslots.contains(&ts) {
                     tracing::trace!("rx_tmd_prim: loopback UL voice on ts={}", ts);
                     if let Some(packed) = pack_ul_acelp_bits(&data) {
                         self.channel_scheduler.dl_schedule_tmd(ts, packed);
@@ -1319,6 +1324,11 @@ impl UmacBs {
                             ts
                         );
                     }
+                } else if self.private_media_timeslots.contains(&ts) {
+                    tracing::trace!(
+                        "rx_tmd_prim: private voice is routed to peer circuit, skipping local loopback on ts={}",
+                        ts
+                    );
                 } else {
                     tracing::trace!("rx_tmd_prim: no active DL circuit on ts={}, skipping loopback", ts);
                 }
@@ -1478,6 +1488,13 @@ impl UmacBs {
         for ts in 1..=4u8 {
             let idx = ts as usize - 1;
 
+            // In a private call the SwMI owns floor state.  One endpoint is
+            // normally silent while the other holds PTT, so the group-call
+            // radio-loss watchdog would generate a false timeout for it.
+            if self.private_media_timeslots.contains(&ts) {
+                continue;
+            }
+
             // Only check timeslots with an active UL circuit
             if !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
                 continue;
@@ -1541,6 +1558,12 @@ impl UmacBs {
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = None;
                 }
+            }
+            CallControl::PrivateMediaStart { ts, .. } => {
+                self.private_media_timeslots.insert(ts);
+            }
+            CallControl::PrivateMediaStop { ts, .. } => {
+                self.private_media_timeslots.remove(&ts);
             }
 
             // UlInactivityTimeout is UMAC→CMCE only, UMAC won't receive it back

@@ -7,13 +7,14 @@ use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
         call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_ul::CmcePduTypeUl,
-        transmission_grant::TransmissionGrant,
+        party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
-        d_call_proceeding::DCallProceeding, d_connect::DConnect, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased,
-        d_tx_granted::DTxGranted, d_tx_wait::DTxWait, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup,
-        u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
+        d_alert::DAlert, d_call_proceeding::DCallProceeding, d_connect::DConnect, d_connect_acknowledge::DConnectAcknowledge,
+        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted, d_tx_wait::DTxWait,
+        u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
+        u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };
@@ -65,6 +66,15 @@ pub struct CcBsSubentity {
     /// independent queues. Keep it until the local listener exists.
     pending_remote_swmi_calls: HashMap<u16, (u32, u32, u32)>,
     next_swmi_command: u64,
+    /// Point-to-point calls are intentionally kept separate from group
+    /// `active_calls`: a same-cell P2P call has two radio circuits sharing
+    /// one call identifier.
+    private_calls: HashMap<u16, PrivateCallLocal>,
+    pending_private_setups: HashMap<u32, SapMsg>,
+    private_circuits: HashMap<(u16, u32), CmceCircuit>,
+    /// P2P circuits whose D-RELEASE has been stolen onto FACCH.  Keep their
+    /// RF resources alive briefly so the addressed release reaches the MS.
+    releasing_private_circuits: Vec<ReleasingPrivateCircuit>,
 }
 
 /// Origin of a group call
@@ -96,6 +106,13 @@ struct ReleasingCall {
     sent_at: TdmaTime,
 }
 
+struct ReleasingPrivateCircuit {
+    call_id: u16,
+    itsi: u32,
+    circuit: CmceCircuit,
+    sent_at: TdmaTime,
+}
+
 /// Tracks an active group call (local or network-initiated)
 #[derive(Clone)]
 struct ActiveCall {
@@ -111,6 +128,18 @@ struct ActiveCall {
     /// Brew session UUID — set when a network speaker is active on this call,
     /// regardless of call origin. Cleared when the network speaker ends.
     brew_uuid: Option<uuid::Uuid>,
+}
+
+#[derive(Clone)]
+struct PrivateCallLocal {
+    caller_itsi: u32,
+    callee_itsi: u32,
+    hook: bool,
+    duplex: bool,
+    request_to_transmit: bool,
+    priority: u8,
+    connected: bool,
+    local_mask: u8,
 }
 
 impl CcBsSubentity {
@@ -130,6 +159,10 @@ impl CcBsSubentity {
             central_setup_call_floors: HashMap::new(),
             pending_remote_swmi_calls: HashMap::new(),
             next_swmi_command: 1,
+            private_calls: HashMap::new(),
+            pending_private_setups: HashMap::new(),
+            private_circuits: HashMap::new(),
+            releasing_private_circuits: Vec::new(),
         }
     }
 
@@ -631,6 +664,14 @@ impl CcBsSubentity {
             }
         };
 
+        // Individual calls are always SwMI-authoritative in network mode.
+        // Handle this before the legacy group feature checks, which correctly
+        // reject hook/duplex only for the current P2MP implementation.
+        if pdu.basic_service_information.communication_type == CommunicationType::P2p {
+            self.rx_private_u_setup(queue, original_message, calling_party, pdu);
+            return;
+        }
+
         // Check if we can satisfy this request
         if !Self::feature_check_u_setup(&pdu) {
             tracing::error!("Unsupported critical features in USetup");
@@ -894,11 +935,9 @@ impl CcBsSubentity {
             CmcePduTypeUl::UTxDemand => self.rx_u_tx_demand(_queue, message),
             CmcePduTypeUl::URelease => self.rx_u_release(_queue, message),
             CmcePduTypeUl::UDisconnect => self.rx_u_disconnect(_queue, message),
-            CmcePduTypeUl::UAlert
-            | CmcePduTypeUl::UConnect
-            | CmcePduTypeUl::UInfo
-            | CmcePduTypeUl::UStatus
-            | CmcePduTypeUl::UCallRestore => {
+            CmcePduTypeUl::UAlert => self.rx_private_u_alert(message),
+            CmcePduTypeUl::UConnect => self.rx_private_u_connect(message),
+            CmcePduTypeUl::UInfo | CmcePduTypeUl::UStatus | CmcePduTypeUl::UCallRestore => {
                 unimplemented_log!("{}", pdu_type);
             }
             _ => {
@@ -932,6 +971,12 @@ impl CcBsSubentity {
             for task in tasks {
                 match task {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
+                        // P2P D-SETUP is individually addressed before RF
+                        // resource reservation; it must never be emitted by
+                        // the group-call late-entry scheduler.
+                        if self.is_private_circuit(call_id, ts) {
+                            continue;
+                        }
                         // Skip late-entry D-SETUP during hangtime. The traffic channel is still
                         // allocated and sending D-SETUP with NotGranted can prevent floor requests.
                         if let Some(active) = self.active_calls.get(&call_id) {
@@ -986,6 +1031,15 @@ impl CcBsSubentity {
                     }
 
                     CircuitMgrCmd::SendClose(call_id, circuit) => {
+                        // P2P calls have no group D-SETUP cache.  Their
+                        // release path is individually addressed and the
+                        // saved private circuit is closed after its stolen
+                        // D-RELEASE has drained.  Never run the group-call
+                        // late-entry cleanup for such a circuit.
+                        if self.is_private_circuit(call_id, circuit.ts) {
+                            tracing::debug!(call_id, ts = circuit.ts, "ignoring group circuit-manager close for private call");
+                            continue;
+                        }
                         tracing::warn!("need to send CLOSE for call id {}", call_id);
                         let ts = circuit.ts;
                         // Get our cached D-SETUP, build D-RELEASE and send
@@ -1162,8 +1216,368 @@ impl CcBsSubentity {
                     self.release_call(queue, call_id, cause);
                 }
             }
-            SwmiMessage::CallReject { call_id, itsi, .. } => {
+            SwmiMessage::PrivateCallProceeding {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(mut request) = self.pending_private_setups.remove(&(caller_itsi as u32)) else {
+                    return;
+                };
+                let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut request.msg else {
+                    return;
+                };
+                let Ok(pdu) = USetup::from_bitbuf(&mut prim.sdu) else { return };
+                self.private_calls.insert(
+                    call_id,
+                    PrivateCallLocal {
+                        caller_itsi: caller_itsi as u32,
+                        callee_itsi: callee_itsi as u32,
+                        hook,
+                        duplex,
+                        request_to_transmit,
+                        priority,
+                        connected: false,
+                        local_mask: 0x01,
+                    },
+                );
+                self.send_d_call_proceeding(queue, &request, &pdu, call_id);
+            }
+            SwmiMessage::PrivateCallOffer {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let call = PrivateCallLocal {
+                    caller_itsi: caller_itsi as u32,
+                    callee_itsi: callee_itsi as u32,
+                    hook,
+                    duplex,
+                    request_to_transmit,
+                    priority,
+                    connected: false,
+                    local_mask: 0x02,
+                };
+                self.private_calls
+                    .entry(call_id)
+                    .and_modify(|existing| existing.local_mask |= 0x02)
+                    .or_insert_with(|| call.clone());
+                self.send_private_d_setup(queue, call_id, &call);
+                tracing::info!(call_id, caller_itsi, callee_itsi, "private D-SETUP sent to called terminal");
+            }
+            SwmiMessage::PrivateCallAlert { call_id, callee_itsi: _ } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(call) = self.private_calls.get(&call_id) else { return };
+                let pdu = DAlert {
+                    call_identifier: call_id,
+                    call_time_out_set_up_phase: 1,
+                    reserved: true,
+                    simplex_duplex_selection: call.duplex,
+                    call_queued: false,
+                    basic_service_information: None,
+                    notification_indicator: None,
+                    facility: None,
+                    proprietary: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                pdu.to_bitbuf(&mut sdu).expect("serialize private D-ALERT");
+                sdu.seek(0);
+                queue.push_back(Self::build_sapmsg(
+                    sdu,
+                    None,
+                    TetraAddress::new(call.caller_itsi, SsiType::Issi),
+                    Layer2Service::Acknowledged,
+                    None,
+                ));
+            }
+            SwmiMessage::PrivateCallReserve {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                endpoint_mask,
+                duplex,
+                ..
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(call) = self.private_calls.get(&call_id).cloned() else {
+                    return;
+                };
+                let mut allocated = Vec::new();
+                if let Some(local) = self.private_calls.get_mut(&call_id) {
+                    local.local_mask |= endpoint_mask;
+                }
+                // A simplex P2P call with both endpoints at this cell uses
+                // one bidirectional traffic channel, just like a two-member
+                // private P2MP call.  Allocating a TCH per ISSI wastes a
+                // carrier slot and is only required for duplex P2P.
+                let shared_simplex = !duplex && endpoint_mask & 0x03 == 0x03;
+                let mut shared_circuit = if shared_simplex {
+                    [caller_itsi as u32, callee_itsi as u32]
+                        .into_iter()
+                        .find_map(|itsi| self.private_circuits.get(&(call_id, itsi)).cloned())
+                } else {
+                    None
+                };
+                if shared_simplex {
+                    tracing::info!(
+                        call_id,
+                        caller_itsi,
+                        callee_itsi,
+                        "reserving one shared radio circuit for same-cell simplex private call"
+                    );
+                }
+                for (mask, itsi) in [(0x01, caller_itsi as u32), (0x02, callee_itsi as u32)] {
+                    if endpoint_mask & mask == 0 || self.private_circuits.contains_key(&(call_id, itsi)) {
+                        continue;
+                    }
+                    if let Some(circuit) = shared_circuit.as_ref() {
+                        self.private_circuits.insert((call_id, itsi), circuit.clone());
+                        continue;
+                    }
+                    let result = {
+                        let mut state = self.config.state_write();
+                        self.circuits
+                            .allocate_circuit_with_allocator_and_call_id_and_mode(
+                                Direction::Both,
+                                CommunicationType::P2p,
+                                &mut state.timeslot_alloc,
+                                TimeslotOwner::Cmce,
+                                call_id,
+                                duplex,
+                            )
+                            .map(Clone::clone)
+                    };
+                    match result {
+                        Ok(circuit) => {
+                            Self::signal_umac_circuit_open(queue, &circuit);
+                            self.private_circuits.insert((call_id, itsi), circuit.clone());
+                            allocated.push((itsi, circuit));
+                            if shared_simplex {
+                                shared_circuit = allocated.last().map(|(_, circuit)| circuit.clone());
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(call_id, itsi, ?error, "private call resource allocation failed");
+                            for (allocated_itsi, circuit) in allocated {
+                                self.private_circuits.remove(&(call_id, allocated_itsi));
+                                let _ = self.circuits.close_circuit(Direction::Both, circuit.ts);
+                                Self::signal_umac_circuit_close(queue, circuit.clone());
+                                self.release_timeslot(circuit.ts);
+                            }
+                            if let Some(swmi) = self.swmi.as_ref() {
+                                let _ = swmi.submit(SwmiMessage::PrivateCallResourceResult {
+                                    call_id: call_id as u64,
+                                    endpoint_mask,
+                                    accepted: false,
+                                });
+                            }
+                            return;
+                        }
+                    }
+                }
+                if let Some(swmi) = self.swmi.as_ref() {
+                    let _ = swmi.submit(SwmiMessage::PrivateCallResourceResult {
+                        call_id: call_id as u64,
+                        endpoint_mask,
+                        accepted: true,
+                    });
+                }
+                let _ = call;
+            }
+            SwmiMessage::PrivateCallConnected {
+                call_id,
+                initial_floor_itsi,
+                ..
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(call) = self.private_calls.get_mut(&call_id) else { return };
+                call.connected = true;
+                let call = call.clone();
+                let shared_simplex = !call.duplex
+                    && call.local_mask & 0x03 == 0x03
+                    && self
+                        .private_circuits
+                        .get(&(call_id, call.caller_itsi))
+                        .zip(self.private_circuits.get(&(call_id, call.callee_itsi)))
+                        .is_some_and(|(caller, callee)| caller.ts == callee.ts);
+                for itsi in [call.caller_itsi, call.callee_itsi] {
+                    let Some(circuit) = self.private_circuits.get(&(call_id, itsi)).cloned() else {
+                        continue;
+                    };
+                    self.send_private_connect(queue, call_id, &call, itsi, &circuit, initial_floor_itsi as u32);
+                    let peer = if itsi == call.caller_itsi {
+                        call.callee_itsi
+                    } else {
+                        call.caller_itsi
+                    };
+                    if !shared_simplex {
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Cmce,
+                            dest: TetraEntity::Swmi,
+                            msg: SapMsgInner::CmceCallControl(CallControl::PrivateMediaStart {
+                                call_id,
+                                source_issi: itsi,
+                                destination_issi: peer,
+                                ts: circuit.ts,
+                            }),
+                        });
+                        // UMAC must suppress its group-call same-timeslot
+                        // loopback for P2P.  The media entity above routes
+                        // this circuit to the peer timeslot (locally or via
+                        // the SwMI).
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Cmce,
+                            dest: TetraEntity::Umac,
+                            msg: SapMsgInner::CmceCallControl(CallControl::PrivateMediaStart {
+                                call_id,
+                                source_issi: itsi,
+                                destination_issi: peer,
+                                ts: circuit.ts,
+                            }),
+                        });
+                    }
+                }
+                tracing::info!(
+                    call_id,
+                    caller_itsi = call.caller_itsi,
+                    callee_itsi = call.callee_itsi,
+                    duplex = call.duplex,
+                    shared_simplex,
+                    "private call connected on local RF resources"
+                );
+            }
+            SwmiMessage::PrivateCallRelease { call_id, itsi: _, cause } => {
+                if let Ok(call_id) = u16::try_from(call_id) {
+                    let cause = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+                    self.release_private_call_local(queue, call_id, cause);
+                }
+            }
+            SwmiMessage::PrivateFloorGranted { call_id, itsi } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(call) = self.private_calls.get(&call_id).cloned() else {
+                    return;
+                };
+                let mut resumed_timeslots = HashSet::new();
+                for recipient in [call.caller_itsi, call.callee_itsi] {
+                    if let Some(circuit) = self.private_circuits.get(&(call_id, recipient)) {
+                        self.send_private_d_tx_granted(queue, call_id, itsi as u32, recipient, circuit.ts);
+                        // A private call has one RF circuit per endpoint.
+                        // Both must leave hangtime: the selected terminal
+                        // needs an UL traffic channel and its peer needs the
+                        // DL traffic channel that receives the routed TMD
+                        // frames.  Leaving either slot in signalling mode
+                        // makes a subsequent simplex PTT appear dead.
+                        if resumed_timeslots.insert(circuit.ts) {
+                            queue.push_back(SapMsg {
+                                sap: Sap::Control,
+                                src: TetraEntity::Cmce,
+                                dest: TetraEntity::Umac,
+                                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                                    call_id,
+                                    source_issi: itsi as u32,
+                                    dest_gssi: 0,
+                                    ts: circuit.ts,
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+            SwmiMessage::PrivateFloorReleased { call_id, .. } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                if let Some(call) = self.private_calls.get(&call_id).cloned() {
+                    let mut hangtime_timeslots = HashSet::new();
+                    for itsi in [call.caller_itsi, call.callee_itsi] {
+                        if let Some(circuit) = self.private_circuits.get(&(call_id, itsi)) {
+                            let pdu = DTxCeased {
+                                call_identifier: call_id,
+                                transmission_request_permission: false,
+                                notification_indicator: None,
+                                facility: None,
+                                dm_ms_address: None,
+                                proprietary: None,
+                            };
+                            let mut sdu = BitBuffer::new_autoexpand(24);
+                            pdu.to_bitbuf(&mut sdu).expect("serialize private D-TX CEASED");
+                            sdu.seek(0);
+                            queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(itsi, SsiType::Issi), circuit.ts));
+                            // D-TX CEASED alone only produces the terminal's
+                            // end-of-transmission tone.  The scheduler must
+                            // also advertise AssignedControl during P2P
+                            // hangtime or the MS cannot send its next
+                            // U-TX DEMAND.
+                            if hangtime_timeslots.insert(circuit.ts) {
+                                queue.push_back(SapMsg {
+                                    sap: Sap::Control,
+                                    src: TetraEntity::Cmce,
+                                    dest: TetraEntity::Umac,
+                                    msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: circuit.ts }),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            SwmiMessage::PrivateCallKeepalive {
+                call_id,
+                itsi,
+                sequence: _,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let Some(circuit) = self.private_circuits.get(&(call_id, itsi as u32)) else {
+                    return;
+                };
+                let pdu = DInfo {
+                    call_identifier: call_id,
+                    reset_call_time_out_timer_t310_: true,
+                    poll_request: false,
+                    new_call_identifier: None,
+                    call_time_out: None,
+                    call_time_out_set_up_phase_t301_t302_: None,
+                    call_ownership: None,
+                    modify: None,
+                    call_status: None,
+                    temporary_address: None,
+                    notification_indicator: None,
+                    poll_response_percentage: None,
+                    poll_response_number: None,
+                    dtmf: None,
+                    facility: None,
+                    poll_response_addresses: None,
+                    proprietary: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                pdu.to_bitbuf(&mut sdu).expect("serialize private D-INFO");
+                sdu.seek(0);
+                // The LLC implementation cannot send acknowledged BL-DATA
+                // through FACCH/STCH. P2P D-INFO has no valid poll-response
+                // procedure, so this is deliberately normal FACCH: it only
+                // refreshes T310 at the called terminal.
+                queue.push_back(Self::build_sapmsg_stealing(
+                    sdu,
+                    TetraAddress::new(itsi as u32, SsiType::Issi),
+                    circuit.ts,
+                ));
+            }
+            SwmiMessage::CallReject { call_id, itsi, cause, .. } => {
                 if call_id == 0 {
+                    if let Some(request) = self.pending_private_setups.remove(&(itsi as u32)) {
+                        let cause = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::RequestedServiceNotAvailable);
+                        self.send_d_release_for_setup_reject(queue, &request, cause);
+                        return;
+                    }
                     let request_key = self
                         .pending_swmi_setups
                         .keys()
@@ -1333,6 +1747,57 @@ impl CcBsSubentity {
                 i += 1;
             }
         }
+
+        let mut i = 0;
+        while i < self.releasing_private_circuits.len() {
+            if self.releasing_private_circuits[i].sent_at.age(now) >= CLOSE_AFTER_SEND_TS {
+                let rc = self.releasing_private_circuits.remove(i);
+                // The circuit may have been removed already by a stale
+                // CircuitMgr timeout task; the saved circuit still carries
+                // the exact UMAC/timeslot teardown information we need.
+                let _ = self.circuits.close_circuit(Direction::Both, rc.circuit.ts);
+                Self::signal_umac_circuit_close(queue, rc.circuit.clone());
+                self.release_timeslot(rc.circuit.ts);
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Swmi,
+                    msg: SapMsgInner::CmceCallControl(CallControl::PrivateMediaStop {
+                        call_id: rc.call_id,
+                        ts: rc.circuit.ts,
+                    }),
+                });
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::PrivateMediaStop {
+                        call_id: rc.call_id,
+                        ts: rc.circuit.ts,
+                    }),
+                });
+                tracing::debug!(
+                    call_id = rc.call_id,
+                    itsi = rc.itsi,
+                    ts = rc.circuit.ts,
+                    "private RF circuit released after D-RELEASE transmission"
+                );
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn is_private_circuit(&self, call_id: u16, ts: u8) -> bool {
+        self.private_calls.contains_key(&call_id)
+            || self
+                .private_circuits
+                .iter()
+                .any(|((private_call_id, _), circuit)| *private_call_id == call_id && circuit.ts == ts)
+            || self
+                .releasing_private_circuits
+                .iter()
+                .any(|circuit| circuit.call_id == call_id && circuit.circuit.ts == ts)
     }
 
     /// Tear down a released call: close the circuit, free the timeslot, notify Brew.
@@ -1393,6 +1858,253 @@ impl CcBsSubentity {
                     dest: TetraEntity::Brew,
                     msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
                 });
+            }
+        }
+    }
+
+    fn rx_private_u_setup(&mut self, queue: &mut MessageQueue, original: SapMsg, caller: TetraAddress, pdu: USetup) {
+        let Some(callee_itsi) = pdu.called_party_ssi.map(|value| value as u32) else {
+            self.send_d_release_for_setup_reject(queue, &original, DisconnectCause::RequestedServiceNotAvailable);
+            return;
+        };
+        if pdu.called_party_type_identifier != PartyTypeIdentifier::Ssi || pdu.called_party_extension.is_some() {
+            self.send_d_release_for_setup_reject(queue, &original, DisconnectCause::RequestedServiceNotAvailable);
+            return;
+        }
+        if !self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
+            self.send_d_release_for_setup_reject(queue, &original, DisconnectCause::RequestedServiceNotAvailable);
+            return;
+        }
+        let command_id = self.next_swmi_command_id();
+        let request = SwmiMessage::PrivateCallRequest {
+            command_id,
+            caller_itsi: caller.ssi as u64,
+            callee_itsi: callee_itsi as u64,
+            hook: pdu.hook_method_selection,
+            duplex: pdu.simplex_duplex_selection,
+            request_to_transmit: pdu.request_to_transmit_send_data,
+            priority: pdu.call_priority,
+        };
+        let submitted = self.swmi.as_ref().is_some_and(|swmi| swmi.submit(request).is_ok());
+        if submitted {
+            self.pending_private_setups.insert(caller.ssi, original);
+            tracing::info!(
+                caller_itsi = caller.ssi,
+                callee_itsi,
+                command_id,
+                "private U-SETUP forwarded to central SwMI"
+            );
+        } else {
+            let rejected_request = self.pending_private_setups.remove(&caller.ssi).unwrap_or(original);
+            self.send_d_release_for_setup_reject(queue, &rejected_request, DisconnectCause::RequestedServiceNotAvailable);
+        }
+    }
+
+    fn send_private_d_setup(&self, queue: &mut MessageQueue, call_id: u16, call: &PrivateCallLocal) {
+        let pdu = DSetup {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T30s,
+            hook_method_selection: call.hook,
+            simplex_duplex_selection: call.duplex,
+            basic_service_information: BasicServiceInformation {
+                circuit_mode_type: CircuitModeType::TchS,
+                encryption_flag: false,
+                communication_type: CommunicationType::P2p,
+                slots_per_frame: None,
+                speech_service: Some(0),
+            },
+            transmission_grant: TransmissionGrant::NotGranted,
+            transmission_request_permission: !call.duplex,
+            call_priority: call.priority,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(call.caller_itsi),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(80);
+        pdu.to_bitbuf(&mut sdu).expect("serialize private D-SETUP");
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg(
+            sdu,
+            None,
+            TetraAddress::new(call.callee_itsi, SsiType::Issi),
+            Layer2Service::Acknowledged,
+            None,
+        ));
+    }
+
+    fn rx_private_u_alert(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            return;
+        };
+        let itsi = prim.received_tetra_address.ssi;
+        let Ok(pdu) = UAlert::from_bitbuf(&mut prim.sdu) else { return };
+        if self
+            .private_calls
+            .get(&pdu.call_identifier)
+            .is_some_and(|call| call.callee_itsi == itsi)
+        {
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                let _ = swmi.submit(SwmiMessage::PrivateCallAlert {
+                    call_id: pdu.call_identifier as u64,
+                    callee_itsi: itsi as u64,
+                });
+            }
+        }
+    }
+
+    fn rx_private_u_connect(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            return;
+        };
+        let itsi = prim.received_tetra_address.ssi;
+        let Ok(pdu) = UConnect::from_bitbuf(&mut prim.sdu) else { return };
+        if self
+            .private_calls
+            .get(&pdu.call_identifier)
+            .is_some_and(|call| call.callee_itsi == itsi)
+        {
+            if self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
+                let command_id = self.next_swmi_command_id();
+                let _ = self
+                    .swmi
+                    .as_ref()
+                    .expect("checked above")
+                    .submit(SwmiMessage::PrivateCallConnectRequest {
+                        command_id,
+                        call_id: pdu.call_identifier as u64,
+                        itsi: itsi as u64,
+                    });
+                tracing::info!(
+                    call_id = pdu.call_identifier,
+                    itsi,
+                    command_id,
+                    "private U-CONNECT forwarded to SwMI"
+                );
+            }
+        }
+    }
+
+    fn send_private_connect(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        call: &PrivateCallLocal,
+        itsi: u32,
+        circuit: &CmceCircuit,
+        initial_floor_itsi: u32,
+    ) {
+        let mut timeslots = [false; 4];
+        timeslots[circuit.ts as usize - 1] = true;
+        let grant = if call.duplex || initial_floor_itsi == itsi {
+            TransmissionGrant::Granted
+        } else {
+            TransmissionGrant::GrantedToOtherUser
+        };
+        let allocation = CmceChanAllocReq {
+            usage: Some(circuit.usage),
+            alloc_type: ChanAllocType::Replace,
+            carrier: None,
+            timeslots,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        if itsi == call.caller_itsi {
+            let pdu = DConnect {
+                call_identifier: call_id,
+                call_time_out: CallTimeout::T5m,
+                hook_method_selection: call.hook,
+                simplex_duplex_selection: call.duplex,
+                transmission_grant: grant,
+                transmission_request_permission: !call.duplex,
+                call_ownership: true,
+                call_priority: Some(call.priority as u64),
+                basic_service_information: None,
+                temporary_address: None,
+                notification_indicator: None,
+                facility: None,
+                proprietary: None,
+            };
+            pdu.to_bitbuf(&mut sdu).expect("serialize private D-CONNECT");
+        } else {
+            let pdu = DConnectAcknowledge {
+                call_identifier: call_id,
+                call_time_out: CallTimeout::T5m as u8,
+                transmission_grant: grant as u8,
+                transmission_request_permission: !call.duplex,
+                notification_indicator: None,
+                facility: None,
+                proprietary: None,
+            };
+            pdu.to_bitbuf(&mut sdu).expect("serialize private D-CONNECT ACKNOWLEDGE");
+        }
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg(
+            sdu,
+            Some(allocation),
+            TetraAddress::new(itsi, SsiType::Issi),
+            Layer2Service::Acknowledged,
+            None,
+        ));
+    }
+
+    fn release_private_call_local(&mut self, queue: &mut MessageQueue, call_id: u16, cause: DisconnectCause) {
+        let Some(call) = self.private_calls.remove(&call_id) else { return };
+        let mut teardown_timeslots = HashSet::new();
+        for (mask, itsi) in [(0x01, call.caller_itsi), (0x02, call.callee_itsi)] {
+            if call.local_mask & mask == 0 {
+                continue;
+            }
+            if let Some(circuit) = self.private_circuits.remove(&(call_id, itsi)) {
+                let pdu = DRelease {
+                    call_identifier: call_id,
+                    disconnect_cause: cause,
+                    notification_indicator: None,
+                    facility: None,
+                    proprietary: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                pdu.to_bitbuf(&mut sdu).expect("serialize private D-RELEASE");
+                sdu.seek(0);
+                queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(itsi, SsiType::Issi), circuit.ts));
+                // FACCH stealing only works while the traffic circuit still
+                // exists.  Closing it here drops D-RELEASE, after which the
+                // terminal reports its own setup timeout ("Geen antwoord").
+                // Keep the circuit for a few TDMA frames, then tear it down
+                // from process_releasing_calls.
+                if teardown_timeslots.insert(circuit.ts) {
+                    self.releasing_private_circuits.push(ReleasingPrivateCircuit {
+                        call_id,
+                        itsi,
+                        circuit,
+                        sent_at: self.dltime,
+                    });
+                }
+            } else {
+                // An offer has no traffic circuit yet.  Still answer its
+                // central release immediately, notably when the called MS
+                // did not respond, so the calling MS sees the reject cause.
+                let pdu = DRelease {
+                    call_identifier: call_id,
+                    disconnect_cause: cause,
+                    notification_indicator: None,
+                    facility: None,
+                    proprietary: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                pdu.to_bitbuf(&mut sdu).expect("serialize pre-connect private D-RELEASE");
+                sdu.seek(0);
+                queue.push_back(Self::build_sapmsg(
+                    sdu,
+                    None,
+                    TetraAddress::new(itsi, SsiType::Issi),
+                    Layer2Service::Acknowledged,
+                    None,
+                ));
             }
         }
     }
@@ -1461,6 +2173,19 @@ impl CcBsSubentity {
         };
 
         let call_id = pdu.call_identifier;
+
+        if let Some(call) = self.private_calls.get(&call_id) {
+            if !call.connected || call.duplex {
+                return;
+            }
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                let _ = swmi.submit(SwmiMessage::PrivateFloorReleased {
+                    call_id: call_id as u64,
+                    itsi: prim.received_tetra_address.ssi as u64,
+                });
+            }
+            return;
+        }
 
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
             let itsi = prim.received_tetra_address.ssi;
@@ -1565,6 +2290,20 @@ impl CcBsSubentity {
         };
 
         let call_id = pdu.call_identifier;
+
+        if let Some(call) = self.private_calls.get(&call_id) {
+            if !call.connected || call.duplex {
+                return;
+            }
+            self.send_d_tx_wait(queue, &message, call_id);
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                let _ = swmi.submit(SwmiMessage::PrivateFloorGranted {
+                    call_id: call_id as u64,
+                    itsi: requesting_party.ssi as u64,
+                });
+            }
+            return;
+        }
 
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
             // The asynchronous central decision must not leave the MS with a
@@ -1710,6 +2449,18 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
         tracing::info!("U-RELEASE: call_id={} cause={}", call_id, pdu.disconnect_cause);
+        if self.private_calls.contains_key(&call_id) {
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                let _ = swmi.submit(SwmiMessage::PrivateCallRelease {
+                    call_id: call_id as u64,
+                    itsi: prim.received_tetra_address.ssi as u64,
+                    cause: pdu.disconnect_cause as u8,
+                });
+                return;
+            }
+            self.release_private_call_local(queue, call_id, pdu.disconnect_cause);
+            return;
+        }
         self.release_call(queue, call_id, DisconnectCause::UserRequestedDisconnection);
     }
 
@@ -1738,6 +2489,20 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
+
+        if self.private_calls.contains_key(&call_id) {
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                let _ = swmi.submit(SwmiMessage::PrivateCallRelease {
+                    call_id: call_id as u64,
+                    itsi: sender.ssi as u64,
+                    cause: disconnect_cause as u8,
+                });
+                tracing::info!(call_id, itsi = sender.ssi, "private U-DISCONNECT forwarded to central SwMI");
+                return;
+            }
+            self.release_private_call_local(queue, call_id, disconnect_cause);
+            return;
+        }
 
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
             let command_id = self.next_swmi_command_id();
@@ -2185,6 +2950,37 @@ impl CcBsSubentity {
         sdu.seek(0);
         tracing::info!(issi = source_issi, call_id, "-> individual FACCH D-TX GRANTED");
         queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(source_issi, SsiType::Issi), ts));
+    }
+
+    fn send_private_d_tx_granted(&self, queue: &mut MessageQueue, call_id: u16, source_itsi: u32, recipient_itsi: u32, ts: u8) {
+        let pdu = DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: if source_itsi == recipient_itsi {
+                TransmissionGrant::Granted
+            } else {
+                TransmissionGrant::GrantedToOtherUser
+            }
+            .into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1),
+            transmitting_party_address_ssi: Some(source_itsi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("serialize private D-TX GRANTED");
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg_stealing(
+            sdu,
+            TetraAddress::new(recipient_itsi, SsiType::Issi),
+            ts,
+        ));
     }
 
     /// Handle UL inactivity timeout from UMAC: a radio disappeared mid-transmission.

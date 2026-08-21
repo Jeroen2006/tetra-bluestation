@@ -211,6 +211,20 @@ impl CircuitMgr {
         owner: TimeslotOwner,
         call_id: CallId,
     ) -> Result<&CmceCircuit, CircuitErr> {
+        self.allocate_circuit_with_allocator_and_call_id_and_mode(dir, comm_type, timeslot_alloc, owner, call_id, false)
+    }
+
+    /// Same central call-id allocator, with the P2P simplex/duplex bit kept
+    /// on the local RF circuit for channel allocation signalling.
+    pub fn allocate_circuit_with_allocator_and_call_id_and_mode(
+        &mut self,
+        dir: Direction,
+        comm_type: CommunicationType,
+        timeslot_alloc: &mut TimeslotAllocator,
+        owner: TimeslotOwner,
+        call_id: CallId,
+        simplex_duplex: bool,
+    ) -> Result<&CmceCircuit, CircuitErr> {
         if call_id == 0 || call_id > 0x3fff {
             return Err(CircuitErr::CircuitAlreadyInUse);
         }
@@ -224,7 +238,7 @@ impl CircuitMgr {
             usage,
             circuit_mode: CircuitModeType::TchS,
             comm_type,
-            simplex_duplex: false,
+            simplex_duplex,
             speech_service: Some(0),
             etee_encrypted: false,
         };
@@ -341,6 +355,13 @@ impl CircuitMgr {
             // Late entry: resend D-SETUP every 5 seconds
             for circuit in self.dl.iter() {
                 if let Some(circuit) = circuit {
+                    // P2P setup is individually addressed by CMCE before
+                    // traffic resources are reserved.  It has no multicast
+                    // D-SETUP cache and must not use the group late-entry
+                    // scheduler.
+                    if circuit.comm_type == CommunicationType::P2p {
+                        continue;
+                    }
                     let age = circuit.ts_created.age(dltime);
 
                     // Send D-SETUP for the initial frame + 1 backup frame after circuit creation.
