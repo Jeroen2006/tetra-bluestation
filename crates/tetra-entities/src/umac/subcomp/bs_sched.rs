@@ -114,6 +114,11 @@ pub enum DlSchedElem {
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
     Resource(MacResource, BitBuffer, Option<TxReporter>),
 
+    /// A capacity request received on an active assigned channel. The grant
+    /// and its corresponding future FN18 reservation must be built together,
+    /// when the actual associated FN18 transmission time is known.
+    AssociatedGrantRequest(TetraAddress, ReservationRequirement),
+
     /// A FragBuf containing remaining non-transmitted information after a MAC-RESOURCE start has been transmitted
     FragBuf(BsFragger),
 
@@ -731,10 +736,36 @@ impl BsChannelScheduler {
         self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, BitBuffer::new(0), None));
     }
 
+    /// Queue an associated-channel capacity request without reserving its
+    /// target FN18 yet. A mandatory BSCH/BNCH can defer this request, so the
+    /// grant and reservation must be derived from the FN18 that really
+    /// carries the MAC-RESOURCE.
+    pub fn dl_enqueue_associated_grant_request(
+        &mut self,
+        ts: u8,
+        addr: TetraAddress,
+        res_req: ReservationRequirement,
+    ) {
+        assert!((2..=4).contains(&ts), "associated grant must use an assigned timeslot");
+        tracing::debug!(
+            ts,
+            address = ?addr,
+            res_req = ?res_req,
+            "queued associated FN18 grant request"
+        );
+        self.assoc_dltx_queues[ts as usize - 1]
+            .push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+    }
+
     fn dl_build_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let item = {
             let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
-            let pos = queue.iter().position(|item| matches!(item, DlSchedElem::Resource(..) | DlSchedElem::FragBuf(..)))?;
+            let pos = queue.iter().position(|item| matches!(
+                item,
+                DlSchedElem::Resource(..)
+                    | DlSchedElem::FragBuf(..)
+                    | DlSchedElem::AssociatedGrantRequest(..)
+            ))?;
             queue.remove(pos)
         };
         let mut buf = BitBuffer::new(SCH_F_CAP);
@@ -772,6 +803,31 @@ impl BsChannelScheduler {
                 }
             }
             DlSchedElem::FragBuf(mut fragger) => {
+                if !fragger.get_next_chunk(&mut buf) {
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                }
+            }
+            DlSchedElem::AssociatedGrantRequest(addr, res_req) => {
+                let Some(grant) = self.ul_process_associated_fn18_cap_req(ts, addr, &res_req) else {
+                    tracing::warn!(
+                        dltime = %ts,
+                        address = ?addr,
+                        res_req = ?res_req,
+                        "associated FN18 grant could not be allocated; retrying request"
+                    );
+                    self.assoc_dltx_queues[ts.t as usize - 1]
+                        .push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+                    return None;
+                };
+
+                tracing::info!(
+                    dltime = %ts,
+                    address = ?addr,
+                    grant = ?grant,
+                    "prepared associated FN18 grant at actual transmission time"
+                );
+                let pdu = Self::dl_make_minimal_resource(&addr, Some(grant), true);
+                let mut fragger = BsFragger::new(pdu, BitBuffer::new(0), None);
                 if !fragger.get_next_chunk(&mut buf) {
                     self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
@@ -2133,6 +2189,67 @@ mod tests {
             sched.ul_get_slot_owner(usable.add_timeslots(18 * 4), PhyBlockNum::Both),
             Some(1234),
             "ACK reservation must follow the actual transmitted FN18"
+        );
+        assert!(sched.assoc_dltx_queues[1].is_empty());
+    }
+
+    #[test]
+    fn test_associated_grant_request_reserves_after_actual_fn18() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    direction,
+                    ts: 2,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(1234, SsiType::Issi);
+        sched.dl_enqueue_associated_grant_request(2, addr, ReservationRequirement::Req1Subslot);
+
+        // The first candidate FN18 is mandatory BSCH. The request must stay
+        // queued and must not reserve the target based on this skipped frame.
+        let mandatory = TdmaTime { t: 2, f: 18, m: 1, h: 0 };
+        assert!(mandatory.is_mandatory_bsch());
+        sched.cur_dltime = mandatory.add_timeslots(-1);
+        let mandatory_slot = sched.finalize_ts_for_tick();
+        assert_eq!(mandatory_slot.blk1.unwrap().logical_channel, LogicalChannel::Bsch);
+        assert_eq!(sched.assoc_dltx_queues[1].len(), 1);
+        assert_eq!(
+            sched.ul_get_slot_owner(mandatory.add_timeslots(18 * 4), PhyBlockNum::Block1),
+            None,
+            "a deferred request must not reserve from the skipped FN18"
+        );
+
+        // The next usable FN18 carries the grant; only then is the following
+        // FN18 reserved for the MS.
+        let usable = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        sched.cur_dltime = usable.add_timeslots(-1);
+        let usable_slot = sched.finalize_ts_for_tick();
+        let blk1 = usable_slot.blk1.as_ref().expect("associated FN18 must contain SCH/F");
+        let mut mac_block = blk1.mac_block.clone();
+        mac_block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated grant resource");
+        let grant = resource.slot_granting_element.expect("grant must be built at actual FN18");
+        let target = usable.add_timeslots(18 * 4);
+        let target_block = match grant.capacity_allocation {
+            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
+            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
+            allocation => panic!("unexpected associated half-slot allocation: {:?}", allocation),
+        };
+        assert_eq!(
+            sched.ul_get_slot_owner(target, target_block),
+            Some(1234),
+            "reservation must follow the FN18 that actually carried the grant"
         );
         assert!(sched.assoc_dltx_queues[1].is_empty());
     }

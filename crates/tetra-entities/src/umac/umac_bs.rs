@@ -596,18 +596,16 @@ impl UmacBs {
         // Handle reservation if present
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some(grant) = grant {
-                // During a call the request was received on an assigned slot.
-                // Return the grant in that slot's SACCH/FN18 rather than
-                // trying to insert normal signalling into downlink speech.
-                let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
-                    && !self.channel_scheduler.is_hangtime(msg_dltime.t);
-                if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
-                    self.channel_scheduler.dl_enqueue_associated_grant(msg_dltime.t, addr, grant);
-                } else {
-                    self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
-                }
+            // During a call, queue only the request. The associated FN18 may
+            // be deferred by mandatory BSCH/BNCH; building the grant now
+            // would reserve a different target FN18 than the one the MS sees.
+            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
+                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
+                self.channel_scheduler
+                    .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
+            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req) {
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
@@ -770,13 +768,14 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some(grant) = grant {
-                if in_active_over && (2..=4).contains(&msg_dltime.t) {
-                    self.channel_scheduler.dl_enqueue_associated_grant(msg_dltime.t, addr, grant);
-                } else {
-                    self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
-                }
+            if in_active_over && (2..=4).contains(&msg_dltime.t) {
+                // Defer both grant construction and reservation until the
+                // actual associated FN18 is transmitted. This keeps the BS
+                // reservation aligned when BSCH/BNCH defers the queue.
+                self.channel_scheduler
+                    .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
+            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req) {
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
@@ -958,9 +957,12 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
+            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
+                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
+                self.channel_scheduler
+                    .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
+            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req) {
                 self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
             } else {
                 tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
@@ -1074,9 +1076,12 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
+            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
+                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
+                self.channel_scheduler
+                    .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
+            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req) {
                 self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
             } else {
                 tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
