@@ -378,7 +378,8 @@ impl BsChannelScheduler {
     /// If successful, returns a BasicSlotgrant with the granting delay and capacity allocation.
     pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
         if self.circuits.is_active(Direction::Ul, timeslot) && !self.is_hangtime(timeslot) {
-            return self.ul_process_associated_fn18_cap_req(timeslot, addr, res_req);
+            let grant_frame = self.next_associated_fn18(timeslot);
+            return self.ul_process_associated_fn18_cap_req(grant_frame, addr, res_req);
         }
 
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
@@ -443,8 +444,8 @@ impl BsChannelScheduler {
         }
     }
 
-    /// Reserve the full FN18 uplink control block needed for the BL-ACK of
-    /// an acknowledged downlink resource sent through the associated SACCH.
+    /// Reserve one FN18 uplink subslot needed for the BL-ACK of an
+    /// acknowledged downlink resource sent through the associated SACCH.
     ///
     /// With an active uplink speaker, frames 1..17 belong to that speaker's
     /// TCH.  The addressed listener can therefore acknowledge SDS only in
@@ -462,11 +463,35 @@ impl BsChannelScheduler {
             return None;
         }
 
-        self.ul_process_associated_fn18_cap_req(
-            timeslot,
-            addr,
-            &ReservationRequirement::Req1Slot,
-        )
+        let grant_frame = self.next_associated_fn18(timeslot);
+        self.ul_process_associated_fn18_cap_req(grant_frame, addr, &ReservationRequirement::Req1Subslot)
+    }
+
+    /// Prepare an associated BL-ACK grant after the actual downlink FN18 is
+    /// known. This is intentionally separate from the enqueue-time helper:
+    /// the downlink may be deferred when that FN18 is a mandatory BSCH/BNCH.
+    pub fn ul_prepare_associated_basic_link_ack_grant_at(
+        &mut self,
+        tx_time: TdmaTime,
+        addr: TetraAddress,
+    ) -> Option<BasicSlotgrant> {
+        if tx_time.f != 18
+            || !(2..=4).contains(&tx_time.t)
+            || !self.circuits.is_active(Direction::Ul, tx_time.t)
+            || self.is_hangtime(tx_time.t)
+        {
+            return None;
+        }
+
+        self.ul_process_associated_fn18_cap_req(tx_time, addr, &ReservationRequirement::Req1Subslot)
+    }
+
+    fn next_associated_fn18(&self, timeslot: u8) -> TdmaTime {
+        let mut frame = self.cur_dltime.forward_to_timeslot(timeslot);
+        while frame.f != 18 {
+            frame = frame.add_timeslots(4);
+        }
+        frame
     }
 
     /// Reserve the FN18 *after* the one carrying a downlink associated grant.
@@ -478,7 +503,7 @@ impl BsChannelScheduler {
     /// both control frames to the same entry.
     fn ul_process_associated_fn18_cap_req(
         &mut self,
-        timeslot: u8,
+        grant_frame: TdmaTime,
         addr: TetraAddress,
         res_req: &ReservationRequirement,
     ) -> Option<BasicSlotgrant> {
@@ -493,23 +518,7 @@ impl BsChannelScheduler {
             return None;
         }
 
-        let mut grant_frame = self.cur_dltime.forward_to_timeslot(timeslot);
-        while grant_frame.f != 18 {
-            grant_frame = grant_frame.add_timeslots(4);
-        }
-        let mut target_frame = grant_frame.add_timeslots((18 * 4) as i32);
-        // The predefined CLCH opportunity is not available for a normal
-        // full-slot basic-link acknowledgement grant. Move the associated
-        // reservation to the next FN18 opportunity when the first candidate
-        // is the CLCH position.
-        while target_frame.is_mandatory_clch() {
-            tracing::debug!(
-                grant_frame = ?grant_frame,
-                skipped_target = ?target_frame,
-                "skipping predefined CLCH opportunity for associated FN18 grant"
-            );
-            target_frame = target_frame.add_timeslots(18 * 4);
-        }
+        let target_frame = grant_frame.add_timeslots((18 * 4) as i32);
 
         let schedule_index = self
             .associated_ulsched
@@ -529,7 +538,21 @@ impl BsChannelScheduler {
         };
 
         let capacity_allocation = if is_halfslot {
-            if schedule.ul1.is_none() {
+            // Subslot 1 is the predefined CLCH position on this FN18. It is
+            // not available for a reserved SCH/HU response, while subslot 2
+            // remains usable with the same relative FN18 grant delay.
+            if target_frame.is_mandatory_clch() {
+                if schedule.ul2.is_none() {
+                    schedule.ul2 = Some(addr.ssi);
+                    BasicSlotgrantCapAlloc::SecondSubslotGranted
+                } else {
+                    tracing::warn!(
+                        "ul_process_associated_fn18_cap_req: FN18 {} subslot 2 is already reserved",
+                        target_frame
+                    );
+                    return None;
+                }
+            } else if schedule.ul1.is_none() {
                 schedule.ul1 = Some(addr.ssi);
                 BasicSlotgrantCapAlloc::FirstSubslotGranted
             } else if schedule.ul2.is_none() {
@@ -542,6 +565,15 @@ impl BsChannelScheduler {
                 );
                 return None;
             }
+        } else if target_frame.is_mandatory_clch() {
+            // A full-slot grant would overlap the predefined CLCH in
+            // subslot 1. Do not encode a relative grant that the MS cannot
+            // use; the caller must request a subslot instead.
+            tracing::warn!(
+                "ul_process_associated_fn18_cap_req: FN18 {} is a predefined CLCH; full-slot grant rejected",
+                target_frame
+            );
+            return None;
         } else if schedule.ul1.is_none() && schedule.ul2.is_none() {
             schedule.ul1 = Some(addr.ssi);
             schedule.ul2 = Some(addr.ssi);
@@ -700,27 +732,48 @@ impl BsChannelScheduler {
     }
 
     fn dl_build_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
-        let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
-        let pos = queue.iter().position(|item| matches!(item, DlSchedElem::Resource(..) | DlSchedElem::FragBuf(..)))?;
-        let item = queue.remove(pos);
+        let item = {
+            let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
+            let pos = queue.iter().position(|item| matches!(item, DlSchedElem::Resource(..) | DlSchedElem::FragBuf(..)))?;
+            queue.remove(pos)
+        };
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
-            DlSchedElem::Resource(pdu, sdu, reporter) => {
+            DlSchedElem::Resource(mut pdu, sdu, reporter) => {
+                // Build the BL-ACK grant from the FN18 that is actually being
+                // transmitted. The queue can survive mandatory BSCH/BNCH
+                // frames, so an enqueue-time reservation may point one
+                // multiframe too early.
+                if pdu.slot_granting_element.is_none()
+                    && reporter.as_ref().is_some_and(|tx| tx.expects_ack())
+                    && let Some(addr) = pdu.addr
+                {
+                    pdu.slot_granting_element = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr);
+                    if pdu.slot_granting_element.is_some() {
+                        pdu.update_len_and_fill_ind(sdu.get_len());
+                        tracing::info!(
+                            dltime = %ts,
+                            address = ?addr,
+                            grant = ?pdu.slot_granting_element,
+                            "prepared FN18 basic-link acknowledgement grant at actual transmission time"
+                        );
+                    }
+                }
                 tracing::debug!(
                     dltime = %ts,
                     addr = ?pdu.addr,
                     sdu_bits = sdu.get_len(),
-                    queued_after_pop = queue.len(),
+                    queued_after_pop = self.assoc_dltx_queues[ts.t as usize - 1].len(),
                     "building associated FN18 control block"
                 );
                 let mut fragger = BsFragger::new(pdu, sdu, reporter);
                 if !fragger.get_next_chunk(&mut buf) {
-                    queue.push(DlSchedElem::FragBuf(fragger));
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
             }
             DlSchedElem::FragBuf(mut fragger) => {
                 if !fragger.get_next_chunk(&mut buf) {
-                    queue.push(DlSchedElem::FragBuf(fragger));
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
             }
             _ => unreachable!(),
@@ -1245,15 +1298,16 @@ impl BsChannelScheduler {
             // rotating FN18 position is mandatory BSCH or BNCH, however;
             // that broadcast has priority over SACCH and the associated
             // queue must remain intact until the next usable FN18.
-            // FN18 is always a signalling burst. The active speech state
-            // on FN1..17 must not turn the FN18 SCH/F opportunity into a
-            // traffic-plane uplink indication.
-            let traffic_control_frame = false;
+            // Associated FN18 control is signalling at both the logical and
+            // PHY-processing layers. Keep the Cp context so the LMAC expects
+            // SCH/F or SCH/HU with the control-channel training sequence;
+            // PhysicalChannel::Tp is reserved for traffic-plane bursts.
             let associated_control = self.dl_build_associated_control_block(ts);
             if associated_control.is_some() {
                 tracing::info!(
                     dltime = %ts,
-                    traffic_control_frame,
+                    traffic_control_frame = false,
+                    ul_phy_chan = ?PhysicalChannel::Cp,
                     "transmitting queued associated FN18 SCH/F control block"
                 );
             }
@@ -1982,7 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associated_fn18_grant_skips_predefined_clch() {
+    fn test_associated_fn18_grant_uses_second_subslot_at_predefined_clch() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -2005,12 +2059,22 @@ mod tests {
             .ul_prepare_associated_basic_link_ack_grant(2, addr)
             .expect("active speaker must provide an associated FN18 grant");
 
-        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(
+            grant.capacity_allocation,
+            BasicSlotgrantCapAlloc::SecondSubslotGranted
+        );
         let clch = TdmaTime { t: 2, f: 18, m: 5, h: 0 };
-        let next_fn18 = TdmaTime { t: 2, f: 18, m: 6, h: 0 };
         assert!(clch.is_mandatory_clch());
-        assert_eq!(sched.ul_get_slot_owner(clch, PhyBlockNum::Both), None);
-        assert_eq!(sched.ul_get_slot_owner(next_fn18, PhyBlockNum::Both), Some(1234));
+        assert_eq!(
+            sched.ul_get_slot_owner(clch, PhyBlockNum::Block1),
+            None,
+            "the predefined CLCH subslot must remain available"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(clch, PhyBlockNum::Block2),
+            Some(1234),
+            "the reserved response must use the second FN18 subslot"
+        );
     }
 
     #[test]
@@ -2037,7 +2101,13 @@ mod tests {
             ssi_type: SsiType::Issi,
             ssi: 1234,
         };
-        sched.dl_enqueue_associated_tma(2, BsChannelScheduler::dl_make_minimal_resource(&addr, None, false), BitBuffer::new(0), None);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::new(0),
+            Some(reporter),
+        );
 
         // In multiframe 1, frame 18 slot 2 is the mandatory BSCH position.
         let mandatory = TdmaTime { t: 2, f: 18, m: 1, h: 0 };
@@ -2052,8 +2122,18 @@ mod tests {
         assert!(!usable.is_mandatory_bsch() && !usable.is_mandatory_bnch());
         sched.cur_dltime = usable.add_timeslots(-1);
         let usable_slot = sched.finalize_ts_for_tick();
-        assert_eq!(usable_slot.blk1.unwrap().logical_channel, LogicalChannel::SchF);
+        let blk1 = usable_slot.blk1.as_ref().expect("associated FN18 must contain SCH/F");
+        assert_eq!(blk1.logical_channel, LogicalChannel::SchF);
         assert_eq!(usable_slot.ul_phy_chan, PhysicalChannel::Cp);
+        let mut mac_block = blk1.mac_block.clone();
+        mac_block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated FN18 resource");
+        assert!(resource.slot_granting_element.is_some(), "grant must be built at actual FN18 transmission time");
+        assert_eq!(
+            sched.ul_get_slot_owner(usable.add_timeslots(18 * 4), PhyBlockNum::Both),
+            Some(1234),
+            "ACK reservation must follow the actual transmitted FN18"
+        );
         assert!(sched.assoc_dltx_queues[1].is_empty());
     }
 
