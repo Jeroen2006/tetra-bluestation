@@ -1,6 +1,6 @@
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, TetraAddress, Todo, TxReporter};
 
-use crate::{control::enums::circuit_mode_type::CircuitModeType, lcmc::fields::chan_alloc_req::CmceChanAllocReq};
+use crate::{control::enums::circuit_mode_type::CircuitModeType, lcmc::fields::chan_alloc_req::CmceChanAllocReq, tma::AssociatedChannel};
 
 pub mod enums;
 pub mod fields;
@@ -188,6 +188,7 @@ pub struct LcmcMleUnitdataReq {
     /// Custom field to allow for creating circuits
     pub main_address: TetraAddress,
     pub chan_alloc: Option<CmceChanAllocReq>,
+    pub associated_channel: Option<AssociatedChannel>,
     // Transmit 4 times (if capacity allows)
     // pub redundant_transmission: u8,
     pub tx_reporter: Option<TxReporter>,

@@ -312,8 +312,11 @@ impl UmacBs {
             cell_change_flag: false,
             carrier_num,
             ext: None,
-            mon_pattern: 0,
-            frame18_mon_pattern: Some(0),
+            // Core TIP 14.1.6: a normal CCCH -> TCH allocation assigns all
+            // three monitoring patterns.  The frame-18-only field is then
+            // conditional absent, not a zero-valued field on the air.
+            mon_pattern: 0b11,
+            frame18_mon_pattern: None,
         }
     }
 
@@ -595,8 +598,16 @@ impl UmacBs {
         if let Some(res_req) = &pdu.reservation_req {
             let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
             if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+                // During a call the request was received on an assigned slot.
+                // Return the grant in that slot's SACCH/FN18 rather than
+                // trying to insert normal signalling into downlink speech.
+                let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
+                    && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+                if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
+                    self.channel_scheduler.dl_enqueue_associated_grant(msg_dltime.t, addr, grant);
+                } else {
+                    self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+                }
             } else {
                 tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
@@ -761,8 +772,11 @@ impl UmacBs {
         if let Some(res_req) = &pdu.reservation_req {
             let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
             if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+                if in_active_over && (2..=4).contains(&msg_dltime.t) {
+                    self.channel_scheduler.dl_enqueue_associated_grant(msg_dltime.t, addr, grant);
+                } else {
+                    self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+                }
             } else {
                 tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
@@ -1188,6 +1202,7 @@ impl UmacBs {
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
         let mut sdu = prim.pdu;
+        let associated_channel = prim.associated_channel;
 
         // ── FACCH/Stealing path ──────────────────────────────────────────
         // stealing_permission → STCH on traffic channel for time-critical signaling
@@ -1284,6 +1299,7 @@ impl UmacBs {
         } else {
             (None, None)
         };
+        let carries_channel_allocation = mac_chan_alloc.is_some();
 
         // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
         // random_access_flag: true for SSI-addressed (responses to random access requests),
@@ -1313,7 +1329,20 @@ impl UmacBs {
         // }
         // self.channel_scheduler.dl_enqueue_tma(message.dltime.t, pdu, sdu, prim.tx_reporter);
 
-        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
+        if let Some(channel) = associated_channel {
+            if !carries_channel_allocation
+                && (2..=4).contains(&channel.timeslot)
+                && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot)
+                && self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot)
+            {
+                self.channel_scheduler.dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
+            } else {
+                tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
+                self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
+            }
+        } else {
+            self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
+        }
 
         // let enqueue_ts = 1;
         // self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);

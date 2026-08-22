@@ -58,7 +58,7 @@ pub struct PrecomputedUmacPdus {
     pub mle_sync: DMleSync,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TimeslotSchedule {
     pub ul1: Option<u32>,
     pub ul2: Option<u32>,
@@ -75,7 +75,14 @@ pub struct BsChannelScheduler {
     dltx_next_slot_queue: Vec<DlSchedElem>,
     /// Four queues for scheduled downlink traffic, one per timeslot
     dltx_queues: [Vec<DlSchedElem>; 4],
+    /// Associated-control messages. These are consumed only in FN18 on an
+    /// assigned channel and therefore never steal a normal speech frame.
+    assoc_dltx_queues: [Vec<DlSchedElem>; 4],
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
+    /// Uplink reservations announced in an associated FN18 grant.  They must
+    /// outlive the FN18 that carries the grant: the MS uses the *following*
+    /// control frame, so an 18-frame ring cannot represent them correctly.
+    associated_ulsched: Vec<(TdmaTime, TimeslotSchedule)>,
 
     circuits: CircuitMgr,
 
@@ -132,7 +139,9 @@ impl BsChannelScheduler {
             precomps,
             dltx_next_slot_queue: Vec::new(),
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            assoc_dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             ulsched: EMPTY_SCHED,
+            associated_ulsched: Vec::new(),
             circuits: CircuitMgr::new(),
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
@@ -236,7 +245,9 @@ impl BsChannelScheduler {
     /// Fully wipe the schedule
     pub fn purge_schedule(&mut self) {
         self.dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        self.assoc_dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         self.ulsched = EMPTY_SCHED;
+        self.associated_ulsched.clear();
     }
 
     /// Sets the current downlink time to the given TdmaTime
@@ -264,7 +275,9 @@ impl BsChannelScheduler {
 
         assert!(!is_halfslot || num_slots == 1, "is_halfslot set for num_slots > 1");
 
-        for dist in 0..MACSCHED_NUM_FRAMES - 1 {
+        // Include all 18 frames.  In an active UL-TCH only FN18 remains an
+        // eligible associated-access opportunity for another terminal.
+        for dist in 0..MACSCHED_NUM_FRAMES {
             // let candidate_t = self.cur_ts.add_timeslots(dist as i32 * 4);
             // Base off of internal perception of time, convert to UL time
             // Below may crash someday, but I'd want to investigate that situation
@@ -284,6 +297,14 @@ impl BsChannelScheduler {
 
             if candidate_t.is_mandatory_clch() {
                 // Not an opportunity; skip
+                continue;
+            }
+
+            // A transmitting MS owns UL TCH in FN1..17.  Other terminals may
+            // receive associated access only in the control frame, avoiding a
+            // collision with the active speaker.  During hangtime the slot is
+            // FACCH again and normal grant selection remains available.
+            if self.circuits.is_active(Direction::Ul, t) && !self.is_hangtime(t) && candidate_t.f != 18 {
                 continue;
             }
 
@@ -344,6 +365,10 @@ impl BsChannelScheduler {
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
     /// If successful, returns a BasicSlotgrant with the granting delay and capacity allocation.
     pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
+        if self.circuits.is_active(Direction::Ul, timeslot) && !self.is_hangtime(timeslot) {
+            return self.ul_process_associated_fn18_cap_req(timeslot, addr, res_req);
+        }
+
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
 
@@ -361,6 +386,10 @@ impl BsChannelScheduler {
 
         // If found, reserve the slots and return a BasicSlotgrant
         if let Some((skips, grant_timestamps)) = grant_op {
+            let associated_fn18_grant = self.circuits.is_active(Direction::Ul, timeslot)
+                && !self.is_hangtime(timeslot)
+                && grant_timestamps.iter().all(|timestamp| timestamp.f == 18);
+
             // Reserve the target granting opportunity. Get subslot (only relevant for halfslot reservation)
             let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
 
@@ -377,7 +406,13 @@ impl BsChannelScheduler {
             } else {
                 BasicSlotgrantCapAlloc::from_req_slotcount(requested_cap)
             };
-            let grant_delay = if skips == 0 {
+            let grant_delay = if associated_fn18_grant {
+                // The only uplink opportunity left while this assigned channel
+                // carries speech is its control frame.  This special value tells
+                // the MS to apply the allocation at FN18 rather than interpreting
+                // it as the next ordinary (FN1..17) access opportunity.
+                BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18
+            } else if skips == 0 {
                 BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
             } else {
                 BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
@@ -396,11 +431,101 @@ impl BsChannelScheduler {
         }
     }
 
+    /// Reserve the FN18 *after* the one carrying a downlink associated grant.
+    ///
+    /// A grant generated after an access in multiframe N is emitted on the next
+    /// FN18.  The MS cannot use that already-current uplink frame, so granting
+    /// delay value 14 directs it to FN18 of multiframe N+1.  This schedule is
+    /// deliberately separate from `ulsched`, whose 18-frame ring would alias
+    /// both control frames to the same entry.
+    fn ul_process_associated_fn18_cap_req(
+        &mut self,
+        timeslot: u8,
+        addr: TetraAddress,
+        res_req: &ReservationRequirement,
+    ) -> Option<BasicSlotgrant> {
+        let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
+        let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        if requested_cap != 1 {
+            tracing::warn!(
+                "ul_process_associated_fn18_cap_req: cannot grant {} slots on one FN18 for addr {}",
+                requested_cap,
+                addr
+            );
+            return None;
+        }
+
+        let mut grant_frame = self.cur_dltime.forward_to_timeslot(timeslot);
+        while grant_frame.f != 18 {
+            grant_frame = grant_frame.add_timeslots(4);
+        }
+        let target_frame = grant_frame.add_timeslots((18 * 4) as i32);
+
+        let schedule_index = self
+            .associated_ulsched
+            .iter()
+            .position(|(timestamp, _)| *timestamp == target_frame);
+        let schedule = if let Some(index) = schedule_index {
+            &mut self.associated_ulsched[index].1
+        } else {
+            self.associated_ulsched.push((
+                target_frame,
+                TimeslotSchedule {
+                    ul1: None,
+                    ul2: None,
+                },
+            ));
+            &mut self.associated_ulsched.last_mut().unwrap().1
+        };
+
+        let capacity_allocation = if is_halfslot {
+            if schedule.ul1.is_none() {
+                schedule.ul1 = Some(addr.ssi);
+                BasicSlotgrantCapAlloc::FirstSubslotGranted
+            } else if schedule.ul2.is_none() {
+                schedule.ul2 = Some(addr.ssi);
+                BasicSlotgrantCapAlloc::SecondSubslotGranted
+            } else {
+                tracing::warn!(
+                    "ul_process_associated_fn18_cap_req: FN18 {} is fully reserved",
+                    target_frame
+                );
+                return None;
+            }
+        } else if schedule.ul1.is_none() && schedule.ul2.is_none() {
+            schedule.ul1 = Some(addr.ssi);
+            schedule.ul2 = Some(addr.ssi);
+            BasicSlotgrantCapAlloc::Grant1Slot
+        } else {
+            tracing::warn!(
+                "ul_process_associated_fn18_cap_req: FN18 {} is already reserved",
+                target_frame
+            );
+            return None;
+        };
+
+        tracing::debug!(
+            "ul_process_associated_fn18_cap_req: addr {}, res_req {:?}, grant frame {}, target frame {}",
+            addr,
+            res_req,
+            grant_frame,
+            target_frame
+        );
+        Some(BasicSlotgrant {
+            capacity_allocation,
+            granting_delay: BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18,
+        })
+    }
+
     /// Returns schedule info for the given uplink timeslot and full-or-subslot
     /// If Both is requested, schedule is assumed to have matching allocation for two subslots
     /// If not, a warning is issued and None is returned.
     pub fn ul_get_slot_owner(&self, ts: TdmaTime, slot: PhyBlockNum) -> Option<u32> {
-        let sched = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
+        let sched = self
+            .associated_ulsched
+            .iter()
+            .find_map(|(timestamp, schedule)| (*timestamp == ts).then_some(schedule))
+            .unwrap_or_else(|| &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)]);
         match slot {
             PhyBlockNum::Block1 => sched.ul1,
             PhyBlockNum::Block2 => sched.ul2,
@@ -416,7 +541,11 @@ impl BsChannelScheduler {
     }
 
     fn ul_get_usage(&self, ts: TdmaTime) -> AccessAssignUlUsage {
-        let ul_sched = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
+        let ul_sched = self
+            .associated_ulsched
+            .iter()
+            .find_map(|(timestamp, schedule)| (*timestamp == ts).then_some(schedule))
+            .unwrap_or_else(|| &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)]);
         match (ul_sched.ul1, ul_sched.ul2) {
             (Some(_), Some(_)) => AccessAssignUlUsage::AssignedOnly,
             (Some(_), None) => AccessAssignUlUsage::CommonAndAssigned,
@@ -477,6 +606,46 @@ impl BsChannelScheduler {
                 break;
             }
         }
+    }
+
+    pub fn dl_enqueue_associated_tma(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        assert!((2..=4).contains(&ts), "associated control must use an assigned timeslot");
+        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
+    }
+
+    /// Deliver a capacity grant through the target channel's FN18 control
+    /// frame. This makes the preceding AACH reservation and the grant PDU
+    /// visible on the same associated channel, without downlink stealing.
+    pub fn dl_enqueue_associated_grant(&mut self, ts: u8, addr: TetraAddress, grant: BasicSlotgrant) {
+        assert!((2..=4).contains(&ts), "associated grant must use an assigned timeslot");
+        // A MAC-ACCESS reservation is complete only once the BS acknowledges
+        // that random access.  In the normal control path this flag is added
+        // while integrating a queued RandomAccessAck; on FN18 we build the
+        // associated response directly, so it must be present here.
+        let pdu = Self::dl_make_minimal_resource(&addr, Some(grant), true);
+        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, BitBuffer::new(0), None));
+    }
+
+    fn dl_build_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
+        let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
+        let pos = queue.iter().position(|item| matches!(item, DlSchedElem::Resource(..) | DlSchedElem::FragBuf(..)))?;
+        let item = queue.remove(pos);
+        let mut buf = BitBuffer::new(SCH_F_CAP);
+        match item {
+            DlSchedElem::Resource(pdu, sdu, reporter) => {
+                let mut fragger = BsFragger::new(pdu, sdu, reporter);
+                if !fragger.get_next_chunk(&mut buf) {
+                    queue.push(DlSchedElem::FragBuf(fragger));
+                }
+            }
+            DlSchedElem::FragBuf(mut fragger) => {
+                if !fragger.get_next_chunk(&mut buf) {
+                    queue.push(DlSchedElem::FragBuf(fragger));
+                }
+            }
+            _ => unreachable!(),
+        }
+        Some(buf)
     }
 
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
@@ -961,7 +1130,27 @@ impl BsChannelScheduler {
         // For traffic timeslots, also check for FACCH/stealing (STCH half-slot)
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
 
-        let mut elem = if dl_is_traffic {
+        let mut elem = if ts.f == 18 && ts.t != 1 && (self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t)) {
+            // FN18 is the assigned channel's fixed ACCH opportunity.  Do not
+            // borrow capacity from FN1..17 for ordinary call signalling.
+            let mut buf = self.dl_build_associated_control_block(ts).unwrap_or_else(|| {
+                let mut idle = BitBuffer::new(SCH_F_CAP);
+                MacResource::null_pdu().to_bitbuf(&mut idle);
+                idle
+            });
+            buf.seek(0);
+            TmvUnitdataReqSlot {
+                ts,
+                blk1: Some(TmvUnitdataReq {
+                    logical_channel: LogicalChannel::SchF,
+                    mac_block: buf,
+                    scrambling_code: self.scrambling_code,
+                }),
+                blk2: None,
+                bbk: None,
+                ul_phy_chan: PhysicalChannel::Cp,
+            }
+        } else if dl_is_traffic {
             let (tch_buf, stch_opt) = self.dl_build_traffic_block(ts);
 
             if let Some(stch_buf) = stch_opt {
@@ -1049,9 +1238,11 @@ impl BsChannelScheduler {
             }
         };
 
-        // Sanity check: frame 18 should not carry user blocks
-        if elem.blk1.is_some() {
-            assert!(ts.f != 18, "frame 18 shouldn't have blk1 set");
+        // FN18 may carry only control (SACCH/FACCH), never a traffic block.
+        if ts.f == 18 {
+            if let Some(block) = elem.blk1.as_ref() {
+                assert!(!block.logical_channel.is_traffic());
+            }
         }
 
         // Construct the BBK block to reflect UL/DL usage
@@ -1123,6 +1314,10 @@ impl BsChannelScheduler {
         let index = self.ul_ts_to_sched_index(&ts.add_timeslots(-4));
         self.ulsched[ts.t as usize - 1][index].ul1 = None;
         self.ulsched[ts.t as usize - 1][index].ul2 = None;
+
+        // Keep an FN18 grant long enough for the delayed UL receive path to
+        // consume it, then discard it before a later multiframe can reuse it.
+        self.associated_ulsched.retain(|(reservation_ts, _)| reservation_ts.age(ts) <= 16);
 
         // tracing::warn!("end finalize");
         // self.dump_ul_schedule_full(true);
@@ -1198,17 +1393,37 @@ impl BsChannelScheduler {
                             },
                         }
                     } else {
-                        // Normal operation: Traffic(usage) when a circuit is active, else Unallocated
-                        AccessAssign::DownlinkDefinedUplinkDefined {
-                            downlink_usage_marker: if let Some(usage) = dl_traffic_usage {
-                                AccessAssignDlUsage::Traffic(usage)
-                            } else {
-                                AccessAssignDlUsage::Unallocated
+                        match (dl_traffic_usage, ul_traffic_usage) {
+                            (Some(dl_usage), Some(ul_usage)) => AccessAssign::DownlinkDefinedUplinkDefined {
+                                downlink_usage_marker: AccessAssignDlUsage::Traffic(dl_usage),
+                                uplink_usage_marker: AccessAssignUlUsage::Traffic(ul_usage),
                             },
-                            uplink_usage_marker: if let Some(usage) = ul_traffic_usage {
-                                AccessAssignUlUsage::Traffic(usage)
-                            } else {
-                                AccessAssignUlUsage::Unallocated
+                            // Core TIP 14.1.1.4: downlink TCH and uplink
+                            // FACCH has assigned-only access, not an UL UMt.
+                            (Some(dl_usage), None) => AccessAssign::DownlinkDefinedUplinkAssignedOnly {
+                                downlink_usage_marker: AccessAssignDlUsage::Traffic(dl_usage),
+                                access_field: AccessField {
+                                    access_code: AccessCode::AccessCodeA,
+                                    base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
+                                },
+                            },
+                            // Core TIP 14.1.1.5: downlink FACCH plus uplink TCH.
+                            (None, Some(ul_usage)) => AccessAssign::DownlinkDefinedUplinkDefined {
+                                downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
+                                uplink_usage_marker: AccessAssignUlUsage::Traffic(ul_usage),
+                            },
+                            (None, None) if self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t) => {
+                                AccessAssign::DownlinkDefinedUplinkAssignedOnly {
+                                    downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
+                                    access_field: AccessField {
+                                        access_code: AccessCode::AccessCodeA,
+                                        base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
+                                    },
+                                }
+                            }
+                            (None, None) => AccessAssign::DownlinkDefinedUplinkDefined {
+                                downlink_usage_marker: AccessAssignDlUsage::Unallocated,
+                                uplink_usage_marker: AccessAssignUlUsage::Unallocated,
                             },
                         }
                     }
@@ -1222,27 +1437,31 @@ impl BsChannelScheduler {
             // Frame 18 is the Control Frame, which cannot contain traffic
             assert!(ul_traffic_usage.is_none() && dl_traffic_usage.is_none());
 
-            let aach = AccessAssignFr18::UplinkCommonOnly {
-                access_field_1: AccessField {
-                    access_code: AccessCode::AccessCodeA,
-                    base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
-                        // Subslot is reserved in the uplink
-                        BaseFrameLength::ReservedSubslot
-                    } else if ts.is_mandatory_clch() {
-                        // CLCH opportunity (which is always in SSN1, see EN 300 392 §9.5.1 Table 9.27)
-                        BaseFrameLength::CLCHSubslot
-                    } else {
-                        self.common_access_frame_len()
-                    },
+            let assigned_channel = ts.t != 1
+                && (self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t));
+            let access_field_1 = AccessField {
+                access_code: AccessCode::AccessCodeA,
+                base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
+                    BaseFrameLength::ReservedSubslot
+                } else if !assigned_channel && ts.is_mandatory_clch() {
+                    // The fixed MCCH CLCH mapping applies only on common TS1.
+                    BaseFrameLength::CLCHSubslot
+                } else {
+                    self.common_access_frame_len()
                 },
-                access_field_2: AccessField {
-                    access_code: AccessCode::AccessCodeA,
-                    base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
-                        BaseFrameLength::ReservedSubslot
-                    } else {
-                        self.common_access_frame_len()
-                    },
+            };
+            let access_field_2 = AccessField {
+                access_code: AccessCode::AccessCodeA,
+                base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
+                    BaseFrameLength::ReservedSubslot
+                } else {
+                    self.common_access_frame_len()
                 },
+            };
+            let aach = if assigned_channel {
+                AccessAssignFr18::UplinkAssignedOnly { access_field_1, access_field_2 }
+            } else {
+                AccessAssignFr18::UplinkCommonOnly { access_field_1, access_field_2 }
             };
 
             aach.to_bitbuf(&mut aach_bb);
@@ -1586,6 +1805,52 @@ mod tests {
 
         assert_eq!(grant2.capacity_allocation, BasicSlotgrantCapAlloc::Grant3Slots);
         assert_eq!(grant2.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    }
+
+    #[test]
+    fn test_active_uplink_uses_frame18_grant_delay() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        sched.create_circuit(
+            Direction::Ul,
+            Circuit {
+                direction: Direction::Ul,
+                ts: 2,
+                usage: 6,
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            },
+        );
+
+        let grant = sched
+            .ul_process_cap_req(
+                2,
+                TetraAddress {
+                    ssi_type: SsiType::Issi,
+                    ssi: 1234,
+                },
+                &ReservationRequirement::Req1Subslot,
+            )
+            .expect("active traffic channel must offer a FN18 capacity grant");
+
+        assert_eq!(
+            grant.granting_delay,
+            BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18,
+            "FN18-associated access must not use the normal next-opportunity delay"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 18, m: 1, h: 0 }, PhyBlockNum::Block1),
+            None,
+            "the FN18 carrying the downlink grant must not be reserved"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 18, m: 2, h: 0 }, PhyBlockNum::Block1),
+            Some(1234),
+            "the following FN18 must be reserved for the granted MS"
+        );
     }
 
     #[test]

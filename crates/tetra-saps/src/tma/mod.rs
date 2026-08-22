@@ -2,6 +2,13 @@ use tetra_core::{BitBuffer, EndpointId, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssociatedChannel {
+    pub call_id: u16,
+    pub timeslot: u8,
+    pub usage: u8,
+}
+
 /// Clause 20.4.1.1.1
 /// TMA-CANCEL request: this primitive shall be used to cancel a TMA-UNITDATA
 /// request primitive that was submitted by the LLC.
@@ -65,6 +72,7 @@ pub struct TmaUnitdataReq {
     // Custom fields for BS stack:
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
+    pub associated_channel: Option<AssociatedChannel>,
     pub tx_reporter: Option<TxReporter>,
 }
 
