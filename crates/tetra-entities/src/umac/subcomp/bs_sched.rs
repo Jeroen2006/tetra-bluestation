@@ -6,7 +6,7 @@ use tetra_saps::{
 
 use crate::{
     lmac::components::scrambler,
-    umac::subcomp::{bs_frag::BsFragger, circuit_mgr::CircuitMgr},
+    umac::subcomp::{bs_frag::BsFragger, circuit_mgr::CircuitMgr, fillbits},
 };
 use tetra_pdus::umac::enums::access_code::AccessCode;
 use tetra_pdus::umac::structs::access_field::AccessField;
@@ -47,6 +47,31 @@ const DEFAULT_ACCESS_FRAME_MARKER: BaseFrameLength = BaseFrameLength::Subslots2;
 /// Number of timeslots the scheduler operates on. May become larger when secondary carriers are supported.
 pub const NUM_TIMESLOTS: usize = 4;
 
+/// Close a signalling MAC block with a valid Null PDU and/or fill bits.
+///
+/// A freshly allocated BitBuffer is zero-filled, but trailing zeroes are not a
+/// valid MAC block termination. Return whether a Null PDU and fill bits were
+/// inserted so callers can include the result in diagnostics.
+fn finalize_downlink_mac_block(buf: &mut BitBuffer) -> (bool, bool) {
+    let remaining = buf.get_len_remaining();
+    if remaining == 0 {
+        return (false, false);
+    }
+
+    let null_pdu_inserted = remaining >= NULL_PDU_LEN_BITS;
+    if null_pdu_inserted {
+        MacResource::null_pdu().to_bitbuf(buf);
+    }
+
+    let fill_bits_inserted = buf.get_len_remaining() > 0;
+    if fill_bits_inserted {
+        fillbits::addition::write(buf, None);
+    }
+
+    assert_eq!(buf.get_len_remaining(), 0, "signalling MAC block was not finalized");
+    (null_pdu_inserted, fill_bits_inserted)
+}
+
 #[derive(Debug)]
 pub struct PrecomputedUmacPdus {
     pub mac_sysinfo1: MacSysinfo,
@@ -79,9 +104,9 @@ pub struct BsChannelScheduler {
     /// assigned channel and therefore never steal a normal speech frame.
     assoc_dltx_queues: [Vec<DlSchedElem>; 4],
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
-    /// Uplink reservations announced in an associated FN18 grant.  They must
-    /// outlive the FN18 that carries the grant: the MS uses the *following*
-    /// control frame, so an 18-frame ring cannot represent them correctly.
+    /// Uplink reservations announced in an associated FN18 grant. They are
+    /// kept separate from the ordinary 18-frame ring because the associated
+    /// grant and its reserved control opportunity are built together.
     associated_ulsched: Vec<(TdmaTime, TimeslotSchedule)>,
 
     circuits: CircuitMgr,
@@ -404,10 +429,6 @@ impl BsChannelScheduler {
 
         // If found, reserve the slots and return a BasicSlotgrant
         if let Some((skips, grant_timestamps)) = grant_op {
-            let associated_fn18_grant = self.circuits.is_active(Direction::Ul, timeslot)
-                && !self.is_hangtime(timeslot)
-                && grant_timestamps.iter().all(|timestamp| timestamp.f == 18);
-
             // Reserve the target granting opportunity. Get subslot (only relevant for halfslot reservation)
             let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
 
@@ -424,13 +445,7 @@ impl BsChannelScheduler {
             } else {
                 BasicSlotgrantCapAlloc::from_req_slotcount(requested_cap)
             };
-            let grant_delay = if associated_fn18_grant {
-                // The only uplink opportunity left while this assigned channel
-                // carries speech is its control frame.  This special value tells
-                // the MS to apply the allocation at FN18 rather than interpreting
-                // it as the next ordinary (FN1..17) access opportunity.
-                BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18
-            } else if skips == 0 {
+            let grant_delay = if skips == 0 {
                 BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
             } else {
                 BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
@@ -453,9 +468,9 @@ impl BsChannelScheduler {
     /// acknowledged downlink resource sent through the associated SACCH.
     ///
     /// With an active uplink speaker, frames 1..17 belong to that speaker's
-    /// TCH.  The addressed listener can therefore acknowledge SDS only in
-    /// the next frame-18 SCH/F.  The grant is included in the same
-    /// MAC-RESOURCE as the BL-DATA and uses the FN18-specific delay value.
+    /// TCH. The addressed listener can acknowledge SDS in the corresponding
+    /// frame-18 SCH/F. The grant is included in the same MAC-RESOURCE as the
+    /// BL-DATA and uses the zero-delay FN18 opportunity.
     pub fn ul_prepare_associated_basic_link_ack_grant(
         &mut self,
         timeslot: u8,
@@ -499,13 +514,11 @@ impl BsChannelScheduler {
         frame
     }
 
-    /// Reserve the FN18 *after* the one carrying a downlink associated grant.
-    ///
-    /// A grant generated after an access in multiframe N is emitted on the next
-    /// FN18.  The MS cannot use that already-current uplink frame, so granting
-    /// delay value 14 directs it to FN18 of multiframe N+1.  This schedule is
-    /// deliberately separate from `ulsched`, whose 18-frame ring would alias
-    /// both control frames to the same entry.
+    /// Reserve the corresponding FN18 uplink opportunity for an associated
+    /// grant. The A/B mode under investigation uses granting delay 0000, so
+    /// the MS answers in the same FN18 as the downlink grant. This schedule is
+    /// deliberately separate from `ulsched`, whose 18-frame ring is not used
+    /// for associated control reservations.
     fn ul_process_associated_fn18_cap_req(
         &mut self,
         grant_frame: TdmaTime,
@@ -523,7 +536,7 @@ impl BsChannelScheduler {
             return None;
         }
 
-        let target_frame = grant_frame.add_timeslots((18 * 4) as i32);
+        let target_frame = grant_frame;
 
         let schedule_index = self
             .associated_ulsched
@@ -545,7 +558,7 @@ impl BsChannelScheduler {
         let capacity_allocation = if is_halfslot {
             // Subslot 1 is the predefined CLCH position on this FN18. It is
             // not available for a reserved SCH/HU response, while subslot 2
-            // remains usable with the same relative FN18 grant delay.
+            // remains usable with the same zero-delay FN18 grant.
             if target_frame.is_mandatory_clch() {
                 if schedule.ul2.is_none() {
                     schedule.ul2 = Some(addr.ssi);
@@ -600,7 +613,7 @@ impl BsChannelScheduler {
         );
         Some(BasicSlotgrant {
             capacity_allocation,
-            granting_delay: BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
         })
     }
 
@@ -834,6 +847,20 @@ impl BsChannelScheduler {
             }
             _ => unreachable!(),
         }
+
+        let remaining_before = buf.get_len_remaining();
+        let (null_pdu_inserted, fill_bits_inserted) = finalize_downlink_mac_block(&mut buf);
+        tracing::info!(
+            dltime = %ts,
+            timeslot = ts.t,
+            physical_channel = ?PhysicalChannel::Tp,
+            logical_channel = ?LogicalChannel::SchF,
+            used_bits = buf.get_pos() - remaining_before,
+            remaining_bits_before = remaining_before,
+            null_pdu_inserted,
+            fill_bits_inserted,
+            "building associated FN18 SACCH"
+        );
         Some(buf)
     }
 
@@ -908,32 +935,21 @@ impl BsChannelScheduler {
     /// If blk is None, returns None.
     /// Otherwise, returns blk unchanged (eg. for SYNC, broadcast, etc).
     pub fn try_add_null_pdus(&mut self, blk: Option<TmvUnitdataReq>) -> Option<TmvUnitdataReq> {
-        // A null pdu in a slot:
-        // 0000000000010000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
-        // Oddly, the fill_bits ind is set to 0, while a fill bit is indeed present to fill the slot.
-        // We replicate that behavior here.
         if let Some(mut b) = blk {
             // STCH: MAC-U-SIGNAL occupies entire half-slot (3-bit header + 121-bit TM-SDU).
             // No additional MAC PDUs may be concatenated; receiver passes all bits after header to LLC.
             // Adding a null PDU would corrupt TM-SDU (misinterpreted as optional CMCE element flags).
             if b.logical_channel == LogicalChannel::SchHd || b.logical_channel == LogicalChannel::SchF {
-                if b.mac_block.get_len_remaining() >= NULL_PDU_LEN_BITS {
-                    tracing::trace!("try_add_null_pdus: closing blk with Null PDU");
-
-                    // We have room for a Null PDU
-                    let mut null_pdu = MacResource::null_pdu();
-                    null_pdu.length_ind = 2; // Null PDU is 16 bits
-                    let _ = null_pdu.update_len_and_fill_ind(0);
-                    null_pdu.to_bitbuf(&mut b.mac_block);
-
-                    // TODO FIXME: it's possibly the best idea to still add fill bits trailing this null pdu.
-                    // Check real-world captures.
-                } else {
-                    tracing::debug!(
-                        "try_add_null_pdus: not enough space for Null PDU in block, got {} bits remaining",
-                        b.mac_block.get_len_remaining()
-                    );
-                }
+                let remaining_before = b.mac_block.get_len_remaining();
+                let (null_pdu_inserted, fill_bits_inserted) = finalize_downlink_mac_block(&mut b.mac_block);
+                tracing::debug!(
+                    logical_channel = ?b.logical_channel,
+                    used_bits = b.mac_block.get_pos() - remaining_before,
+                    remaining_bits_before = remaining_before,
+                    null_pdu_inserted,
+                    fill_bits_inserted,
+                    "finalized downlink signalling MAC block"
+                );
             }
 
             Some(b)
@@ -1182,6 +1198,20 @@ impl BsChannelScheduler {
             std::mem::swap(a, b);
         }
 
+        if let Some(buf) = buf_opt.as_mut() {
+            let remaining_before = buf.get_len_remaining();
+            let (null_pdu_inserted, fill_bits_inserted) = finalize_downlink_mac_block(buf);
+            tracing::debug!(
+                dltime = %ts,
+                logical_channel = ?LogicalChannel::SchF,
+                used_bits = buf.get_pos() - remaining_before,
+                remaining_bits_before = remaining_before,
+                null_pdu_inserted,
+                fill_bits_inserted,
+                "finalized downlink signalling MAC block"
+            );
+        }
+
         buf_opt
     }
 
@@ -1354,16 +1384,16 @@ impl BsChannelScheduler {
             // rotating FN18 position is mandatory BSCH or BNCH, however;
             // that broadcast has priority over SACCH and the associated
             // queue must remain intact until the next usable FN18.
-            // Associated FN18 control is signalling at both the logical and
-            // PHY-processing layers. Keep the Cp context so the LMAC expects
-            // SCH/F or SCH/HU with the control-channel training sequence;
-            // PhysicalChannel::Tp is reserved for traffic-plane bursts.
+            // Associated FN18 remains on the assigned TP physical resource,
+            // while its logical channel is SCH/F and therefore uses signalling
+            // coding in LMAC (encode_cp), not TCH speech coding.
             let associated_control = self.dl_build_associated_control_block(ts);
             if associated_control.is_some() {
                 tracing::info!(
                     dltime = %ts,
-                    traffic_control_frame = false,
-                    ul_phy_chan = ?PhysicalChannel::Cp,
+                    assigned_traffic_channel = true,
+                    physical_channel = ?PhysicalChannel::Tp,
+                    logical_channel = ?LogicalChannel::SchF,
                     "transmitting queued associated FN18 SCH/F control block"
                 );
             }
@@ -1382,7 +1412,7 @@ impl BsChannelScheduler {
                 }),
                 blk2: None,
                 bbk: None,
-                ul_phy_chan: PhysicalChannel::Cp,
+                ul_phy_chan: PhysicalChannel::Tp,
             }
         } else if dl_is_traffic {
             let (tch_buf, stch_opt) = self.dl_build_traffic_block(ts);
@@ -2058,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_active_uplink_uses_frame18_grant_delay() {
+    fn test_active_uplink_uses_same_frame18_grant_delay() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -2088,18 +2118,13 @@ mod tests {
 
         assert_eq!(
             grant.granting_delay,
-            BasicSlotgrantGrantingDelay::AllocStartsAtOpportunityInFr18,
-            "FN18-associated access must not use the normal next-opportunity delay"
+            BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+            "associated access A/B test must use zero delay"
         );
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 2, f: 18, m: 1, h: 0 }, PhyBlockNum::Block1),
-            None,
-            "the FN18 carrying the downlink grant must not be reserved"
-        );
-        assert_eq!(
-            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 18, m: 2, h: 0 }, PhyBlockNum::Block1),
             Some(1234),
-            "the following FN18 must be reserved for the granted MS"
+            "the corresponding FN18 must be reserved for the granted MS"
         );
     }
 
@@ -2192,13 +2217,13 @@ mod tests {
         let usable_slot = sched.finalize_ts_for_tick();
         let blk1 = usable_slot.blk1.as_ref().expect("associated FN18 must contain SCH/F");
         assert_eq!(blk1.logical_channel, LogicalChannel::SchF);
-        assert_eq!(usable_slot.ul_phy_chan, PhysicalChannel::Cp);
+        assert_eq!(usable_slot.ul_phy_chan, PhysicalChannel::Tp);
         let mut mac_block = blk1.mac_block.clone();
         mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated FN18 resource");
         assert!(resource.slot_granting_element.is_some(), "grant must be built at actual FN18 transmission time");
         assert_eq!(
-            sched.ul_get_slot_owner(usable.add_timeslots(18 * 4), PhyBlockNum::Both),
+            sched.ul_get_slot_owner(usable, PhyBlockNum::Both),
             Some(1234),
             "ACK reservation must follow the actual transmitted FN18"
         );
@@ -2242,8 +2267,8 @@ mod tests {
             "a deferred request must not reserve from the skipped FN18"
         );
 
-        // The next usable FN18 carries the grant; only then is the following
-        // FN18 reserved for the MS.
+        // The next usable FN18 carries the grant and is reserved immediately
+        // for the MS because the grant uses zero delay.
         let usable = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
         sched.cur_dltime = usable.add_timeslots(-1);
         let usable_slot = sched.finalize_ts_for_tick();
@@ -2252,7 +2277,7 @@ mod tests {
         mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated grant resource");
         let grant = resource.slot_granting_element.expect("grant must be built at actual FN18");
-        let target = usable.add_timeslots(18 * 4);
+        let target = usable;
         let target_block = match grant.capacity_allocation {
             BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
             BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
