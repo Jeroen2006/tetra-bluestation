@@ -335,6 +335,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         Ok(
                             message @ (SwmiMessage::RegistrationDecision { .. }
                             | SwmiMessage::AttachmentDecision { .. }
+                            | SwmiMessage::SubscriberStateSync { .. }
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
                             | SwmiMessage::AuthenticationResult { .. }),

@@ -28,6 +28,8 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
             issi,
             groups: vec![],
             action: BrewSubscriberAction::Register,
+            class_of_usage: vec![],
+            scanning_enabled: None,
         }),
     };
     test.submit_message(register);
@@ -41,6 +43,8 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
             issi,
             groups: vec![gssi],
             action: BrewSubscriberAction::Affiliate,
+            class_of_usage: vec![3],
+            scanning_enabled: None,
         }),
     };
     test.submit_message(affiliate);

@@ -121,6 +121,7 @@ pub enum DlSchedElem {
     /// Contains MAC-U-SIGNAL (3 bits) + TM-SDU = 124 type1 bits.
     /// Delivers time-critical signaling (D-TX CEASED, D-TX GRANTED) per EN 300 392-2, clause 23.5.
     Stealing(BitBuffer, Option<TxReporter>),
+
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -158,7 +159,6 @@ impl BsChannelScheduler {
 
         let idx = ts as usize - 1;
         self.hangtime[idx] = active;
-
         // When leaving hangtime, drain stale signaling items that can only be consumed
         // in signaling mode. Keep Stealing items — they carry D-TX GRANTED/CEASED
         // that still need FACCH delivery.
@@ -179,6 +179,18 @@ impl BsChannelScheduler {
             return false;
         }
         self.hangtime[ts as usize - 1]
+    }
+
+    /// A granted floor must be advertised as traffic before the queued FACCH
+    /// D-TX GRANTED is emitted.  Otherwise an MS interprets NormalTrainSeq2
+    /// as two signalling half-slots rather than STCH.
+    pub fn begin_floor_grant_transition(&mut self, ts: u8, source_issi: u32) {
+        if !(2..=4).contains(&ts) {
+            tracing::warn!(ts, "floor grant transition requested for invalid traffic timeslot");
+            return;
+        }
+        tracing::info!(ts, source_issi, "ending hangtime before FACCH D-TX GRANTED");
+        self.set_hangtime(ts, false);
     }
 
     fn is_hangtime_effective(&self, ts: u8) -> bool {
@@ -608,9 +620,32 @@ impl BsChannelScheduler {
         }
     }
 
+    /// Queue ordinary signalling on a currently allocated, non-traffic
+    /// channel.  This is used for a tracked listener during hangtime: the MS
+    /// is still tuned to that slot, but no speech is being carried so FN1-17
+    /// are available and waiting for FN18 only adds avoidable latency.
+    pub fn dl_enqueue_tma_on_timeslot(
+        &mut self,
+        ts: u8,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+    ) {
+        assert!((1..=4).contains(&ts), "invalid downlink timeslot");
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
+    }
+
     pub fn dl_enqueue_associated_tma(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
         assert!((2..=4).contains(&ts), "associated control must use an assigned timeslot");
-        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
+        let queue = &mut self.assoc_dltx_queues[ts as usize - 1];
+        tracing::debug!(
+            ts,
+            addr = ?pdu.addr,
+            sdu_bits = sdu.get_len(),
+            queued_before = queue.len(),
+            "queued associated FN18 control resource"
+        );
+        queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
     }
 
     /// Deliver a capacity grant through the target channel's FN18 control
@@ -633,6 +668,13 @@ impl BsChannelScheduler {
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
             DlSchedElem::Resource(pdu, sdu, reporter) => {
+                tracing::debug!(
+                    dltime = %ts,
+                    addr = ?pdu.addr,
+                    sdu_bits = sdu.get_len(),
+                    queued_after_pop = queue.len(),
+                    "building associated FN18 control block"
+                );
                 let mut fragger = BsFragger::new(pdu, sdu, reporter);
                 if !fragger.get_next_chunk(&mut buf) {
                     queue.push(DlSchedElem::FragBuf(fragger));
@@ -664,7 +706,14 @@ impl BsChannelScheduler {
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
     /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
     pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>) {
-        tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
+        tracing::info!(
+            dltime = %self.cur_dltime,
+            ts,
+            stch_bits = block.get_len(),
+            hangtime = self.is_hangtime(ts),
+            queued_before = self.dltx_queues[ts as usize - 1].len(),
+            "queued FACCH/STCH block"
+        );
         self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter));
     }
 
@@ -817,7 +866,12 @@ impl BsChannelScheduler {
                 // Remove, log, and call tx_reporter::mark_discarded() if applicable
                 let elem = queue.remove(i);
                 item_was_discarded = true;
-                tracing::debug!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
+                tracing::warn!(
+                    dltime = %self.cur_dltime,
+                    ts = timeslot,
+                    element = ?elem,
+                    "discarding pending signalling while leaving hangtime"
+                );
 
                 match elem {
                     DlSchedElem::Resource(_, _, tx_reporter) => {
@@ -1133,7 +1187,11 @@ impl BsChannelScheduler {
         let mut elem = if ts.f == 18 && ts.t != 1 && (self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t)) {
             // FN18 is the assigned channel's fixed ACCH opportunity.  Do not
             // borrow capacity from FN1..17 for ordinary call signalling.
-            let mut buf = self.dl_build_associated_control_block(ts).unwrap_or_else(|| {
+            let associated_control = self.dl_build_associated_control_block(ts);
+            if associated_control.is_some() {
+                tracing::info!(dltime = %ts, "transmitting queued associated FN18 SCH/F control block");
+            }
+            let mut buf = associated_control.unwrap_or_else(|| {
                 let mut idle = BitBuffer::new(SCH_F_CAP);
                 MacResource::null_pdu().to_bitbuf(&mut idle);
                 idle
@@ -1157,10 +1215,14 @@ impl BsChannelScheduler {
                 // FACCH/Stealing: 1st half = STCH signaling, 2nd half = TCH speech.
                 // NDB uses NormalTrainSeq2 for independent half-slot demodulation (EN 300 392-2, clause 23.5).
                 tracing::info!(
-                    "finalize_ts_for_tick: FACCH stealing on ts {} (stch={} bits, tch={} bits)",
-                    ts.t,
-                    stch_buf.get_len(),
-                    tch_buf.get_len()
+                    dltime = %ts,
+                    ts = ts.t,
+                    hangtime = self.is_hangtime(ts.t),
+                    hangtime_effective = hang_effective,
+                    ul_phy = ?ul_phy,
+                    stch_bits = stch_buf.get_len(),
+                    tch_bits = tch_buf.get_len(),
+                    "transmitting FACCH/STCH as traffic burst (NormalTrainSeq2 expected)"
                 );
                 TmvUnitdataReqSlot {
                     ts,

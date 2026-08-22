@@ -67,12 +67,18 @@ impl CmceBs {
             | CmcePduTypeUl::UTxDemand
             | CmcePduTypeUl::UCallRestore => {
                 self.cc.route_xx_deliver(_queue, message);
+                // CC may have produced individually addressed private-call
+                // signalling. Give it the same tracked call-channel route as
+                // SDS/STATUS before MLE consumes the queue.
+                self.cc.decorate_pending_downlinks(_queue);
             }
             CmcePduTypeUl::UStatus => {
                 self.sds.route_status_deliver(_queue, message);
+                self.cc.decorate_pending_downlinks(_queue);
             }
             CmcePduTypeUl::USdsData => {
                 self.sds.route_rf_deliver(_queue, message);
+                self.cc.decorate_pending_downlinks(_queue);
             }
             CmcePduTypeUl::UFacility => {
                 unimplemented_log!("{:?}", pdu_type);
@@ -97,6 +103,9 @@ impl TetraEntityTrait for CmceBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         // Propagate tick to subentities
         self.cc.tick_start(queue, ts);
+        // Central private-call actions and CC timers also create downlink
+        // messages outside rx_lcmc_mle_unitdata_ind.
+        self.cc.decorate_pending_downlinks(queue);
 
         // Process incoming control commands, if control link is enabled
         if let Some(cep) = &self.control {
@@ -104,6 +113,7 @@ impl TetraEntityTrait for CmceBs {
                 match cmd {
                     ControlCommand::SendSds { handle, .. } => {
                         let success = self.sds.rx_sds_from_control(queue, cmd);
+                        self.cc.decorate_pending_downlinks(queue);
                         let response = ControlResponse::SendSdsResponse { handle, success };
                         cep.respond(response);
                     }
@@ -137,6 +147,7 @@ impl TetraEntityTrait for CmceBs {
                 }
                 SapMsgInner::CmceSdsData(_) => {
                     self.sds.rx_sds_from_brew(queue, message);
+                    self.cc.decorate_pending_downlinks(queue);
                 }
                 _ => {
                     panic!("Unexpected control message: {:?}", message.msg);

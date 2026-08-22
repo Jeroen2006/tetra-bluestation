@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
@@ -22,7 +22,13 @@ pub enum MmClientState {
 pub struct MmClientProperties {
     pub issi: u32,
     pub state: MmClientState,
-    pub groups: HashSet<u32>,
+    /// Attached groups plus their over-the-air class of usage.  Keeping the
+    /// CoU here is essential: a bare affiliation cannot tell CMCE whether a
+    /// terminal is actually scanning the group.
+    pub groups: HashMap<u32, u8>,
+    /// TS 100 392-2 defaults to scanning enabled until an MS explicitly
+    /// reports otherwise with U-MM STATUS / Change of scanning state.
+    pub scanning_enabled: bool,
     pub energy_saving_mode: EnergySavingMode,
     pub class_of_ms: Option<ClassOfMs>,
     // pub last_seen: TdmaTime,
@@ -33,7 +39,8 @@ impl MmClientProperties {
         MmClientProperties {
             issi: ssi,
             state: MmClientState::Unknown,
-            groups: HashSet::new(),
+            groups: HashMap::new(),
+            scanning_enabled: true,
             energy_saving_mode: EnergySavingMode::StayAlive,
             class_of_ms: None,
             // last_seen: TdmaTime::default(),
@@ -106,6 +113,20 @@ impl MmClientMgr {
         }
     }
 
+    pub fn set_client_scanning_enabled(&mut self, issi: u32, enabled: bool) -> Result<(), ClientMgrErr> {
+        let client = self.clients.get_mut(&issi).ok_or(ClientMgrErr::ClientNotFound { issi })?;
+        client.scanning_enabled = enabled;
+        Ok(())
+    }
+
+    pub fn client_scanning_enabled(&self, issi: u32) -> Option<bool> {
+        self.clients.get(&issi).map(|client| client.scanning_enabled)
+    }
+
+    pub fn client_group_class_of_usage(&self, issi: u32, gssi: u32) -> Option<u8> {
+        self.clients.get(&issi)?.groups.get(&gssi).copied()
+    }
+
     /// Registers a fresh state for a client, based on ssi
     /// If client is already registered, previous state is discarded.
     pub fn try_register_client(&mut self, issi: u32, attached: bool) -> Result<bool, ClientMgrErr> {
@@ -153,7 +174,7 @@ impl MmClientMgr {
             if let Some(sink) = &self.telemetry_sink {
                 sink.send(TelemetryEvent::MsGroupDetach {
                     issi: client.issi,
-                    gssis: client.groups.iter().cloned().collect(),
+                    gssis: client.groups.keys().copied().collect(),
                 });
             }
             client.groups.clear();
@@ -165,6 +186,19 @@ impl MmClientMgr {
 
     /// Attaches or detaches a client from a group
     pub fn client_group_attach(&mut self, issi: u32, gssi: u32, do_attach: bool) -> Result<bool, ClientMgrErr> {
+        self.client_group_attach_with_class_of_usage(issi, gssi, do_attach, 0)
+    }
+
+    /// Attach/update a group and retain its advertised class of usage.  A
+    /// re-attachment with a changed CoU is a state change even when the GSSI
+    /// was already attached.
+    pub fn client_group_attach_with_class_of_usage(
+        &mut self,
+        issi: u32,
+        gssi: u32,
+        do_attach: bool,
+        class_of_usage: u8,
+    ) -> Result<bool, ClientMgrErr> {
         // Checks
         if !in_group_range(gssi) {
             return Err(ClientMgrErr::GssiInClientRange { gssi });
@@ -186,9 +220,10 @@ impl MmClientMgr {
                     });
                 }
 
-                Ok(client.groups.insert(gssi))
+                let previous = client.groups.insert(gssi, class_of_usage);
+                Ok(previous != Some(class_of_usage))
             } else {
-                Ok(client.groups.remove(&gssi))
+                Ok(client.groups.remove(&gssi).is_some())
             }
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })

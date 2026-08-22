@@ -448,6 +448,7 @@ impl MleMs {
                 req_handle: 0, // TODO FIXME; should we pass the same handle here?
                 graceful_degradation: None,
                 chan_alloc: None,
+                associated_channel: None,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -511,6 +512,7 @@ impl MleMs {
                 req_handle: 0, // TODO FIXME
                 graceful_degradation: None,
                 chan_alloc,
+                associated_channel: None,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };

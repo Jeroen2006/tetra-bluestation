@@ -19,7 +19,12 @@ pub enum StatusUplink {
     AcceptanceToRemovalOfDmMsAddresses = 22,
     AcceptanceToChangeRegistrationLabel = 23,
     AcceptanceToStopDmGatewayOperation = 24,
-    NetworkOrUserSpecific32 = 32,
+    /// 16.9.3.5.8: the dependent-information bit is 0 for scanning on and
+    /// 1 for scanning off.  This was previously treated as an opaque
+    /// network-specific value, which meant the serving cell could never
+    /// distinguish an MS listening to all attached groups from one that had
+    /// deliberately stopped scanning.
+    ChangeOfScanningState = 32,
     NetworkOrUserSpecific33 = 33,
     NetworkOrUserSpecific34 = 34,
     NetworkOrUserSpecific35 = 35,
@@ -73,7 +78,7 @@ impl std::convert::TryFrom<u64> for StatusUplink {
             22 => Ok(StatusUplink::AcceptanceToRemovalOfDmMsAddresses),
             23 => Ok(StatusUplink::AcceptanceToChangeRegistrationLabel),
             24 => Ok(StatusUplink::AcceptanceToStopDmGatewayOperation),
-            32 => Ok(StatusUplink::NetworkOrUserSpecific32),
+            32 => Ok(StatusUplink::ChangeOfScanningState),
             33 => Ok(StatusUplink::NetworkOrUserSpecific33),
             34 => Ok(StatusUplink::NetworkOrUserSpecific34),
             35 => Ok(StatusUplink::NetworkOrUserSpecific35),
@@ -130,7 +135,7 @@ impl StatusUplink {
             StatusUplink::AcceptanceToRemovalOfDmMsAddresses => 22,
             StatusUplink::AcceptanceToChangeRegistrationLabel => 23,
             StatusUplink::AcceptanceToStopDmGatewayOperation => 24,
-            StatusUplink::NetworkOrUserSpecific32 => 32,
+            StatusUplink::ChangeOfScanningState => 32,
             StatusUplink::NetworkOrUserSpecific33 => 33,
             StatusUplink::NetworkOrUserSpecific34 => 34,
             StatusUplink::NetworkOrUserSpecific35 => 35,
@@ -191,7 +196,7 @@ impl core::fmt::Display for StatusUplink {
             StatusUplink::AcceptanceToRemovalOfDmMsAddresses => write!(f, "AcceptanceToRemovalOfDmMsAddresses"),
             StatusUplink::AcceptanceToChangeRegistrationLabel => write!(f, "AcceptanceToChangeRegistrationLabel"),
             StatusUplink::AcceptanceToStopDmGatewayOperation => write!(f, "AcceptanceToStopDmGatewayOperation"),
-            StatusUplink::NetworkOrUserSpecific32 => write!(f, "NetworkOrUserSpecific32"),
+            StatusUplink::ChangeOfScanningState => write!(f, "ChangeOfScanningState"),
             StatusUplink::NetworkOrUserSpecific33 => write!(f, "NetworkOrUserSpecific33"),
             StatusUplink::NetworkOrUserSpecific34 => write!(f, "NetworkOrUserSpecific34"),
             StatusUplink::NetworkOrUserSpecific35 => write!(f, "NetworkOrUserSpecific35"),

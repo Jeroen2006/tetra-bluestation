@@ -216,6 +216,7 @@ impl MleBs {
                 req_handle: 0, // TODO FIXME; should we pass the same handle here?
                 graceful_degradation: None,
                 chan_alloc: None,
+                associated_channel: None,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -260,6 +261,8 @@ impl MleBs {
         // assert_eq!(endpoint, prim.endpoint_id);
         // Take Channel Allocation Request if any
         let chan_alloc = prim.chan_alloc.take();
+        // Preserve CMCE's likely-listening-channel decision through LLC.
+        let associated_channel = prim.associated_channel.take();
 
         let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
             // Unacknowledged service, send a TlUnitdataReqBl
@@ -282,6 +285,7 @@ impl MleBs {
                     req_handle: 0,
 
                     chan_alloc,
+                    associated_channel,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
@@ -305,6 +309,7 @@ impl MleBs {
                     req_handle: 0, // TODO FIXME
                     graceful_degradation: None,
                     chan_alloc,
+                    associated_channel,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }

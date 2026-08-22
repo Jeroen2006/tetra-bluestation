@@ -111,6 +111,7 @@ impl MleBroadcast {
                 data_class_info: None,
                 req_handle: 0,
                 chan_alloc: None,
+                associated_channel: None,
                 tx_reporter: None,
             }),
         };

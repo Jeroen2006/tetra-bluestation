@@ -1,5 +1,6 @@
 #![allow(unused)]
 use tetra_core::{BitBuffer, EndpointId, LinkId, TetraAddress, Todo, TxReporter};
+use crate::tma::AssociatedChannel;
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
@@ -113,6 +114,10 @@ pub struct TlaTlDataReqBl {
     // Custom fields for BS stack:
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
+
+    /// BS-only routing context for a terminal that is listening on a traffic
+    /// channel. It must survive MLE and LLC for delivery on FN18/FN1–17.
+    pub associated_channel: Option<AssociatedChannel>,
 
     /// Optional TxReporter that may be included to track transmission and optionally, acknowledgement
     pub tx_reporter: Option<TxReporter>,
@@ -263,6 +268,10 @@ pub struct TlaTlUnitdataReqBl {
     // Custom fields for BS stack:
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
+
+    /// BS-only routing context for a terminal that is listening on a traffic
+    /// channel. It must survive MLE and LLC for delivery on FN18/FN1–17.
+    pub associated_channel: Option<AssociatedChannel>,
 
     /// Optional TxReporter that may be included to track transmission and optionally, acknowledgement
     pub tx_reporter: Option<TxReporter>,

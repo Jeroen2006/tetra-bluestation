@@ -229,9 +229,7 @@ impl Llc {
                 stealing_repeats_flag: None, // fixme
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
-                // TLA requests do not carry BS call context. They remain on
-                // their normal channel unless CMCE submitted an LCMC request.
-                associated_channel: None,
+                associated_channel: prim.associated_channel,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -321,9 +319,7 @@ impl Llc {
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
-                // TLA requests do not carry BS call context. They remain on
-                // their normal channel unless CMCE submitted an LCMC request.
-                associated_channel: None,
+                associated_channel: prim.associated_channel,
                 tx_reporter: Some(tx_reporter.clone()),
             }),
         };

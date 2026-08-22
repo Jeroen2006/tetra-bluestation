@@ -44,6 +44,13 @@ impl MessageQueue {
     pub fn pop_front(&mut self) -> Option<SapMsg> {
         self.messages.pop_front()
     }
+
+    /// Lets a producing entity enrich messages that it just queued before the
+    /// router hands them to the next layer.  Used by CMCE to attach the
+    /// current probabilistic listening-channel context to SDS/STATUS.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut SapMsg> {
+        self.messages.iter_mut()
+    }
 }
 
 pub struct MessageRouter {

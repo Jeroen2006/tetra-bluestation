@@ -291,6 +291,10 @@ impl BrewEntity {
                     );
                 }
             }
+            // Group-scanning state is purely radio-side policy.  The legacy
+            // Brew peer only receives affiliations, so deliberately do not
+            // serialize this update onto that protocol.
+            BrewSubscriberAction::ScanningState => {}
         }
     }
 

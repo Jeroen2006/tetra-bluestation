@@ -142,6 +142,10 @@ impl MmBs {
     }
 
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
+        let class_of_usage = groups
+            .iter()
+            .map(|gssi| self.client_mgr.client_group_class_of_usage(issi, *gssi).unwrap_or(0))
+            .collect::<Vec<_>>();
         // If brew is active, forward subscriber updates to the Brew entity.
         // Register/Deregister must always be sent for brew-routable ISSIs,
         // even when there are no group affiliations yet. The Brew worker
@@ -156,12 +160,15 @@ impl MmBs {
             let should_send = match action {
                 BrewSubscriberAction::Register | BrewSubscriberAction::Deregister => net_brew::is_brew_issi_routable(&self.config, issi),
                 BrewSubscriberAction::Affiliate | BrewSubscriberAction::Deaffiliate => !brew_groups.is_empty(),
+                BrewSubscriberAction::ScanningState => false,
             };
             if should_send {
                 let brew_update = MmSubscriberUpdate {
                     issi,
                     groups: brew_groups,
                     action,
+                    class_of_usage: Vec::new(),
+                    scanning_enabled: None,
                 };
                 let msg = SapMsg {
                     sap: Sap::Control,
@@ -174,7 +181,13 @@ impl MmBs {
         }
 
         // Always emit an update to the Cmce entity
-        let mm_update = MmSubscriberUpdate { issi, groups, action };
+        let mm_update = MmSubscriberUpdate {
+            issi,
+            groups,
+            action,
+            class_of_usage,
+            scanning_enabled: None,
+        };
         let msg = SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Mm,
@@ -233,7 +246,7 @@ impl MmBs {
         if let Some(client) = detached_client {
             self.config.state_write().subscribers.deregister(ssi);
             if !client.groups.is_empty() {
-                let groups: Vec<u32> = client.groups.iter().copied().collect();
+                let groups: Vec<u32> = client.groups.keys().copied().collect();
                 self.emit_subscriber_update(_queue, ssi, groups, BrewSubscriberAction::Deaffiliate);
             }
             self.emit_subscriber_update(_queue, ssi, Vec::new(), BrewSubscriberAction::Deregister);
@@ -406,7 +419,7 @@ impl MmBs {
                 let prior_groups: Vec<u32> = self
                     .client_mgr
                     .get_client_by_issi(issi)
-                    .map(|client| client.groups.iter().copied().collect())
+                    .map(|client| client.groups.keys().copied().collect())
                     .unwrap_or_default();
                 if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
                     tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
@@ -579,6 +592,42 @@ impl MmBs {
                 let _ = self.client_mgr.set_client_energy_saving_mode(issi, esm);
                 handled = true;
             }
+            StatusUplink::ChangeOfScanningState => {
+                let enabled = match (pdu.status_uplink_dependent_information, pdu.status_uplink_dependent_information_len) {
+                    (Some(value), Some(bits)) if bits > 0 => ((value >> (bits - 1)) & 1) == 0,
+                    _ => {
+                        tracing::warn!(issi, "U-MM STATUS ChangeOfScanningState without state bit");
+                        true
+                    }
+                };
+                if let Err(error) = self.client_mgr.set_client_scanning_enabled(issi, enabled) {
+                    tracing::warn!(issi, ?error, "cannot store group scanning state for unknown MS");
+                }
+                if self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
+                    let command_id = self.next_swmi_command_id();
+                    if let Err(error) = self.swmi.as_ref().expect("SwMI checked above").submit(SwmiMessage::ScanningStateUpdate {
+                        command_id,
+                        itsi: issi as u64,
+                        scanning_enabled: enabled,
+                    }) {
+                        tracing::warn!(issi, command_id, ?error, "cannot forward group scanning state to SwMI");
+                    }
+                }
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Mm,
+                    dest: TetraEntity::Cmce,
+                    msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                        issi,
+                        groups: Vec::new(),
+                        action: BrewSubscriberAction::ScanningState,
+                        class_of_usage: Vec::new(),
+                        scanning_enabled: Some(enabled),
+                    }),
+                });
+                tracing::info!(issi, scanning_enabled = enabled, "MS changed group scanning state");
+                handled = true;
+            }
             StatusUplink::DualWatchModeRequest
             | StatusUplink::TerminatingDualWatchModeRequest
             | StatusUplink::ChangeOfDualWatchModeResponse
@@ -700,7 +749,7 @@ impl MmBs {
                 let prior_groups: Vec<u32> = self
                     .client_mgr
                     .get_client_by_issi(issi)
-                    .map(|client| client.groups.iter().copied().collect())
+                    .map(|client| client.groups.keys().copied().collect())
                     .unwrap_or_default();
                 match self.client_mgr.client_detach_all_groups(issi) {
                     Ok(_) => {
@@ -893,7 +942,12 @@ impl MmBs {
                     }
                 }
             } else {
-                match self.client_mgr.client_group_attach(issi, gssi, true) {
+                match self.client_mgr.client_group_attach_with_class_of_usage(
+                    issi,
+                    gssi,
+                    true,
+                    giu.class_of_usage.unwrap_or(0),
+                ) {
                     Ok(changed) => {
                         if changed {
                             self.config.state_write().subscribers.affiliate(issi, gssi);
@@ -1152,6 +1206,79 @@ impl MmBs {
         );
     }
 
+    /// Restore affiliations received from the SwMI after a successful roam.
+    /// This deliberately emits only internal MM->CMCE state changes: the MS
+    /// has already completed its location update and must not receive a
+    /// synthetic D-ATTACH/DETACH acknowledgement for state it did not just
+    /// request over the air.
+    fn apply_swmi_subscriber_state_sync(
+        &mut self,
+        queue: &mut MessageQueue,
+        itsi: u64,
+        groups: Vec<AttachmentOperation>,
+        scanning_enabled: bool,
+    ) {
+        let Ok(issi) = u32::try_from(itsi) else {
+            tracing::warn!(itsi, "discarding roaming state with invalid ISSI");
+            return;
+        };
+        if !self.client_mgr.client_is_known(issi) {
+            tracing::warn!(issi, "received roaming state before local registration; ignoring");
+            return;
+        }
+        let old_groups = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !old_groups.is_empty() {
+            let _ = self.client_mgr.client_detach_all_groups(issi);
+            {
+                let mut state = self.config.state_write();
+                for gssi in &old_groups {
+                    state.subscribers.deaffiliate(issi, *gssi);
+                }
+            }
+            self.emit_subscriber_update(queue, issi, old_groups, BrewSubscriberAction::Deaffiliate);
+        }
+
+        let mut restored = Vec::new();
+        for group in groups.into_iter().filter(|group| !group.detach) {
+            match self.client_mgr.client_group_attach_with_class_of_usage(
+                issi,
+                group.gssi,
+                true,
+                group.class_of_usage,
+            ) {
+                Ok(_) => {
+                    self.config.state_write().subscribers.affiliate(issi, group.gssi);
+                    restored.push(group.gssi);
+                }
+                Err(error) => tracing::warn!(issi, gssi = group.gssi, ?error, "unable to restore roaming affiliation"),
+            }
+        }
+        let restored_count = restored.len();
+        if !restored.is_empty() {
+            self.emit_subscriber_update(queue, issi, restored, BrewSubscriberAction::Affiliate);
+        }
+        if self.client_mgr.set_client_scanning_enabled(issi, scanning_enabled).is_ok() {
+            let update = MmSubscriberUpdate {
+                issi,
+                groups: Vec::new(),
+                action: BrewSubscriberAction::ScanningState,
+                class_of_usage: Vec::new(),
+                scanning_enabled: Some(scanning_enabled),
+            };
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(update),
+            });
+        }
+        tracing::info!(issi, groups = restored_count, scanning_enabled, "restored roaming group-scanning state from SwMI");
+    }
+
     fn apply_swmi_attachment_state(
         &mut self,
         queue: &mut MessageQueue,
@@ -1167,7 +1294,7 @@ impl MmBs {
             let prior_groups = self
                 .client_mgr
                 .get_client_by_issi(pending.itsi)
-                .map(|client| client.groups.iter().copied().collect::<Vec<_>>())
+                .map(|client| client.groups.keys().copied().collect::<Vec<_>>())
                 .unwrap_or_default();
             if self.client_mgr.client_detach_all_groups(pending.itsi).is_ok() && !prior_groups.is_empty() {
                 {
@@ -1207,7 +1334,12 @@ impl MmBs {
             }
             let gssi = result.operation.gssi;
             let detach = result.operation.detach;
-            match self.client_mgr.client_group_attach(pending.itsi, gssi, !detach) {
+            match self.client_mgr.client_group_attach_with_class_of_usage(
+                pending.itsi,
+                gssi,
+                !detach,
+                result.operation.class_of_usage,
+            ) {
                 Ok(changed) => {
                     if changed {
                         if detach {
@@ -1773,6 +1905,11 @@ impl TetraEntityTrait for MmBs {
                         self.apply_swmi_attachment_decision(queue, command_id, itsi, air_handle, has_rejection, results);
                     }
                 }
+                SwmiMessage::SubscriberStateSync {
+                    itsi,
+                    groups,
+                    scanning_enabled,
+                } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled),
                 message => tracing::warn!(?message, "unexpected non-MM SwMI message on MM endpoint"),
             }
         }

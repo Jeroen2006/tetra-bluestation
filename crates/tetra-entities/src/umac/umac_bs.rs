@@ -1275,10 +1275,14 @@ impl UmacBs {
                 }
 
                 tracing::info!(
-                    "rx_ul_tma_unitdata_req: FACCH stealing on ts {} (MAC-RESOURCE + {} SDU bits → {} STCH bits)",
+                    dltime = %self.dltime,
                     ts,
-                    sdu_len,
-                    stch_block.get_len()
+                    address = ?prim.main_address,
+                    random_access_flag = is_random_access_response,
+                    associated_channel = ?associated_channel,
+                    sdu_bits = sdu_len,
+                    stch_bits = stch_block.get_len(),
+                    "queueing FACCH/STCH floor-control block"
                 );
 
                 self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
@@ -1299,13 +1303,14 @@ impl UmacBs {
         } else {
             (None, None)
         };
-        let carries_channel_allocation = mac_chan_alloc.is_some();
-
-        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
-        // random_access_flag: true for SSI-addressed (responses to random access requests),
-        // false for GSSI-addressed (unsolicited group signaling like D-SETUP).
-        // A radio will reject a random-access-flagged message if it didn't initiate one.
-        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi;
+        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot).
+        // This is not, merely by being ISSI-addressed, an answer to a random
+        // access request.  In particular SDS and private-call signalling to a
+        // listening terminal are unsolicited.  Marking those resources as a
+        // random-access response makes an MS that did not request access drop
+        // them.  The scheduler sets this flag only when it integrates a real
+        // queued RandomAccessAck for the same address.
+        let is_random_access_response = false;
         let mut pdu = MacResource {
             fill_bits: false, // Updated later
             pos_of_grant: 0,
@@ -1330,12 +1335,30 @@ impl UmacBs {
         // self.channel_scheduler.dl_enqueue_tma(message.dltime.t, pdu, sdu, prim.tx_reporter);
 
         if let Some(channel) = associated_channel {
-            if !carries_channel_allocation
-                && (2..=4).contains(&channel.timeslot)
+            // A late-entry D-SETUP is transmitted where the target MS is
+            // believed to be listening, while its channel allocation points
+            // at the *new* call.  Do not discard that association merely
+            // because the MAC-RESOURCE carries a channel allocation.
+            if (2..=4).contains(&channel.timeslot)
                 && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot)
-                && self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot)
             {
-                self.channel_scheduler.dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
+                let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
+                if !hangtime && ul_active {
+                    tracing::debug!(
+                        ?channel,
+                        "routing ordinary signalling through associated FN18 control queue"
+                    );
+                    self.channel_scheduler.dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                } else {
+                    tracing::debug!(
+                        ?channel,
+                        hangtime,
+                        ul_active,
+                        "routing ordinary signalling through associated non-traffic signalling queue"
+                    );
+                    self.channel_scheduler.dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                }
             } else {
                 tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
                 self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
@@ -1659,8 +1682,8 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = None;
                 }
             }
-            CallControl::FloorGranted { ts, .. } => {
-                self.channel_scheduler.set_hangtime(ts, false);
+            CallControl::FloorGranted { ts, source_issi, .. } => {
+                self.channel_scheduler.begin_floor_grant_transition(ts, source_issi);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
