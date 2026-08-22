@@ -13,7 +13,7 @@ use tetra_pdus::cmce::{
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_connect::DConnect, d_connect_acknowledge::DConnectAcknowledge,
-        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_continue::DTxContinue,
+        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased,
         d_tx_granted::DTxGranted, d_tx_wait::DTxWait,
         u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
         u_tx_demand::UTxDemand,
@@ -79,10 +79,6 @@ pub struct CcBsSubentity {
     /// attachment decision because the SwMI worker fans messages out to two
     /// independent queues. Keep it until the local listener exists.
     pending_remote_swmi_calls: HashMap<u16, (u32, u32, u32, bool)>,
-    /// A D-TX WAIT puts the requesting terminal in CC state WAIT. When the
-    /// central decision grants that request, D-TX CONTINUE(not-continue) must
-    /// precede the individual D-TX GRANTED (ETSI 14.5.2.2.1 d), case 3).
-    pending_wait_floor_requests: HashSet<(u16, u32)>,
     next_swmi_command: u64,
     /// Point-to-point calls are intentionally kept separate from group
     /// `active_calls`: a same-cell P2P call has two radio circuits sharing
@@ -197,7 +193,6 @@ impl CcBsSubentity {
             central_setup_call_ids: HashMap::new(),
             central_setup_call_floors: HashMap::new(),
             pending_remote_swmi_calls: HashMap::new(),
-            pending_wait_floor_requests: HashSet::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
             pending_private_setups: HashMap::new(),
@@ -1487,13 +1482,6 @@ impl CcBsSubentity {
                     call.hangtime_start = None;
                     (call.dest_gssi, call.ts)
                 };
-                // D-TX WAIT transitions the requester to CC state WAIT.  A
-                // request made during that interruption must be resumed with
-                // D-TX CONTINUE(not-continue) before it receives its new
-                // floor grant (ETSI 14.5.2.2.1 d, case 3).
-                if self.pending_wait_floor_requests.remove(&(call_id, itsi as u32)) {
-                    self.send_d_tx_continue_not_continue_facch(queue, call_id, dest_gssi, ts);
-                }
                 // Send the explicit response first.  A group D-TX GRANTED is
                 // deliberately after it, so a pending U-TX DEMAND cannot be
                 // cancelled by the "granted to another user" indication.
@@ -2067,7 +2055,6 @@ impl CcBsSubentity {
     /// traffic mode. With no cached D-SETUP there is no D-RELEASE to send, so it tears down
     /// at once.
     fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
-        self.pending_wait_floor_requests.retain(|(pending_call_id, _)| *pending_call_id != call_id);
         let Some(call) = self.active_calls.remove(&call_id) else {
             return;
         };
@@ -2545,11 +2532,7 @@ impl CcBsSubentity {
 
         let call_id = pdu.call_identifier;
 
-        let itsi = prim.received_tetra_address.ssi;
-        // A U-TX CEASED also withdraws a pending transmission request.  A
-        // delayed central floor decision must not resume it afterwards.
-        self.pending_wait_floor_requests.remove(&(call_id, itsi));
-        self.record_uplink_call_location(itsi, call_id);
+        self.record_uplink_call_location(prim.received_tetra_address.ssi, call_id);
 
         if let Some(call) = self.private_calls.get(&call_id) {
             if !call.connected || call.duplex {
@@ -2684,11 +2667,19 @@ impl CcBsSubentity {
         }
 
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
-            // The asynchronous central decision must not leave the MS with a
-            // silent PTT press.  D-TX WAIT is the immediate ETSI response;
-            // a later FloorGranted changes the floor network-wide.
-            self.pending_wait_floor_requests.insert((call_id, requesting_party.ssi));
-            self.send_d_tx_wait(queue, &message, call_id);
+            // D-TX WAIT is a call-interruption primitive: a terminal that
+            // receives it switches its U-plane off.  A pending floor decision
+            // is instead acknowledged with the normal U-TX DEMAND response,
+            // D-TX GRANTED(RequestQueued), on the traffic channel.
+            if let Some(ts) = self.active_calls.get(&call_id).map(|call| call.ts) {
+                self.send_d_tx_request_queued_individual_facch(queue, call_id, requesting_party.ssi, ts);
+            } else {
+                tracing::warn!(
+                    call_id,
+                    itsi = requesting_party.ssi,
+                    "U-TX DEMAND for unknown central call; cannot send queued floor response"
+                );
+            }
             let command_id = self.next_swmi_command_id();
             if self
                 .swmi
@@ -2748,10 +2739,6 @@ impl CcBsSubentity {
         };
         let dest_addr = *dest_addr;
 
-        let resumed_from_wait = self.pending_wait_floor_requests.remove(&(call_id, requesting_party.ssi));
-        if resumed_from_wait {
-            self.send_d_tx_continue_not_continue_facch(queue, call_id, dest_addr.ssi, ts);
-        }
         // The explicit response must reach the requester before the
         // group-addressed indication.  Otherwise an MS may cancel its still
         // pending U-TX DEMAND after seeing "granted to another user".
@@ -3276,26 +3263,6 @@ impl CcBsSubentity {
         }
     }
 
-    /// Resolve a preceding D-TX WAIT without continuing the old speaker.
-    /// This is the required group transition before awarding a request that
-    /// arrived while the call was in WAIT (ETSI 14.5.2.2.1 d, case 3).
-    fn send_d_tx_continue_not_continue_facch(&self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8) {
-        let pdu = DTxContinue {
-            call_identifier: call_id,
-            do_continue: false,
-            transmission_request_permission: false,
-            notification_indicator: None,
-            facility: None,
-            dm_ms_address: None,
-            proprietary: None,
-        };
-        let mut sdu = BitBuffer::new_autoexpand(24);
-        pdu.to_bitbuf(&mut sdu).expect("serialize D-TX CONTINUE");
-        sdu.seek(0);
-        tracing::info!(call_id, dest_gssi, ts, "-> group FACCH D-TX CONTINUE (not continue) before floor grant");
-        queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(dest_gssi, SsiType::Gssi), ts));
-    }
-
     /// Send D-TX GRANTED via FACCH stealing
     fn send_d_tx_granted_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8) {
         let pdu = DTxGranted {
@@ -3325,9 +3292,26 @@ impl CcBsSubentity {
     }
 
     fn send_d_tx_granted_individual_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, ts: u8) {
+        self.send_d_tx_grant_individual_facch(queue, call_id, source_issi, ts, TransmissionGrant::Granted);
+    }
+
+    /// Acknowledge an asynchronous central floor decision without interrupting
+    /// the call.  The MS keeps its transmit request queued and its U-plane off.
+    fn send_d_tx_request_queued_individual_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, ts: u8) {
+        self.send_d_tx_grant_individual_facch(queue, call_id, source_issi, ts, TransmissionGrant::RequestQueued);
+    }
+
+    fn send_d_tx_grant_individual_facch(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        source_issi: u32,
+        ts: u8,
+        transmission_grant: TransmissionGrant,
+    ) {
         let pdu = DTxGranted {
             call_identifier: call_id,
-            transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
+            transmission_grant: transmission_grant.into_raw() as u8,
             transmission_request_permission: false,
             encryption_control: false,
             reserved: false,
@@ -3343,7 +3327,7 @@ impl CcBsSubentity {
         let mut sdu = BitBuffer::new_autoexpand(48);
         pdu.to_bitbuf(&mut sdu).expect("serialize individual D-TX GRANTED");
         sdu.seek(0);
-        tracing::info!(issi = source_issi, call_id, "-> individual FACCH D-TX GRANTED");
+        tracing::info!(issi = source_issi, call_id, ?transmission_grant, "-> individual FACCH D-TX GRANTED");
         queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(source_issi, SsiType::Issi), ts));
     }
 
