@@ -1,7 +1,10 @@
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, TrainingSequence};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, TdmaTime, TrainingSequence};
 
 #[derive(Debug, Clone)]
 pub struct TpUnitdataInd {
+    /// Exact TDMA time of the received uplink burst, captured by PHY.
+    /// Consumers must not reconstruct this from their own local clock.
+    pub ul_time: TdmaTime,
     pub train_type: TrainingSequence,
     pub burst_type: BurstType,
     pub block_type: PhyBlockType,

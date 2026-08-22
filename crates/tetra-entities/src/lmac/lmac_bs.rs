@@ -120,7 +120,12 @@ impl LmacBs {
     // }
 
     /// Yields logical channel for given block. Based on Clause 9.5.1
-    fn determine_logical_channel_ul(blk: &TpUnitdataInd, burst_is_traffic: bool, block2_stolen: bool) -> LogicalChannel {
+    fn determine_logical_channel_ul(
+        blk: &TpUnitdataInd,
+        burst_is_traffic: bool,
+        is_sacch_frame: bool,
+        block2_stolen: bool,
+    ) -> LogicalChannel {
         match blk.burst_type {
             BurstType::CUB => {
                 // CUB is always SCH/HU
@@ -139,7 +144,12 @@ impl LmacBs {
                             "NUB with NormalTrainSeq1 must have one large block, got {:?}",
                             blk.block_num
                         );
-                        if burst_is_traffic {
+                        // On an assigned traffic channel the 18th frame is
+                        // SACCH: it is still carried on TP, but uses SCH/F
+                        // coding rather than TCH coding (EN 300 392-2,
+                        // table 9.27).  Treating this as TCH/S drops an
+                        // MS's BL-ACK for an individually addressed SDS.
+                        if burst_is_traffic && !is_sacch_frame {
                             // Only support TCH/S speech channel for now
                             LogicalChannel::TchS
                         } else {
@@ -230,6 +240,15 @@ impl LmacBs {
         let block_num = blk.block_num;
         let (type1bits, crc_pass) = errorcontrol::decode_cp(lchan, blk, Some(self.scrambling_code));
 
+        if ul_time.f == 18 && lchan == LogicalChannel::SchF {
+            tracing::info!(
+                ul_time = %ul_time,
+                block = ?block_num,
+                crc_pass,
+                "decoded frame-18 SACCH/SCH-F uplink block"
+            );
+        }
+
         // tracing::debug!("rx_blk_cp {:?} CRC: {} type1 {:?}",
         //     lchan,
         //     if crc_pass { "ok" } else { "WRONG" },
@@ -300,10 +319,34 @@ impl LmacBs {
 
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
 
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
-        let ts_idx = msg_dltime.t as usize - 1;
+        // PHY captured this at reception.  Do not derive it again from the
+        // LMAC clock: queue timing can advance that clock before this burst
+        // is decoded, which would misclassify FN18 SACCH as TCH/S.
+        let ul_time = prim.ul_time;
+        let ts_idx = ul_time.t as usize - 1;
         let pchan = self.uplink_phy_chan[ts_idx];
-        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, self.blk2_stolen);
+        let lchan = Self::determine_logical_channel_ul(
+            &prim,
+            pchan == PhysicalChannel::Tp,
+            ul_time.f == 18,
+            self.blk2_stolen,
+        );
+
+        // FN18 on a TP channel is SACCH/SCH-F, not TCH/S. The physical
+        // receiver reports only the training sequence, so record the LMAC
+        // classification at info level while investigating associated SDS.
+        if ul_time.f == 18 {
+            tracing::info!(
+                lmac_dltime = %self.dltime,
+                ul_time = %ul_time,
+                physical_channel = ?pchan,
+                training_sequence = ?prim.train_type,
+                burst_type = ?prim.burst_type,
+                block = ?prim.block_num,
+                logical_channel = ?lchan,
+                "received frame-18 uplink burst"
+            );
+        }
 
         // Sanity checks
         assert!(
@@ -318,10 +361,10 @@ impl LmacBs {
         match lchan {
             LogicalChannel::Clch => {}
             LogicalChannel::TchS | LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => {
-                self.rx_blk_traffic(queue, prim, lchan, msg_dltime)
+                self.rx_blk_traffic(queue, prim, lchan, ul_time)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
-                self.rx_blk_control(queue, prim, lchan, msg_dltime, pchan == PhysicalChannel::Cp && msg_dltime.t == 1);
+                self.rx_blk_control(queue, prim, lchan, ul_time, pchan == PhysicalChannel::Cp && ul_time.t == 1);
             }
             _ => {
                 panic!()
@@ -391,6 +434,17 @@ impl LmacBs {
             blk1: None,
             blk2: None,
         };
+
+        if prim.ts.f == 18 && (2..=4).contains(&prim.ts.t) {
+            tracing::debug!(
+                dltime = %prim.ts,
+                logical_channel = ?blk1.logical_channel,
+                burst_type = ?burst_type,
+                training_sequence = ?train_type,
+                ul_phy_channel = ?prim.ul_phy_chan,
+                "encoding assigned frame-18 downlink burst"
+            );
+        }
 
         // Encode blk1 and optionally blk2
         prim_phy.bbk = Some(errorcontrol::encode_aach(bbk.mac_block, bbk.scrambling_code));
@@ -483,6 +537,39 @@ impl TetraEntityTrait for LmacBs {
     fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
         self.blk2_stolen = false; // reset in case it was set during this tick
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_core::PhyBlockType;
+
+    fn normal_uplink_burst() -> TpUnitdataInd {
+        TpUnitdataInd {
+            ul_time: TdmaTime::default(),
+            train_type: TrainingSequence::NormalTrainSeq1,
+            burst_type: BurstType::NUB,
+            block_type: PhyBlockType::NUB,
+            block_num: PhyBlockNum::Both,
+            block: BitBuffer::new(0),
+        }
+    }
+
+    #[test]
+    fn decodes_associated_frame18_as_schf_on_tp() {
+        assert_eq!(
+            LmacBs::determine_logical_channel_ul(&normal_uplink_burst(), true, true, false),
+            LogicalChannel::SchF,
+        );
+    }
+
+    #[test]
+    fn decodes_ordinary_traffic_frame_as_tchs_on_tp() {
+        assert_eq!(
+            LmacBs::determine_logical_channel_ul(&normal_uplink_burst(), true, false, false),
+            LogicalChannel::TchS,
+        );
     }
 }
 use std::collections::VecDeque;

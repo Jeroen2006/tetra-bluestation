@@ -21,6 +21,13 @@ use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 
+// Assigned-channel signalling has fewer opportunities to return a BL-ACK:
+// while the speaker owns FN1..17, the associated listener normally waits for
+// FN18. Keep the basic-link retry window and retry budget aligned with that
+// delivery path.
+const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 4;
+const ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS: u8 = 2;
+
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
 pub struct ExpectedInAck {
@@ -250,6 +257,33 @@ impl Llc {
         queue.push_back(sapmsg);
     }
 
+    fn has_assigned_channel_context(ack: &ExpectedInAck) -> bool {
+        let SapMsgInner::TmaUnitdataReq(ref req) = ack.retransmission_buf.msg else {
+            return false;
+        };
+
+        req.associated_channel.is_some()
+            || req.chan_alloc.as_ref().is_some_and(|alloc| {
+                alloc.usage.is_some() || alloc.timeslots[1..].iter().any(|assigned| *assigned)
+            })
+    }
+
+    fn basic_link_retry_timer(ack: &ExpectedInAck) -> u32 {
+        if Self::has_assigned_channel_context(ack) {
+            T251_SENDER_RETRY_TIMER * ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER
+        } else {
+            T251_SENDER_RETRY_TIMER
+        }
+    }
+
+    fn max_over_air_retransmits(ack: &ExpectedInAck) -> u8 {
+        if Self::has_assigned_channel_context(ack) {
+            N252_BL_MAX_TLSDU_RETRANSMITS_ACKED.saturating_add(ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS)
+        } else {
+            N252_BL_MAX_TLSDU_RETRANSMITS_ACKED
+        }
+    }
+
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
@@ -324,12 +358,14 @@ impl Llc {
             }),
         };
 
-        // Register that we expect an ACK for this message
-        tracing::warn!("setting expected ack for ts1, but that's not neccessarily correct");
+        // The basic-link acknowledgement returns on the associated traffic
+        // channel when this message was delivered through FN18; otherwise it
+        // uses the MCCH.  Keep that context for retransmission/accounting.
+        let ack_timeslot = prim.associated_channel.as_ref().map(|channel| channel.timeslot).unwrap_or(1);
         self.outbound_messages.push_back(ExpectedInAck {
             ns,
             addr: prim.main_address,
-            ts: 1,
+            ts: ack_timeslot,
             bl_type: Layer2Service::Acknowledged,
             tx_reporter,
             t_first: self.dltime,
@@ -588,16 +624,19 @@ impl Llc {
             // Retransmit scenario 1: it was transmitted but no ack received within the expected window (ETSI T.251 / N.252)
             // Retransmission scenario 2: it has been dropped by Umac due to congestion. Retransmit after same window
             let age = dltime.diff(t_umac_done); // Never fails
-            if age as u32 >= T251_SENDER_RETRY_TIMER {
+            let retry_timer = Self::basic_link_retry_timer(ack);
+            let max_retransmits = Self::max_over_air_retransmits(ack);
+            if age as u32 >= retry_timer {
                 // Time for either retransmitting or giving up
-                if ack.retransmit_count < N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
+                if ack.retransmit_count < max_retransmits {
                     // Retransmit
                     ack.retransmit_count += 1;
                     tracing::info!(
-                        "retransmitting SSI {} N(S) {} attempt {}",
+                        "retransmitting SSI {} N(S) {} attempt {}{}",
                         ack.addr.ssi,
                         ack.ns,
-                        ack.retransmit_count
+                        ack.retransmit_count,
+                        if Self::has_assigned_channel_context(ack) { " after assigned-channel grace" } else { "" }
                     );
 
                     Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));

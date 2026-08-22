@@ -437,7 +437,7 @@ pub fn decode_aach(buf: BitBuffer, scrambling_code: u32) -> BitBuffer {
 
 #[cfg(test)]
 mod tests {
-    use tetra_core::{BurstType, PhyBlockNum, TrainingSequence, debug::setup_logging_verbose};
+    use tetra_core::{BurstType, PhyBlockNum, TdmaTime, TrainingSequence, debug::setup_logging_verbose};
 
     use super::*;
 
@@ -462,6 +462,7 @@ mod tests {
         assert_eq!(type5vec, type5.to_bitstr());
 
         let prim_ind = TpUnitdataInd {
+            ul_time: TdmaTime::default(),
             train_type: TrainingSequence::SyncTrainSeq,
             burst_type: BurstType::SDB,
             block_type: PhyBlockType::SB2,
@@ -491,6 +492,7 @@ mod tests {
         };
         let type5 = encode_cp(prim_req);
         let prim_ind = TpUnitdataInd {
+            ul_time: TdmaTime::default(),
             train_type: TrainingSequence::SyncTrainSeq,
             burst_type: BurstType::SDB,
             block_type: PhyBlockType::SB2,
@@ -564,6 +566,7 @@ mod tests {
         };
         let type5 = encode_cp(prim_req);
         let prim_ind = TpUnitdataInd {
+            ul_time: TdmaTime::default(),
             train_type: TrainingSequence::NormalTrainSeq1,
             burst_type: BurstType::NDB,
             block_type: PhyBlockType::NDB,

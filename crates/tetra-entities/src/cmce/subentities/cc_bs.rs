@@ -511,11 +511,16 @@ impl CcBsSubentity {
             if prim.associated_channel.is_some()
                 || prim.stealing_permission
                 || prim.chan_alloc.is_some()
-                || prim.main_address.ssi_type != SsiType::Issi
             {
                 continue;
             }
 
+            // On an assigned channel that carries traffic, SDS uses the
+            // SACCH in frame 18.  Its acknowledged BL-DATA plus MAC-RESOURCE
+            // header can exceed the 124-bit STCH half-slot, whereas the
+            // frame-18 SCH/F provides 268 bits and supports fragmentation.
+            // During hangtime UMAC deliberately sends this ordinary resource
+            // in the available FACCH frames 1..17 instead.
             // D-CALL-PROCEEDING is the immediate response to a U-SETUP on
             // the MCCH.  At this point the terminal is not yet reliably
             // assigned to, or listening on, the new traffic slot.  Routing
@@ -524,10 +529,35 @@ impl CcBsSubentity {
             // in-call delivery (such as D-SDS-DATA) uses the tracked channel.
             let mut cmce_sdu = prim.sdu.clone();
             cmce_sdu.seek(0);
-            if matches!(
-                cmce_sdu.read_field(5, "cmce_pdu_type"),
-                Ok(value) if value == CmcePduTypeDl::DCallProceeding.into_raw()
-            ) {
+            let pdu_type = cmce_sdu.read_field(5, "cmce_pdu_type").ok();
+            if pdu_type == Some(CmcePduTypeDl::DSdsData.into_raw()) {
+                let channel = match prim.main_address.ssi_type {
+                    SsiType::Issi => self.preferred_listener_channel(prim.main_address.ssi),
+                    SsiType::Gssi => self.active_calls.iter().find_map(|(&call_id, call)| {
+                        (call.dest_gssi == prim.main_address.ssi).then_some(AssociatedChannel {
+                            call_id,
+                            timeslot: call.ts,
+                            usage: call.usage,
+                        })
+                    }),
+                    _ => None,
+                };
+                if let Some(channel) = channel {
+                    tracing::info!(
+                        address = ?prim.main_address,
+                        call_id = channel.call_id,
+                        timeslot = channel.timeslot,
+                        "routing D-SDS-DATA through associated SACCH frame 18"
+                    );
+                    prim.associated_channel = Some(channel);
+                }
+                continue;
+            }
+
+            if prim.main_address.ssi_type != SsiType::Issi {
+                continue;
+            }
+            if pdu_type == Some(CmcePduTypeDl::DCallProceeding.into_raw()) {
                 tracing::debug!(issi = prim.main_address.ssi, "keeping D-CALL-PROCEEDING on MCCH");
                 continue;
             }

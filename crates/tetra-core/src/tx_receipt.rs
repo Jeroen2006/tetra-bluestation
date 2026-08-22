@@ -77,6 +77,12 @@ impl TxReporter {
         TxState::from_raw(self.state.load(Ordering::Relaxed))
     }
 
+    /// Returns whether the receiving peer must send a basic-link
+    /// acknowledgement for this transmission.
+    pub fn expects_ack(&self) -> bool {
+        self.expects_ack
+    }
+
     /// True if the PDU was discarded by the Umac due to congestion
     pub fn is_discarded(&self) -> bool {
         self.state.load(Ordering::Relaxed) == TxState::Discarded as u8

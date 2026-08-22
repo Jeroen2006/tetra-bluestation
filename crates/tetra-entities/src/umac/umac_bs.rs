@@ -1345,6 +1345,26 @@ impl UmacBs {
                 let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
                 let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
                 if !hangtime && ul_active {
+                    // An acknowledged BL-DATA on the associated SACCH needs
+                    // an explicit return opportunity.  FN1..17 are occupied
+                    // by the current uplink speaker, so reserve the *next*
+                    // FN18 full slot for the listener's BL-ACK and carry that
+                    // grant in this MAC-RESOURCE.
+                    if matches!(prim.tx_reporter.as_ref(), Some(reporter) if reporter.expects_ack()) {
+                        pdu.slot_granting_element = self
+                            .channel_scheduler
+                            .ul_prepare_associated_basic_link_ack_grant(channel.timeslot, prim.main_address);
+                        // Keep the immediately visible PDU metadata correct;
+                        // BsFragger performs the same calculation when it
+                        // writes the queued MAC block.
+                        pdu.update_len_and_fill_ind(sdu.get_len());
+                        tracing::info!(
+                            ?channel,
+                            address = ?prim.main_address,
+                            grant = ?pdu.slot_granting_element,
+                            "prepared FN18 basic-link acknowledgement grant for associated control"
+                        );
+                    }
                     tracing::debug!(
                         ?channel,
                         "routing ordinary signalling through associated FN18 control queue"
