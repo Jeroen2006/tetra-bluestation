@@ -1681,8 +1681,10 @@ impl BsChannelScheduler {
                 access_code: AccessCode::AccessCodeA,
                 base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
                     BaseFrameLength::ReservedSubslot
-                } else if !assigned_channel && ts.is_mandatory_clch() {
-                    // The fixed MCCH CLCH mapping applies only on common TS1.
+                } else if ts.is_mandatory_clch() {
+                    // The predefined FN18 CLCH position applies to the
+                    // physical channel even when it is an assigned channel.
+                    // It remains unavailable for ordinary reserved access.
                     BaseFrameLength::CLCHSubslot
                 } else {
                     self.common_access_frame_len()
@@ -1701,6 +1703,16 @@ impl BsChannelScheduler {
             } else {
                 AccessAssignFr18::UplinkCommonOnly { access_field_1, access_field_2 }
             };
+
+            tracing::info!(
+                dltime = %ts,
+                assigned_channel,
+                clch = ts.is_mandatory_clch(),
+                ul_ssn1_reserved = self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some(),
+                ul_ssn2_reserved = self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some(),
+                aach = ?aach,
+                "generated FN18 ACCESS-ASSIGN"
+            );
 
             aach.to_bitbuf(&mut aach_bb);
         };
@@ -2358,7 +2370,7 @@ mod tests {
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
         let mut sched = get_testing_slotter();
-        let ts = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        let ts = TdmaTime { t: 2, f: 18, m: 5, h: 0 };
 
         sched.create_circuit(
             Direction::Ul,
@@ -2377,7 +2389,13 @@ mod tests {
         buf.seek(0);
         assert!(matches!(
             AccessAssignFr18::from_bitbuf(&mut buf).expect("valid active FN18 AACH"),
-            AccessAssignFr18::UplinkAssignedOnly { .. }
+            AccessAssignFr18::UplinkAssignedOnly {
+                access_field_1: AccessField {
+                    base_frame_len: BaseFrameLength::CLCHSubslot,
+                    ..
+                },
+                ..
+            }
         ));
 
         sched.set_hangtime(2, true);
