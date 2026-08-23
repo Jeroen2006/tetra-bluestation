@@ -58,6 +58,14 @@ pub enum CallControl {
         call_id: u16,
         ts: u8,
     },
+    /// A full-duplex private call is immediately active in both directions.
+    /// This is intentionally separate from a floor grant: duplex calls have
+    /// no floor owner and must never enter simplex hangtime after restore.
+    /// Sent only from CMCE to UMAC.
+    PrivateCallTrafficActive {
+        call_id: u16,
+        ts: u8,
+    },
     /// Private-call media mapping.  Unlike group calls the destination is a
     /// single ISSI and a duplex call may have two simultaneous mappings.
     PrivateMediaStart {

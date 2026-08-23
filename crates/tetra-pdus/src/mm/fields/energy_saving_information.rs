@@ -60,18 +60,20 @@ impl EnergySavingInformation {
             }
             buf.write_bits(0, 5 + 6);
         } else {
-            if let Some(f) = self.frame_number {
+            if let Some(f @ 1..=18) = self.frame_number {
                 buf.write_bits(f as u64, 5);
             } else {
-                return Err(PduParseErr::FieldNotPresent {
-                    field: Some("frame_number"),
+                return Err(PduParseErr::InvalidValue {
+                    field: "frame_number",
+                    value: self.frame_number.unwrap_or(0) as u64,
                 });
             }
-            if let Some(f) = self.multiframe_number {
+            if let Some(f @ 1..=60) = self.multiframe_number {
                 buf.write_bits(f as u64, 6);
             } else {
-                return Err(PduParseErr::FieldNotPresent {
-                    field: Some("multiframe_number"),
+                return Err(PduParseErr::InvalidValue {
+                    field: "multiframe_number",
+                    value: self.multiframe_number.unwrap_or(0) as u64,
                 });
             }
         }

@@ -472,12 +472,7 @@ impl MleBs {
                 self.send_restore_fail(queue, prim.main_address, 1);
             } else {
                 let mut bits = BitBuffer::new_autoexpand(64);
-                if (DRestoreAck {
-                    sdu: Some(prim.sdu.clone()),
-                })
-                .to_bitbuf(&mut bits)
-                .is_ok()
-                {
+                if (DRestoreAck { sdu: prim.sdu.clone() }).to_bitbuf(&mut bits).is_ok() {
                     bits.seek(0);
                     self.send_mle_downlink(queue, prim.main_address, bits, prim.chan_alloc.take());
                 }

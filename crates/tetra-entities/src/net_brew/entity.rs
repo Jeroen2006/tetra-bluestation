@@ -733,7 +733,9 @@ impl TetraEntityTrait for BrewEntity {
             }
             // UlInactivityTimeout is UMAC→CMCE only; Brew handles FloorReleased instead
             SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { .. }) => {}
-            SapMsgInner::CmceCallControl(CallControl::PrivateMediaStart { .. } | CallControl::PrivateMediaStop { .. }) => {}
+            SapMsgInner::CmceCallControl(
+                CallControl::PrivateCallTrafficActive { .. } | CallControl::PrivateMediaStart { .. } | CallControl::PrivateMediaStop { .. },
+            ) => {}
             SapMsgInner::MmSubscriberUpdate(update) => {
                 self.handle_subscriber_update(update);
             }

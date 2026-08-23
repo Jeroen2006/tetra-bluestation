@@ -30,6 +30,9 @@ pub struct MmClientProperties {
     /// reports otherwise with U-MM STATUS / Change of scanning state.
     pub scanning_enabled: bool,
     pub energy_saving_mode: EnergySavingMode,
+    /// ETSI 16.10.10 MCCH monitoring startpoint for non-StayAlive EE.
+    pub energy_saving_frame_number: Option<u8>,
+    pub energy_saving_multiframe_number: Option<u8>,
     pub class_of_ms: Option<ClassOfMs>,
     // pub last_seen: TdmaTime,
 }
@@ -42,6 +45,8 @@ impl MmClientProperties {
             groups: HashMap::new(),
             scanning_enabled: true,
             energy_saving_mode: EnergySavingMode::StayAlive,
+            energy_saving_frame_number: None,
+            energy_saving_multiframe_number: None,
             class_of_ms: None,
             // last_seen: TdmaTime::default(),
         }
@@ -102,6 +107,20 @@ impl MmClientMgr {
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })
         }
+    }
+
+    pub fn set_client_energy_saving(
+        &mut self,
+        issi: u32,
+        mode: EnergySavingMode,
+        frame_number: Option<u8>,
+        multiframe_number: Option<u8>,
+    ) -> Result<(), ClientMgrErr> {
+        let client = self.clients.get_mut(&issi).ok_or(ClientMgrErr::ClientNotFound { issi })?;
+        client.energy_saving_mode = mode;
+        client.energy_saving_frame_number = frame_number;
+        client.energy_saving_multiframe_number = multiframe_number;
+        Ok(())
     }
 
     pub fn set_client_class_of_ms(&mut self, issi: u32, class: Option<ClassOfMs>) -> Result<(), ClientMgrErr> {

@@ -1,9 +1,12 @@
-use std::{collections::HashSet, panic};
+use std::{
+    collections::{HashSet, VecDeque},
+    panic,
+};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
+use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -68,6 +71,9 @@ pub struct UmacBs {
     /// group-call same-timeslot UL loopback for these circuits: it returns a
     /// speaker's audio to the speaker instead of their private peer.
     private_media_timeslots: HashSet<u8>,
+    /// MCCH resources held until an EE terminal's next monitoring occasion.
+    /// Associated traffic-channel and FACCH paths never enter this queue.
+    deferred_mcch: VecDeque<DeferredMcch>,
 }
 
 struct PendingStch {
@@ -76,6 +82,13 @@ struct PendingStch {
     encrypted: bool,
     fill_bits: bool,
     sdu_part: BitBuffer,
+}
+
+struct DeferredMcch {
+    due: TdmaTime,
+    pdu: MacResource,
+    sdu: BitBuffer,
+    tx_reporter: Option<TxReporter>,
 }
 
 impl UmacBs {
@@ -100,7 +113,37 @@ impl UmacBs {
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             last_ul_voice: [None; 4],
             private_media_timeslots: HashSet::new(),
+            deferred_mcch: VecDeque::new(),
         }
+    }
+
+    /// Return the next MCCH TS1 monitoring opportunity for an individual
+    /// terminal. EE mode n repeats on the ESI phase every 2^(n-1)
+    /// multiframes; the ESI itself is the phase/activation anchor.
+    fn next_energy_economy_mcch(&self, issi: u32) -> Option<TdmaTime> {
+        let (mode, frame, multiframe) = self.config.state_read().subscribers.energy_economy(issi)?;
+        self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe)
+    }
+
+    fn next_energy_economy_mcch_for_assignment(&self, mode: u8, frame: Option<u8>, multiframe: Option<u8>) -> Option<TdmaTime> {
+        if mode == 0 {
+            return None;
+        }
+        let (Some(frame), Some(multiframe)) = (frame, multiframe) else {
+            tracing::warn!(mode, "invalid local EE assignment; falling back to immediate MCCH");
+            return None;
+        };
+        let period = 1_i32 << (mode - 1);
+        let anchor = i32::from(multiframe - 1).rem_euclid(period);
+        // At most 64 multiframes plus one frame are searched (EG7).
+        for offset in 1..=(64 * 18 * 4 + 4) {
+            let candidate = self.dltime.add_timeslots(offset);
+            let absolute_multiframe = i32::from(candidate.h) * 60 + i32::from(candidate.m - 1);
+            if candidate.t == 1 && candidate.f == frame && absolute_multiframe.rem_euclid(period) == anchor {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Precomputes SYNC, SYSINFO messages (and subfield variants) for faster TX msg building
@@ -1302,6 +1345,11 @@ impl UmacBs {
         }
 
         // ── Normal signaling path (MCCH / SCH/F) ────────────────────────
+        // Every group-addressed MCCH resource (including D-SETUP and SDS)
+        // needs one replay per distinct EE monitoring phase. Associated
+        // traffic-channel delivery remains a bypass: the MS listens there on
+        // every frame and must not get MCCH duplicates.
+        let group_ee_replay = associated_channel.is_none() && prim.main_address.ssi_type == SsiType::Gssi;
         let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc {
             (
                 chan_alloc.usage,
@@ -1332,6 +1380,51 @@ impl UmacBs {
             chan_alloc_element: mac_chan_alloc,
         };
         pdu.update_len_and_fill_ind(sdu.get_len());
+
+        if group_ee_replay {
+            let assignments = self.config.state_read().subscribers.group_energy_economies(prim.main_address.ssi);
+            let mut scheduled = Vec::new();
+            for (issi, mode, frame, multiframe) in assignments {
+                let Some(due) = self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe) else {
+                    continue;
+                };
+                if due.age(self.dltime) <= 0 || scheduled.contains(&due) {
+                    continue;
+                }
+                tracing::debug!(gssi = prim.main_address.ssi, issi, due = %due, "queuing EE group-MCCH replay");
+                scheduled.push(due);
+                self.deferred_mcch.push_back(DeferredMcch {
+                    due,
+                    pdu: pdu.clone(),
+                    sdu: sdu.clone(),
+                    tx_reporter: None,
+                });
+            }
+        }
+
+        // Ordinary individually addressed MCCH signalling is sent only at a
+        // terminal's EE monitoring opportunity. A known associated channel
+        // means the terminal is on TCH and listens continuously, so it is an
+        // explicit bypass (as are FACCH resources handled above).
+        if associated_channel.is_none() && prim.main_address.ssi_type == SsiType::Issi {
+            let activation_response = self
+                .config
+                .state_write()
+                .subscribers
+                .take_energy_economy_activation_pending(prim.main_address.ssi);
+            if !activation_response {
+                if let Some(due) = self.next_energy_economy_mcch(prim.main_address.ssi) {
+                    tracing::debug!(issi = prim.main_address.ssi, due = %due, "deferring MCCH resource for EE monitoring occasion");
+                    self.deferred_mcch.push_back(DeferredMcch {
+                        due,
+                        pdu,
+                        sdu,
+                        tx_reporter: prim.tx_reporter,
+                    });
+                    return;
+                }
+            }
+        }
 
         // // Per ETSI EN 300 392-2 Clause 23.3.1.1.2: idle MSes monitor the MCCH (slot 1)
         // // for signaling. Without common SCCHs, all MSes listen on slot 1.
@@ -1702,6 +1795,15 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = None;
                 }
             }
+            CallControl::PrivateCallTrafficActive { ts, .. } => {
+                // Full-duplex P2P has no simplex floor or hangtime.  A
+                // restore must therefore keep its traffic slot active even
+                // though the central private floor holder is zero.
+                self.channel_scheduler.set_hangtime(ts, false);
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
+            }
             CallControl::PrivateMediaStart { ts, .. } => {
                 self.private_media_timeslots.insert(ts);
             }
@@ -1771,6 +1873,20 @@ impl TetraEntityTrait for UmacBs {
             // When running, we adopt the new time and check for desync
             self.channel_scheduler.tick_start(ts);
         }
+
+        // Release EE-gated MCCH resources only on/after their exact TS1
+        // monitoring occasion. `age >= 0` also makes a missed radio tick
+        // recover safely rather than retaining a PDU forever.
+        let mut retained = VecDeque::new();
+        while let Some(resource) = self.deferred_mcch.pop_front() {
+            if resource.due.age(ts) >= 0 {
+                self.channel_scheduler
+                    .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter);
+            } else {
+                retained.push_back(resource);
+            }
+        }
+        self.deferred_mcch = retained;
 
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);

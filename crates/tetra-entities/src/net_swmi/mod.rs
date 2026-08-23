@@ -395,6 +395,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         Ok(
                             message @ (SwmiMessage::RegistrationDecision { .. }
                             | SwmiMessage::AttachmentDecision { .. }
+                            | SwmiMessage::EnergyEconomyDecision { .. }
                             | SwmiMessage::SubscriberStateSync { .. }
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
@@ -424,6 +425,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::PrivateCallReserve { .. }
                             | SwmiMessage::PrivateCallConnected { .. }
                             | SwmiMessage::PrivateCallRestore { .. }
+                            | SwmiMessage::PrivateCallEndpointMoved { .. }
                             | SwmiMessage::PrivateCallRelease { .. }
                             | SwmiMessage::PrivateFloorGranted { .. }
                             | SwmiMessage::PrivateFloorReleased { .. }

@@ -7,6 +7,16 @@ pub struct Subscriber {
     pub issi: u32,
     // Set of attached GSSIs
     pub attached_groups: HashSet<u32>,
+    /// Authoritative EE assignment last accepted by the SwMI (or LST).
+    /// Raw values avoid making config depend on the PDU crate.
+    pub energy_economy_mode: u8,
+    pub energy_economy_frame_number: Option<u8>,
+    pub energy_economy_multiframe_number: Option<u8>,
+    /// One control response establishes a new EE phase before ordinary MCCH
+    /// traffic is gated. UMAC consumes this atomically for the addressed MS.
+    pub energy_economy_activation_pending: bool,
+    /// Group MCCH replay is relevant only while the terminal scans groups.
+    pub scanning_enabled: bool,
 }
 
 /// Centralized subscriber registry tracking locally registered ISSIs and their group affiliations.
@@ -86,6 +96,11 @@ impl SubscriberRegistry {
             Subscriber {
                 issi,
                 attached_groups: HashSet::new(),
+                energy_economy_mode: 0,
+                energy_economy_frame_number: None,
+                energy_economy_multiframe_number: None,
+                energy_economy_activation_pending: false,
+                scanning_enabled: true,
             },
         );
     }
@@ -95,6 +110,11 @@ impl SubscriberRegistry {
         self.subscribers.entry(issi).or_insert_with(|| Subscriber {
             issi,
             attached_groups: HashSet::new(),
+            energy_economy_mode: 0,
+            energy_economy_frame_number: None,
+            energy_economy_multiframe_number: None,
+            energy_economy_activation_pending: false,
+            scanning_enabled: true,
         })
     }
 
@@ -135,6 +155,63 @@ impl SubscriberRegistry {
     /// Check if any subscriber is affiliated with the given GSSI
     pub fn has_group_members(&self, gssi: u32) -> bool {
         self.all_attached_groups.contains(&gssi)
+    }
+
+    pub fn set_energy_economy(&mut self, issi: u32, mode: u8, frame_number: Option<u8>, multiframe_number: Option<u8>) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&issi) else {
+            return false;
+        };
+        subscriber.energy_economy_mode = mode;
+        subscriber.energy_economy_frame_number = frame_number;
+        subscriber.energy_economy_multiframe_number = multiframe_number;
+        true
+    }
+
+    pub fn set_energy_economy_activation_pending(&mut self, issi: u32, pending: bool) {
+        if let Some(subscriber) = self.subscribers.get_mut(&issi) {
+            subscriber.energy_economy_activation_pending = pending;
+        }
+    }
+
+    pub fn take_energy_economy_activation_pending(&mut self, issi: u32) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&issi) else {
+            return false;
+        };
+        std::mem::take(&mut subscriber.energy_economy_activation_pending)
+    }
+
+    pub fn set_scanning_enabled(&mut self, issi: u32, enabled: bool) {
+        if let Some(subscriber) = self.subscribers.get_mut(&issi) {
+            subscriber.scanning_enabled = enabled;
+        }
+    }
+
+    pub fn energy_economy(&self, issi: u32) -> Option<(u8, Option<u8>, Option<u8>)> {
+        let subscriber = self.subscribers.get(&issi)?;
+        Some((
+            subscriber.energy_economy_mode,
+            subscriber.energy_economy_frame_number,
+            subscriber.energy_economy_multiframe_number,
+        ))
+    }
+
+    pub fn group_energy_economies(&self, gssi: u32) -> Vec<(u32, u8, Option<u8>, Option<u8>)> {
+        self.subscribers
+            .values()
+            .filter(|subscriber| {
+                subscriber.attached_groups.contains(&gssi)
+                    && subscriber.scanning_enabled
+                    && self.active_subscribers.contains(&subscriber.issi)
+            })
+            .map(|subscriber| {
+                (
+                    subscriber.issi,
+                    subscriber.energy_economy_mode,
+                    subscriber.energy_economy_frame_number,
+                    subscriber.energy_economy_multiframe_number,
+                )
+            })
+            .collect()
     }
 }
 

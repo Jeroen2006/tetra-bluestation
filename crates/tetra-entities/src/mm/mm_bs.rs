@@ -11,7 +11,7 @@ use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_w
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
-use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, HandoverChannelAllocation, SwmiMessage};
+use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, EnergyEconomyAssignment, HandoverChannelAllocation, SwmiMessage};
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
@@ -55,6 +55,7 @@ pub struct MmBs {
     registration_deadlines: HashMap<u64, TdmaTime>,
     pending_attachments: HashMap<u64, PendingAttachment>,
     pending_location_attachments: HashMap<u64, PendingLocationAttachment>,
+    pending_energy_economy: HashMap<u64, (u32, u32)>,
     /// SwMI authentication correlation per terminal and air-interface handle.
     /// MLE reuses handle 0 for concurrent registrations, so a handle alone is
     /// not a unique key.
@@ -136,6 +137,7 @@ impl MmBs {
             registration_deadlines: HashMap::new(),
             pending_attachments: HashMap::new(),
             pending_location_attachments: HashMap::new(),
+            pending_energy_economy: HashMap::new(),
             pending_auth_commands: HashMap::new(),
             authenticated_registrations: HashSet::new(),
             current_time: TdmaTime::default(),
@@ -150,6 +152,48 @@ impl MmBs {
 
     fn authentication_correlation_key(issi: u32, air_handle: u32) -> (u32, u32) {
         (issi, air_handle)
+    }
+
+    /// The ESI startpoint is the activation/monitoring phase. It deliberately
+    /// uses the next MCCH slot rather than inventing a separate timer.
+    fn energy_economy_assignment(&self, mode: EnergySavingMode) -> EnergyEconomyAssignment {
+        if mode == EnergySavingMode::StayAlive {
+            return EnergyEconomyAssignment::default();
+        }
+        let start = self.current_time.add_timeslots(1).forward_to_timeslot(1);
+        EnergyEconomyAssignment {
+            mode: mode as u8,
+            frame_number: Some(start.f),
+            multiframe_number: Some(start.m),
+        }
+    }
+
+    fn esi_from_assignment(assignment: EnergyEconomyAssignment) -> EnergySavingInformation {
+        EnergySavingInformation {
+            energy_saving_mode: EnergySavingMode::try_from(assignment.mode as u64).expect("validated EE mode"),
+            frame_number: assignment.frame_number,
+            multiframe_number: assignment.multiframe_number,
+        }
+    }
+
+    fn store_energy_economy(&mut self, issi: u32, assignment: EnergyEconomyAssignment) {
+        let mode = EnergySavingMode::try_from(assignment.mode as u64).expect("validated EE mode");
+        let _ = self
+            .client_mgr
+            .set_client_energy_saving(issi, mode, assignment.frame_number, assignment.multiframe_number);
+        self.config.state_write().subscribers.set_energy_economy(
+            issi,
+            assignment.mode,
+            assignment.frame_number,
+            assignment.multiframe_number,
+        );
+    }
+
+    fn activate_energy_economy_after_next_control(&self, issi: u32) {
+        self.config
+            .state_write()
+            .subscribers
+            .set_energy_economy_activation_pending(issi, true);
     }
 
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
@@ -311,27 +355,11 @@ impl MmBs {
             return;
         }
 
-        // Handle Energy Saving Mode request (clause 23.7.6)
-        // Always override to StayAlive. DL scheduler does not track per-MS monitoring
-        // patterns, so non-StayAlive modes would cause missed downlink messages.
-        // Per clause 16.7.1 NOTE 1: "The BS may allocate a different energy saving mode
-        // than requested and the BS assumes that the allocated value will be used."
-        let esi = if let Some(esm) = pdu.energy_saving_mode {
-            if esm != EnergySavingMode::StayAlive {
-                tracing::debug!(
-                    "MS {} requested energy saving mode {:?}, overriding to StayAlive",
-                    prim.received_address.ssi,
-                    esm,
-                );
-            }
-            Some(EnergySavingInformation {
-                energy_saving_mode: EnergySavingMode::StayAlive,
-                frame_number: None,
-                multiframe_number: None,
-            })
-        } else {
-            None
-        };
+        // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
+        // startpoint. Current policy accepts the requested mode and selects
+        // the next MCCH phase from the local TDMA clock.
+        let energy_economy = self.energy_economy_assignment(pdu.energy_saving_mode.unwrap_or(EnergySavingMode::StayAlive));
+        let esi = pdu.energy_saving_mode.map(|_| Self::esi_from_assignment(energy_economy));
 
         // In network mode the SwMI owns registration policy. The air handle
         // stays at the BS and is echoed by the SwMI decision, so this router
@@ -372,6 +400,7 @@ impl MmBs {
                 location_update_type: u64::from(pdu.location_update_type) as u8,
                 address_extension: pdu.address_extension,
                 forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
+                energy_economy,
                 authentication,
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
@@ -421,8 +450,10 @@ impl MmBs {
         self.config.state_write().subscribers.set_registration_delivery_pending(issi, true);
 
         // Store energy saving mode in client state
-        let esm = esi.as_ref().map(|e| e.energy_saving_mode).unwrap_or(EnergySavingMode::StayAlive);
-        let _ = self.client_mgr.set_client_energy_saving_mode(issi, esm);
+        self.store_energy_economy(issi, energy_economy);
+        if energy_economy.mode != 0 {
+            self.activate_energy_economy_after_next_control(issi);
+        }
 
         // Process optional GroupIdentityLocationDemand field
         let has_groups = pdu.group_identity_location_demand.is_some();
@@ -568,26 +599,28 @@ impl MmBs {
                     EnergySavingMode::StayAlive
                 };
 
-                if esm != EnergySavingMode::StayAlive {
-                    tracing::info!(
-                        "MS {} requested energy saving mode change to {:?}, overriding to StayAlive",
-                        issi,
-                        esm
-                    );
-                } else {
-                    tracing::info!("MS {} energy saving mode change request: StayAlive", issi);
+                let assignment = self.energy_economy_assignment(esm);
+                tracing::info!(issi, mode = ?esm, ?assignment, "MS requested EE mode change");
+                if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
+                    let command_id = self.next_swmi_command_id();
+                    let request = SwmiMessage::EnergyEconomyUpdate {
+                        command_id,
+                        itsi: issi as u64,
+                        air_handle: handle,
+                        energy_economy: assignment,
+                    };
+                    if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                        self.pending_energy_economy.insert(command_id, (issi, handle));
+                        handled = true;
+                        return;
+                    }
+                    tracing::warn!(command_id, issi, "SwMI EE request queue unavailable; using local-site trunking");
                 }
-
-                // Store StayAlive (see clause 16.7.1 NOTE 1)
-                let _ = self.client_mgr.set_client_energy_saving_mode(issi, EnergySavingMode::StayAlive);
-
-                // Respond with StayAlive
-                let esi = EnergySavingInformation {
-                    energy_saving_mode: EnergySavingMode::StayAlive,
-                    frame_number: None,
-                    multiframe_number: None,
-                };
-                Self::send_d_mm_status_energy_saving(queue, issi, handle, esi);
+                self.store_energy_economy(issi, assignment);
+                if assignment.mode != 0 {
+                    self.activate_energy_economy_after_next_control(issi);
+                }
+                Self::send_d_mm_status_energy_saving(queue, issi, handle, Self::esi_from_assignment(assignment));
                 handled = true;
             }
             StatusUplink::ChangeOfEnergySavingModeResponse => {
@@ -605,7 +638,7 @@ impl MmBs {
                 };
 
                 tracing::info!("MS {} energy saving mode change response: {:?}", issi, esm);
-                let _ = self.client_mgr.set_client_energy_saving_mode(issi, esm);
+                self.store_energy_economy(issi, self.energy_economy_assignment(esm));
                 handled = true;
             }
             StatusUplink::ChangeOfScanningState => {
@@ -618,6 +651,8 @@ impl MmBs {
                 };
                 if let Err(error) = self.client_mgr.set_client_scanning_enabled(issi, enabled) {
                     tracing::warn!(issi, ?error, "cannot store group scanning state for unknown MS");
+                } else {
+                    self.config.state_write().subscribers.set_scanning_enabled(issi, enabled);
                 }
                 if self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
                     let command_id = self.next_swmi_command_id();
@@ -1011,6 +1046,7 @@ impl MmBs {
         air_handle: u32,
         accepted: bool,
         cause: u16,
+        energy_economy: EnergyEconomyAssignment,
         handover_allocation: Option<HandoverChannelAllocation>,
     ) {
         let Some(pending) = self.pending_registrations.get(&command_id) else {
@@ -1061,6 +1097,10 @@ impl MmBs {
             );
             return;
         }
+
+        // The SwMI decision is authoritative. This also ensures a roaming
+        // target uses the exact phase that the serving SwMI record carries.
+        pending.energy_saving_information = (energy_economy.mode != 0).then(|| Self::esi_from_assignment(energy_economy));
 
         if pending.forward_registration_target_station_id.is_some() {
             // The SwMI has already moved the central serving-cell anchor and
@@ -1135,12 +1175,10 @@ impl MmBs {
             .state_write()
             .subscribers
             .set_registration_delivery_pending(pending.itsi, true);
-        let energy_saving_mode = pending
-            .energy_saving_information
-            .as_ref()
-            .map(|info| info.energy_saving_mode)
-            .unwrap_or(EnergySavingMode::StayAlive);
-        let _ = self.client_mgr.set_client_energy_saving_mode(pending.itsi, energy_saving_mode);
+        self.store_energy_economy(pending.itsi, energy_economy);
+        if energy_economy.mode != 0 {
+            self.activate_energy_economy_after_next_control(pending.itsi);
+        }
 
         // A location update can atomically contain group attachment changes.
         // The SwMI must decide those as well, but the resulting elements belong
@@ -1270,6 +1308,7 @@ impl MmBs {
         itsi: u64,
         groups: Vec<AttachmentOperation>,
         scanning_enabled: bool,
+        energy_economy: EnergyEconomyAssignment,
     ) {
         let Ok(issi) = u32::try_from(itsi) else {
             tracing::warn!(itsi, "discarding roaming state with invalid ISSI");
@@ -1283,6 +1322,9 @@ impl MmBs {
             self.config.state_write().subscribers.register(issi);
             self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
         }
+        // This arrives before call replay during roaming, so UMAC has the
+        // target-cell monitoring phase before it queues any MCCH setup.
+        self.store_energy_economy(issi, energy_economy);
         let old_groups = self
             .client_mgr
             .get_client_by_issi(issi)
@@ -1317,6 +1359,7 @@ impl MmBs {
             self.emit_subscriber_update(queue, issi, restored, BrewSubscriberAction::Affiliate);
         }
         if self.client_mgr.set_client_scanning_enabled(issi, scanning_enabled).is_ok() {
+            self.config.state_write().subscribers.set_scanning_enabled(issi, scanning_enabled);
             let update = MmSubscriberUpdate {
                 issi,
                 groups: Vec::new(),
@@ -1335,6 +1378,7 @@ impl MmBs {
             issi,
             groups = restored_count,
             scanning_enabled,
+            ?energy_economy,
             "restored roaming group-scanning state from SwMI"
         );
     }
@@ -1880,9 +1924,19 @@ impl TetraEntityTrait for MmBs {
                     air_handle,
                     accepted,
                     cause,
+                    energy_economy,
                     handover_allocation,
                     ..
-                } => self.apply_swmi_registration_decision(queue, command_id, itsi, air_handle, accepted, cause, handover_allocation),
+                } => self.apply_swmi_registration_decision(
+                    queue,
+                    command_id,
+                    itsi,
+                    air_handle,
+                    accepted,
+                    cause,
+                    energy_economy,
+                    handover_allocation,
+                ),
                 SwmiMessage::AuthenticationChallenge {
                     command_id,
                     itsi,
@@ -2022,7 +2076,38 @@ impl TetraEntityTrait for MmBs {
                     itsi,
                     groups,
                     scanning_enabled,
-                } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled),
+                    energy_economy,
+                } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled, energy_economy),
+                SwmiMessage::EnergyEconomyDecision {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    accepted,
+                    energy_economy,
+                } => {
+                    let Some((expected_issi, expected_handle)) = self.pending_energy_economy.remove(&command_id) else {
+                        tracing::warn!(command_id, itsi, "EE decision without pending request");
+                        continue;
+                    };
+                    if expected_issi != itsi as u32 || expected_handle != air_handle {
+                        tracing::warn!(command_id, itsi, "discarding mismatched EE decision");
+                        continue;
+                    }
+                    if accepted {
+                        self.store_energy_economy(expected_issi, energy_economy);
+                        if energy_economy.mode != 0 {
+                            self.activate_energy_economy_after_next_control(expected_issi);
+                        }
+                        Self::send_d_mm_status_energy_saving(
+                            queue,
+                            expected_issi,
+                            expected_handle,
+                            Self::esi_from_assignment(energy_economy),
+                        );
+                    } else {
+                        tracing::warn!(command_id, itsi, "SwMI rejected EE mode change");
+                    }
+                }
                 message => tracing::warn!(?message, "unexpected non-MM SwMI message on MM endpoint"),
             }
         }
@@ -2041,7 +2126,17 @@ impl TetraEntityTrait for MmBs {
                     itsi,
                     "SwMI link unavailable; completing pending location update in local-site trunking"
                 );
-                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, None);
+                let energy_economy = self
+                    .pending_registrations
+                    .get(&command_id)
+                    .and_then(|pending| pending.energy_saving_information.as_ref())
+                    .map(|info| EnergyEconomyAssignment {
+                        mode: info.energy_saving_mode as u8,
+                        frame_number: info.frame_number,
+                        multiframe_number: info.multiframe_number,
+                    })
+                    .unwrap_or_default();
+                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, energy_economy, None);
             }
             let recover_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
                 .pending_attachments

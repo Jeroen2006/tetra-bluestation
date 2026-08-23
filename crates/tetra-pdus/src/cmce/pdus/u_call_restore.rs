@@ -75,17 +75,36 @@ impl UCallRestore {
         // Type2
         let basic_service_information = typed::parse_type2_struct(obit, buffer, BasicServiceInformation::from_bitbuf)?;
 
-        // Type3
-        let facility = typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Facility)?;
+        // A field-complete U-CALL RESTORE is allowed to end immediately after
+        // its mandatory Type-2 basic-service information. Some terminals do
+        // exactly that instead of appending a zero M-bit for an empty Type-3
+        // chain. Do not mistake this valid termination for a malformed PDU.
+        // If bits remain, preserve the normal Type-3/M-bit parsing rules.
+        let facility = if obit && buffer.get_len_remaining() != 0 {
+            typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Facility)?
+        } else {
+            None
+        };
 
-        // Type3
-        let dm_ms_address = typed::parse_type3_generic(obit, buffer, CmceType3ElemId::DmMsAddr)?;
+        let dm_ms_address = if obit && buffer.get_len_remaining() != 0 {
+            typed::parse_type3_generic(obit, buffer, CmceType3ElemId::DmMsAddr)?
+        } else {
+            None
+        };
 
-        // Type3
-        let proprietary = typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Proprietary)?;
+        let proprietary = if obit && buffer.get_len_remaining() != 0 {
+            typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Proprietary)?
+        } else {
+            None
+        };
 
-        // Read trailing mbit (if not previously encountered)
-        obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
+        // Read a trailing M-bit only when the terminal actually supplied one.
+        // See the field-complete form accepted above.
+        obit = if obit && buffer.get_len_remaining() != 0 {
+            buffer.read_field(1, "trailing_obit")? == 1
+        } else {
+            false
+        };
         if obit {
             return Err(PduParseErr::InvalidTrailingMbitValue);
         }
@@ -171,5 +190,24 @@ impl fmt::Display for UCallRestore {
             self.dm_ms_address,
             self.proprietary,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UCallRestore;
+    use tetra_core::BitBuffer;
+
+    #[test]
+    fn parses_terminal_u_call_restore_without_empty_type3_mbit() {
+        // Captured from ISSI 77479 during service-restoration roaming. The
+        // terminal ends the PDU directly after the mandatory Type-2 BSI.
+        let mut buffer = BitBuffer::from_bitstr("01110000000000010100010000000100101110100111001100000000");
+        let pdu = UCallRestore::from_bitbuf(&mut buffer).expect("valid U-CALL RESTORE");
+
+        assert_eq!(pdu.call_identifier, 10);
+        assert_eq!(pdu.other_party_ssi, Some(77468));
+        assert!(pdu.basic_service_information.is_some());
+        assert_eq!(buffer.get_len_remaining(), 0);
     }
 }
