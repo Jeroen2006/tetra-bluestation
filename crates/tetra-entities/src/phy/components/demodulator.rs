@@ -1,7 +1,7 @@
 use num;
 use num::complex::ComplexFloat;
 
-use tetra_core::TdmaTime;
+use tetra_core::{SoftBit, TdmaTime};
 use tetra_core::TrainingSequence;
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
@@ -245,6 +245,7 @@ impl Demodulator {
         burst_finder.clear();
 
         let bits = &mut burst_finder.bits;
+        let soft_bits = &mut burst_finder.soft_bits;
         let mut previous_symbol: Option<ComplexSample> = None;
         for i in (first_symbol_index..first_symbol_index + SPS * n_symbols).step_by(SPS) {
             // Use fractional part of timing estimate to interpolate between samples.
@@ -257,6 +258,12 @@ impl Demodulator {
                 // Make decisions
                 bits.push(if diff.im < 0.0 { 1 } else { 0 });
                 bits.push(if diff.re < 0.0 { 1 } else { 0 });
+                // Preserve calibrated decision distance for the FEC layer.
+                // Signed values use the same convention as Viterbi: + is 1.
+                let amplitude = diff.abs();
+                let scale = if amplitude > 0.0 { SoftBit::MAX as RealSample / amplitude } else { 0.0 };
+                soft_bits.push((-diff.im * scale).round().clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit);
+                soft_bits.push((-diff.re * scale).round().clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit);
             }
             previous_symbol = Some(symbol);
         }
@@ -441,6 +448,8 @@ enum SlotType {
 struct SlotBurstFinder {
     /// Demodulated bits of a slot
     bits: Vec<u8>,
+    /// Signed bit reliabilities aligned one-to-one with `bits`.
+    soft_bits: Vec<SoftBit>,
     /// Training sequence found
     train_type: TrainingSequence,
     /// Number of bit errors in training sequence
@@ -467,6 +476,7 @@ impl SlotBurstFinder {
     fn new() -> Self {
         Self {
             bits: Vec::with_capacity(510),
+            soft_bits: Vec::with_capacity(510),
             train_type: TrainingSequence::NotFound,
             train_errs: Self::ERRS_NO_BURST,
             burst_pos: 0,
@@ -476,6 +486,7 @@ impl SlotBurstFinder {
 
     fn clear(&mut self) {
         self.bits.clear();
+        self.soft_bits.clear();
         self.train_type = TrainingSequence::NotFound;
         self.train_errs = Self::ERRS_NO_BURST;
         self.burst_pos = 0;
@@ -582,6 +593,8 @@ impl SlotBurstFinder {
         RxBurstBits {
             train_type: self.train_type,
             bits: &self.bits[self.burst_pos..self.burst_pos + self.burst_len],
+            soft_bits: (self.soft_bits.len() >= self.burst_pos + self.burst_len)
+                .then(|| &self.soft_bits[self.burst_pos..self.burst_pos + self.burst_len]),
         }
     }
 }

@@ -274,6 +274,19 @@ pub fn tetra_rcpc_depunct(pu: RcpcPunctMode, input: &[u8], len: usize, output: &
     }
 }
 
+/// Soft-decision counterpart of [`tetra_rcpc_depunct`]. Missing punctured
+/// symbols remain zero, which Viterbi interprets as an erasure.
+pub fn tetra_rcpc_depunct_soft(pu: RcpcPunctMode, input: &[tetra_core::SoftBit], len: usize, output: &mut [tetra_core::SoftBit]) {
+    let puncturer = get_puncturer(pu);
+    for j in 1..=len as u32 {
+        let i = (puncturer.i_func)(j);
+        let blk = (i - 1) / puncturer.t;
+        let idx = (i - puncturer.t * blk) as usize;
+        let k = puncturer.period * blk + puncturer.p[idx];
+        output[(k - 1) as usize] = input[(j - 1) as usize];
+    }
+}
+
 /// Compare mother vs depunct buffers, ignoring `0xff` in `depunct`.
 /// Returns count of matched symbols or `Err(())` on mismatch.
 pub fn mother_memcmp(mother: &[u8], depunct: &[u8]) -> Result<usize, ()> {

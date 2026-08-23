@@ -86,18 +86,60 @@ pub fn compute_syndrome(codeword: u32) -> u16 {
     syn
 }
 
-pub fn tetra_rm3014_decode_limited_ecc(codeword: u32) -> u16 {
-    let syn = compute_syndrome(codeword);
-    let mut corrected = codeword;
-    if syn != 0 {
-        for (k, &col_syn) in COL_SYNDROMES.iter().enumerate() {
-            if col_syn == syn {
-                corrected ^= 1 << (29 - k);
-                break;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rm3014Decoded {
+    pub data: u16,
+    pub corrected_bits: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rm3014Uncorrectable {
+    pub syndrome: u16,
+}
+
+#[inline]
+fn bit_mask(bit: usize) -> u32 {
+    1u32 << (29 - bit)
+}
+
+/// Decode within the guaranteed radius of the shortened RM(30,14) code.
+/// Its minimum distance is eight, so error patterns of weight up to three are
+/// uniquely correctable; all other syndromes are deliberately rejected.
+pub fn tetra_rm3014_decode(codeword: u32) -> Result<Rm3014Decoded, Rm3014Uncorrectable> {
+    let syndrome = compute_syndrome(codeword);
+    if syndrome == 0 {
+        return Ok(Rm3014Decoded { data: (codeword >> 16) as u16, corrected_bits: 0 });
+    }
+    for i in 0..30 {
+        if COL_SYNDROMES[i] == syndrome {
+            return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i)) >> 16) as u16, corrected_bits: 1 });
+        }
+    }
+    for i in 0..29 {
+        for j in i + 1..30 {
+            if COL_SYNDROMES[i] ^ COL_SYNDROMES[j] == syndrome {
+                return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i) ^ bit_mask(j)) >> 16) as u16, corrected_bits: 2 });
             }
         }
     }
-    (corrected >> 16) as u16
+    for i in 0..28 {
+        for j in i + 1..29 {
+            for k in j + 1..30 {
+                if COL_SYNDROMES[i] ^ COL_SYNDROMES[j] ^ COL_SYNDROMES[k] == syndrome {
+                    return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i) ^ bit_mask(j) ^ bit_mask(k)) >> 16) as u16, corrected_bits: 3 });
+                }
+            }
+        }
+    }
+    Err(Rm3014Uncorrectable { syndrome })
+}
+
+/// Compatibility helper for legacy callers. New receive paths must use
+/// [`tetra_rm3014_decode`] so uncorrectable words are never accepted.
+pub fn tetra_rm3014_decode_limited_ecc(codeword: u32) -> u16 {
+    tetra_rm3014_decode(codeword)
+        .map(|decoded| decoded.data)
+        .unwrap_or_else(|_| tetra_rm3014_decode_naive(codeword))
 }
 
 #[cfg(test)]

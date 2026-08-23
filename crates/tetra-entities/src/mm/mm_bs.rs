@@ -64,6 +64,9 @@ pub struct MmBs {
     /// authentication.  The final D-LOCATION UPDATE ACCEPT carries the
     /// Authentication Downlink only for these registrations.
     authenticated_registrations: HashSet<u64>,
+    /// Recovery request IDs awaiting one canonical SwMI result. These are
+    /// session-scoped; a stale result from an older connection is ignored.
+    pending_lst_recoveries: HashSet<u64>,
     current_time: TdmaTime,
 }
 
@@ -141,6 +144,7 @@ impl MmBs {
             pending_energy_economy: HashMap::new(),
             pending_auth_commands: HashMap::new(),
             authenticated_registrations: HashSet::new(),
+            pending_lst_recoveries: HashSet::new(),
             current_time: TdmaTime::default(),
         }
     }
@@ -2112,6 +2116,58 @@ impl TetraEntityTrait for MmBs {
                     scanning_enabled,
                     energy_economy,
                 } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled, energy_economy),
+                SwmiMessage::LstRecoveryRequest { command_id } => {
+                    if !self.pending_lst_recoveries.insert(command_id) {
+                        tracing::warn!(command_id, "duplicate LST recovery request ignored");
+                        continue;
+                    }
+                    let subscribers = self.client_mgr.lst_recovery_snapshot();
+                    let subscriber_count = subscribers.len();
+                    let Some(endpoint) = self.swmi.as_ref() else {
+                        self.pending_lst_recoveries.remove(&command_id);
+                        continue;
+                    };
+                    if let Err(error) = endpoint.submit(SwmiMessage::LstRecoverySnapshot {
+                        command_id,
+                        subscribers,
+                    }) {
+                        self.pending_lst_recoveries.remove(&command_id);
+                        tracing::warn!(command_id, ?error, "cannot submit LST recovery snapshot to SwMI");
+                    } else {
+                        tracing::info!(command_id, subscriber_count, "uploaded LST subscriber recovery snapshot to SwMI");
+                    }
+                }
+                SwmiMessage::LstRecoveryResult {
+                    command_id,
+                    accepted,
+                    rejected,
+                } => {
+                    if !self.pending_lst_recoveries.remove(&command_id) {
+                        tracing::warn!(command_id, "stale LST recovery result ignored");
+                        continue;
+                    }
+                    let accepted_count = accepted.len();
+                    let rejected_count = rejected.len();
+                    for subscriber in accepted {
+                        self.apply_swmi_subscriber_state_sync(
+                            queue,
+                            subscriber.itsi,
+                            subscriber.groups,
+                            subscriber.scanning_enabled,
+                            subscriber.energy_economy,
+                        );
+                    }
+                    for rejection in rejected {
+                        let Ok(issi) = u32::try_from(rejection.itsi) else {
+                            tracing::warn!(itsi = rejection.itsi, "invalid ISSI in LST recovery rejection");
+                            continue;
+                        };
+                        if self.remove_local_subscriber(queue, issi) {
+                            tracing::warn!(command_id, issi, cause = rejection.cause, "SwMI rejected LST subscriber recovery; removed local state");
+                        }
+                    }
+                    tracing::info!(command_id, accepted_count, rejected_count, "applied canonical LST recovery result from SwMI");
+                }
                 // Command id zero is reserved for the SwMI-to-old-serving-BS
                 // direction. It is deliberately not a normal U-ITSI DETACH:
                 // the SwMI has already moved the authoritative registration

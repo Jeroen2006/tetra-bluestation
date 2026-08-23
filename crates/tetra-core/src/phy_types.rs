@@ -3,6 +3,10 @@
 //! These types originate from the PHY layer but are referenced by LMAC, UMAC,
 //! and SAP primitives, so they live in tetra-core to avoid circular dependencies.
 
+/// Signed confidence for a received bit: negative is 0, positive is 1, zero is
+/// an erasure.  The magnitude is consumed by soft-decision Viterbi decoding.
+pub type SoftBit = i8;
+
 /// Identifies which block(s) within a timeslot
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PhyBlockNum {

@@ -1,4 +1,4 @@
-use tetra_core::TdmaTime;
+use tetra_core::{SoftBit, TdmaTime};
 use tetra_core::TrainingSequence;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -11,6 +11,8 @@ pub enum RxTxDevError {
 pub struct RxBurstBits<'a> {
     pub train_type: TrainingSequence,
     pub bits: &'a [u8],
+    /// Signed reliabilities aligned one-to-one with `bits`.
+    pub soft_bits: Option<&'a [SoftBit]>,
 }
 
 #[derive(Debug, Default)]

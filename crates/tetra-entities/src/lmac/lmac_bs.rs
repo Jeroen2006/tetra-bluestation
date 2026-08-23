@@ -198,7 +198,7 @@ impl LmacBs {
             return;
         }
 
-        let (decoded, crc_ok) = errorcontrol::decode_tp(lchan, blk.block, self.scrambling_code);
+        let (decoded, crc_ok) = errorcontrol::decode_tp_with_soft(lchan, blk.block, blk.soft_bits.as_deref(), self.scrambling_code);
         let Some(acelp_bits) = decoded else {
             tracing::warn!("rx_blk_traffic: decode_tp returned None");
             return;
@@ -547,6 +547,7 @@ mod tests {
             burst_type: BurstType::NUB,
             block_type: PhyBlockType::NUB,
             block_num: PhyBlockNum::Both,
+            soft_bits: None,
             block: BitBuffer::new(0),
         }
     }

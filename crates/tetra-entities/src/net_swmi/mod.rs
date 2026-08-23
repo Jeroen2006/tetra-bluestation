@@ -314,6 +314,7 @@ struct SwmiWorker<T: NetworkTransport> {
     command_sequence: u64,
     current_cell_config: Option<CellConfig>,
     last_advertisement_version: u64,
+    recovery_request_id: Option<u64>,
 }
 
 impl<T: NetworkTransport> SwmiWorker<T> {
@@ -328,6 +329,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             command_sequence: 1,
             current_cell_config: None,
             last_advertisement_version: 0,
+            recovery_request_id: None,
         }
     }
 
@@ -341,6 +343,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                 continue;
             }
             tracing::info!(host = %self.config.host, "SwMI control connection established");
+            self.recovery_request_id = None;
             if !self.send(SwmiMessage::Hello {
                 connection_epoch: 0,
                 software_version: tetra_core::STACK_VERSION.to_owned(),
@@ -368,24 +371,17 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             // updates the broadcast Extended Services field.
                             self.stack_config.state_write().authentication_required = cell.authentication_required;
                             self.current_cell_config = Some(cell);
-                            // Advertise the same effective system-wide-service
-                            // state that UMAC broadcasts on the serving cell.
-                            // This must be set before reporting the cell, or
-                            // neighbouring cells retain the local fallback bit.
-                            self.stack_config.state_write().network_connected = true;
+                            // This session remains in LST until the SwMI has
+                            // reconciled the local subscriber snapshot.
+                            self.stack_config.state_write().network_connected = false;
                             let accepted = self.report_current_advertisement();
                             let _ = self.send(SwmiMessage::Receipt {
                                 command_id,
                                 accepted,
                                 code: if accepted { 0 } else { 1 },
                             });
-                            self.endpoint.online.store(accepted, Ordering::Release);
-                            // System-wide services are broadcast by UMAC.  Keep
-                            // that radio indication aligned with the *usable*
-                            // SwMI session (cell configuration accepted and
-                            // SYSINFO report queued), rather than merely with
-                            // the presence of a [swmi] configuration section.
-                            self.stack_config.state_write().network_connected = accepted;
+                            self.endpoint.online.store(false, Ordering::Release);
+                            self.stack_config.state_write().network_connected = false;
                         }
                         Ok(SwmiMessage::Receipt {
                             command_id,
@@ -398,13 +394,29 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::EnergyEconomyDecision { .. }
                             | SwmiMessage::EnergyEconomyRebaseRequest { .. }
                             | SwmiMessage::SubscriberStateSync { .. }
+                            | SwmiMessage::LstRecoveryRequest { .. }
                             | SwmiMessage::DeregistrationNotice { .. }
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
                             | SwmiMessage::AuthenticationResult { .. }),
                         ) => {
+                            if let SwmiMessage::LstRecoveryRequest { command_id } = &message {
+                                self.recovery_request_id = Some(*command_id);
+                            }
                             if self.endpoint.mm_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI MM endpoint closed; dropping central decision");
+                            }
+                        }
+                        Ok(message @ SwmiMessage::LstRecoveryResult { command_id, .. }) => {
+                            if self.recovery_request_id != Some(command_id) {
+                                tracing::warn!(command_id, expected = ?self.recovery_request_id, "stale LST recovery result ignored");
+                                continue;
+                            }
+                            self.recovery_request_id = None;
+                            self.endpoint.online.store(true, Ordering::Release);
+                            self.stack_config.state_write().network_connected = true;
+                            if self.endpoint.mm_incoming.send(message).is_err() {
+                                tracing::warn!("SwMI MM endpoint closed; dropping LST recovery result");
                             }
                         }
                         Ok(SwmiMessage::NeighbourCellSnapshot(snapshot)) => {

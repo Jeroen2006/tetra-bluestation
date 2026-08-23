@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, PhyBlockType};
+use tetra_core::{BitBuffer, PhyBlockType, SoftBit};
 use tetra_saps::tmv::TmvUnitdataReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tp::TpUnitdataInd;
@@ -95,6 +95,7 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     // Fetch decoding parameters for this logical channel type
     let params = errorcontrol_params::get_params(lchan);
 
+    let mut soft_type4 = prim.soft_bits.filter(|bits| bits.len() == params.type345_bits);
     let mut type5 = prim.block;
     tracing::trace!("decode_cp {:?} type5: {:?}", lchan, type5.dump_bin());
 
@@ -110,6 +111,9 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     };
 
     scrambler::tetra_scramb_bits(scrambling_code, &mut type5);
+    if let Some(soft_bits) = &mut soft_type4 {
+        descramble_soft_bits(scrambling_code, soft_bits);
+    }
     let mut type4 = type5;
     tracing::trace!("decode_cp {:?} type4: {:?}", lchan, type4.dump_bin());
 
@@ -122,13 +126,16 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
         BitBuffer::from_bitarr(&type3_arr[0..params.type345_bits]).dump_bin()
     );
 
-    // De-puncturing, type3 -> type3dp
-    convenc::tetra_rcpc_depunct(RcpcPunctMode::Rate2_3, &type3_arr, params.type345_bits, &mut type3dp_arr);
-    // tracing::trace!("decode_cp: t3dp:  {:?}", &type3dp_arr[0..4*params.type2_bits]);
-
-    // Viterbi, type3dp -> type2
-    // viterbi_dec_sb1_wrapper(&type3dp_arr, &mut type2_arr, params.type2_bits);
-    viterbi::dec_sb1(&type3dp_arr, &mut type2_arr, params.type2_bits);
+    if let Some(soft_type4) = soft_type4 {
+        let mut soft_type3 = [0 as SoftBit; MAX_TYPE345_BITS];
+        interleaver::block_deinterleave(params.type345_bits, params.interleave_a, &soft_type4, &mut soft_type3);
+        let mut soft_type3dp = [0 as SoftBit; MAX_TYPE345_BITS * 4];
+        convenc::tetra_rcpc_depunct_soft(RcpcPunctMode::Rate2_3, &soft_type3, params.type345_bits, &mut soft_type3dp);
+        viterbi::dec_sb1_soft(&soft_type3dp, &mut type2_arr, params.type2_bits);
+    } else {
+        convenc::tetra_rcpc_depunct(RcpcPunctMode::Rate2_3, &type3_arr, params.type345_bits, &mut type3dp_arr);
+        viterbi::dec_sb1(&type3dp_arr, &mut type2_arr, params.type2_bits);
+    }
     tracing::trace!(
         "decode_cp {:?} type2: {:?}",
         lchan,
@@ -289,7 +296,7 @@ pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
 /// Decode traffic plane from type5 to type1 bits (ACELP codec order). Reverse of `encode_tp()`:
 /// descramble → deinterleave → split UEP → Class0 copy, Class1+2 depuncture+Viterbi → CRC → reassemble → reorder.
 /// Returns (Option<BitBuffer>, bool): 274 ACELP bits if successful, CRC check result for Class 2.
-pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code: u32) -> (Option<BitBuffer>, bool) {
+pub fn decode_tp_with_soft(lchan: LogicalChannel, type5_block: BitBuffer, soft_type5: Option<&[SoftBit]>, scrambling_code: u32) -> (Option<BitBuffer>, bool) {
     assert_eq!(lchan, LogicalChannel::TchS);
 
     let params = errorcontrol_params::get_params(lchan);
@@ -297,6 +304,10 @@ pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code:
     // ── De-scramble type5 → type4 ──────────────────────────────────
     let mut type5 = type5_block;
     scrambler::tetra_scramb_bits(scrambling_code, &mut type5);
+    let mut soft_type4 = soft_type5.filter(|bits| bits.len() == params.type345_bits).map(<[SoftBit]>::to_vec);
+    if let Some(soft_bits) = &mut soft_type4 {
+        descramble_soft_bits(scrambling_code, soft_bits);
+    }
     let mut type4 = type5;
 
     // ── Matrix de-interleave type4 → type3 (reverse 24×18 transpose)
@@ -305,6 +316,11 @@ pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code:
     type4.to_bitarr(&mut type4_arr[0..params.type345_bits]);
     let mut type3_arr = [0u8; MAX_TYPE345_BITS];
     interleaver::matrix_deinterleave(24, 18, &type4_arr, &mut type3_arr);
+    let soft_type3 = soft_type4.map(|soft_type4| {
+        let mut output = [0 as SoftBit; MAX_TYPE345_BITS];
+        interleaver::matrix_deinterleave(24, 18, &soft_type4, &mut output);
+        output
+    });
 
     // ── Split type3 into UEP classes and decode ────────────────────
     const CLASS0_BITS: usize = 102;
@@ -339,16 +355,14 @@ pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code:
         combined_mother[..CLASS1_BITS * 3].copy_from_slice(&mother_class1);
         combined_mother[CLASS1_BITS * 3..].copy_from_slice(&mother_class2);
 
-        // Convert to soft bits and Viterbi decode as one continuous stream
-        let soft: Vec<viterbi::SoftBit> = combined_mother
-            .iter()
-            .map(|&b| match b {
-                0x00 => -1i8,
-                0x01 => 1i8,
-                0xFF => 0i8, // erasure
-                _ => 0i8,
-            })
-            .collect();
+        let soft: Vec<SoftBit> = if let Some(soft_type3) = &soft_type3 {
+            let mut output = vec![0 as SoftBit; (CLASS1_BITS + CLASS2_TYPE2) * 3];
+            convenc::tetra_rcpc_depunct_soft(RcpcPunctMode::Rate112_168, &soft_type3[CLASS0_BITS..CLASS0_BITS + CLASS1_TYPE3], CLASS1_TYPE3, &mut output[..CLASS1_BITS * 3]);
+            convenc::tetra_rcpc_depunct_soft(RcpcPunctMode::Rate72_162, &soft_type3[CLASS0_BITS + CLASS1_TYPE3..CLASS0_BITS + CLASS1_TYPE3 + CLASS2_TYPE3], CLASS2_TYPE3, &mut output[CLASS1_BITS * 3..]);
+            output
+        } else {
+            combined_mother.iter().map(|&bit| match bit { 0x00 => -1, 0x01 => 1, _ => 0 }).collect()
+        };
 
         let decoder = viterbi::TetraCodecViterbiDecoder::new();
         let decoded = decoder.decode(&soft);
@@ -375,6 +389,11 @@ pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code:
     let result = BitBuffer::from_bitarr(&codec_bits);
 
     (Some(result), crc_ok)
+}
+
+/// Backwards-compatible hard-decision traffic decoder.
+pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code: u32) -> (Option<BitBuffer>, bool) {
+    decode_tp_with_soft(lchan, type5_block, None, scrambling_code)
 }
 
 /// Encodes AACH message from type1 to type5 bits
@@ -404,7 +423,7 @@ pub fn encode_aach(buf: BitBuffer, scrambling_code: u32) -> BitBuffer {
 }
 
 /// Decodes
-pub fn decode_aach(buf: BitBuffer, scrambling_code: u32) -> BitBuffer {
+pub fn decode_aach(buf: BitBuffer, scrambling_code: u32) -> Result<BitBuffer, rm3014::Rm3014Uncorrectable> {
     let mut type5 = buf;
     tracing::trace!("decode_aach type5: {:?}", type5.dump_bin());
     assert!(type5.get_len_remaining() == 30);
@@ -418,21 +437,32 @@ pub fn decode_aach(buf: BitBuffer, scrambling_code: u32) -> BitBuffer {
 
     // RM code type2 -> type1
 
-    // Convert to int and perform single-bit error correction
-    // TODO FIXME: Multi-bit error correction (Clause 8.3.1.1)
+    // The ETSI RM(30,14) code has d_min = 8, hence its unique bounded
+    // correction radius is three bits. Reject words beyond that radius.
     let x = type2.read_bits(30).unwrap() as u32; // Guaranteed
-    let y = rm3014::tetra_rm3014_decode_limited_ecc(x);
+    let decoded = rm3014::tetra_rm3014_decode(x)?;
 
     // Write error-corrected data to type1 and return
     let mut type1 = type2;
     type1.set_raw_start(0);
     type1.set_raw_pos(0);
     type1.set_raw_end(14);
-    type1.write_bits(y as u64, 14);
+    type1.write_bits(decoded.data as u64, 14);
     type1.seek(0);
 
     tracing::debug!("decode_aach type1: {:?}", type1.dump_bin());
-    type1
+    Ok(type1)
+}
+
+fn descramble_soft_bits(scrambling_code: u32, soft_bits: &mut [SoftBit]) {
+    let mut scrambling_bits = [0u8; MAX_TYPE345_BITS];
+    assert!(soft_bits.len() <= scrambling_bits.len());
+    scrambler::tetra_scramb_get_bits(scrambling_code, &mut scrambling_bits[..soft_bits.len()]);
+    for (soft_bit, scrambling_bit) in soft_bits.iter_mut().zip(scrambling_bits) {
+        if scrambling_bit != 0 {
+            *soft_bit = soft_bit.saturating_neg();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +497,7 @@ mod tests {
             burst_type: BurstType::SDB,
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
+            soft_bits: None,
             block: type5,
         };
 
@@ -497,6 +528,7 @@ mod tests {
             burst_type: BurstType::SDB,
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
+            soft_bits: None,
             block: type5,
         };
 
@@ -517,7 +549,7 @@ mod tests {
         let type5vec_bb = BitBuffer::from_bitstr(type5vec);
         let type1vec_bb = BitBuffer::from_bitstr(type1vec);
 
-        let type1 = decode_aach(type5vec_bb, scramb_code);
+        let type1 = decode_aach(type5vec_bb, scramb_code).unwrap();
         let type5 = encode_aach(type1vec_bb, scramb_code);
 
         assert_eq!(type5vec, type5.to_bitstr());
@@ -571,6 +603,7 @@ mod tests {
             burst_type: BurstType::NDB,
             block_type: PhyBlockType::NDB,
             block_num: PhyBlockNum::Both,
+            soft_bits: None,
             block: type5,
         };
 

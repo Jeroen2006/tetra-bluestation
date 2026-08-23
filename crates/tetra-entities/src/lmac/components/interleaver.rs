@@ -2,7 +2,7 @@ pub const fn block_interl_func(k: u32, a: u32, i: u32) -> u32 {
     1 + ((a.wrapping_mul(i)) % k)
 }
 
-pub fn block_interleave(k: usize, a: usize, input: &[u8], output: &mut [u8]) {
+pub fn block_interleave<T: Copy>(k: usize, a: usize, input: &[T], output: &mut [T]) {
     assert!(input.len() >= k && output.len() >= k);
     for i in 1..=k {
         let k = block_interl_func(k as u32, a as u32, i as u32) as usize;
@@ -10,7 +10,7 @@ pub fn block_interleave(k: usize, a: usize, input: &[u8], output: &mut [u8]) {
     }
 }
 
-pub fn block_deinterleave(k: usize, a: usize, input: &[u8], output: &mut [u8]) {
+pub fn block_deinterleave<T: Copy>(k: usize, a: usize, input: &[T], output: &mut [T]) {
     assert!(input.len() >= k && output.len() >= k);
     for i in 1..=k {
         let k = block_interl_func(k as u32, a as u32, i as u32) as usize;
@@ -18,7 +18,7 @@ pub fn block_deinterleave(k: usize, a: usize, input: &[u8], output: &mut [u8]) {
     }
 }
 
-pub fn matrix_interleave(lines: usize, columns: usize, input: &[u8], output: &mut [u8]) {
+pub fn matrix_interleave<T: Copy>(lines: usize, columns: usize, input: &[T], output: &mut [T]) {
     let total = lines.checked_mul(columns).expect("overflow");
     assert!(input.len() >= total && output.len() >= total);
     for i in 0..columns {
@@ -28,7 +28,7 @@ pub fn matrix_interleave(lines: usize, columns: usize, input: &[u8], output: &mu
     }
 }
 
-pub fn matrix_deinterleave(lines: usize, columns: usize, input: &[u8], output: &mut [u8]) {
+pub fn matrix_deinterleave<T: Copy>(lines: usize, columns: usize, input: &[T], output: &mut [T]) {
     let total = lines.checked_mul(columns).expect("overflow");
     assert!(input.len() >= total && output.len() >= total);
     for i in 0..columns {

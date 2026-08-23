@@ -75,7 +75,13 @@ impl LmacMs {
             return;
         };
 
-        let type1 = errorcontrol::decode_aach(type5, scrambling_code);
+        let type1 = match errorcontrol::decode_aach(type5, scrambling_code) {
+            Ok(type1) => type1,
+            Err(error) => {
+                tracing::warn!(?error, "rx_bbk: rejecting AACH beyond the three-bit correction radius");
+                return;
+            }
+        };
 
         // Pass block to the upper mac
         let m = SapMsg {

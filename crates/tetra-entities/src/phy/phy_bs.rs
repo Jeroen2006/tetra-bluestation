@@ -3,7 +3,7 @@ use std::panic;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, SoftBit, TdmaTime, TrainingSequence};
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
 use tetra_pdus::phy::traits::rxtx_dev::{RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
@@ -82,6 +82,7 @@ impl<D: RxTxDev> PhyBs<D> {
         block_type: PhyBlockType,
         block_num: PhyBlockNum,
         bits: BitBuffer,
+        soft_bits: Option<Vec<SoftBit>>,
     ) {
         // Uplink timeslot is two after downlink. Thus was transmitted at dltime - 2
         let sapmsg = SapMsg {
@@ -94,10 +95,23 @@ impl<D: RxTxDev> PhyBs<D> {
                 burst_type,
                 block_type,
                 block_num,
+                soft_bits,
                 block: bits,
             }),
         };
         queue.push_back(sapmsg);
+    }
+
+    fn collect_soft_bits(burst: &RxBurstBits<'_>, ranges: &[std::ops::Range<usize>]) -> Option<Vec<SoftBit>> {
+        let soft_bits = burst.soft_bits?;
+        if soft_bits.len() != burst.bits.len() || ranges.iter().any(|range| range.end > soft_bits.len()) {
+            return None;
+        }
+        let mut selected = Vec::with_capacity(ranges.iter().map(|range| range.len()).sum());
+        for range in ranges {
+            selected.extend_from_slice(&soft_bits[range.clone()]);
+        }
+        Some(selected)
     }
 
     fn split_rxslot_and_send_to_lmac(
@@ -116,7 +130,13 @@ impl<D: RxTxDev> PhyBs<D> {
                 blk.copy_bits_from_bitarr(&burst.bits[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]);
                 blk.seek(0);
 
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Both, blk);
+                Self::send_rxblock_to_lmac(
+                    queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Both, blk,
+                    Self::collect_soft_bits(burst, &[
+                        NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS,
+                        NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS,
+                    ]),
+                );
             }
 
             TrainingSequence::NormalTrainSeq2 => {
@@ -125,8 +145,10 @@ impl<D: RxTxDev> PhyBs<D> {
                 let blk1 = BitBuffer::from_bitarr(&burst.bits[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]);
                 let blk2 = BitBuffer::from_bitarr(&burst.bits[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]);
 
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block1, blk1);
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block2, blk2);
+                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block1, blk1,
+                    Self::collect_soft_bits(burst, &[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]));
+                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block2, blk2,
+                    Self::collect_soft_bits(burst, &[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]));
             }
             TrainingSequence::ExtendedTrainSeq => {
                 assert!(burst.bits.len() == CUB_BITS);
@@ -141,7 +163,13 @@ impl<D: RxTxDev> PhyBs<D> {
                     PhyBlockNum::Block2 => PhyBlockType::SSN2,
                     other => panic!("CUB burst must belong to one subslot, got {:?}", other),
                 };
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::CUB, block_type, block_num, blk);
+                Self::send_rxblock_to_lmac(
+                    queue, ul_time, train_seq, BurstType::CUB, block_type, block_num, blk,
+                    Self::collect_soft_bits(burst, &[
+                        CUB_BLK1_OFFSET..CUB_BLK1_OFFSET + CUB_BLK_BITS,
+                        CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS,
+                    ]),
+                );
             }
 
             _ => panic!(),

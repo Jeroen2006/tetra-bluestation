@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, TdmaTime, TrainingSequence};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, SoftBit, TdmaTime, TrainingSequence};
 
 #[derive(Debug, Clone)]
 pub struct TpUnitdataInd {
@@ -10,6 +10,8 @@ pub struct TpUnitdataInd {
     pub block_type: PhyBlockType,
     /// Undefined for BBK. For all others: [ Block1 | Block2 | Both ]
     pub block_num: PhyBlockNum,
+    /// Optional signed reliability for every bit in `block`.
+    pub soft_bits: Option<Vec<SoftBit>>,
     pub block: BitBuffer,
 }
 

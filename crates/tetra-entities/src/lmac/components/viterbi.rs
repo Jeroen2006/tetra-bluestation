@@ -1,14 +1,14 @@
+pub use tetra_core::SoftBit;
+
 /// Type used to represent input bits.
 /// "0" is represented as -1, "1" as +1, and punctured bit as 0.
 /// Soft decision decoding is also possible by using
 /// higher negative values to represent more likely "0"
 /// and higher positive values to represent more likely "1".
 /// Too high values might cause path metrics to overflow though.
-pub type SoftBit = i8;
-
 /// Type used to accumulate path metrics.
 /// 16 bits should be enough for our message lengths without need for renormalizations.
-type Metric = i16;
+type Metric = i32;
 
 /// Constraint length of the code.
 /// This is defined as a constant rather than a const generic parameter
@@ -175,8 +175,15 @@ pub fn dec_sb1(in_buf: &[u8], out_buf: &mut [u8], sym_count: usize) {
         })
         .collect();
 
+    dec_sb1_soft(&soft, out_buf, sym_count);
+}
+
+/// Decode a depunctured rate-1/4 stream with signed reliabilities.
+pub fn dec_sb1_soft(in_buf: &[SoftBit], out_buf: &mut [u8], sym_count: usize) {
+    assert!(in_buf.len() >= sym_count * 4, "in_buf too short");
+    assert!(out_buf.len() >= sym_count, "out_buf too short");
     let decoder = TetraViterbiDecoder::new();
-    let decoded = decoder.decode(&soft);
+    let decoded = decoder.decode(&in_buf[..sym_count * 4]);
     out_buf[..sym_count].copy_from_slice(&decoded[..sym_count]);
 }
 

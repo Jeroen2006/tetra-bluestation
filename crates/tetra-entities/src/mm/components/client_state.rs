@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
+use tetra_swmi_protocol::{AttachmentOperation, EnergyEconomyAssignment, SubscriberRecoveryState};
 
 #[derive(Debug)]
 pub enum ClientMgrErr {
@@ -144,6 +145,41 @@ impl MmClientMgr {
 
     pub fn client_group_class_of_usage(&self, issi: u32, gssi: u32) -> Option<u8> {
         self.clients.get(&issi)?.groups.get(&gssi).copied()
+    }
+
+    /// Capture every currently attached local MS for one LST recovery
+    /// transaction. The result is deterministic so reconnect diagnostics and
+    /// protocol tests do not depend on `HashMap` iteration order.
+    pub fn lst_recovery_snapshot(&self) -> Vec<SubscriberRecoveryState> {
+        let mut subscribers = self
+            .clients
+            .values()
+            .filter(|client| client.state == MmClientState::Attached)
+            .map(|client| {
+                let mut groups = client
+                    .groups
+                    .iter()
+                    .map(|(&gssi, &class_of_usage)| AttachmentOperation {
+                        gssi,
+                        detach: false,
+                        class_of_usage,
+                    })
+                    .collect::<Vec<_>>();
+                groups.sort_unstable_by_key(|group| group.gssi);
+                SubscriberRecoveryState {
+                    itsi: client.issi as u64,
+                    groups,
+                    scanning_enabled: client.scanning_enabled,
+                    energy_economy: EnergyEconomyAssignment {
+                        mode: client.energy_saving_mode as u8,
+                        frame_number: client.energy_saving_frame_number,
+                        multiframe_number: client.energy_saving_multiframe_number,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        subscribers.sort_unstable_by_key(|subscriber| subscriber.itsi);
+        subscribers
     }
 
     /// Registers a fresh state for a client, based on ssi
