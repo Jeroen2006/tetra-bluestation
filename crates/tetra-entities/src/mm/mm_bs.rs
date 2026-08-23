@@ -95,6 +95,7 @@ struct PendingAttachment {
 struct PendingLocationAttachment {
     registration: PendingRegistration,
     attachment: PendingAttachment,
+    rua_requested: bool,
 }
 
 impl MmBs {
@@ -1060,6 +1061,7 @@ impl MmBs {
         accepted: bool,
         cause: u16,
         energy_economy: EnergyEconomyAssignment,
+        rua_requested: bool,
         handover_allocation: Option<HandoverChannelAllocation>,
     ) {
         let Some(pending) = self.pending_registrations.get(&command_id) else {
@@ -1141,6 +1143,7 @@ impl MmBs {
                     group_identity_downlink: None,
                 }),
                 seamless_handover,
+                rua_requested,
             );
             tracing::info!(command_id, itsi, target = ?pending.forward_registration_target_station_id, type_one = handover_allocation.is_some(), "forward registration accepted; response will be wrapped in D-NEW-CELL");
             return;
@@ -1222,6 +1225,7 @@ impl MmBs {
                         PendingLocationAttachment {
                             registration: pending,
                             attachment,
+                            rua_requested,
                         },
                     );
                     tracing::info!(
@@ -1240,7 +1244,7 @@ impl MmBs {
             );
             let local_results = Self::local_attachment_results(&attachment);
             let (had_rejection, groups) = self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
-            Self::send_d_location_update_accept(
+            Self::send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
                 pending.air_handle,
@@ -1251,11 +1255,13 @@ impl MmBs {
                     group_identity_accept_reject: u8::from(had_rejection),
                     group_identity_downlink: Some(groups),
                 }),
+                None,
+                rua_requested,
             );
             self.config.state_write().subscribers.mark_active(pending.itsi);
             return;
         }
-        Self::send_d_location_update_accept(
+        Self::send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
             pending.air_handle,
@@ -1266,6 +1272,8 @@ impl MmBs {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
             }),
+            None,
+            rua_requested,
         );
         self.config.state_write().subscribers.mark_active(pending.itsi);
         tracing::info!(
@@ -1545,7 +1553,7 @@ impl MmBs {
         let (had_rejection, groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
-        Self::send_d_location_update_accept(
+        Self::send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
             registration.air_handle,
@@ -1556,6 +1564,8 @@ impl MmBs {
                 group_identity_accept_reject: u8::from(had_rejection),
                 group_identity_downlink: Some(groups),
             }),
+            None,
+            pending.rua_requested,
         );
         self.config.state_write().subscribers.mark_active(registration.itsi);
         tracing::info!(
@@ -1621,6 +1631,7 @@ impl MmBs {
             authentication_successful,
             group_identity_location_accept,
             None,
+            false,
         );
     }
 
@@ -1633,6 +1644,7 @@ impl MmBs {
         authentication_successful: bool,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
         seamless_handover: Option<LmmMleSeamlessHandover>,
+        rua_requested: bool,
     ) {
         let pdu = DLocationUpdateAccept {
             location_update_accept_type: location_update_type,
@@ -1657,7 +1669,14 @@ impl MmBs {
             }),
             group_identity_security_related_information: None,
             cell_type_control: None,
-            proprietary: None,
+            proprietary: rua_requested.then(|| Type3FieldGeneric {
+                field_id: MmType34ElemIdDl::Proprietary.into(),
+                // TTR 001-17 table 1: TETRA MoU (0x01), RUA requested (0x2),
+                // assignment requested with alpha-tag RUI (0b100).
+                len: 15,
+                data: (1 << 7) | (2 << 3) | 4,
+                raw: Vec::new(),
+            }),
         };
         let mut sdu = BitBuffer::new_autoexpand(32);
         pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-LOCATION UPDATE ACCEPT");
@@ -1938,6 +1957,7 @@ impl TetraEntityTrait for MmBs {
                     accepted,
                     cause,
                     energy_economy,
+                    rua_requested,
                     handover_allocation,
                     ..
                 } => self.apply_swmi_registration_decision(
@@ -1948,6 +1968,7 @@ impl TetraEntityTrait for MmBs {
                     accepted,
                     cause,
                     energy_economy,
+                    rua_requested,
                     handover_allocation,
                 ),
                 SwmiMessage::AuthenticationChallenge {
@@ -2189,7 +2210,7 @@ impl TetraEntityTrait for MmBs {
                         multiframe_number: info.multiframe_number,
                     })
                     .unwrap_or_default();
-                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, energy_economy, None);
+                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, energy_economy, false, None);
             }
             let recover_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
                 .pending_attachments

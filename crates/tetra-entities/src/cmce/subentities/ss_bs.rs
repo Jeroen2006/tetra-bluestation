@@ -168,6 +168,13 @@ impl SsBsSubentity {
                 ss_pdu = ?facility.ss_pdu,
                 "unsupported SS-DGNA PDU in U-FACILITY"
             );
+            // The tested MS explicitly responds to INTERROGATE MS GROUPS with
+            // a short, vendor-specific SS-DGNA rejection PDU rather than the
+            // standard INTERROGATE MS GROUPS ACK.  It has already confirmed
+            // link delivery, so do not retry this optional operation forever.
+            // ETSI TS 100 392-12-22 table 70 reserves cause 110 for an
+            // unsupported interrogation type.
+            self.reject_pending_interrogation(issi);
             return;
         };
 
@@ -236,6 +243,26 @@ impl SsBsSubentity {
             }
         }
     }
+
+    fn reject_pending_interrogation(&mut self, issi: u32) {
+        let key = (issi, ACTION_INTERROGATE, None);
+        let Some(pending) = self.pending.remove(&key) else {
+            return;
+        };
+        tracing::info!(
+            job_id = pending.job_id,
+            issi,
+            "terminal does not support DGNA MS-group interrogation"
+        );
+        self.send_result(
+            pending.job_id,
+            issi,
+            ACTION_INTERROGATE,
+            false,
+            INTERROGATION_TYPE_NOT_SUPPORTED,
+            Vec::new(),
+        );
+    }
 }
 
 const SS_DGNA: u64 = 0b010110;
@@ -249,6 +276,7 @@ const INTERROGATE_MS_GROUPS_ACK: u64 = 0b10010;
 const ACTION_ASSIGN: u8 = 1;
 const ACTION_DEASSIGN: u8 = 2;
 const ACTION_INTERROGATE: u8 = 3;
+const INTERROGATION_TYPE_NOT_SUPPORTED: u8 = 0b110;
 
 struct DecodedDgna {
     action: u8,
