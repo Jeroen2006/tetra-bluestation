@@ -125,6 +125,7 @@ impl SwmiMediaEndpoint {
 /// CMCE's independent non-blocking endpoint.  MM and CMCE never compete for
 /// the same receiver, while both submit requests through the worker's single
 /// ordered WSS egress queue.
+#[derive(Clone)]
 pub struct SwmiCmceEndpoint {
     outgoing: Sender<SwmiMessage>,
     incoming: Receiver<SwmiMessage>,
@@ -346,6 +347,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         }
                         Ok(
                             message @ (SwmiMessage::GroupCallStart { .. }
+                            | SwmiMessage::GroupCallPriorityChanged { .. }
+                            | SwmiMessage::FloorPreempted { .. }
                             | SwmiMessage::FloorGranted { .. }
                             | SwmiMessage::FloorReleased { .. }
                             | SwmiMessage::CallDisconnect { .. }
@@ -359,7 +362,10 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::PrivateCallRelease { .. }
                             | SwmiMessage::PrivateFloorGranted { .. }
                             | SwmiMessage::PrivateFloorReleased { .. }
-                            | SwmiMessage::PrivateCallKeepalive { .. }),
+                            | SwmiMessage::PrivateCallKeepalive { .. }
+                            | SwmiMessage::SdsDeliver { .. }
+                            | SwmiMessage::SdsFailure { .. }
+                            | SwmiMessage::StatusDeliver { .. }),
                         ) => {
                             if self.endpoint.cmce_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI CMCE endpoint closed; dropping central call action");

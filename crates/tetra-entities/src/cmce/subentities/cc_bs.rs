@@ -6,17 +6,16 @@ use tetra_core::{Layer2Service, TimeslotOwner, TxReporter, TxState};
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
-        call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase,
-        cmce_pdu_type_dl::CmcePduTypeDl, cmce_pdu_type_ul::CmcePduTypeUl,
-        party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
+        call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_dl::CmcePduTypeDl,
+        cmce_pdu_type_ul::CmcePduTypeUl, party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_connect::DConnect, d_connect_acknowledge::DConnectAcknowledge,
-        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased,
-        d_tx_granted::DTxGranted, d_tx_wait::DTxWait,
-        u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
-        u_tx_demand::UTxDemand,
+        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted,
+        d_tx_interrupt::DTxInterrupt, d_tx_wait::DTxWait,
+        u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup,
+        u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };
@@ -35,6 +34,7 @@ use tetra_saps::{
     tma::AssociatedChannel,
 };
 
+use crate::cmce::subentities::sds_bs::SdsBsSubentity;
 use crate::net_brew;
 use crate::net_swmi::SwmiCmceEndpoint;
 use crate::{
@@ -75,10 +75,11 @@ pub struct CcBsSubentity {
     pending_swmi_setups: HashMap<(u32, u32), SapMsg>,
     central_setup_call_ids: HashMap<(u32, u32), u16>,
     central_setup_call_floors: HashMap<(u32, u32), u32>,
+    central_setup_call_priorities: HashMap<(u32, u32), u8>,
     /// GroupCallStart may arrive at CMCE before MM has applied the matching
     /// attachment decision because the SwMI worker fans messages out to two
     /// independent queues. Keep it until the local listener exists.
-    pending_remote_swmi_calls: HashMap<u16, (u32, u32, u32, bool)>,
+    pending_remote_swmi_calls: HashMap<u16, (u32, u32, u8, u32, bool)>,
     next_swmi_command: u64,
     /// Point-to-point calls are intentionally kept separate from group
     /// `active_calls`: a same-cell P2P call has two radio circuits sharing
@@ -135,6 +136,7 @@ struct ActiveCall {
     source_issi: u32, // Current speaker
     ts: u8,
     usage: u8,
+    priority: u8,
     /// An acknowledged P2MP call uses INFORM2/U-INFO for late entry.
     acknowledged: bool,
     /// True if someone is currently transmitting
@@ -192,6 +194,7 @@ impl CcBsSubentity {
             pending_swmi_setups: HashMap::new(),
             central_setup_call_ids: HashMap::new(),
             central_setup_call_floors: HashMap::new(),
+            central_setup_call_priorities: HashMap::new(),
             pending_remote_swmi_calls: HashMap::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
@@ -263,7 +266,9 @@ impl CcBsSubentity {
         associated_channel: AssociatedChannel,
     ) -> SapMsg {
         let mut message = Self::build_sapmsg(sdu, chan_alloc, address, layer2service, reporter);
-        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else { unreachable!() };
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else {
+            unreachable!()
+        };
         prim.associated_channel = Some(associated_channel);
         message
     }
@@ -357,16 +362,22 @@ impl CcBsSubentity {
         let Some(cou) = self.subscriber_group_cou.get(&(issi, gssi)).copied() else {
             return false;
         };
-        if cou == 6 { // SwMI locked: only this group is receivable.
+        if cou == 6 {
+            // SwMI locked: only this group is receivable.
             return true;
         }
-        if self.subscriber_group_cou.iter().any(|(&(candidate_issi, _), &value)| candidate_issi == issi && value == 6) {
+        if self
+            .subscriber_group_cou
+            .iter()
+            .any(|(&(candidate_issi, _), &value)| candidate_issi == issi && value == 6)
+        {
             return false;
         }
         if cou == 0 || cou == 1 {
             return false;
         }
-        if cou == 4 || cou == 7 { // selected or always scanned
+        if cou == 4 || cou == 7 {
+            // selected or always scanned
             return true;
         }
         self.subscriber_scanning_enabled.get(&issi).copied().unwrap_or(true)
@@ -389,18 +400,36 @@ impl CcBsSubentity {
 
     fn record_uplink_call_location(&mut self, issi: u32, call_id: u16) {
         if let Some(circuit) = self.private_circuits.get(&(call_id, issi)).cloned() {
-            let peer_issi = self.private_calls.get(&call_id).map(|call| {
-                if call.caller_itsi == issi { call.callee_itsi } else { call.caller_itsi }
-            }).unwrap_or(0);
-            self.record_listening_candidate(issi, ListeningCandidate {
-                call_id, timeslot: circuit.ts, usage: circuit.usage,
-                service: ListeningService::Private { peer_issi }, last_seen: self.dltime, confirmed: true,
-            });
-        } else if let Some((timeslot, usage, gssi)) = self.active_calls.get(&call_id)
-            .map(|call| (call.ts, call.usage, call.dest_gssi)) {
+            let peer_issi = self
+                .private_calls
+                .get(&call_id)
+                .map(|call| {
+                    if call.caller_itsi == issi {
+                        call.callee_itsi
+                    } else {
+                        call.caller_itsi
+                    }
+                })
+                .unwrap_or(0);
+            self.record_listening_candidate(
+                issi,
+                ListeningCandidate {
+                    call_id,
+                    timeslot: circuit.ts,
+                    usage: circuit.usage,
+                    service: ListeningService::Private { peer_issi },
+                    last_seen: self.dltime,
+                    confirmed: true,
+                },
+            );
+        } else if let Some((timeslot, usage, gssi)) = self.active_calls.get(&call_id).map(|call| (call.ts, call.usage, call.dest_gssi)) {
             let candidate = ListeningCandidate {
-                call_id, timeslot, usage,
-                service: ListeningService::Group { gssi }, last_seen: self.dltime, confirmed: true,
+                call_id,
+                timeslot,
+                usage,
+                service: ListeningService::Group { gssi },
+                last_seen: self.dltime,
+                confirmed: true,
             };
             self.record_listening_candidate(issi, candidate);
         }
@@ -408,12 +437,19 @@ impl CcBsSubentity {
 
     fn active_associated_channel(&self, candidate: ListeningCandidate) -> Option<AssociatedChannel> {
         let valid = match candidate.service {
-            ListeningService::Group { .. } => self.active_calls.get(&candidate.call_id)
+            ListeningService::Group { .. } => self
+                .active_calls
+                .get(&candidate.call_id)
                 .is_some_and(|call| call.ts == candidate.timeslot && call.usage == candidate.usage),
-            ListeningService::Private { .. } => self.private_circuits.values()
-                .any(|circuit| circuit.call_id == candidate.call_id && circuit.ts == candidate.timeslot && circuit.usage == candidate.usage),
+            ListeningService::Private { .. } => self.private_circuits.values().any(|circuit| {
+                circuit.call_id == candidate.call_id && circuit.ts == candidate.timeslot && circuit.usage == candidate.usage
+            }),
         };
-        valid.then_some(AssociatedChannel { call_id: candidate.call_id, timeslot: candidate.timeslot, usage: candidate.usage })
+        valid.then_some(AssociatedChannel {
+            call_id: candidate.call_id,
+            timeslot: candidate.timeslot,
+            usage: candidate.usage,
+        })
     }
 
     fn preferred_listener_channel(&self, issi: u32) -> Option<AssociatedChannel> {
@@ -422,9 +458,7 @@ impl CcBsSubentity {
         // so it remains the best target even before that MS has transmitted.
         if self.private_call_is_connected_for(issi) {
             if let Some(circuit) = self.private_circuits.iter().find_map(|(&(call_id, owner), circuit)| {
-                (owner == issi
-                    && self.private_calls.get(&call_id).is_some_and(|call| call.connected))
-                    .then_some(circuit)
+                (owner == issi && self.private_calls.get(&call_id).is_some_and(|call| call.connected)).then_some(circuit)
             }) {
                 return Some(AssociatedChannel {
                     call_id: circuit.call_id,
@@ -433,7 +467,9 @@ impl CcBsSubentity {
                 });
             }
         }
-        self.listening_candidates.get(&issi)?.iter()
+        self.listening_candidates
+            .get(&issi)?
+            .iter()
             .filter_map(|candidate| {
                 self.active_associated_channel(*candidate).map(|channel| {
                     let priority = match candidate.service {
@@ -452,25 +488,29 @@ impl CcBsSubentity {
     /// Without this baseline only active speakers could receive SDS/private
     /// signalling on their traffic channel.
     fn track_group_call_listeners(&mut self, call_id: u16) {
-        let Some((timeslot, usage, gssi)) = self.active_calls.get(&call_id)
-            .map(|call| (call.ts, call.usage, call.dest_gssi)) else { return };
-        let listeners: Vec<u32> = self.subscriber_groups.iter()
+        let Some((timeslot, usage, gssi)) = self.active_calls.get(&call_id).map(|call| (call.ts, call.usage, call.dest_gssi)) else {
+            return;
+        };
+        let listeners: Vec<u32> = self
+            .subscriber_groups
+            .iter()
             .filter_map(|(&issi, groups)| {
-                (groups.contains(&gssi)
-                    && self.group_is_receivable(issi, gssi)
-                    && !self.private_call_is_connected_for(issi))
+                (groups.contains(&gssi) && self.group_is_receivable(issi, gssi) && !self.private_call_is_connected_for(issi))
                     .then_some(issi)
             })
             .collect();
         for issi in listeners {
-            self.record_listening_candidate(issi, ListeningCandidate {
-                call_id,
-                timeslot,
-                usage,
-                service: ListeningService::Group { gssi },
-                last_seen: self.dltime,
-                confirmed: false,
-            });
+            self.record_listening_candidate(
+                issi,
+                ListeningCandidate {
+                    call_id,
+                    timeslot,
+                    usage,
+                    service: ListeningService::Group { gssi },
+                    last_seen: self.dltime,
+                    confirmed: false,
+                },
+            );
         }
     }
 
@@ -484,16 +524,32 @@ impl CcBsSubentity {
             if attached_gssi != gssi || !self.group_is_receivable(issi, gssi) || self.private_call_is_connected_for(issi) {
                 continue;
             }
-            let Some(new_priority) = self.effective_scan_priority(issi, gssi) else { continue };
-            let Some(candidates) = self.listening_candidates.get(&issi) else { continue };
-            let Some(current) = candidates.iter().find(|candidate| matches!(candidate.service, ListeningService::Group { .. })) else { continue };
-            let ListeningService::Group { gssi: current_gssi } = current.service else { continue };
-            let Some(current_priority) = self.effective_scan_priority(issi, current_gssi) else { continue };
+            let Some(new_priority) = self.effective_scan_priority(issi, gssi) else {
+                continue;
+            };
+            let Some(candidates) = self.listening_candidates.get(&issi) else {
+                continue;
+            };
+            let Some(current) = candidates
+                .iter()
+                .find(|candidate| matches!(candidate.service, ListeningService::Group { .. }))
+            else {
+                continue;
+            };
+            let ListeningService::Group { gssi: current_gssi } = current.service else {
+                continue;
+            };
+            let Some(current_priority) = self.effective_scan_priority(issi, current_gssi) else {
+                continue;
+            };
             if new_priority <= current_priority {
                 continue;
             }
             if let Some(channel) = self.active_associated_channel(*current) {
-                if !result.iter().any(|existing: &AssociatedChannel| existing.timeslot == channel.timeslot && existing.call_id == channel.call_id) {
+                if !result
+                    .iter()
+                    .any(|existing: &AssociatedChannel| existing.timeslot == channel.timeslot && existing.call_id == channel.call_id)
+                {
                     result.push(channel);
                 }
             }
@@ -507,11 +563,10 @@ impl CcBsSubentity {
     /// message onto a released slot.
     pub fn decorate_pending_downlinks(&self, queue: &mut MessageQueue) {
         for message in queue.iter_mut() {
-            let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else { continue };
-            if prim.associated_channel.is_some()
-                || prim.stealing_permission
-                || prim.chan_alloc.is_some()
-            {
+            let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else {
+                continue;
+            };
+            if prim.associated_channel.is_some() || prim.stealing_permission || prim.chan_alloc.is_some() {
                 continue;
             }
 
@@ -562,7 +617,11 @@ impl CcBsSubentity {
                 continue;
             }
             if let Some(channel) = self.preferred_listener_channel(prim.main_address.ssi) {
-                tracing::debug!(issi = prim.main_address.ssi, ?channel, "routing individual downlink through tracked listening channel");
+                tracing::debug!(
+                    issi = prim.main_address.ssi,
+                    ?channel,
+                    "routing individual downlink through tracked listening channel"
+                );
                 prim.associated_channel = Some(channel);
             }
         }
@@ -572,12 +631,12 @@ impl CcBsSubentity {
         let pending: Vec<_> = self
             .pending_remote_swmi_calls
             .iter()
-            .filter(|(_, (_, gssi, _, _))| groups.contains(gssi) && self.has_listener(*gssi))
-            .map(|(call_id, (owner_itsi, gssi, floor_itsi, acknowledged))| (*call_id, *owner_itsi, *gssi, *floor_itsi, *acknowledged))
+            .filter(|(_, (_, gssi, _, _, _))| groups.contains(gssi) && self.has_listener(*gssi))
+            .map(|(call_id, (owner_itsi, gssi, priority, floor_itsi, acknowledged))| (*call_id, *owner_itsi, *gssi, *priority, *floor_itsi, *acknowledged))
             .collect();
-        for (call_id, owner_itsi, gssi, floor_itsi, acknowledged) in pending {
+        for (call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged) in pending {
             self.pending_remote_swmi_calls.remove(&call_id);
-            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, floor_itsi, acknowledged);
+            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged);
         }
     }
 
@@ -760,6 +819,7 @@ impl CcBsSubentity {
         usage: u8,
         transmission_grant: TransmissionGrant,
         call_ownership: bool,
+        call_priority: u8,
     ) {
         self.send_d_call_proceeding(queue, message, pdu, call_id);
 
@@ -778,7 +838,7 @@ impl CcBsSubentity {
             transmission_grant,
             transmission_request_permission: false,
             call_ownership,
-            call_priority: None,
+            call_priority: Some(call_priority as u64),
             basic_service_information: None,
             temporary_address: None,
             notification_indicator: None,
@@ -1005,6 +1065,8 @@ impl CcBsSubentity {
         let setup_key = (calling_party.ssi, dest_gssi);
         let central_call_id = self.central_setup_call_ids.remove(&setup_key);
         let central_floor_itsi = self.central_setup_call_floors.remove(&setup_key);
+        let central_call_priority = self.central_setup_call_priorities.remove(&setup_key);
+        let assigned_call_priority = central_call_priority.unwrap_or(pdu.call_priority);
         // A new central call grants its initial floor to the setup caller. A
         // setup resumed for an existing call uses the floor state carried by
         // the SwMI; the joining MS must not transmit while another MS owns it.
@@ -1041,6 +1103,7 @@ impl CcBsSubentity {
                     existing_call.usage,
                     grant,
                     caller_has_floor,
+                    assigned_call_priority,
                 );
                 return;
             }
@@ -1132,6 +1195,7 @@ impl CcBsSubentity {
                 TransmissionGrant::NotGranted
             },
             caller_has_central_floor,
+            assigned_call_priority,
         );
 
         // === 3) Send D-SETUP to group (broadcast on MCCH with channel allocation) ===
@@ -1144,12 +1208,14 @@ impl CcBsSubentity {
             basic_service_information: pdu.basic_service_information.clone(),
             transmission_grant: TransmissionGrant::GrantedToOtherUser,
             transmission_request_permission: false,
-            call_priority: pdu.call_priority,
-            notification_indicator: Some(if pdu.basic_service_information.communication_type == CommunicationType::P2MpAcked {
-                NOTIFICATION_LE_ACKNOWLEDGEMENT
-            } else {
-                NOTIFICATION_LE_BROADCAST
-            }),
+            call_priority: assigned_call_priority,
+            notification_indicator: Some(
+                if pdu.basic_service_information.communication_type == CommunicationType::P2MpAcked {
+                    NOTIFICATION_LE_ACKNOWLEDGEMENT
+                } else {
+                    NOTIFICATION_LE_BROADCAST
+                },
+            ),
             temporary_address: None,
             calling_party_address_ssi: Some(calling_party.ssi),
             calling_party_extension: None,
@@ -1195,9 +1261,10 @@ impl CcBsSubentity {
                     }
                 },
                 dest_gssi,
-                source_issi: calling_party.ssi,
+                source_issi: central_floor_itsi.unwrap_or(calling_party.ssi),
                 ts: circuit.ts,
                 usage: circuit.usage,
+                priority: assigned_call_priority,
                 acknowledged: pdu.basic_service_information.communication_type == CommunicationType::P2MpAcked,
                 tx_active: caller_has_central_floor || another_central_speaker,
                 hangtime_start: None,
@@ -1276,7 +1343,9 @@ impl CcBsSubentity {
     /// proves that the terminal joined an acknowledged late-entry call and is
     /// stronger evidence than a predicted PGS switch.
     fn rx_u_info(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
-        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else { return };
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            return;
+        };
         let itsi = prim.received_tetra_address.ssi;
         let Ok(pdu) = UInfo::from_bitbuf(&mut prim.sdu) else {
             tracing::warn!(itsi, "cannot parse U-INFO");
@@ -1286,13 +1355,20 @@ impl CcBsSubentity {
             tracing::debug!(itsi, call_id = pdu.call_identifier, "non-poll U-INFO ignored for late entry");
             return;
         }
-        let Some((timeslot, usage, gssi, acknowledged)) = self.active_calls.get(&pdu.call_identifier)
-            .map(|call| (call.ts, call.usage, call.dest_gssi, call.acknowledged)) else {
+        let Some((timeslot, usage, gssi, acknowledged)) = self
+            .active_calls
+            .get(&pdu.call_identifier)
+            .map(|call| (call.ts, call.usage, call.dest_gssi, call.acknowledged))
+        else {
             tracing::warn!(itsi, call_id = pdu.call_identifier, "U-INFO poll response for unknown call");
             return;
         };
         if !acknowledged {
-            tracing::debug!(itsi, call_id = pdu.call_identifier, "U-INFO poll response ignored for non-acknowledged group call");
+            tracing::debug!(
+                itsi,
+                call_id = pdu.call_identifier,
+                "U-INFO poll response ignored for non-acknowledged group call"
+            );
             return;
         }
         let candidate = ListeningCandidate {
@@ -1304,10 +1380,15 @@ impl CcBsSubentity {
             confirmed: true,
         };
         self.record_listening_candidate(itsi, candidate);
-        tracing::info!(itsi, call_id = pdu.call_identifier, gssi, "U-INFO poll response recorded as late-entry acknowledgement");
+        tracing::info!(
+            itsi,
+            call_id = pdu.call_identifier,
+            gssi,
+            "U-INFO poll response recorded as late-entry acknowledgement"
+        );
     }
 
-    pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
+    pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime, sds: &mut SdsBsSubentity) {
         self.dltime = dltime;
 
         // Central decisions are applied on the radio/router thread, never on
@@ -1319,7 +1400,11 @@ impl CcBsSubentity {
             }
         }
         for action in swmi_actions {
-            self.handle_swmi_action(queue, action);
+            if SdsBsSubentity::is_swmi_action(&action) {
+                sds.handle_swmi_action(queue, action);
+            } else {
+                self.handle_swmi_action(queue, action);
+            }
         }
 
         // Check hangtime expiry for active local calls
@@ -1464,6 +1549,7 @@ impl CcBsSubentity {
                 call_id,
                 owner_itsi,
                 gssi,
+                priority,
                 floor_itsi,
                 acknowledged,
                 ..
@@ -1489,10 +1575,11 @@ impl CcBsSubentity {
                         .expect("pending setup key found immediately above");
                     self.central_setup_call_ids.insert(pending_key, call_id);
                     self.central_setup_call_floors.insert(pending_key, floor_itsi as u32);
+                    self.central_setup_call_priorities.insert(pending_key, priority);
                     self.rx_u_setup(queue, request);
                 } else if !self.has_listener(gssi) {
                     self.pending_remote_swmi_calls
-                        .insert(call_id, (owner_itsi as u32, gssi, floor_itsi as u32, acknowledged));
+                        .insert(call_id, (owner_itsi as u32, gssi, priority, floor_itsi as u32, acknowledged));
                     tracing::debug!(
                         call_id,
                         owner_itsi,
@@ -1500,8 +1587,21 @@ impl CcBsSubentity {
                         "deferring SwMI group call until local attachment is active"
                     );
                 } else {
-                    self.start_remote_swmi_call(queue, call_id, owner_itsi as u32, gssi, floor_itsi as u32, acknowledged);
+                    self.start_remote_swmi_call(queue, call_id, owner_itsi as u32, gssi, priority, floor_itsi as u32, acknowledged);
                 }
+            }
+            SwmiMessage::GroupCallPriorityChanged { call_id, priority, owner_itsi: _ } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                if let Some(call) = self.active_calls.get_mut(&call_id) {
+                    call.priority = priority;
+                }
+                if let Some((setup, _, _)) = self.cached_setups.get_mut(&call_id) {
+                    setup.call_priority = priority;
+                }
+            }
+            SwmiMessage::FloorPreempted { call_id, previous_itsi, next_itsi } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                self.apply_floor_preemption(queue, call_id, previous_itsi as u32, next_itsi as u32);
             }
             SwmiMessage::FloorGranted { call_id, itsi } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
@@ -1515,7 +1615,9 @@ impl CcBsSubentity {
                 // Send the explicit response first.  A group D-TX GRANTED is
                 // deliberately after it, so a pending U-TX DEMAND cannot be
                 // cancelled by the "granted to another user" indication.
-                self.send_d_tx_granted_individual_facch(queue, call_id, itsi as u32, ts);
+                if self.subscriber_groups.contains_key(&(itsi as u32)) {
+                    self.send_d_tx_granted_individual_facch(queue, call_id, itsi as u32, ts);
+                }
                 self.send_d_tx_granted_facch(queue, call_id, itsi as u32, dest_gssi, ts);
                 queue.push_back(SapMsg {
                     sap: Sap::Control,
@@ -1962,7 +2064,16 @@ impl CcBsSubentity {
 
     /// Allocate the local radio circuit for a centrally-started group call at
     /// a non-originating BS.  Its call identifier is *not* locally generated.
-    fn start_remote_swmi_call(&mut self, queue: &mut MessageQueue, call_id: u16, owner_itsi: u32, gssi: u32, floor_itsi: u32, acknowledged: bool) {
+    fn start_remote_swmi_call(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        owner_itsi: u32,
+        gssi: u32,
+        priority: u8,
+        floor_itsi: u32,
+        acknowledged: bool,
+    ) {
         if !self.has_listener(gssi) || self.active_calls.contains_key(&call_id) {
             return;
         }
@@ -1970,7 +2081,11 @@ impl CcBsSubentity {
             let mut state = self.config.state_write();
             self.circuits.allocate_circuit_with_allocator_and_call_id(
                 Direction::Both,
-                if acknowledged { CommunicationType::P2MpAcked } else { CommunicationType::P2Mp },
+                if acknowledged {
+                    CommunicationType::P2MpAcked
+                } else {
+                    CommunicationType::P2Mp
+                },
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
                 call_id,
@@ -1991,7 +2106,11 @@ impl CcBsSubentity {
             basic_service_information: BasicServiceInformation {
                 circuit_mode_type: CircuitModeType::TchS,
                 encryption_flag: false,
-                communication_type: if acknowledged { CommunicationType::P2MpAcked } else { CommunicationType::P2Mp },
+                communication_type: if acknowledged {
+                    CommunicationType::P2MpAcked
+                } else {
+                    CommunicationType::P2Mp
+                },
                 slots_per_frame: None,
                 speech_service: Some(0),
             },
@@ -2001,7 +2120,7 @@ impl CcBsSubentity {
                 TransmissionGrant::GrantedToOtherUser
             },
             transmission_request_permission: false,
-            call_priority: 0,
+            call_priority: priority,
             notification_indicator: Some(if acknowledged {
                 NOTIFICATION_LE_ACKNOWLEDGEMENT
             } else {
@@ -2048,6 +2167,7 @@ impl CcBsSubentity {
                 source_issi: floor_itsi,
                 ts: circuit.ts,
                 usage: circuit.usage,
+                priority,
                 acknowledged,
                 tx_active: floor_itsi != 0,
                 hangtime_start: None,
@@ -2719,6 +2839,7 @@ impl CcBsSubentity {
                     command_id,
                     call_id: call_id as u64,
                     itsi: requesting_party.ssi as u64,
+                    tx_demand_priority: pdu.tx_demand_priority,
                 })
                 .is_ok()
             {
@@ -3224,6 +3345,7 @@ impl CcBsSubentity {
                 source_issi,
                 ts,
                 usage,
+                priority: 0,
                 acknowledged: false,
                 tx_active: true,
                 hangtime_start: None,
@@ -3291,6 +3413,93 @@ impl CcBsSubentity {
             // Already in hangtime or idle, release immediately
             self.release_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
+    }
+
+    /// Apply the SwMI's pre-emption decision in the exact Figure 29 order.
+    /// The old holder is addressed individually at its serving BS; every BS
+    /// with the group circuit broadcasts the group indication before the
+    /// subsequent FloorGranted action sends D-TX-GRANTED.
+    fn apply_floor_preemption(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        previous_itsi: u32,
+        next_itsi: u32,
+    ) {
+        let (dest_gssi, ts) = {
+            let Some(call) = self.active_calls.get_mut(&call_id) else { return };
+            if call.source_issi != previous_itsi || !call.tx_active {
+                tracing::debug!(call_id, previous_itsi, next_itsi, "ignoring stale central floor-pre-emption");
+                return;
+            }
+            call.tx_active = false;
+            call.hangtime_start = Some(self.dltime);
+            (call.dest_gssi, call.ts)
+        };
+
+        if self.subscriber_groups.contains_key(&previous_itsi) {
+            self.send_d_tx_interrupt_individual_facch(queue, call_id, previous_itsi, next_itsi, ts);
+        }
+        self.send_d_tx_interrupt_group_facch(queue, call_id, next_itsi, dest_gssi, ts);
+        for dest in [TetraEntity::Umac, TetraEntity::Swmi] {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
+            });
+        }
+    }
+
+    fn send_d_tx_interrupt_individual_facch(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        previous_itsi: u32,
+        next_itsi: u32,
+        ts: u8,
+    ) {
+        self.send_d_tx_interrupt_facch(queue, call_id, next_itsi, TetraAddress::new(previous_itsi, SsiType::Issi), ts);
+    }
+
+    fn send_d_tx_interrupt_group_facch(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        next_itsi: u32,
+        dest_gssi: u32,
+        ts: u8,
+    ) {
+        self.send_d_tx_interrupt_facch(queue, call_id, next_itsi, TetraAddress::new(dest_gssi, SsiType::Gssi), ts);
+    }
+
+    fn send_d_tx_interrupt_facch(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        next_itsi: u32,
+        address: TetraAddress,
+        ts: u8,
+    ) {
+        let pdu = DTxInterrupt {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1),
+            transmitting_party_address_ssi: Some(next_itsi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("serialize D-TX INTERRUPT");
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg_stealing(sdu, address, ts));
     }
 
     /// Send D-TX GRANTED via FACCH stealing
