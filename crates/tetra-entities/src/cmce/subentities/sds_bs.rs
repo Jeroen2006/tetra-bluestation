@@ -32,6 +32,7 @@ const SDS_FAILURE_UNKNOWN_DESTINATION: u8 = 0x2d;
 const SDS_FAILURE_DELIVERY_FAILED: u8 = 0x32;
 const SDS_FAILURE_DESTINATION_NOT_REGISTERED: u8 = 0x33;
 const SDS_FAILURE_DESTINATION_NOT_REACHABLE: u8 = 0x3d;
+const RUA_SDS_TL_PID: u8 = 0xc1;
 
 struct PendingSdsDelivery {
     transaction_id: Option<u64>,
@@ -72,6 +73,27 @@ impl SdsBsSubentity {
         let id = self.next_command_id;
         self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
         id
+    }
+
+    /// Record only an RUA state that has been observable on the air
+    /// interface.  The value is later included in the LST recovery snapshot;
+    /// it is not a replacement for the SwMI's durable RUA assignment.
+    fn observe_rua(&self, issi: u32, data_type: u8, data: &[u8]) {
+        if data_type != 3 || data.len() < 4 || data[0] != RUA_SDS_TL_PID {
+            return;
+        }
+        let state = match data[3] {
+            2 => Some(true),  // RUA Accept / dispatcher Book On acknowledgement
+            3 | 4 => Some(false), // RUA Reject / RUA Cancel
+            _ => None,
+        };
+        if let Some(assigned) = state {
+            self.config
+                .state_write()
+                .subscribers
+                .set_rua_assignment_state(issi, Some(assigned));
+            tracing::info!(issi, assigned, rua_pdu_type = data[3], "updated locally observed RUA state");
+        }
     }
 
     pub fn tick_start(&mut self, queue: &mut MessageQueue) {
@@ -127,6 +149,9 @@ impl SdsBsSubentity {
                 data,
             } => {
                 tracing::info!(transaction_id, source_issi, destination_ssi, "SwMI SDS delivery received by BS");
+                if !destination_is_group {
+                    self.observe_rua(destination_ssi, data_type, &data);
+                }
                 self.deliver_from_swmi(
                     queue,
                     transaction_id,
@@ -198,6 +223,9 @@ impl SdsBsSubentity {
         let destination_is_group = !self.config.state_read().subscribers.is_registered(destination_ssi)
             && self.config.state_read().subscribers.has_group_members(destination_ssi);
         if self.swmi_online() {
+            let data_type = pdu.user_defined_data.type_identifier();
+            let data = pdu.user_defined_data.to_arr();
+            self.observe_rua(source_issi, data_type, &data);
             let command_id = self.next_command_id();
             let submitted = self
                 .swmi
@@ -208,9 +236,9 @@ impl SdsBsSubentity {
                     source_issi: source_issi as u64,
                     destination_ssi,
                     destination_is_group,
-                    data_type: pdu.user_defined_data.type_identifier(),
+                    data_type,
                     length_bits: pdu.user_defined_data.length_bits(),
-                    data: pdu.user_defined_data.to_arr(),
+                    data,
                 })
                 .is_ok();
             if !submitted {

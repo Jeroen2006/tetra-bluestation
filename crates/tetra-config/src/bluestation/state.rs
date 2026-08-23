@@ -21,6 +21,10 @@ pub struct Subscriber {
     pub energy_economy_activation_pending: bool,
     /// Group MCCH replay is relevant only while the terminal scans groups.
     pub scanning_enabled: bool,
+    /// Last RUA state observed on the air interface.  This is deliberately
+    /// optional: local-site trunking must not invent an RUA state for a radio
+    /// that has not exchanged an RUA control PDU with this BS.
+    pub rua_assigned: Option<bool>,
 }
 
 /// Centralized subscriber registry tracking locally registered ISSIs and their group affiliations.
@@ -125,6 +129,7 @@ impl SubscriberRegistry {
                 energy_economy_multiframe_number: None,
                 energy_economy_activation_pending: false,
                 scanning_enabled: true,
+                rua_assigned: None,
             },
         );
     }
@@ -139,6 +144,7 @@ impl SubscriberRegistry {
             energy_economy_multiframe_number: None,
             energy_economy_activation_pending: false,
             scanning_enabled: true,
+            rua_assigned: None,
         })
     }
 
@@ -209,6 +215,16 @@ impl SubscriberRegistry {
         if let Some(subscriber) = self.subscribers.get_mut(&issi) {
             subscriber.scanning_enabled = enabled;
         }
+    }
+
+    pub fn set_rua_assignment_state(&mut self, issi: u32, assigned: Option<bool>) {
+        if let Some(subscriber) = self.subscribers.get_mut(&issi) {
+            subscriber.rua_assigned = assigned;
+        }
+    }
+
+    pub fn rua_assignment_state(&self, issi: u32) -> Option<bool> {
+        self.subscribers.get(&issi).and_then(|subscriber| subscriber.rua_assigned)
     }
 
     pub fn energy_economy(&self, issi: u32) -> Option<(u8, Option<u8>, Option<u8>)> {

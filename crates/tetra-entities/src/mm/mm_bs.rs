@@ -2121,7 +2121,10 @@ impl TetraEntityTrait for MmBs {
                         tracing::warn!(command_id, "duplicate LST recovery request ignored");
                         continue;
                     }
-                    let subscribers = self.client_mgr.lst_recovery_snapshot();
+                    let rua_state = self.config.state_read().subscribers.clone();
+                    let subscribers = self
+                        .client_mgr
+                        .lst_recovery_snapshot(|issi| rua_state.rua_assignment_state(issi));
                     let subscriber_count = subscribers.len();
                     let Some(endpoint) = self.swmi.as_ref() else {
                         self.pending_lst_recoveries.remove(&command_id);
@@ -2149,6 +2152,11 @@ impl TetraEntityTrait for MmBs {
                     let accepted_count = accepted.len();
                     let rejected_count = rejected.len();
                     for subscriber in accepted {
+                        let requested_rua_reassignment = subscriber.rua_assigned == Some(false)
+                            && u32::try_from(subscriber.itsi)
+                                .ok()
+                                .and_then(|issi| self.config.state_read().subscribers.rua_assignment_state(issi))
+                                == Some(true);
                         self.apply_swmi_subscriber_state_sync(
                             queue,
                             subscriber.itsi,
@@ -2156,6 +2164,18 @@ impl TetraEntityTrait for MmBs {
                             subscriber.scanning_enabled,
                             subscriber.energy_economy,
                         );
+                        if requested_rua_reassignment {
+                            let issi = subscriber.itsi as u32;
+                            // TTR 001-17 figure 5: a D-LOCATION UPDATE COMMAND
+                            // causes U-LOCATION UPDATE DEMAND, whose accept can
+                            // carry the alpha-tag RUA assignment request.
+                            self.config
+                                .state_write()
+                                .subscribers
+                                .set_rua_assignment_state(issi, None);
+                            Self::send_d_location_update_command(queue, issi, 0);
+                            tracing::info!(issi, command_id, "requested fresh RUA registration after LST mismatch");
+                        }
                     }
                     for rejection in rejected {
                         let Ok(issi) = u32::try_from(rejection.itsi) else {
