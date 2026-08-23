@@ -100,7 +100,12 @@ impl<D: RxTxDev> PhyBs<D> {
         queue.push_back(sapmsg);
     }
 
-    fn split_rxslot_and_send_to_lmac(queue: &mut MessageQueue, ul_time: TdmaTime, burst: &RxBurstBits<'_>) {
+    fn split_rxslot_and_send_to_lmac(
+        queue: &mut MessageQueue,
+        ul_time: TdmaTime,
+        burst: &RxBurstBits<'_>,
+        block_num: PhyBlockNum,
+    ) {
         let train_seq = burst.train_type;
         match train_seq {
             TrainingSequence::NormalTrainSeq1 => {
@@ -131,7 +136,12 @@ impl<D: RxTxDev> PhyBs<D> {
                 blk.copy_bits_from_bitarr(&burst.bits[CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS]);
                 blk.seek(0);
 
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::CUB, PhyBlockType::SSN1, PhyBlockNum::Block1, blk);
+                let block_type = match block_num {
+                    PhyBlockNum::Block1 => PhyBlockType::SSN1,
+                    PhyBlockNum::Block2 => PhyBlockType::SSN2,
+                    other => panic!("CUB burst must belong to one subslot, got {:?}", other),
+                };
+                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::CUB, block_type, block_num, blk);
             }
 
             _ => panic!(),
@@ -234,7 +244,12 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(3, self.tick, rx_slot.slot.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.slot);
+                    Self::split_rxslot_and_send_to_lmac(
+                        queue,
+                        self.dltime.add_timeslots(-2),
+                        &rx_slot.slot,
+                        PhyBlockNum::Both,
+                    );
                     slot_sent = true;
                 }
                 if rx_slot.subslot1.train_type != TrainingSequence::NotFound {
@@ -247,7 +262,12 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(1, self.tick, rx_slot.subslot1.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.subslot1);
+                    Self::split_rxslot_and_send_to_lmac(
+                        queue,
+                        self.dltime.add_timeslots(-2),
+                        &rx_slot.subslot1,
+                        PhyBlockNum::Block1,
+                    );
                     slot_sent = true;
                 }
                 if rx_slot.subslot2.train_type != TrainingSequence::NotFound {
@@ -260,7 +280,12 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(2, self.tick, rx_slot.subslot2.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.subslot2);
+                    Self::split_rxslot_and_send_to_lmac(
+                        queue,
+                        self.dltime.add_timeslots(-2),
+                        &rx_slot.subslot2,
+                        PhyBlockNum::Block2,
+                    );
                 }
             }
         }

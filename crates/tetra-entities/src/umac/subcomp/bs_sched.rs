@@ -1397,12 +1397,11 @@ impl BsChannelScheduler {
                     "transmitting queued associated FN18 SCH/F control block"
                 );
             }
-            let mut buf = associated_control.unwrap_or_else(|| {
+            let buf = associated_control.unwrap_or_else(|| {
                 let mut idle = BitBuffer::new(SCH_F_CAP);
-                MacResource::null_pdu().to_bitbuf(&mut idle);
+                finalize_downlink_mac_block(&mut idle);
                 idle
             });
-            buf.seek(0);
             TmvUnitdataReqSlot {
                 ts,
                 blk1: Some(TmvUnitdataReq {
@@ -2221,6 +2220,8 @@ mod tests {
         let mut mac_block = blk1.mac_block.clone();
         mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated FN18 resource");
+        assert!(!resource.is_null_pdu(), "associated FN18 must not be replaced by a Null PDU");
+        assert_eq!(resource.addr.map(|address| address.ssi), Some(addr.ssi), "associated FN18 grant must target the queued address");
         assert!(resource.slot_granting_element.is_some(), "grant must be built at actual FN18 transmission time");
         assert_eq!(
             sched.ul_get_slot_owner(usable, PhyBlockNum::Both),
@@ -2276,6 +2277,8 @@ mod tests {
         let mut mac_block = blk1.mac_block.clone();
         mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut mac_block).expect("valid associated grant resource");
+        assert!(!resource.is_null_pdu(), "associated FN18 grant must not be overwritten by a Null PDU");
+        assert_eq!(resource.addr.map(|address| address.ssi), Some(addr.ssi), "associated FN18 grant must target the queued address");
         let grant = resource.slot_granting_element.expect("grant must be built at actual FN18");
         let target = usable;
         let target_block = match grant.capacity_allocation {
