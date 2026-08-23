@@ -3,7 +3,7 @@ use core::fmt;
 use tetra_core::{BitBuffer, assert_warn, pdu_parse_error::PduParseErr};
 
 /// Clause 18.5.2.1 D-MLE-SYSINFO Table 18.26: BS Service details information element
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BsServiceDetails {
     // 1
     pub registration: bool,

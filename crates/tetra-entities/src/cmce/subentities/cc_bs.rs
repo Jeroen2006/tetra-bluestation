@@ -11,11 +11,11 @@ use tetra_pdus::cmce::{
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
-        d_alert::DAlert, d_call_proceeding::DCallProceeding, d_connect::DConnect, d_connect_acknowledge::DConnectAcknowledge,
-        d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted,
-        d_tx_interrupt::DTxInterrupt, d_tx_wait::DTxWait,
-        u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup,
-        u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
+        d_alert::DAlert, d_call_proceeding::DCallProceeding, d_call_restore::DCallRestore, d_connect::DConnect,
+        d_connect_acknowledge::DConnectAcknowledge, d_info::DInfo, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased,
+        d_tx_granted::DTxGranted, d_tx_interrupt::DTxInterrupt, d_tx_wait::DTxWait, u_alert::UAlert, u_call_restore::UCallRestore,
+        u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
+        u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };
@@ -41,12 +41,17 @@ use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
 };
-use tetra_swmi_protocol::SwmiMessage;
+use tetra_swmi_protocol::{HandoverChannelAllocation, SwmiMessage};
 
 // ETSI EN 300 392-9, table 3: notification indicator 0 is INFORM1 (LE
 // broadcast); 1 is INFORM2 (LE acknowledgement).
 const NOTIFICATION_LE_BROADCAST: u64 = 0;
 const NOTIFICATION_LE_ACKNOWLEDGEMENT: u64 = 1;
+/// A D-TX-INTERRUPT must reach the current speaker before the replacement
+/// holder receives D-TX-GRANTED.  The UMAC scheduler emits FACCH a few slots
+/// ahead of CMCE, so six complete TDMA frames leaves a deterministic receive
+/// window even when all SwMI actions arrive in the same websocket drain.
+const PREEMPTION_GUARD_TIMESLOTS: i32 = 24;
 
 /// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {
@@ -80,6 +85,10 @@ pub struct CcBsSubentity {
     /// attachment decision because the SwMI worker fans messages out to two
     /// independent queues. Keep it until the local listener exists.
     pending_remote_swmi_calls: HashMap<u16, (u32, u32, u8, u32, bool)>,
+    /// Floor grants held briefly after an on-air D-TX-INTERRUPT.  Without this
+    /// barrier UMAC leaves hangtime immediately and a still-transmitting MS
+    /// can overlap the emergency speaker before it receives the interrupt.
+    pending_preemptive_floor_grants: HashMap<u16, (u32, TdmaTime)>,
     next_swmi_command: u64,
     /// Point-to-point calls are intentionally kept separate from group
     /// `active_calls`: a same-cell P2P call has two radio circuits sharing
@@ -196,6 +205,7 @@ impl CcBsSubentity {
             central_setup_call_floors: HashMap::new(),
             central_setup_call_priorities: HashMap::new(),
             pending_remote_swmi_calls: HashMap::new(),
+            pending_preemptive_floor_grants: HashMap::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
             pending_private_setups: HashMap::new(),
@@ -222,6 +232,7 @@ impl CcBsSubentity {
             alloc_type: ChanAllocType::Replace,
             carrier: None,
             timeslots,
+            cell_change_flag: false,
             ul_dl_assigned: ul_dl,
         };
         (sdu, chan_alloc)
@@ -282,6 +293,7 @@ impl CcBsSubentity {
             carrier: None,
             timeslots,
             alloc_type: ChanAllocType::Replace,
+            cell_change_flag: false,
             ul_dl_assigned: UlDlAssignment::Both,
         };
 
@@ -632,7 +644,9 @@ impl CcBsSubentity {
             .pending_remote_swmi_calls
             .iter()
             .filter(|(_, (_, gssi, _, _, _))| groups.contains(gssi) && self.has_listener(*gssi))
-            .map(|(call_id, (owner_itsi, gssi, priority, floor_itsi, acknowledged))| (*call_id, *owner_itsi, *gssi, *priority, *floor_itsi, *acknowledged))
+            .map(|(call_id, (owner_itsi, gssi, priority, floor_itsi, acknowledged))| {
+                (*call_id, *owner_itsi, *gssi, *priority, *floor_itsi, *acknowledged)
+            })
             .collect();
         for (call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged) in pending {
             self.pending_remote_swmi_calls.remove(&call_id);
@@ -876,6 +890,7 @@ impl CcBsSubentity {
                     alloc_type: ChanAllocType::Replace,
                     carrier: None,
                     timeslots,
+                    cell_change_flag: false,
                     ul_dl_assigned: UlDlAssignment::Both,
                 }),
                 associated_channel: None,
@@ -1330,13 +1345,115 @@ impl CcBsSubentity {
             CmcePduTypeUl::UAlert => self.rx_private_u_alert(message),
             CmcePduTypeUl::UConnect => self.rx_private_u_connect(message),
             CmcePduTypeUl::UInfo => self.rx_u_info(_queue, message),
-            CmcePduTypeUl::UStatus | CmcePduTypeUl::UCallRestore => {
-                unimplemented_log!("{}", pdu_type);
-            }
+            CmcePduTypeUl::UCallRestore => self.rx_u_call_restore(_queue, message),
+            CmcePduTypeUl::UStatus => unimplemented_log!("{}", pdu_type),
             _ => {
                 panic!();
             }
         }
+    }
+
+    /// Complete the CMCE half of an MLE U-RESTORE. MLE wraps the resulting
+    /// D-CALL-RESTORE in D-RESTORE-ACK, so CMCE stays unaware of the MLE
+    /// transport wrapper.
+    fn rx_u_call_restore(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            return;
+        };
+        let itsi = prim.received_tetra_address.ssi;
+        let pdu = match UCallRestore::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(itsi, ?error, "invalid U-CALL RESTORE");
+                self.send_restore_failure(queue, itsi);
+                return;
+            }
+        };
+        let group_call = self.active_calls.get(&pdu.call_identifier).filter(|call| {
+            self.subscriber_groups
+                .get(&itsi)
+                .is_some_and(|groups| groups.contains(&call.dest_gssi))
+        });
+        let private_circuit = self.private_circuits.get(&(pdu.call_identifier, itsi));
+        let Some((transmission_grant, transmission_request_permission, usage, ts)) = group_call
+            .map(|call| {
+                (
+                    if call.tx_active && call.source_issi == itsi {
+                        TransmissionGrant::Granted
+                    } else {
+                        TransmissionGrant::GrantedToOtherUser
+                    },
+                    false,
+                    call.usage,
+                    call.ts,
+                )
+            })
+            .or_else(|| private_circuit.map(|circuit| (TransmissionGrant::GrantedToOtherUser, false, circuit.usage, circuit.ts)))
+        else {
+            tracing::info!(
+                itsi,
+                call_id = pdu.call_identifier,
+                "U-CALL RESTORE rejected because the call is not active at this serving cell"
+            );
+            self.send_restore_failure(queue, itsi);
+            return;
+        };
+        let response = DCallRestore {
+            call_identifier: pdu.call_identifier,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission,
+            // A successful restoration returns the MS to the existing call;
+            // it does not restart T310 merely because the serving cell changed.
+            reset_call_time_out_timer_t310_: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_status: None,
+            modify: None,
+            notification_indicator: None,
+            facility: None,
+            temporary_address: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        if response.to_bitbuf(&mut sdu).is_err() {
+            self.send_restore_failure(queue, itsi);
+            return;
+        }
+        sdu.seek(0);
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+        queue.push_back(Self::build_sapmsg(
+            sdu,
+            Some(CmceChanAllocReq {
+                usage: Some(usage),
+                alloc_type: ChanAllocType::Replace,
+                carrier: None,
+                timeslots,
+                cell_change_flag: false,
+                ul_dl_assigned: UlDlAssignment::Both,
+            }),
+            TetraAddress::issi(itsi),
+            Layer2Service::Acknowledged,
+            None,
+        ));
+        // U-RESTORE positively confirms that this MS has reached the target
+        // traffic circuit. Keep the local delivery/routing hint aligned with
+        // the restored serving-cell context.
+        self.record_uplink_call_location(itsi, pdu.call_identifier);
+        tracing::info!(itsi, call_id = pdu.call_identifier, "U-CALL RESTORE accepted");
+    }
+
+    /// An empty internal CMCE SDU is a deliberate MLE-only sentinel. MLE
+    /// converts it to D-RESTORE-FAIL and it is never sent to LLC.
+    fn send_restore_failure(&self, queue: &mut MessageQueue, itsi: u32) {
+        queue.push_back(Self::build_sapmsg(
+            BitBuffer::new_autoexpand(0),
+            None,
+            TetraAddress::issi(itsi),
+            Layer2Service::Acknowledged,
+            None,
+        ));
     }
 
     /// INFORM2 ACK is carried by the ordinary U-INFO poll-response bit.  It
@@ -1406,6 +1523,8 @@ impl CcBsSubentity {
                 self.handle_swmi_action(queue, action);
             }
         }
+
+        self.process_pending_preemptive_floor_grants(queue);
 
         // Check hangtime expiry for active local calls
         self.check_hangtime_expiry(queue);
@@ -1542,9 +1661,128 @@ impl CcBsSubentity {
         }
     }
 
+    /// Allocate the local RF resources for one or both endpoints of an
+    /// already-known individual call.  The caller decides whether this is a
+    /// normal reserve (which must report the result to the SwMI) or a restore
+    /// of a call that is already active centrally (which must not).
+    fn allocate_private_call_resources(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        caller_itsi: u64,
+        callee_itsi: u64,
+        endpoint_mask: u8,
+        duplex: bool,
+    ) -> bool {
+        let Some(call) = self.private_calls.get(&call_id).cloned() else {
+            return false;
+        };
+        let original_local_mask = call.local_mask;
+        if let Some(local) = self.private_calls.get_mut(&call_id) {
+            local.local_mask |= endpoint_mask;
+        }
+
+        // A simplex P2P call with both endpoints at this cell uses one
+        // bidirectional traffic channel, just like a two-member private P2MP
+        // call. Allocating a TCH per ISSI wastes a carrier slot and is only
+        // required for duplex P2P.
+        let shared_simplex = !duplex && endpoint_mask & 0x03 == 0x03;
+        let mut shared_circuit = if shared_simplex {
+            [caller_itsi as u32, callee_itsi as u32]
+                .into_iter()
+                .find_map(|itsi| self.private_circuits.get(&(call_id, itsi)).cloned())
+        } else {
+            None
+        };
+        if shared_simplex {
+            tracing::info!(
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                "reserving one shared radio circuit for same-cell simplex private call"
+            );
+        }
+
+        let mut allocated = Vec::new();
+        for (mask, itsi) in [(0x01, caller_itsi as u32), (0x02, callee_itsi as u32)] {
+            if endpoint_mask & mask == 0 || self.private_circuits.contains_key(&(call_id, itsi)) {
+                continue;
+            }
+            if let Some(circuit) = shared_circuit.as_ref() {
+                self.private_circuits.insert((call_id, itsi), circuit.clone());
+                continue;
+            }
+            let result = {
+                let mut state = self.config.state_write();
+                self.circuits
+                    .allocate_circuit_with_allocator_and_call_id_and_mode(
+                        Direction::Both,
+                        CommunicationType::P2p,
+                        &mut state.timeslot_alloc,
+                        TimeslotOwner::Cmce,
+                        call_id,
+                        duplex,
+                    )
+                    .map(Clone::clone)
+            };
+            match result {
+                Ok(circuit) => {
+                    Self::signal_umac_circuit_open(queue, &circuit);
+                    self.private_circuits.insert((call_id, itsi), circuit.clone());
+                    allocated.push((itsi, circuit));
+                    if shared_simplex {
+                        shared_circuit = allocated.last().map(|(_, circuit)| circuit.clone());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(call_id, itsi, ?error, "private call resource allocation failed");
+                    for (allocated_itsi, circuit) in allocated {
+                        self.private_circuits.remove(&(call_id, allocated_itsi));
+                        let _ = self.circuits.close_circuit(Direction::Both, circuit.ts);
+                        Self::signal_umac_circuit_close(queue, circuit.clone());
+                        self.release_timeslot(circuit.ts);
+                    }
+                    if let Some(local) = self.private_calls.get_mut(&call_id) {
+                        local.local_mask = original_local_mask;
+                    }
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Apply a central call/floor decision received over the SwMI WSS link.
     fn handle_swmi_action(&mut self, queue: &mut MessageQueue, action: SwmiMessage) {
         match action {
+            SwmiMessage::HandoverReserveGroupCall {
+                reservation_id,
+                itsi,
+                call_id,
+                owner_itsi,
+                gssi,
+                priority,
+                floor_itsi,
+                acknowledged,
+            } => {
+                let allocation = self.reserve_seamless_handover_group_call(
+                    queue,
+                    itsi as u32,
+                    call_id,
+                    owner_itsi as u32,
+                    gssi,
+                    priority,
+                    floor_itsi as u32,
+                    acknowledged,
+                );
+                if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                    let _ = swmi.submit(SwmiMessage::HandoverReservationResult {
+                        reservation_id,
+                        accepted: allocation.is_some(),
+                        allocation,
+                    });
+                }
+            }
             SwmiMessage::GroupCallStart {
                 call_id,
                 owner_itsi,
@@ -1590,7 +1828,11 @@ impl CcBsSubentity {
                     self.start_remote_swmi_call(queue, call_id, owner_itsi as u32, gssi, priority, floor_itsi as u32, acknowledged);
                 }
             }
-            SwmiMessage::GroupCallPriorityChanged { call_id, priority, owner_itsi: _ } => {
+            SwmiMessage::GroupCallPriorityChanged {
+                call_id,
+                priority,
+                owner_itsi: _,
+            } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
                 if let Some(call) = self.active_calls.get_mut(&call_id) {
                     call.priority = priority;
@@ -1599,51 +1841,38 @@ impl CcBsSubentity {
                     setup.call_priority = priority;
                 }
             }
-            SwmiMessage::FloorPreempted { call_id, previous_itsi, next_itsi } => {
+            SwmiMessage::FloorPreempted {
+                call_id,
+                previous_itsi,
+                next_itsi,
+            } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
-                self.apply_floor_preemption(queue, call_id, previous_itsi as u32, next_itsi as u32);
+                if self.apply_floor_preemption(queue, call_id, previous_itsi as u32, next_itsi as u32) {
+                    let ready_at = self.dltime.add_timeslots(PREEMPTION_GUARD_TIMESLOTS);
+                    self.pending_preemptive_floor_grants.insert(call_id, (next_itsi as u32, ready_at));
+                    tracing::info!(
+                        call_id,
+                        previous_itsi,
+                        next_itsi,
+                        ready_at = %ready_at,
+                        "holding central floor grant until D-TX-INTERRUPT is on air"
+                    );
+                }
             }
             SwmiMessage::FloorGranted { call_id, itsi } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
-                let (dest_gssi, ts) = {
-                    let Some(call) = self.active_calls.get_mut(&call_id) else { return };
-                    call.source_issi = itsi as u32;
-                    call.tx_active = true;
-                    call.hangtime_start = None;
-                    (call.dest_gssi, call.ts)
-                };
-                // Send the explicit response first.  A group D-TX GRANTED is
-                // deliberately after it, so a pending U-TX DEMAND cannot be
-                // cancelled by the "granted to another user" indication.
-                if self.subscriber_groups.contains_key(&(itsi as u32)) {
-                    self.send_d_tx_granted_individual_facch(queue, call_id, itsi as u32, ts);
+                if self
+                    .pending_preemptive_floor_grants
+                    .get(&call_id)
+                    .is_some_and(|(expected_itsi, _)| *expected_itsi == itsi as u32)
+                {
+                    return;
                 }
-                self.send_d_tx_granted_facch(queue, call_id, itsi as u32, dest_gssi, ts);
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Umac,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: itsi as u32,
-                        dest_gssi,
-                        ts,
-                    }),
-                });
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Swmi,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: itsi as u32,
-                        dest_gssi,
-                        ts,
-                    }),
-                });
+                self.apply_central_floor_grant(queue, call_id, itsi as u32);
             }
             SwmiMessage::FloorReleased { call_id, .. } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
+                self.pending_preemptive_floor_grants.remove(&call_id);
                 if let Some(call) = self.active_calls.get_mut(&call_id) {
                     call.tx_active = false;
                     call.hangtime_start = Some(self.dltime);
@@ -1772,90 +2001,14 @@ impl CcBsSubentity {
                 ..
             } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
-                let Some(call) = self.private_calls.get(&call_id).cloned() else {
-                    return;
-                };
-                let mut allocated = Vec::new();
-                if let Some(local) = self.private_calls.get_mut(&call_id) {
-                    local.local_mask |= endpoint_mask;
-                }
-                // A simplex P2P call with both endpoints at this cell uses
-                // one bidirectional traffic channel, just like a two-member
-                // private P2MP call.  Allocating a TCH per ISSI wastes a
-                // carrier slot and is only required for duplex P2P.
-                let shared_simplex = !duplex && endpoint_mask & 0x03 == 0x03;
-                let mut shared_circuit = if shared_simplex {
-                    [caller_itsi as u32, callee_itsi as u32]
-                        .into_iter()
-                        .find_map(|itsi| self.private_circuits.get(&(call_id, itsi)).cloned())
-                } else {
-                    None
-                };
-                if shared_simplex {
-                    tracing::info!(
-                        call_id,
-                        caller_itsi,
-                        callee_itsi,
-                        "reserving one shared radio circuit for same-cell simplex private call"
-                    );
-                }
-                for (mask, itsi) in [(0x01, caller_itsi as u32), (0x02, callee_itsi as u32)] {
-                    if endpoint_mask & mask == 0 || self.private_circuits.contains_key(&(call_id, itsi)) {
-                        continue;
-                    }
-                    if let Some(circuit) = shared_circuit.as_ref() {
-                        self.private_circuits.insert((call_id, itsi), circuit.clone());
-                        continue;
-                    }
-                    let result = {
-                        let mut state = self.config.state_write();
-                        self.circuits
-                            .allocate_circuit_with_allocator_and_call_id_and_mode(
-                                Direction::Both,
-                                CommunicationType::P2p,
-                                &mut state.timeslot_alloc,
-                                TimeslotOwner::Cmce,
-                                call_id,
-                                duplex,
-                            )
-                            .map(Clone::clone)
-                    };
-                    match result {
-                        Ok(circuit) => {
-                            Self::signal_umac_circuit_open(queue, &circuit);
-                            self.private_circuits.insert((call_id, itsi), circuit.clone());
-                            allocated.push((itsi, circuit));
-                            if shared_simplex {
-                                shared_circuit = allocated.last().map(|(_, circuit)| circuit.clone());
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(call_id, itsi, ?error, "private call resource allocation failed");
-                            for (allocated_itsi, circuit) in allocated {
-                                self.private_circuits.remove(&(call_id, allocated_itsi));
-                                let _ = self.circuits.close_circuit(Direction::Both, circuit.ts);
-                                Self::signal_umac_circuit_close(queue, circuit.clone());
-                                self.release_timeslot(circuit.ts);
-                            }
-                            if let Some(swmi) = self.swmi.as_ref() {
-                                let _ = swmi.submit(SwmiMessage::PrivateCallResourceResult {
-                                    call_id: call_id as u64,
-                                    endpoint_mask,
-                                    accepted: false,
-                                });
-                            }
-                            return;
-                        }
-                    }
-                }
+                let accepted = self.allocate_private_call_resources(queue, call_id, caller_itsi, callee_itsi, endpoint_mask, duplex);
                 if let Some(swmi) = self.swmi.as_ref() {
                     let _ = swmi.submit(SwmiMessage::PrivateCallResourceResult {
                         call_id: call_id as u64,
                         endpoint_mask,
-                        accepted: true,
+                        accepted,
                     });
                 }
-                let _ = call;
             }
             SwmiMessage::PrivateCallConnected {
                 call_id,
@@ -1927,6 +2080,42 @@ impl CcBsSubentity {
                     shared_simplex,
                     "private call connected on local RF resources"
                 );
+            }
+            SwmiMessage::PrivateCallRestore {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+                initial_floor_itsi: _,
+                endpoint_mask,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else { return };
+                let call = PrivateCallLocal {
+                    caller_itsi: caller_itsi as u32,
+                    callee_itsi: callee_itsi as u32,
+                    hook,
+                    duplex,
+                    request_to_transmit,
+                    priority,
+                    connected: true,
+                    local_mask: endpoint_mask,
+                };
+                self.private_calls
+                    .entry(call_id)
+                    .and_modify(|existing| existing.local_mask |= endpoint_mask)
+                    .or_insert(call);
+                if !self.allocate_private_call_resources(queue, call_id, caller_itsi, callee_itsi, endpoint_mask, duplex) {
+                    tracing::warn!(call_id, endpoint_mask, "cannot recreate private call endpoint for roaming restore");
+                    return;
+                }
+                // This message represents an already active call. Do not feed
+                // it through PrivateCallReserve (which would send a new
+                // resource result to the SwMI) or PrivateCallConnected (which
+                // would emit a spurious D-CONNECT before U-RESTORE).
+                tracing::info!(call_id, endpoint_mask, "recreated private call endpoint for roaming restore");
             }
             SwmiMessage::PrivateCallRelease { call_id, itsi: _, cause } => {
                 if let Ok(call_id) = u16::try_from(call_id) {
@@ -2062,6 +2251,49 @@ impl CcBsSubentity {
         }
     }
 
+    fn process_pending_preemptive_floor_grants(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<_> = self
+            .pending_preemptive_floor_grants
+            .iter()
+            .filter_map(|(&call_id, &(itsi, ready_at))| (ready_at.age(self.dltime) >= 0).then_some((call_id, itsi)))
+            .collect();
+        for (call_id, itsi) in ready {
+            self.pending_preemptive_floor_grants.remove(&call_id);
+            tracing::info!(call_id, itsi, "D-TX-INTERRUPT guard elapsed; granting central floor");
+            self.apply_central_floor_grant(queue, call_id, itsi);
+        }
+    }
+
+    fn apply_central_floor_grant(&mut self, queue: &mut MessageQueue, call_id: u16, itsi: u32) {
+        let (dest_gssi, ts) = {
+            let Some(call) = self.active_calls.get_mut(&call_id) else { return };
+            call.source_issi = itsi;
+            call.tx_active = true;
+            call.hangtime_start = None;
+            (call.dest_gssi, call.ts)
+        };
+        // Send the explicit response first. A group D-TX GRANTED is deliberately
+        // after it, so a pending U-TX DEMAND cannot be cancelled by the
+        // "granted to another user" indication.
+        if self.subscriber_groups.contains_key(&itsi) {
+            self.send_d_tx_granted_individual_facch(queue, call_id, itsi, ts);
+        }
+        self.send_d_tx_granted_facch(queue, call_id, itsi, dest_gssi, ts);
+        for dest in [TetraEntity::Umac, TetraEntity::Swmi] {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: itsi,
+                    dest_gssi,
+                    ts,
+                }),
+            });
+        }
+    }
+
     /// Allocate the local radio circuit for a centrally-started group call at
     /// a non-originating BS.  Its call identifier is *not* locally generated.
     fn start_remote_swmi_call(
@@ -2191,6 +2423,67 @@ impl CcBsSubentity {
         tracing::info!(call_id, gssi, ts = circuit.ts, "central SwMI group call activated at serving BS");
     }
 
+    /// Reserve the target TCH before the old BS emits D-NEW-CELL for an
+    /// announced Type-1 handover.  MM's SubscriberStateSync and CMCE actions
+    /// are asynchronous, so this deliberately establishes the moving MS's
+    /// group membership locally and lets the later authoritative sync be
+    /// idempotent.
+    fn reserve_seamless_handover_group_call(
+        &mut self,
+        queue: &mut MessageQueue,
+        itsi: u32,
+        central_call_id: u64,
+        owner_itsi: u32,
+        gssi: u32,
+        priority: u8,
+        floor_itsi: u32,
+        acknowledged: bool,
+    ) -> Option<HandoverChannelAllocation> {
+        let call_id = u16::try_from(central_call_id).ok()?;
+        if call_id == 0 {
+            return None;
+        }
+
+        let is_new_listener = self.subscriber_groups.entry(itsi).or_insert_with(HashSet::new).insert(gssi);
+        if is_new_listener {
+            self.inc_group_listener(gssi);
+        }
+        self.subscriber_scanning_enabled.entry(itsi).or_insert(true);
+
+        if let Some(existing) = self.active_calls.get(&call_id) {
+            if existing.dest_gssi != gssi {
+                tracing::warn!(
+                    call_id,
+                    gssi,
+                    existing_gssi = existing.dest_gssi,
+                    "refusing incompatible Type-1 handover reservation"
+                );
+                return None;
+            }
+        } else {
+            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged);
+        }
+
+        let (timeslot, usage) = self.active_calls.get(&call_id).map(|call| (call.ts, call.usage))?;
+        let allocation = HandoverChannelAllocation {
+            carrier: self.config.config().cell.main_carrier,
+            timeslot_bitmap: 1 << (timeslot - 1),
+            usage,
+        };
+        allocation.validate().ok()?;
+        self.record_uplink_call_location(itsi, call_id);
+        tracing::info!(
+            itsi,
+            call_id,
+            gssi,
+            carrier = allocation.carrier,
+            timeslot,
+            usage = allocation.usage,
+            "reserved target traffic channel for Type-1 seamless handover"
+        );
+        Some(allocation)
+    }
+
     fn release_timeslot(&mut self, ts: u8) {
         let mut state = self.config.state_write();
         if let Err(err) = state.timeslot_alloc.release(TimeslotOwner::Cmce, ts) {
@@ -2205,6 +2498,7 @@ impl CcBsSubentity {
     /// traffic mode. With no cached D-SETUP there is no D-RELEASE to send, so it tears down
     /// at once.
     fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        self.pending_preemptive_floor_grants.remove(&call_id);
         let Some(call) = self.active_calls.remove(&call_id) else {
             return;
         };
@@ -2518,6 +2812,7 @@ impl CcBsSubentity {
             alloc_type: ChanAllocType::Replace,
             carrier: None,
             timeslots,
+            cell_change_flag: false,
             ul_dl_assigned: UlDlAssignment::Both,
         };
         let mut sdu = BitBuffer::new_autoexpand(48);
@@ -3419,18 +3714,14 @@ impl CcBsSubentity {
     /// The old holder is addressed individually at its serving BS; every BS
     /// with the group circuit broadcasts the group indication before the
     /// subsequent FloorGranted action sends D-TX-GRANTED.
-    fn apply_floor_preemption(
-        &mut self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        previous_itsi: u32,
-        next_itsi: u32,
-    ) {
+    fn apply_floor_preemption(&mut self, queue: &mut MessageQueue, call_id: u16, previous_itsi: u32, next_itsi: u32) -> bool {
         let (dest_gssi, ts) = {
-            let Some(call) = self.active_calls.get_mut(&call_id) else { return };
+            let Some(call) = self.active_calls.get_mut(&call_id) else {
+                return false;
+            };
             if call.source_issi != previous_itsi || !call.tx_active {
                 tracing::debug!(call_id, previous_itsi, next_itsi, "ignoring stale central floor-pre-emption");
-                return;
+                return false;
             }
             call.tx_active = false;
             call.hangtime_start = Some(self.dltime);
@@ -3449,38 +3740,18 @@ impl CcBsSubentity {
                 msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
             });
         }
+        true
     }
 
-    fn send_d_tx_interrupt_individual_facch(
-        &self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        previous_itsi: u32,
-        next_itsi: u32,
-        ts: u8,
-    ) {
+    fn send_d_tx_interrupt_individual_facch(&self, queue: &mut MessageQueue, call_id: u16, previous_itsi: u32, next_itsi: u32, ts: u8) {
         self.send_d_tx_interrupt_facch(queue, call_id, next_itsi, TetraAddress::new(previous_itsi, SsiType::Issi), ts);
     }
 
-    fn send_d_tx_interrupt_group_facch(
-        &self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        next_itsi: u32,
-        dest_gssi: u32,
-        ts: u8,
-    ) {
+    fn send_d_tx_interrupt_group_facch(&self, queue: &mut MessageQueue, call_id: u16, next_itsi: u32, dest_gssi: u32, ts: u8) {
         self.send_d_tx_interrupt_facch(queue, call_id, next_itsi, TetraAddress::new(dest_gssi, SsiType::Gssi), ts);
     }
 
-    fn send_d_tx_interrupt_facch(
-        &self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        next_itsi: u32,
-        address: TetraAddress,
-        ts: u8,
-    ) {
+    fn send_d_tx_interrupt_facch(&self, queue: &mut MessageQueue, call_id: u16, next_itsi: u32, address: TetraAddress, ts: u8) {
         let pdu = DTxInterrupt {
             call_identifier: call_id,
             transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,

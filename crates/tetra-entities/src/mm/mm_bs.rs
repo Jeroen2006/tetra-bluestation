@@ -9,9 +9,9 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
-use tetra_saps::lmm::LmmMleUnitdataReq;
+use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
-use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, SwmiMessage};
+use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, HandoverChannelAllocation, SwmiMessage};
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
@@ -41,6 +41,9 @@ use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
 
+/// ETSI T351 = 10 seconds. TETRA has 18 TDMA frames of four slots per second.
+const T351_TIMESLOTS: i32 = 10 * 18 * 4;
+
 pub struct MmBs {
     config: SharedConfig,
     telemetry: Option<TelemetrySink>,
@@ -49,6 +52,7 @@ pub struct MmBs {
     swmi: Option<SwmiMmEndpoint>,
     next_swmi_command_id: u64,
     pending_registrations: HashMap<u64, PendingRegistration>,
+    registration_deadlines: HashMap<u64, TdmaTime>,
     pending_attachments: HashMap<u64, PendingAttachment>,
     pending_location_attachments: HashMap<u64, PendingLocationAttachment>,
     /// SwMI authentication correlation per terminal and air-interface handle.
@@ -59,6 +63,7 @@ pub struct MmBs {
     /// authentication.  The final D-LOCATION UPDATE ACCEPT carries the
     /// Authentication Downlink only for these registrations.
     authenticated_registrations: HashSet<u64>,
+    current_time: TdmaTime,
 }
 
 struct PendingRegistration {
@@ -70,6 +75,10 @@ struct PendingRegistration {
     has_group_identity_location_demand: bool,
     location_attachment: Option<PendingAttachment>,
     authentication_successful: bool,
+    /// Present only when the MM SDU arrived inside MLE U-PREPARE. The source
+    /// cell merely carries the forward-registration exchange; subscriber
+    /// state belongs to this target serving cell.
+    forward_registration_target_station_id: Option<String>,
 }
 
 struct PendingAttachment {
@@ -124,10 +133,12 @@ impl MmBs {
             swmi,
             next_swmi_command_id: 1,
             pending_registrations: HashMap::new(),
+            registration_deadlines: HashMap::new(),
             pending_attachments: HashMap::new(),
             pending_location_attachments: HashMap::new(),
             pending_auth_commands: HashMap::new(),
             authenticated_registrations: HashSet::new(),
+            current_time: TdmaTime::default(),
         }
     }
 
@@ -360,6 +371,7 @@ impl MmBs {
                 air_handle: prim.handle,
                 location_update_type: u64::from(pdu.location_update_type) as u8,
                 address_extension: pdu.address_extension,
+                forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
                 authentication,
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
@@ -375,8 +387,11 @@ impl MmBs {
                         has_group_identity_location_demand,
                         location_attachment,
                         authentication_successful: false,
+                        forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
                     },
                 );
+                self.registration_deadlines
+                    .insert(command_id, self.current_time.add_timeslots(T351_TIMESLOTS));
                 tracing::info!(command_id, issi, "location update forwarded to SwMI");
                 return;
             }
@@ -497,6 +512,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         };
         queue.push_back(msg);
@@ -605,11 +621,16 @@ impl MmBs {
                 }
                 if self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
                     let command_id = self.next_swmi_command_id();
-                    if let Err(error) = self.swmi.as_ref().expect("SwMI checked above").submit(SwmiMessage::ScanningStateUpdate {
-                        command_id,
-                        itsi: issi as u64,
-                        scanning_enabled: enabled,
-                    }) {
+                    if let Err(error) = self
+                        .swmi
+                        .as_ref()
+                        .expect("SwMI checked above")
+                        .submit(SwmiMessage::ScanningStateUpdate {
+                            command_id,
+                            itsi: issi as u64,
+                            scanning_enabled: enabled,
+                        })
+                    {
                         tracing::warn!(issi, command_id, ?error, "cannot forward group scanning state to SwMI");
                     }
                 }
@@ -804,6 +825,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         };
         queue.push_back(msg);
@@ -942,12 +964,10 @@ impl MmBs {
                     }
                 }
             } else {
-                match self.client_mgr.client_group_attach_with_class_of_usage(
-                    issi,
-                    gssi,
-                    true,
-                    giu.class_of_usage.unwrap_or(0),
-                ) {
+                match self
+                    .client_mgr
+                    .client_group_attach_with_class_of_usage(issi, gssi, true, giu.class_of_usage.unwrap_or(0))
+                {
                     Ok(changed) => {
                         if changed {
                             self.config.state_write().subscribers.affiliate(issi, gssi);
@@ -991,11 +1011,13 @@ impl MmBs {
         air_handle: u32,
         accepted: bool,
         cause: u16,
+        handover_allocation: Option<HandoverChannelAllocation>,
     ) {
         let Some(pending) = self.pending_registrations.get(&command_id) else {
             tracing::warn!(command_id, itsi, "received SwMI registration decision without pending air request");
             return;
         };
+        self.registration_deadlines.remove(&command_id);
         if pending.itsi as u64 != itsi || pending.air_handle != air_handle {
             tracing::warn!(
                 command_id,
@@ -1037,6 +1059,37 @@ impl MmBs {
                 pending.address_extension,
                 cause as u8,
             );
+            return;
+        }
+
+        if pending.forward_registration_target_station_id.is_some() {
+            // The SwMI has already moved the central serving-cell anchor and
+            // pushed the authoritative subscriber state to the target BS. Do
+            // not create a duplicate local client at the old cell merely
+            // because it transported the U-PREPARE exchange.
+            self.config
+                .state_write()
+                .subscribers
+                .set_registration_delivery_pending(pending.itsi, false);
+            let seamless_handover = handover_allocation.map(|allocation| LmmMleSeamlessHandover {
+                carrier: allocation.carrier,
+                timeslots: std::array::from_fn(|index| allocation.timeslot_bitmap & (1 << index) != 0),
+                usage: allocation.usage,
+            });
+            Self::send_d_location_update_accept_with_handover(
+                queue,
+                pending.itsi,
+                pending.air_handle,
+                pending.location_update_type,
+                pending.energy_saving_information,
+                pending.authentication_successful,
+                pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
+                    group_identity_accept_reject: 0,
+                    group_identity_downlink: None,
+                }),
+                seamless_handover,
+            );
+            tracing::info!(command_id, itsi, target = ?pending.forward_registration_target_station_id, type_one = handover_allocation.is_some(), "forward registration accepted; response will be wrapped in D-NEW-CELL");
             return;
         }
 
@@ -1223,8 +1276,12 @@ impl MmBs {
             return;
         };
         if !self.client_mgr.client_is_known(issi) {
-            tracing::warn!(issi, "received roaming state before local registration; ignoring");
-            return;
+            if let Err(error) = self.client_mgr.try_register_client(issi, true) {
+                tracing::warn!(issi, ?error, "unable to create target-cell subscriber state for roaming MS");
+                return;
+            }
+            self.config.state_write().subscribers.register(issi);
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
         }
         let old_groups = self
             .client_mgr
@@ -1244,12 +1301,10 @@ impl MmBs {
 
         let mut restored = Vec::new();
         for group in groups.into_iter().filter(|group| !group.detach) {
-            match self.client_mgr.client_group_attach_with_class_of_usage(
-                issi,
-                group.gssi,
-                true,
-                group.class_of_usage,
-            ) {
+            match self
+                .client_mgr
+                .client_group_attach_with_class_of_usage(issi, group.gssi, true, group.class_of_usage)
+            {
                 Ok(_) => {
                     self.config.state_write().subscribers.affiliate(issi, group.gssi);
                     restored.push(group.gssi);
@@ -1276,7 +1331,12 @@ impl MmBs {
                 msg: SapMsgInner::MmSubscriberUpdate(update),
             });
         }
-        tracing::info!(issi, groups = restored_count, scanning_enabled, "restored roaming group-scanning state from SwMI");
+        tracing::info!(
+            issi,
+            groups = restored_count,
+            scanning_enabled,
+            "restored roaming group-scanning state from SwMI"
+        );
     }
 
     fn apply_swmi_attachment_state(
@@ -1334,12 +1394,10 @@ impl MmBs {
             }
             let gssi = result.operation.gssi;
             let detach = result.operation.detach;
-            match self.client_mgr.client_group_attach_with_class_of_usage(
-                pending.itsi,
-                gssi,
-                !detach,
-                result.operation.class_of_usage,
-            ) {
+            match self
+                .client_mgr
+                .client_group_attach_with_class_of_usage(pending.itsi, gssi, !detach, result.operation.class_of_usage)
+            {
                 Ok(changed) => {
                     if changed {
                         if detach {
@@ -1483,6 +1541,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         });
     }
@@ -1495,6 +1554,28 @@ impl MmBs {
         energy_saving_information: Option<EnergySavingInformation>,
         authentication_successful: bool,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
+    ) {
+        Self::send_d_location_update_accept_with_handover(
+            queue,
+            issi,
+            handle,
+            location_update_type,
+            energy_saving_information,
+            authentication_successful,
+            group_identity_location_accept,
+            None,
+        );
+    }
+
+    fn send_d_location_update_accept_with_handover(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        energy_saving_information: Option<EnergySavingInformation>,
+        authentication_successful: bool,
+        group_identity_location_accept: Option<GroupIdentityLocationAccept>,
+        seamless_handover: Option<LmmMleSeamlessHandover>,
     ) {
         let pdu = DLocationUpdateAccept {
             location_update_accept_type: location_update_type,
@@ -1543,6 +1624,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover,
             }),
         });
     }
@@ -1578,6 +1660,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         };
         queue.push_back(msg);
@@ -1639,6 +1722,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         };
         queue.push_back(msg);
@@ -1670,6 +1754,7 @@ impl MmBs {
                 encryption_flag: false,
                 is_null_pdu: false,
                 tx_reporter: None,
+                seamless_handover: None,
             }),
         };
         queue.push_back(msg);
@@ -1762,7 +1847,31 @@ impl TetraEntityTrait for MmBs {
         self.config = config;
     }
 
-    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.current_time = ts;
+        let timed_out: Vec<u64> = self
+            .registration_deadlines
+            .iter()
+            .filter_map(|(&command_id, deadline)| (deadline.age(ts) >= 0).then_some(command_id))
+            .collect();
+        for command_id in timed_out {
+            self.registration_deadlines.remove(&command_id);
+            if let Some(pending) = self.pending_registrations.remove(&command_id) {
+                self.config
+                    .state_write()
+                    .subscribers
+                    .set_registration_delivery_pending(pending.itsi, false);
+                tracing::warn!(command_id, issi = pending.itsi, "location update timed out at T351");
+                Self::send_d_location_update_reject_with_cause(
+                    queue,
+                    pending.itsi,
+                    pending.air_handle,
+                    pending.location_update_type,
+                    pending.address_extension,
+                    RejectCause::NetworkFailure as u8,
+                );
+            }
+        }
         while let Some(message) = self.swmi.as_ref().and_then(SwmiMmEndpoint::try_recv) {
             match message {
                 SwmiMessage::RegistrationDecision {
@@ -1771,8 +1880,9 @@ impl TetraEntityTrait for MmBs {
                     air_handle,
                     accepted,
                     cause,
+                    handover_allocation,
                     ..
-                } => self.apply_swmi_registration_decision(queue, command_id, itsi, air_handle, accepted, cause),
+                } => self.apply_swmi_registration_decision(queue, command_id, itsi, air_handle, accepted, cause, handover_allocation),
                 SwmiMessage::AuthenticationChallenge {
                     command_id,
                     itsi,
@@ -1801,6 +1911,7 @@ impl TetraEntityTrait for MmBs {
                             encryption_flag: false,
                             is_null_pdu: false,
                             tx_reporter: None,
+                            seamless_handover: None,
                         }),
                     });
                     tracing::debug!(command_id, itsi, mutual, "sent D-AUTHENTICATION DEMAND");
@@ -1839,6 +1950,7 @@ impl TetraEntityTrait for MmBs {
                                 encryption_flag: false,
                                 is_null_pdu: false,
                                 tx_reporter: None,
+                                seamless_handover: None,
                             }),
                         });
                     }
@@ -1886,6 +1998,7 @@ impl TetraEntityTrait for MmBs {
                                 encryption_flag: false,
                                 is_null_pdu: false,
                                 tx_reporter: None,
+                                seamless_handover: None,
                             }),
                         });
                     }
@@ -1928,7 +2041,7 @@ impl TetraEntityTrait for MmBs {
                     itsi,
                     "SwMI link unavailable; completing pending location update in local-site trunking"
                 );
-                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0);
+                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, None);
             }
             let recover_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
                 .pending_attachments

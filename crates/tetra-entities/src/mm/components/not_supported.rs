@@ -37,6 +37,7 @@ pub fn make_ul_mm_pdu_function_not_supported(
             encryption_flag: false,
             is_null_pdu: false,
             tx_reporter: None,
+            seamless_handover: None,
         }),
     };
     (msg, debug_str)

@@ -1,3 +1,4 @@
+use crate::bluestation::RuntimeNetworkBroadcast;
 use std::collections::{HashMap, HashSet};
 use tetra_core::TimeslotAllocator;
 
@@ -148,6 +149,9 @@ pub struct StackState {
     pub authentication_required: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
+    /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
+    /// API. The worker reports each version to the SwMI.
+    pub network_broadcast: RuntimeNetworkBroadcast,
 }
 
 #[cfg(test)]
@@ -226,6 +230,11 @@ impl Default for StackState {
             network_connected: false,
             authentication_required: false,
             subscribers: SubscriberRegistry::new(),
+            network_broadcast: RuntimeNetworkBroadcast {
+                version: 0,
+                neighbours: Default::default(),
+                broadcast: Default::default(),
+            },
         }
     }
 }

@@ -141,6 +141,13 @@ voice_service = true
 # Frame 18 extension support
 # frame_18_ext = false
 
+# TDMA synchronisation with neighbour cells. Keep this false unless every
+# participating cell shares a common TDMA timebase. When false, the neighbour
+# cell "synchronized" bit is broadcast as 0 and no TDMA frame offset is sent.
+tdma_synchronized = false
+# Valid only when tdma_synchronized = true; range 0..63 frames.
+# tdma_frame_offset = 0
+
 # Open-loop power control broadcast parameters.
 # MS_TXPWR_MAX_CELL: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
 # ms_txpwr_max_cell = 4
@@ -149,11 +156,6 @@ voice_service = true
 # ACCESS_PARAMETER: 0=-53 dBm, 1=-51 dBm, ... 15=-23 dBm
 # access_parameter = 7
 
-# IANA timezone for D-NWRK-BROADCAST time broadcasting. When set, the BS will
-# broadcast UTC time and local time offset once per hyperframe (~61s) so MSs
-# can synchronize their clocks. Handles DST automatically.
-# timezone = "Europe/Amsterdam"
-
 # Local SSI ranges for this cell. Traffic for these ranges will not leave the cell
 # This overrides any settings in brew section, if enabled.
 # Also, incoming brew traffic on those ranges will be dropped
@@ -161,6 +163,36 @@ voice_service = true
 local_ssi_ranges = [
     [0, 90],
 ]
+
+# CA neighbours are the stable IDs from the SwMI [base_stations] list. Their
+# configured order becomes the per-cell CA identifiers 1..31 advertised to MSs.
+[neighbour_cells]
+ids = []
+
+# D-NWRK-BROADCAST settings. Time is encoded as TETRA network time and uses an
+# IANA timezone so the local offset follows daylight-saving changes.
+[network_broadcast]
+# Legacy alternative: the complete 16-bit ETSI field, for existing configs.
+# Do not combine it with [network_broadcast.cell_reselect].
+# cell_reselect_parameters = 0x0000
+cell_load_ca = 0
+time_enabled = false
+# timezone = "Europe/Amsterdam"
+
+# ETSI TS 100 392-2 table 18.38: the four cell-reselection thresholds sent in
+# D-NWRK-BROADCAST.  Set values in dB, using only even values 0..30 (the TETRA
+# air-interface field encodes dB / 2).  Omitted fields default to 0 dB.
+#
+# fast_reselect_threshold_db: serving-cell level below which the link can be
+#   relinquished; measured above C1 = 0.
+# slow_reselect_threshold_above_fast_db: added to the fast threshold to form
+#   the threshold for a radio-improvable link.
+# *_hysteresis_db: required neighbour advantage before the MS reselects.
+[network_broadcast.cell_reselect]
+# fast_reselect_threshold_db = 8
+# slow_reselect_threshold_above_fast_db = 6
+# slow_reselect_hysteresis_db = 4
+# fast_reselect_hysteresis_db = 4
 
 ###############################################################################
 

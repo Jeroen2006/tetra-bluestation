@@ -112,7 +112,7 @@ impl ComponentTest {
                     self.router.register_entity(Box::new(llc));
                 }
                 TetraEntity::Mle => {
-                    let mle = MleBs::new(self.config.clone());
+                    let mle = MleBs::new(self.config.clone(), None, None);
                     self.router.register_entity(Box::new(mle));
                 }
                 TetraEntity::Mm => {

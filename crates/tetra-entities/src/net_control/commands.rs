@@ -21,6 +21,17 @@ pub enum ControlCommand {
         payload: Vec<u8>,
     },
 
+    /// Atomically replace the local CA neighbour list and D-NWRK-BROADCAST
+    /// settings. It intentionally does not retune SDR hardware.
+    UpdateCellAdvertisement {
+        handle: u32,
+        neighbour_ids: Vec<String>,
+        cell_reselect_parameters: u16,
+        cell_load_ca: u8,
+        time_enabled: bool,
+        timezone: Option<String>,
+    },
+
     /// Placeholder command A.
     CommandA { handle: u32, parameter: u32 },
     /// Placeholder command B.
@@ -39,4 +50,10 @@ pub enum ControlResponse {
     CommandAResponse { handle: u32, result: u32 },
     /// Response to [`Command::SendSds`].
     SendSdsResponse { handle: u32, success: bool },
+    UpdateCellAdvertisementResponse {
+        handle: u32,
+        success: bool,
+        version: u64,
+        error: Option<String>,
+    },
 }

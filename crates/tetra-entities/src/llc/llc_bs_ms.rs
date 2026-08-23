@@ -263,9 +263,10 @@ impl Llc {
         };
 
         req.associated_channel.is_some()
-            || req.chan_alloc.as_ref().is_some_and(|alloc| {
-                alloc.usage.is_some() || alloc.timeslots[1..].iter().any(|assigned| *assigned)
-            })
+            || req
+                .chan_alloc
+                .as_ref()
+                .is_some_and(|alloc| alloc.usage.is_some() || alloc.timeslots[1..].iter().any(|assigned| *assigned))
     }
 
     fn basic_link_retry_timer(ack: &ExpectedInAck) -> u32 {
@@ -636,7 +637,11 @@ impl Llc {
                         ack.addr.ssi,
                         ack.ns,
                         ack.retransmit_count,
-                        if Self::has_assigned_channel_context(ack) { " after assigned-channel grace" } else { "" }
+                        if Self::has_assigned_channel_context(ack) {
+                            " after assigned-channel grace"
+                        } else {
+                            ""
+                        }
                     );
 
                     Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
@@ -732,6 +737,7 @@ impl Llc {
                         usage: None,
                         timeslots,
                         alloc_type: ChanAllocType::Replace,
+                        cell_change_flag: false,
                         ul_dl_assigned: UlDlAssignment::Both,
                         carrier: None,
                     })

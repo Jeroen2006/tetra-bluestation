@@ -146,6 +146,7 @@ fn test_out_fragmented_resource() {
         encryption_flag: false,
         is_null_pdu: false,
         tx_reporter: None,
+        seamless_handover: None,
     };
     let test_sapmsg = SapMsg {
         sap: Sap::LmmSap,

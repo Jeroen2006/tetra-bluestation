@@ -122,6 +122,7 @@ impl MleMs {
                     sdu,
                     handle: 0, // handle,
                     received_address: prim.main_address,
+                    forward_registration_target_station_id: None,
                 };
                 let msg = SapMsg {
                     sap: Sap::LmmSap,
@@ -212,6 +213,7 @@ impl MleMs {
                     sdu,
                     handle: 0, // handle,
                     received_address: prim.main_address,
+                    forward_registration_target_station_id: None,
                 };
                 let msg = SapMsg {
                     sap: Sap::LmmSap,

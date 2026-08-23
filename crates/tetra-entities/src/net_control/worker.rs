@@ -114,6 +114,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
     fn route_control_command(command: &ControlCommand) -> TetraEntity {
         match command {
             ControlCommand::SendSds { .. } => TetraEntity::Cmce,
+            ControlCommand::UpdateCellAdvertisement { .. } => TetraEntity::Mle,
             ControlCommand::CommandA { .. } => TetraEntity::Mm,
             ControlCommand::TestCmdB { .. } => TetraEntity::Cmce,
         }

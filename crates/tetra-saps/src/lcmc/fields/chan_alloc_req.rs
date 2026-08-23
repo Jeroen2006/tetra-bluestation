@@ -1,5 +1,3 @@
-use tetra_core::Todo;
-
 use crate::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
 
 #[derive(Debug, Clone)]
@@ -7,7 +5,7 @@ pub struct CmceChanAllocReq {
     /// Set for new allocation, None for QuitAndGo
     pub usage: Option<u8>,
     /// Carrier frequency; by default, uses self
-    pub carrier: Option<Todo>,
+    pub carrier: Option<u16>,
     /// Bitmap of slots to use.
     pub timeslots: [bool; 4],
     /// Alloc type.
@@ -15,5 +13,9 @@ pub struct CmceChanAllocReq {
     /// Replace: update existing allocation, or create if it does not exist.
     /// QuitAndGo: remove existing allocation.
     pub alloc_type: ChanAllocType,
+    /// Set for an announced Type-1 allocation that moves the MS to a traffic
+    /// channel in another cell.  It maps to MAC Channel Allocation's cell
+    /// change flag and must remain clear for ordinary same-cell allocations.
+    pub cell_change_flag: bool,
     pub ul_dl_assigned: UlDlAssignment,
 }

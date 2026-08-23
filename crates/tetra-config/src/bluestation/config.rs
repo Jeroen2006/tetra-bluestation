@@ -2,7 +2,9 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
+use crate::bluestation::{
+    CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, PhyBackend, RuntimeNetworkBroadcast, StackState,
+};
 
 use super::sec_brew::CfgBrew;
 use super::sec_swmi::CfgSwmi;
@@ -61,6 +63,8 @@ pub struct StackConfig {
     pub phy_io: CfgPhyIo,
     pub net: CfgNetInfo,
     pub cell: CfgCellInfo,
+    pub neighbour_cells: CfgNeighbourCells,
+    pub network_broadcast: CfgNetworkBroadcast,
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,
@@ -132,6 +136,9 @@ impl StackConfig {
         if self.cell.access_parameter > 15 {
             return Err("access_parameter must be 0-15 (4 bits)");
         }
+        if self.cell.tdma_frame_offset > 63 {
+            return Err("tdma_frame_offset must be 0-63 (6 bits)");
+        }
 
         let random_access = &self.cell.random_access;
         if !(1..=60).contains(&random_access.update_interval_multiframes) {
@@ -181,6 +188,29 @@ impl StackConfig {
                 return Err("Invalid IANA timezone name in cell.timezone");
             }
         }
+        if self.neighbour_cells.ids.len() > 31 {
+            return Err("neighbour_cells.ids may contain at most 31 CA cells");
+        }
+        let mut neighbour_ids = std::collections::HashSet::new();
+        for id in &self.neighbour_cells.ids {
+            if id.trim().is_empty() {
+                return Err("neighbour_cells.ids may not contain an empty ID");
+            }
+            if !neighbour_ids.insert(id) {
+                return Err("neighbour_cells.ids must be unique");
+            }
+        }
+        if self.network_broadcast.cell_load_ca > 3 {
+            return Err("network_broadcast.cell_load_ca must be 0-3");
+        }
+        if self.network_broadcast.time_enabled {
+            let Some(tz) = &self.network_broadcast.timezone else {
+                return Err("network_broadcast.timezone is required when time_enabled is true");
+            };
+            if tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err("Invalid IANA timezone name in network_broadcast.timezone");
+            }
+        }
 
         Ok(())
     }
@@ -208,6 +238,11 @@ impl SharedConfig {
         // serving-cell policy.  The SwMI worker overwrites this when CellConfig
         // arrives, so SYSINFO can follow central policy at runtime.
         state.authentication_required = cfg.cell.authentication_required;
+        state.network_broadcast = RuntimeNetworkBroadcast {
+            version: 1,
+            neighbours: cfg.neighbour_cells.clone(),
+            broadcast: cfg.network_broadcast.clone(),
+        };
 
         Self {
             cfg: Arc::new(cfg),

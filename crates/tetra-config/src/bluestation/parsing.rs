@@ -6,7 +6,10 @@ use std::path::Path;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
+use crate::bluestation::{
+    CellInfoDto, CfgControlDto, NeighbourCellsDto, NetInfoDto, NetworkBroadcastDto, apply_control_patch, cell_dto_to_cfg,
+    neighbour_cells_dto_to_cfg, net_dto_to_cfg, network_broadcast_dto_to_cfg,
+};
 
 use super::config::{StackConfig, StackMode};
 use super::sec_brew::CfgBrewDto;
@@ -60,6 +63,32 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
         return Err("[brew] has been removed; configure the central connection with [swmi]".into());
     }
+    if !root.neighbour_cells.extra.is_empty() {
+        return Err(format!(
+            "Unrecognized fields in neighbour_cells: {:?}",
+            sorted_keys(&root.neighbour_cells.extra)
+        )
+        .into());
+    }
+    if !root.network_broadcast.extra.is_empty() {
+        return Err(format!(
+            "Unrecognized fields in network_broadcast: {:?}",
+            sorted_keys(&root.network_broadcast.extra)
+        )
+        .into());
+    }
+    if let Some(cell_reselect) = &root.network_broadcast.cell_reselect
+        && !cell_reselect.extra.is_empty()
+    {
+        return Err(format!(
+            "Unrecognized fields in network_broadcast.cell_reselect: {:?}",
+            sorted_keys(&cell_reselect.extra)
+        )
+        .into());
+    }
+    if root.cell_info.timezone.is_some() && root.network_broadcast.timezone.is_some() {
+        return Err("configure timezone in either cell_info (legacy) or network_broadcast, not both".into());
+    }
     if let Some(ref swmi) = root.swmi {
         if !swmi.extra.is_empty() {
             return Err(format!("Unrecognized fields in swmi config: {:?}", sorted_keys(&swmi.extra)).into());
@@ -74,12 +103,15 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
     }
 
     // Build config from required and optional values
+    let legacy_timezone = root.cell_info.timezone.clone();
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
         debug_log: root.debug_log,
         phy_io: phy_dto_to_cfg(root.phy_io),
         net: net_dto_to_cfg(root.net_info),
         cell: cell_dto_to_cfg(root.cell_info),
+        neighbour_cells: neighbour_cells_dto_to_cfg(root.neighbour_cells),
+        network_broadcast: network_broadcast_dto_to_cfg(root.network_broadcast, legacy_timezone)?,
         brew: None,
         swmi: None,
         telemetry: None,
@@ -134,6 +166,10 @@ struct TomlConfigRoot {
     phy_io: PhyIoDto,
     net_info: NetInfoDto,
     cell_info: CellInfoDto,
+    #[serde(default)]
+    neighbour_cells: NeighbourCellsDto,
+    #[serde(default)]
+    network_broadcast: NetworkBroadcastDto,
 
     brew: Option<CfgBrewDto>,
     swmi: Option<CfgSwmiDto>,

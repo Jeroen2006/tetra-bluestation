@@ -4,6 +4,83 @@ use std::collections::HashMap;
 use tetra_core::ranges::{SortedDisjointSsiRanges, SsiRange};
 use toml::Value;
 
+/// CA neighbours are referenced by their stable SwMI base-station IDs. Their
+/// order is deliberately preserved: it maps to the per-serving-cell CA
+/// identifiers announced over the air.
+#[derive(Debug, Clone, Default)]
+pub struct CfgNeighbourCells {
+    pub ids: Vec<String>,
+}
+
+#[derive(Default, Deserialize)]
+pub struct NeighbourCellsDto {
+    #[serde(default)]
+    pub ids: Vec<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Parameters sent in D-NWRK-BROADCAST for the serving CA cell.
+#[derive(Debug, Clone)]
+pub struct CfgNetworkBroadcast {
+    pub cell_reselect_parameters: u16,
+    pub cell_load_ca: u8,
+    pub time_enabled: bool,
+    pub timezone: Option<String>,
+}
+
+impl Default for CfgNetworkBroadcast {
+    fn default() -> Self {
+        Self {
+            cell_reselect_parameters: 0,
+            cell_load_ca: 0,
+            time_enabled: false,
+            timezone: None,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub struct NetworkBroadcastDto {
+    /// Legacy packed 16-bit air-interface value.  Prefer the descriptive
+    /// `[network_broadcast.cell_reselect]` table in new configurations.
+    pub cell_reselect_parameters: Option<u16>,
+    #[serde(default)]
+    pub cell_reselect: Option<CellReselectParametersDto>,
+    pub cell_load_ca: Option<u8>,
+    pub time_enabled: Option<bool>,
+    pub timezone: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Human-readable representation of the four nibbles in the 16-bit
+/// "cell re-select parameters" air-interface information element (ETSI TS
+/// 100 392-2, table 18.38).  Values are configured in dB; the on-air value is
+/// dB / 2 and can therefore represent the even values 0 through 30 dB.
+#[derive(Default, Deserialize)]
+pub struct CellReselectParametersDto {
+    /// Difference between slow and fast reselection thresholds, in dB.
+    pub slow_reselect_threshold_above_fast_db: Option<u8>,
+    /// Serving-cell threshold for a radio-relinquishable link, in dB above C1 = 0.
+    pub fast_reselect_threshold_db: Option<u8>,
+    /// Required neighbour advantage for a radio-improvable link, in dB.
+    pub slow_reselect_hysteresis_db: Option<u8>,
+    /// Required neighbour advantage for a radio-relinquishable link, in dB.
+    pub fast_reselect_hysteresis_db: Option<u8>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Live replacement for the broadcast-only portion of the local cell
+/// advertisement. Radio tuning stays outside this control path.
+#[derive(Debug, Clone)]
+pub struct RuntimeNetworkBroadcast {
+    pub version: u64,
+    pub neighbours: CfgNeighbourCells,
+    pub broadcast: CfgNetworkBroadcast,
+}
+
 /// Dynamic common-channel random-access control for access code A.
 #[derive(Debug, Clone)]
 pub struct CfgRandomAccess {
@@ -104,6 +181,14 @@ pub struct CfgCellInfo {
     pub u_plane_dtx: bool,
     pub frame_18_ext: bool,
 
+    /// Whether this cell shares the TETRA TDMA timebase with its advertised
+    /// neighbours. This becomes the "neighbour cell synchronized" bit in
+    /// D-NWRK-BROADCAST reports made by other cells.
+    pub tdma_synchronized: bool,
+    /// Relative TDMA frame offset, 0-63. It is advertised only when
+    /// `tdma_synchronized` is true.
+    pub tdma_frame_offset: u8,
+
     pub ms_txpwr_max_cell: u8,
 
     pub rxlev_access_min: u8,
@@ -151,6 +236,8 @@ pub struct CellInfoDto {
     pub ts_reserved_frames: Option<u8>,
     pub u_plane_dtx: Option<bool>,
     pub frame_18_ext: Option<bool>,
+    pub tdma_synchronized: Option<bool>,
+    pub tdma_frame_offset: Option<u8>,
 
     pub ms_txpwr_max_cell: Option<u8>,
     pub rxlev_access_min: Option<u8>,
@@ -245,6 +332,10 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         ts_reserved_frames: ci.ts_reserved_frames.unwrap_or(0),
         u_plane_dtx: ci.u_plane_dtx.unwrap_or(false),
         frame_18_ext: ci.frame_18_ext.unwrap_or(false),
+        // Cells are not synchronized unless the operator explicitly declares
+        // a shared TDMA timebase and optional frame offset.
+        tdma_synchronized: ci.tdma_synchronized.unwrap_or(false),
+        tdma_frame_offset: ci.tdma_frame_offset.unwrap_or(0),
         ms_txpwr_max_cell: ci.ms_txpwr_max_cell.unwrap_or(4), // 30 dBm (1W), Table 18.57
         rxlev_access_min: ci.rxlev_access_min.unwrap_or(3),   // -110 dBm, Table 21.64
         access_parameter: ci.access_parameter.unwrap_or(7),   // -39 dBm, Table 21.65
@@ -257,9 +348,97 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
     }
 }
 
+pub fn neighbour_cells_dto_to_cfg(src: NeighbourCellsDto) -> CfgNeighbourCells {
+    CfgNeighbourCells { ids: src.ids }
+}
+
+pub fn network_broadcast_dto_to_cfg(src: NetworkBroadcastDto, legacy_timezone: Option<String>) -> Result<CfgNetworkBroadcast, String> {
+    let cell_reselect_parameters = match (src.cell_reselect_parameters, src.cell_reselect) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "configure either network_broadcast.cell_reselect_parameters (legacy raw value) or [network_broadcast.cell_reselect], not both"
+                    .into(),
+            );
+        }
+        (Some(raw), None) => raw,
+        (None, Some(parameters)) => parameters.to_air_interface_value()?,
+        (None, None) => 0,
+    };
+    let timezone = src.timezone.or(legacy_timezone);
+    Ok(CfgNetworkBroadcast {
+        cell_reselect_parameters,
+        cell_load_ca: src.cell_load_ca.unwrap_or(0),
+        // The historical `cell_info.timezone` enabled broadcasts implicitly.
+        time_enabled: src.time_enabled.unwrap_or(timezone.is_some()),
+        timezone,
+    })
+}
+
+impl CellReselectParametersDto {
+    fn to_air_interface_value(self) -> Result<u16, String> {
+        let slow_above_fast = reselect_db_to_nibble(
+            "slow_reselect_threshold_above_fast_db",
+            self.slow_reselect_threshold_above_fast_db.unwrap_or(0),
+        )?;
+        let fast_threshold = reselect_db_to_nibble("fast_reselect_threshold_db", self.fast_reselect_threshold_db.unwrap_or(0))?;
+        let slow_hysteresis = reselect_db_to_nibble("slow_reselect_hysteresis_db", self.slow_reselect_hysteresis_db.unwrap_or(0))?;
+        let fast_hysteresis = reselect_db_to_nibble("fast_reselect_hysteresis_db", self.fast_reselect_hysteresis_db.unwrap_or(0))?;
+
+        Ok((u16::from(slow_above_fast) << 12)
+            | (u16::from(fast_threshold) << 8)
+            | (u16::from(slow_hysteresis) << 4)
+            | u16::from(fast_hysteresis))
+    }
+}
+
+fn reselect_db_to_nibble(field: &str, value_db: u8) -> Result<u8, String> {
+    if value_db > 30 || value_db % 2 != 0 {
+        return Err(format!(
+            "network_broadcast.cell_reselect.{field} must be an even value from 0 through 30 dB"
+        ));
+    }
+    Ok(value_db / 2)
+}
+
 /// Default local SSI ranges are defined as 0-90 (inclusive), which fits the TetraPack configuration.
 /// This helps prevent excessive flows of unroutable traffic to TetraPack, and can be overridden
 /// by users if needed.
 fn default_tetrapack_local_ranges() -> SortedDisjointSsiRanges {
     SortedDisjointSsiRanges::from_vec_ssirange(vec![SsiRange::new(0, 90)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_reselect_db_values_pack_in_etsi_order() {
+        let cfg = network_broadcast_dto_to_cfg(
+            NetworkBroadcastDto {
+                cell_reselect_parameters: None,
+                cell_reselect: Some(CellReselectParametersDto {
+                    slow_reselect_threshold_above_fast_db: Some(6),
+                    fast_reselect_threshold_db: Some(8),
+                    slow_reselect_hysteresis_db: Some(10),
+                    fast_reselect_hysteresis_db: Some(12),
+                    extra: HashMap::new(),
+                }),
+                cell_load_ca: None,
+                time_enabled: None,
+                timezone: None,
+                extra: HashMap::new(),
+            },
+            None,
+        )
+        .expect("valid individual cell-reselect parameters");
+
+        // 6/8/10/12 dB becomes the four ETSI nibbles 3/4/5/6.
+        assert_eq!(cfg.cell_reselect_parameters, 0x3456);
+    }
+
+    #[test]
+    fn cell_reselect_db_values_reject_odd_or_out_of_range_values() {
+        assert!(reselect_db_to_nibble("fast_reselect_threshold_db", 7).is_err());
+        assert!(reselect_db_to_nibble("fast_reselect_threshold_db", 32).is_err());
+    }
 }

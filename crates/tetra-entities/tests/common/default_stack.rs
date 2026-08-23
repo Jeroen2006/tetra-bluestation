@@ -1,4 +1,6 @@
-use tetra_config::bluestation::{CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, StackConfig, StackMode};
+use tetra_config::bluestation::{
+    CfgCellInfo, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, PhyBackend, StackConfig, StackMode,
+};
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
 /// Creates a default config for testing. It can still be modified as needed
@@ -16,6 +18,8 @@ pub fn default_test_config_bs() -> StackConfig {
         phy_io,
         net: net_info,
         cell: cell_info,
+        neighbour_cells: CfgNeighbourCells::default(),
+        network_broadcast: CfgNetworkBroadcast::default(),
         brew: None,
         swmi: None,
         telemetry: None,
@@ -68,6 +72,8 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         ts_reserved_frames: 0,
         u_plane_dtx: false,
         frame_18_ext: false,
+        tdma_synchronized: false,
+        tdma_frame_offset: 0,
         ms_txpwr_max_cell: 4,
         rxlev_access_min: 3,
         access_parameter: 7,

@@ -131,6 +131,16 @@ pub struct LmmMleReportInd {
     pub transfer_result: Todo,
 }
 
+/// Target-cell MAC allocation carried with a successful forward-registration
+/// response.  MLE serializes it with D-NEW-CELL using channel command `00`,
+/// while UMAC uses it to build the replace-channel MAC header on the old cell.
+#[derive(Debug, Clone, Copy)]
+pub struct LmmMleSeamlessHandover {
+    pub carrier: u16,
+    pub timeslots: [bool; 4],
+    pub usage: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct LmmMleUnitdataReq {
     pub sdu: BitBuffer,
@@ -144,6 +154,9 @@ pub struct LmmMleUnitdataReq {
     pub encryption_flag: bool,
     pub is_null_pdu: bool, // Prio should be lowest and may not steal
     pub tx_reporter: Option<TxReporter>,
+    /// Present only for a forward-registration D-LOCATION UPDATE ACCEPT that
+    /// can complete as announced Type-1 seamless handover.
+    pub seamless_handover: Option<LmmMleSeamlessHandover>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +164,10 @@ pub struct LmmMleUnitdataInd {
     pub sdu: BitBuffer,
     pub handle: MleHandle,
     pub received_address: TetraAddress,
+    /// Set only for an MM SDU embedded in MLE U-PREPARE.  The target is
+    /// resolved from the serving cell's CA neighbour directory, not supplied
+    /// by an unauthenticated mobile station.
+    pub forward_registration_target_station_id: Option<String>,
     // pub received_address_type: Todo,
 }
 

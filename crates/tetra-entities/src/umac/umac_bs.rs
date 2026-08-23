@@ -300,7 +300,7 @@ impl UmacBs {
         }
     }
 
-    fn cmce_to_mac_chanalloc(chan_alloc: &CmceChanAllocReq, carrier_num: u16) -> ChanAllocElement {
+    fn cmce_to_mac_chanalloc(chan_alloc: &CmceChanAllocReq, default_carrier_num: u16) -> ChanAllocElement {
         // We grant clch permission for Replace and Additional allocations on the uplink
         let clch_permission = (chan_alloc.alloc_type == ChanAllocType::Replace || chan_alloc.alloc_type == ChanAllocType::Additional)
             && (chan_alloc.ul_dl_assigned == UlDlAssignment::Ul || chan_alloc.ul_dl_assigned == UlDlAssignment::Both);
@@ -309,8 +309,10 @@ impl UmacBs {
             ts_assigned: chan_alloc.timeslots,
             ul_dl_assigned: chan_alloc.ul_dl_assigned,
             clch_permission,
-            cell_change_flag: false,
-            carrier_num,
+            cell_change_flag: chan_alloc.cell_change_flag,
+            // For an announced Type-1 handover the MAC header is emitted by
+            // the old cell but must identify the target cell's carrier.
+            carrier_num: chan_alloc.carrier.unwrap_or(default_carrier_num),
             ext: None,
             // Core TIP 14.1.6: a normal CCCH -> TCH allocation assigns all
             // three monitoring patterns.  The frame-18-only field is then
@@ -599,8 +601,8 @@ impl UmacBs {
             // During a call, queue only the request. The associated FN18 may
             // be deferred by mandatory BSCH/BNCH; building the grant now
             // would reserve a different target FN18 than the one the MS sees.
-            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
-                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            let active_assigned_channel =
+                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
             if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
@@ -957,8 +959,8 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
-                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            let active_assigned_channel =
+                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
             if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
@@ -1076,8 +1078,8 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let active_assigned_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t)
-                && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+            let active_assigned_channel =
+                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
             if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
@@ -1344,20 +1346,16 @@ impl UmacBs {
             // believed to be listening, while its channel allocation points
             // at the *new* call.  Do not discard that association merely
             // because the MAC-RESOURCE carries a channel allocation.
-            if (2..=4).contains(&channel.timeslot)
-                && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot)
-            {
+            if (2..=4).contains(&channel.timeslot) && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot) {
                 let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
                 let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
                 if !hangtime && ul_active {
                     // Keep the PDU grant-free until the scheduler knows which
                     // FN18 will actually transmit it. A mandatory BSCH/BNCH
                     // can defer this queue entry by one or more multiframes.
-                    tracing::debug!(
-                        ?channel,
-                        "routing ordinary signalling through associated FN18 control queue"
-                    );
-                    self.channel_scheduler.dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                    tracing::debug!(?channel, "routing ordinary signalling through associated FN18 control queue");
+                    self.channel_scheduler
+                        .dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
                 } else {
                     tracing::debug!(
                         ?channel,
@@ -1365,7 +1363,8 @@ impl UmacBs {
                         ul_active,
                         "routing ordinary signalling through associated non-traffic signalling queue"
                     );
-                    self.channel_scheduler.dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                    self.channel_scheduler
+                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter);
                 }
             } else {
                 tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
@@ -1817,4 +1816,25 @@ fn pack_ul_acelp_bits(bits: &[u8]) -> Option<Vec<u8>> {
         out.push(byte);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_one_channel_allocation_keeps_target_carrier_and_cell_change() {
+        let allocation = CmceChanAllocReq {
+            usage: Some(17),
+            carrier: Some(1521),
+            timeslots: [false, false, true, false],
+            alloc_type: ChanAllocType::Replace,
+            cell_change_flag: true,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+        let mac = UmacBs::cmce_to_mac_chanalloc(&allocation, 1000);
+        assert_eq!(mac.carrier_num, 1521);
+        assert!(mac.cell_change_flag);
+        assert_eq!(mac.ts_assigned, [false, false, true, false]);
+    }
 }

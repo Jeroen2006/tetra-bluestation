@@ -325,12 +325,7 @@ impl LmacBs {
         let ul_time = prim.ul_time;
         let ts_idx = ul_time.t as usize - 1;
         let pchan = self.uplink_phy_chan[ts_idx];
-        let lchan = Self::determine_logical_channel_ul(
-            &prim,
-            pchan == PhysicalChannel::Tp,
-            ul_time.f == 18,
-            self.blk2_stolen,
-        );
+        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, ul_time.f == 18, self.blk2_stolen);
 
         // FN18 on a TP channel is SACCH/SCH-F, not TCH/S. The physical
         // receiver reports only the training sequence, so record the LMAC
@@ -543,7 +538,7 @@ impl TetraEntityTrait for LmacBs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tetra_core::PhyBlockType;
+    use tetra_core::{BitBuffer, PhyBlockType};
 
     fn normal_uplink_burst() -> TpUnitdataInd {
         TpUnitdataInd {

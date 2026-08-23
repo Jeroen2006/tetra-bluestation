@@ -23,6 +23,7 @@ fn test_u_mm_status_energy_saving() {
             ssi_type: SsiType::Issi,
             ssi: 2040814,
         },
+        forward_registration_target_station_id: None,
     };
     let test_sapmsg1 = SapMsg {
         sap: Sap::LmmSap,
