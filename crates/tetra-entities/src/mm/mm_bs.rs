@@ -252,7 +252,29 @@ impl MmBs {
         queue.push_back(msg);
     }
 
-    fn rx_u_itsi_detach(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    /// Remove a terminal's local serving-cell state.
+    ///
+    /// This is shared by a locally initiated U-ITSI DETACH and by the SwMI's
+    /// authoritative notification that the terminal has re-anchored at
+    /// another cell. The latter must not be echoed back to the SwMI: the
+    /// central anchor has already moved, and a stale-cell deregistration must
+    /// not be allowed to deregister the new serving cell.
+    fn remove_local_subscriber(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
+        let Some(client) = self.client_mgr.remove_client(issi) else {
+            tracing::debug!(issi, "local subscriber cleanup ignored for unknown client");
+            return false;
+        };
+
+        self.config.state_write().subscribers.deregister(issi);
+        if !client.groups.is_empty() {
+            let groups: Vec<u32> = client.groups.keys().copied().collect();
+            self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+        }
+        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+        true
+    }
+
+    fn rx_u_itsi_detach(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_u_itsi_detach");
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
@@ -297,18 +319,9 @@ impl MmBs {
                 );
             }
         }
-        let detached_client = self.client_mgr.remove_client(ssi);
-        if let Some(client) = detached_client {
-            self.config.state_write().subscribers.deregister(ssi);
-            if !client.groups.is_empty() {
-                let groups: Vec<u32> = client.groups.keys().copied().collect();
-                self.emit_subscriber_update(_queue, ssi, groups, BrewSubscriberAction::Deaffiliate);
-            }
-            self.emit_subscriber_update(_queue, ssi, Vec::new(), BrewSubscriberAction::Deregister);
-        } else {
+        if !self.remove_local_subscriber(queue, ssi) {
             tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
-            // return;
-        };
+        }
     }
 
     fn rx_u_location_update_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -2078,6 +2091,22 @@ impl TetraEntityTrait for MmBs {
                     scanning_enabled,
                     energy_economy,
                 } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled, energy_economy),
+                // Command id zero is reserved for the SwMI-to-old-serving-BS
+                // direction. It is deliberately not a normal U-ITSI DETACH:
+                // the SwMI has already moved the authoritative registration
+                // anchor, so only local MM/CMCE state must be discarded.
+                SwmiMessage::DeregistrationNotice { command_id: 0, itsi } => {
+                    let Ok(issi) = u32::try_from(itsi) else {
+                        tracing::warn!(itsi, "discarding old-serving-cell cleanup with invalid ISSI");
+                        continue;
+                    };
+                    if self.remove_local_subscriber(queue, issi) {
+                        tracing::info!(issi, "discarded stale old-serving-cell subscriber state after roam");
+                    }
+                }
+                SwmiMessage::DeregistrationNotice { command_id, itsi } => {
+                    tracing::warn!(command_id, itsi, "unexpected nonzero deregistration notice from SwMI");
+                }
                 SwmiMessage::EnergyEconomyDecision {
                     command_id,
                     itsi,
@@ -2106,6 +2135,30 @@ impl TetraEntityTrait for MmBs {
                         );
                     } else {
                         tracing::warn!(command_id, itsi, "SwMI rejected EE mode change");
+                    }
+                }
+                SwmiMessage::EnergyEconomyRebaseRequest { request_id, itsi, mode } => {
+                    let Ok(issi) = u32::try_from(itsi) else {
+                        tracing::warn!(request_id, itsi, "discarding EE rebase request with invalid ISSI");
+                        continue;
+                    };
+                    let Ok(mode) = EnergySavingMode::try_from(mode as u64) else {
+                        tracing::warn!(request_id, itsi, "discarding EE rebase request with invalid mode");
+                        continue;
+                    };
+                    let assignment = self.energy_economy_assignment(mode);
+                    if assignment.mode == 0 {
+                        tracing::warn!(request_id, issi, "unexpected StayAlive EE rebase request");
+                        continue;
+                    }
+                    if let Some(endpoint) = self.swmi.as_ref() {
+                        if let Err(error) = endpoint.submit(SwmiMessage::EnergyEconomyRebaseResult {
+                            request_id,
+                            itsi,
+                            energy_economy: assignment,
+                        }) {
+                            tracing::warn!(request_id, issi, ?error, "cannot return target-BS EE rebase result");
+                        }
                     }
                 }
                 message => tracing::warn!(?message, "unexpected non-MM SwMI message on MM endpoint"),

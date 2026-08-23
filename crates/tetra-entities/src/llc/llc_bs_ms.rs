@@ -537,11 +537,21 @@ impl Llc {
         }
 
         if pdu_type == LlcPduType::BlAck || pdu_type == LlcPduType::BlAckFcs {
-            // No payload, no need to do anything further
-            if pdu.get_len_remaining() > 4 {
-                tracing::warn!("BL-ACK PDU with unexpected payload, ignoring extra bits: {}", pdu.dump_bin());
+            // A bare BL-ACK can carry up to four radio-fill bits after its
+            // five-bit header; those are not a TL-SDU.
+            if pdu.get_len_remaining() <= 4 {
+                return;
             }
-            return;
+            // Some MS implementations piggyback the acknowledged TL-SDU on
+            // the BL-ACK that confirms its downlink.  In particular this is
+            // how the tested terminals return an SS-DGNA ASSIGN ACK.  The
+            // five LLC ACK bits have already been consumed, so pass the
+            // remaining TL-SDU through the normal acknowledged-data path.
+            tracing::debug!(
+                ts = %self.dltime,
+                payload_bits = pdu.get_len_remaining(),
+                "delivering BL-ACK piggyback payload"
+            );
         }
 
         // If unacknowledged data transfer service, we send a TL-UNITDATA indication

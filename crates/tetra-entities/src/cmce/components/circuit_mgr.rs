@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use tetra_core::{Direction, TdmaTime, TimeslotAllocator, TimeslotOwner, frames, multiframes};
 use tetra_pdus::cmce::structs::cmce_circuit::CmceCircuit;
@@ -316,16 +316,24 @@ impl CircuitMgr {
         }
     }
 
-    /// Closes any circuits that have expired.
-    /// Safety timeout: 6 minutes (beyond the 5-minute call timeout T5m).
-    /// Active calls are cleaned up earlier by CMCE hangtime/release logic.
-    fn close_expired_circuits(&mut self, mut tasks: Option<Vec<CircuitMgrCmd>>) -> Option<Vec<CircuitMgrCmd>> {
+    /// Closes orphaned circuits that have expired.
+    ///
+    /// CMCE owns the lifetime of every active call, particularly centrally
+    /// controlled calls whose legitimate lifetime is not tied to the local
+    /// circuit creation timestamp.  The safety timeout therefore applies only
+    /// to circuits that no longer have an active call owner.
+    fn close_expired_circuits(
+        &mut self,
+        mut tasks: Option<Vec<CircuitMgrCmd>>,
+        protected_call_ids: &HashSet<CallId>,
+    ) -> Option<Vec<CircuitMgrCmd>> {
         const CIRCUIT_EXPIRY_TIMESLOTS: i32 = 6 * 60 * 18 * 4; // 6 minutes
 
         let mut to_close: Vec<_> = self
             .dl
             .iter()
             .filter_map(|circuit| circuit.as_ref())
+            .filter(|circuit| !protected_call_ids.contains(&circuit.call_id))
             .filter(|circuit| circuit.ts_created.age(self.dltime) > CIRCUIT_EXPIRY_TIMESLOTS)
             .map(|circuit| (circuit.direction, circuit.ts, circuit.call_id))
             .collect();
@@ -333,6 +341,7 @@ impl CircuitMgr {
             self.ul_only
                 .iter()
                 .filter_map(|circuit| circuit.as_ref())
+                .filter(|circuit| !protected_call_ids.contains(&circuit.call_id))
                 .filter(|circuit| circuit.ts_created.age(self.dltime) > CIRCUIT_EXPIRY_TIMESLOTS)
                 .map(|circuit| (circuit.direction, circuit.ts, circuit.call_id)),
         );
@@ -343,13 +352,13 @@ impl CircuitMgr {
         tasks
     }
 
-    pub fn tick_start(&mut self, dltime: TdmaTime) -> Option<Vec<CircuitMgrCmd>> {
+    pub fn tick_start(&mut self, dltime: TdmaTime, protected_call_ids: &HashSet<CallId>) -> Option<Vec<CircuitMgrCmd>> {
         self.dltime = dltime;
         let mut tasks = None;
 
         if dltime.t == 1 {
             // First, close any expired circuits
-            tasks = self.close_expired_circuits(tasks);
+            tasks = self.close_expired_circuits(tasks, protected_call_ids);
 
             // Next, go through channels, see if D-SETUPs need to be sent
             // Late entry: resend D-SETUP every 5 seconds

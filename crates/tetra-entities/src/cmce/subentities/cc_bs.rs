@@ -35,6 +35,7 @@ use tetra_saps::{
 };
 
 use crate::cmce::subentities::sds_bs::SdsBsSubentity;
+use crate::cmce::subentities::ss_bs::SsBsSubentity;
 use crate::net_brew;
 use crate::net_swmi::SwmiCmceEndpoint;
 use crate::{
@@ -1613,7 +1614,7 @@ impl CcBsSubentity {
         );
     }
 
-    pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime, sds: &mut SdsBsSubentity) {
+    pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime, sds: &mut SdsBsSubentity, ss: &mut SsBsSubentity) {
         self.dltime = dltime;
 
         // Central decisions are applied on the radio/router thread, never on
@@ -1627,6 +1628,8 @@ impl CcBsSubentity {
         for action in swmi_actions {
             if SdsBsSubentity::is_swmi_action(&action) {
                 sds.handle_swmi_action(queue, action);
+            } else if SsBsSubentity::is_swmi_action(&action) {
+                ss.handle_swmi_action(queue, action);
             } else {
                 self.handle_swmi_action(queue, action);
             }
@@ -1642,7 +1645,13 @@ impl CcBsSubentity {
         // Drive deferred D-RELEASE teardown
         self.process_releasing_calls(queue);
 
-        if let Some(tasks) = self.circuits.tick_start(dltime) {
+        // The circuit manager may reap orphaned allocations, but active group
+        // and private calls are owned by their call-control state. In
+        // particular, a central call can remain valid beyond the local
+        // circuit's six-minute safety age and must only be released by its
+        // central lifecycle decision.
+        let protected_call_ids: HashSet<u16> = self.active_calls.keys().chain(self.private_calls.keys()).copied().collect();
+        if let Some(tasks) = self.circuits.tick_start(dltime, &protected_call_ids) {
             for task in tasks {
                 match task {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
@@ -4387,10 +4396,31 @@ impl CcBsSubentity {
             return;
         };
 
+        let (dest_gssi, source_issi) = self
+            .active_calls
+            .get(&call_id)
+            .map(|call| (call.dest_gssi, call.source_issi))
+            .expect("call id selected from active_calls");
+
+        // A TCH is bidirectional so local members can request the next
+        // floor, but only the cell currently serving the granted MS expects
+        // uplink speech. A receiving cell otherwise times out after three
+        // multiframes, emits a spurious D-TX CEASED and drops its SwMI
+        // downlink-media mapping while the remote speaker is still talking.
+        if !self.active_floor_holder_is_local_member(dest_gssi, source_issi) {
+            tracing::debug!(
+                call_id,
+                ts,
+                source_issi,
+                dest_gssi,
+                "ignoring UL inactivity timeout for remotely served floor holder"
+            );
+            return;
+        }
+
         let call = self.active_calls.get_mut(&call_id).unwrap();
         tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
 
-        let dest_gssi = call.dest_gssi;
         call.tx_active = false;
         call.hangtime_start = Some(self.dltime);
 

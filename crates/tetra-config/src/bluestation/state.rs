@@ -1,6 +1,10 @@
 use crate::bluestation::RuntimeNetworkBroadcast;
 use std::collections::{HashMap, HashSet};
-use tetra_core::TimeslotAllocator;
+use tetra_core::{TdmaTime, TimeslotAllocator};
+
+/// Two multiframes cover the immediate call-control response to a received
+/// MAC-ACCESS while remaining much shorter than an EE monitoring interval.
+const DIRECT_RESPONSE_WINDOW_TIMESLOTS: i32 = 2 * 18 * 4;
 
 #[derive(Debug, Clone)]
 pub struct Subscriber {
@@ -32,6 +36,10 @@ pub struct SubscriberRegistry {
     registration_delivery_failures: u16,
     /// Set of all GSSIs with at least one local affiliate
     all_attached_groups: HashSet<u32>,
+    /// Short-lived MS-initiated MAC-ACCESS contexts. These are deliberately
+    /// independent of registration so a first location-update response also
+    /// remains immediate.
+    direct_response_deadlines: HashMap<u32, TdmaTime>,
 }
 
 impl SubscriberRegistry {
@@ -42,6 +50,7 @@ impl SubscriberRegistry {
             pending_registration_deliveries: HashSet::new(),
             registration_delivery_failures: 0,
             all_attached_groups: HashSet::new(),
+            direct_response_deadlines: HashMap::new(),
         }
     }
 
@@ -61,6 +70,21 @@ impl SubscriberRegistry {
     pub fn mark_inactive(&mut self, issi: u32) {
         self.active_subscribers.remove(&issi);
         self.pending_registration_deliveries.remove(&issi);
+    }
+
+    /// An MS that just used MAC-ACCESS is listening for the direct outcome of
+    /// that procedure. The resulting call-control response must not wait for
+    /// its ordinary EE MCCH monitoring phase.
+    pub fn mark_direct_response_window(&mut self, issi: u32, now: TdmaTime) {
+        self.direct_response_deadlines
+            .insert(issi, now.add_timeslots(DIRECT_RESPONSE_WINDOW_TIMESLOTS));
+    }
+
+    pub fn direct_response_window_active(&mut self, issi: u32, now: TdmaTime) -> bool {
+        self.direct_response_deadlines.retain(|_, deadline| deadline.age(now) <= 0);
+        self.direct_response_deadlines
+            .get(&issi)
+            .is_some_and(|deadline| deadline.age(now) <= 0)
     }
 
     pub fn set_registration_delivery_pending(&mut self, issi: u32, pending: bool) {
@@ -121,6 +145,7 @@ impl SubscriberRegistry {
     /// Deregister an ISSI, removing it from the registry and cleaning up any group affiliations
     pub fn deregister(&mut self, issi: u32) {
         self.mark_inactive(issi);
+        self.direct_response_deadlines.remove(&issi);
         if let Some(subscriber) = self.subscribers.remove(&issi) {
             // Clean up global group affiliations for this subscriber
             for gssi in &subscriber.attached_groups {
@@ -243,6 +268,15 @@ mod tests {
         assert!(reg.is_registered(1001));
         reg.deregister(1001);
         assert!(!reg.is_registered(1001));
+    }
+
+    #[test]
+    fn direct_response_window_expires() {
+        let mut reg = SubscriberRegistry::new();
+        let now = TdmaTime::default();
+        reg.mark_direct_response_window(1001, now);
+        assert!(reg.direct_response_window_active(1001, now.add_timeslots(143)));
+        assert!(!reg.direct_response_window_active(1001, now.add_timeslots(145)));
     }
 
     #[test]

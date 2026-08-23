@@ -35,8 +35,8 @@ impl CmceBs {
             telemetry,
             control,
             sds: SdsBsSubentity::new(config.clone(), swmi.clone()),
-            cc: CcBsSubentity::new(config.clone(), swmi),
-            ss: SsBsSubentity::new(),
+            cc: CcBsSubentity::new(config.clone(), swmi.clone()),
+            ss: SsBsSubentity::new(config, swmi),
         }
     }
 
@@ -81,8 +81,7 @@ impl CmceBs {
                 self.cc.decorate_pending_downlinks(_queue);
             }
             CmcePduTypeUl::UFacility => {
-                unimplemented_log!("{:?}", pdu_type);
-                // self.ss.route_xx_deliver(_queue, message);
+                self.ss.route_re_deliver(_queue, message);
             }
             CmcePduTypeUl::CmceFunctionNotSupported => {
                 unimplemented_log!("{:?}", pdu_type);
@@ -102,7 +101,8 @@ impl TetraEntityTrait for CmceBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         // Propagate tick to subentities
-        self.cc.tick_start(queue, ts, &mut self.sds);
+        self.cc.tick_start(queue, ts, &mut self.sds, &mut self.ss);
+        self.ss.tick_start(queue);
         self.sds.tick_start(queue);
         // Central private-call actions and CC timers also create downlink
         // messages outside rx_lcmc_mle_unitdata_ind.

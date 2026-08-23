@@ -396,7 +396,9 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             message @ (SwmiMessage::RegistrationDecision { .. }
                             | SwmiMessage::AttachmentDecision { .. }
                             | SwmiMessage::EnergyEconomyDecision { .. }
+                            | SwmiMessage::EnergyEconomyRebaseRequest { .. }
                             | SwmiMessage::SubscriberStateSync { .. }
+                            | SwmiMessage::DeregistrationNotice { .. }
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
                             | SwmiMessage::AuthenticationResult { .. }),
@@ -433,7 +435,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::HandoverReserveGroupCall { .. }
                             | SwmiMessage::SdsDeliver { .. }
                             | SwmiMessage::SdsFailure { .. }
-                            | SwmiMessage::StatusDeliver { .. }),
+                            | SwmiMessage::StatusDeliver { .. }
+                            | SwmiMessage::DgnaCommand { .. }),
                         ) => {
                             if self.endpoint.cmce_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI CMCE endpoint closed; dropping central call action");

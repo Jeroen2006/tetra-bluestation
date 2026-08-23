@@ -794,6 +794,14 @@ impl UmacBs {
             return;
         }
 
+        if let Some(issi) = issi {
+            // Preserve this context independently of the queued RA ACK. The
+            // ACK itself is normally emitted before CMCE/SwMI has produced
+            // D-CALL-PROCEEDING or D-CONNECT, so queue inspection alone is
+            // too short-lived to protect the actual PTT response.
+            self.config.state_write().subscribers.mark_direct_response_window(issi, self.dltime);
+        }
+
         // Acknowledge the access, unless it is on a timeslot in an active over. During
         // traffic the uplink is reserved (ETSI 23.5.1.3), so the talker is not on random
         // access and acking it would steal an extra MAC-RESOURCE onto the traffic channel.
@@ -1407,12 +1415,25 @@ impl UmacBs {
         // means the terminal is on TCH and listens continuously, so it is an
         // explicit bypass (as are FACCH resources handled above).
         if associated_channel.is_none() && prim.main_address.ssi_type == SsiType::Issi {
-            let activation_response = self
-                .config
-                .state_write()
-                .subscribers
-                .take_energy_economy_activation_pending(prim.main_address.ssi);
-            if !activation_response {
+            // ETSI TS 100 392-2 §21.4.3.1 requires the random-access flag to
+            // stop retransmissions. The matching response is therefore sent
+            // immediately while that acknowledgement remains queued, rather
+            // than waiting for a later EE monitoring occasion.
+            let random_access_response = self.channel_scheduler.has_pending_random_access_ack(prim.main_address.ssi);
+            let (activation_response, direct_response_window) = {
+                let mut state = self.config.state_write();
+                (
+                    state.subscribers.take_energy_economy_activation_pending(prim.main_address.ssi),
+                    state.subscribers.direct_response_window_active(prim.main_address.ssi, self.dltime),
+                )
+            };
+            if direct_response_window {
+                tracing::debug!(
+                    issi = prim.main_address.ssi,
+                    "sending correlated MAC-ACCESS response without EE deferral"
+                );
+            }
+            if !activation_response && !random_access_response && !direct_response_window {
                 if let Some(due) = self.next_energy_economy_mcch(prim.main_address.ssi) {
                     tracing::debug!(issi = prim.main_address.ssi, due = %due, "deferring MCCH resource for EE monitoring occasion");
                     self.deferred_mcch.push_back(DeferredMcch {
