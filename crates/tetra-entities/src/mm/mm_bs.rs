@@ -1939,6 +1939,7 @@ impl MmBs {
             status_downlink: StatusDownlink::ChangeOfEnergySavingModeResponse,
             energy_saving_information: Some(esi),
             gateway_payload: None,
+            proprietary: None,
         };
 
         let mut sdu = BitBuffer::new_autoexpand(32);
@@ -1977,6 +1978,7 @@ impl MmBs {
             status_downlink,
             energy_saving_information: None,
             gateway_payload: Some(gateway_payload),
+            proprietary: None,
         };
         let mut sdu = BitBuffer::new_autoexpand(128);
         if let Err(error) = pdu.to_bitbuf(&mut sdu) {

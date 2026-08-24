@@ -7,7 +7,7 @@ pub struct Type4FieldGeneric {
     pub data: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Type3FieldGeneric {
     pub field_id: u64,
     pub len: usize,

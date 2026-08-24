@@ -1,10 +1,12 @@
 use core::fmt;
 
 use tetra_core::expect_pdu_type;
+use tetra_core::typed_pdu_fields::{Type3FieldGeneric, delimiters, typed};
 use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use crate::mm::enums::status_downlink::StatusDownlink;
+use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 use crate::mm::fields::dm_ms_address::DmMsAddress;
 use crate::mm::fields::energy_saving_information::EnergySavingInformation;
 
@@ -22,6 +24,8 @@ pub struct DMmStatus {
     pub status_downlink: StatusDownlink,
     pub energy_saving_information: Option<EnergySavingInformation>,
     pub gateway_payload: Option<DMmStatusGatewayPayload>,
+    /// Annex B optional Type-3 proprietary information.
+    pub proprietary: Option<Type3FieldGeneric>,
 }
 
 impl DMmStatus {
@@ -33,12 +37,18 @@ impl DMmStatus {
             field: "status_downlink",
             value,
         })?;
-        let (energy_saving_information, gateway_payload) = match status_downlink {
+        let (energy_saving_information, gateway_payload, proprietary) = match status_downlink {
             StatusDownlink::ChangeOfEnergySavingModeRequest | StatusDownlink::ChangeOfEnergySavingModeResponse => {
-                (Some(EnergySavingInformation::from_bitbuf(buffer)?), None)
+                (Some(EnergySavingInformation::from_bitbuf(buffer)?), None, None)
             }
             StatusDownlink::AcceptanceToStartDmGatewayOperation | StatusDownlink::AcceptanceOfDmMsAddresses => {
-                (None, Some(DMmStatusGatewayPayload::RejectedAddresses(read_addresses(buffer)?)))
+                read_reserved(buffer)?;
+                let addresses = read_addresses(buffer)?;
+                (
+                    None,
+                    Some(DMmStatusGatewayPayload::RejectedAddresses(addresses)),
+                    read_proprietary(buffer)?,
+                )
             }
             StatusDownlink::AcceptanceToContinueDmGatewayOperation => {
                 let retained = buffer.read_field(1, "retained_dm_ms_address_set")? != 0;
@@ -49,20 +59,36 @@ impl DMmStatus {
                         value: reserved,
                     });
                 }
-                (None, Some(DMmStatusGatewayPayload::RetainedAddressSet(retained)))
+                (
+                    None,
+                    Some(DMmStatusGatewayPayload::RetainedAddressSet(retained)),
+                    read_proprietary(buffer)?,
+                )
             }
-            StatusDownlink::CommandToRemoveDmMsAddresses => (None, Some(DMmStatusGatewayPayload::RemoveAddresses(read_addresses(buffer)?))),
+            StatusDownlink::CommandToRemoveDmMsAddresses => {
+                read_reserved(buffer)?;
+                let addresses = read_addresses(buffer)?;
+                (
+                    None,
+                    Some(DMmStatusGatewayPayload::RemoveAddresses(addresses)),
+                    read_proprietary(buffer)?,
+                )
+            }
             StatusDownlink::RejectionToStartDmGatewayOperation
             | StatusDownlink::RejectionToContinueDmGatewayOperation
             | StatusDownlink::AcceptanceToStopDmGatewayOperation
             | StatusDownlink::CommandToChangeRegistrationLabel
-            | StatusDownlink::CommandToStopDmGatewayOperation => (None, Some(DMmStatusGatewayPayload::Empty)),
-            _ => (None, None),
+            | StatusDownlink::CommandToStopDmGatewayOperation => {
+                read_reserved(buffer)?;
+                (None, Some(DMmStatusGatewayPayload::Empty), read_proprietary(buffer)?)
+            }
+            _ => (None, None, None),
         };
         Ok(Self {
             status_downlink,
             energy_saving_information,
             gateway_payload,
+            proprietary,
         })
     }
 
@@ -79,7 +105,7 @@ impl DMmStatus {
                 .to_bitbuf(buffer)?,
             _ => {
                 if let Some(payload) = &self.gateway_payload {
-                    write_gateway_payload(self.status_downlink, payload, buffer)?;
+                    write_gateway_payload(self.status_downlink, payload, &self.proprietary, buffer)?;
                 }
             }
         }
@@ -104,18 +130,58 @@ fn write_addresses(addresses: &[DmMsAddress], buffer: &mut BitBuffer) -> Result<
     }
     Ok(())
 }
-fn write_gateway_payload(status: StatusDownlink, payload: &DMmStatusGatewayPayload, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+fn read_reserved(buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+    let reserved = buffer.read_field(8, "reserved")?;
+    if reserved != 0 {
+        return Err(PduParseErr::InvalidValue {
+            field: "reserved",
+            value: reserved,
+        });
+    }
+    Ok(())
+}
+fn read_proprietary(buffer: &mut BitBuffer) -> Result<Option<Type3FieldGeneric>, PduParseErr> {
+    let obit = delimiters::read_obit(buffer)?;
+    let proprietary = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::Proprietary)?;
+    if obit && buffer.read_field(1, "trailing_mbit")? != 0 {
+        return Err(PduParseErr::InvalidTrailingMbitValue);
+    }
+    Ok(proprietary)
+}
+fn write_proprietary(proprietary: &Option<Type3FieldGeneric>, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+    let obit = proprietary.is_some();
+    delimiters::write_obit(buffer, obit as u8);
+    if !obit {
+        return Ok(());
+    }
+    typed::write_type3_generic(obit, buffer, proprietary, MmType34ElemIdDl::Proprietary)?;
+    delimiters::write_mbit(buffer, 0);
+    Ok(())
+}
+fn write_gateway_payload(
+    status: StatusDownlink,
+    payload: &DMmStatusGatewayPayload,
+    proprietary: &Option<Type3FieldGeneric>,
+    buffer: &mut BitBuffer,
+) -> Result<(), PduParseErr> {
     match (status, payload) {
         (
             StatusDownlink::AcceptanceToStartDmGatewayOperation | StatusDownlink::AcceptanceOfDmMsAddresses,
             DMmStatusGatewayPayload::RejectedAddresses(addresses),
-        ) => write_addresses(addresses, buffer)?,
+        ) => {
+            buffer.write_bits(0, 8);
+            write_addresses(addresses, buffer)?;
+            write_proprietary(proprietary, buffer)?;
+        }
         (StatusDownlink::AcceptanceToContinueDmGatewayOperation, DMmStatusGatewayPayload::RetainedAddressSet(retained)) => {
             buffer.write_bits(*retained as u64, 1);
             buffer.write_bits(0, 7);
+            write_proprietary(proprietary, buffer)?;
         }
         (StatusDownlink::CommandToRemoveDmMsAddresses, DMmStatusGatewayPayload::RemoveAddresses(addresses)) => {
-            write_addresses(addresses, buffer)?
+            buffer.write_bits(0, 8);
+            write_addresses(addresses, buffer)?;
+            write_proprietary(proprietary, buffer)?;
         }
         (
             StatusDownlink::RejectionToStartDmGatewayOperation
@@ -124,7 +190,10 @@ fn write_gateway_payload(status: StatusDownlink, payload: &DMmStatusGatewayPaylo
             | StatusDownlink::CommandToChangeRegistrationLabel
             | StatusDownlink::CommandToStopDmGatewayOperation,
             DMmStatusGatewayPayload::Empty,
-        ) => {}
+        ) => {
+            buffer.write_bits(0, 8);
+            write_proprietary(proprietary, buffer)?;
+        }
         _ => {
             return Err(PduParseErr::InvalidValue {
                 field: "gateway_status_payload",
