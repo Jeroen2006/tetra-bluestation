@@ -71,6 +71,11 @@ pub struct UmacBs {
     /// group-call same-timeslot UL loopback for these circuits: it returns a
     /// speaker's audio to the speaker instead of their private peer.
     private_media_timeslots: HashSet<u8>,
+    /// Duplex private calls still use individually routed media, but unlike
+    /// simplex calls both endpoints are expected to provide an uplink. Keep
+    /// their radio-loss watchdog active so a vanished endpoint terminates the
+    /// call instead of leaving a dead traffic circuit behind.
+    duplex_private_media_timeslots: HashSet<u8>,
     /// MCCH resources held until an EE terminal's next monitoring occasion.
     /// Associated traffic-channel and FACCH paths never enter this queue.
     deferred_mcch: VecDeque<DeferredMcch>,
@@ -113,6 +118,7 @@ impl UmacBs {
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             last_ul_voice: [None; 4],
             private_media_timeslots: HashSet::new(),
+            duplex_private_media_timeslots: HashSet::new(),
             deferred_mcch: VecDeque::new(),
         }
     }
@@ -1515,9 +1521,14 @@ impl UmacBs {
             // DL voice from Brew/upper layer → schedule for DL transmission
             SapMsgInner::TmdCircuitDataReq(prim) => {
                 let ts = prim.ts;
-                // Refresh UL inactivity timer when DL voice is being fed (network call scenario).
-                // This prevents false timeout when Brew is the speaker and no UL radio is transmitting.
-                if (1..=4).contains(&ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                // Network-originated group audio has no local UL speaker, so
+                // it keeps the group-call watchdog alive. Never use private
+                // duplex downlink audio as evidence of its endpoint's UL: it
+                // can be the surviving peer talking to a vanished terminal.
+                if (1..=4).contains(&ts)
+                    && self.channel_scheduler.circuit_is_active(Direction::Ul, ts)
+                    && !self.duplex_private_media_timeslots.contains(&ts)
+                {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
@@ -1745,10 +1756,11 @@ impl UmacBs {
         for ts in 1..=4u8 {
             let idx = ts as usize - 1;
 
-            // In a private call the SwMI owns floor state.  One endpoint is
-            // normally silent while the other holds PTT, so the group-call
-            // radio-loss watchdog would generate a false timeout for it.
-            if self.private_media_timeslots.contains(&ts) {
+            // A simplex private call is floor controlled and one endpoint is
+            // normally silent, so it must not use the radio-loss watchdog.
+            // Duplex calls use distinct traffic circuits per endpoint and are
+            // intentionally kept under this guard.
+            if self.private_media_timeslots.contains(&ts) && !self.duplex_private_media_timeslots.contains(&ts) {
                 continue;
             }
 
@@ -1814,15 +1826,18 @@ impl UmacBs {
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = None;
+                    self.duplex_private_media_timeslots.remove(&ts);
                 }
             }
             CallControl::PrivateCallTrafficActive { ts, .. } => {
                 // Full-duplex P2P has no simplex floor or hangtime.  A
                 // restore must therefore keep its traffic slot active even
-                // though the central private floor holder is zero.
+                // though the central private floor holder is zero. It does
+                // still require the UL inactivity guard for a lost endpoint.
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    self.duplex_private_media_timeslots.insert(ts);
                 }
             }
             CallControl::PrivateMediaStart { ts, .. } => {
@@ -1830,6 +1845,7 @@ impl UmacBs {
             }
             CallControl::PrivateMediaStop { ts, .. } => {
                 self.private_media_timeslots.remove(&ts);
+                self.duplex_private_media_timeslots.remove(&ts);
             }
 
             // UlInactivityTimeout is UMAC→CMCE only, UMAC won't receive it back

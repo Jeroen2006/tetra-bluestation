@@ -110,6 +110,9 @@ pub struct CcBsSubentity {
     /// GRANTED that identifies the live speaker. Key: (call id, restored
     /// ISSI); value: (floor holder, due time).
     pending_restore_floor_indications: HashMap<(u16, u32), (u32, TdmaTime)>,
+    /// SwMI-scheduled acknowledged D-INFO probes for simplex private-call
+    /// hangtime. The LLC TxReporter is the authoritative BL-ACK outcome.
+    pending_private_keepalives: HashMap<(u16, u32, u64), TxReporter>,
     next_swmi_command: u64,
     /// Point-to-point calls are intentionally kept separate from group
     /// `active_calls`: a same-cell P2P call has two radio circuits sharing
@@ -234,6 +237,7 @@ impl CcBsSubentity {
             pending_preemptive_floor_grants: HashMap::new(),
             pending_private_floor_requests: HashMap::new(),
             pending_restore_floor_indications: HashMap::new(),
+            pending_private_keepalives: HashMap::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
             pending_private_setups: HashMap::new(),
@@ -1637,6 +1641,7 @@ impl CcBsSubentity {
 
         self.process_pending_preemptive_floor_grants(queue);
         self.process_pending_private_floor_requests(queue);
+        self.process_pending_private_keepalives();
         self.process_pending_restore_floor_indications(queue);
 
         // Check hangtime expiry for active local calls
@@ -1940,6 +1945,8 @@ impl CcBsSubentity {
         }
 
         self.pending_private_floor_requests.remove(&(call_id, departed_itsi));
+        self.pending_private_keepalives
+            .retain(|(pending_call_id, pending_itsi, _), _| *pending_call_id != call_id || *pending_itsi != departed_itsi);
         let departed_circuit = self.private_circuits.remove(&(call_id, departed_itsi));
         if let Some(local) = self.private_calls.get_mut(&call_id) {
             local.local_mask &= !endpoint_mask;
@@ -2291,6 +2298,22 @@ impl CcBsSubentity {
                         self.start_private_media(queue, call_id, itsi, peer, circuit.ts);
                     }
                 }
+                if call.duplex {
+                    let mut duplex_timeslots = HashSet::new();
+                    for itsi in [call.caller_itsi, call.callee_itsi] {
+                        let Some(circuit) = self.private_circuits.get(&(call_id, itsi)) else {
+                            continue;
+                        };
+                        if duplex_timeslots.insert(circuit.ts) {
+                            queue.push_back(SapMsg {
+                                sap: Sap::Control,
+                                src: TetraEntity::Cmce,
+                                dest: TetraEntity::Umac,
+                                msg: SapMsgInner::CmceCallControl(CallControl::PrivateCallTrafficActive { call_id, ts: circuit.ts }),
+                            });
+                        }
+                    }
+                }
                 // A connected private call is the strongest listening
                 // evidence for both endpoints, including a silent callee.
                 // This makes individual SDS and later private signalling use
@@ -2503,15 +2526,26 @@ impl CcBsSubentity {
             SwmiMessage::PrivateCallKeepalive {
                 call_id,
                 itsi,
-                sequence: _,
+                sequence,
             } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
-                let Some(circuit) = self.private_circuits.get(&(call_id, itsi as u32)) else {
+                let itsi = itsi as u32;
+                let Some(call) = self.private_calls.get(&call_id) else {
                     return;
                 };
+                if !call.connected || call.duplex || call.floor_itsi != 0 {
+                    tracing::debug!(call_id, itsi, sequence, "ignoring private keepalive outside simplex hangtime");
+                    return;
+                }
+                let Some(circuit) = self.private_circuits.get(&(call_id, itsi)).cloned() else {
+                    return;
+                };
+                if self.pending_private_keepalives.contains_key(&(call_id, itsi, sequence)) {
+                    return;
+                }
                 let pdu = DInfo {
                     call_identifier: call_id,
-                    reset_call_time_out_timer_t310_: true,
+                    reset_call_time_out_timer_t310_: false,
                     poll_request: false,
                     new_call_identifier: None,
                     call_time_out: None,
@@ -2531,15 +2565,20 @@ impl CcBsSubentity {
                 let mut sdu = BitBuffer::new_autoexpand(32);
                 pdu.to_bitbuf(&mut sdu).expect("serialize private D-INFO");
                 sdu.seek(0);
-                tracing::debug!(call_id, itsi, ts = circuit.ts, "sending periodic private D-INFO T310 refresh");
-                // The LLC implementation cannot send acknowledged BL-DATA
-                // through FACCH/STCH. P2P D-INFO has no valid poll-response
-                // procedure, so this is deliberately normal FACCH: it only
-                // refreshes T310 at the called terminal.
-                queue.push_back(Self::build_sapmsg_stealing(
+                let reporter = TxReporter::new();
+                self.pending_private_keepalives.insert((call_id, itsi, sequence), reporter.clone());
+                tracing::debug!(call_id, itsi, sequence, ts = circuit.ts, "sending acknowledged private hangtime D-INFO reachability probe");
+                queue.push_back(Self::build_sapmsg_associated(
                     sdu,
+                    None,
                     TetraAddress::new(itsi as u32, SsiType::Issi),
-                    circuit.ts,
+                    Layer2Service::Acknowledged,
+                    Some(reporter),
+                    AssociatedChannel {
+                        call_id,
+                        timeslot: circuit.ts,
+                        usage: circuit.usage,
+                    },
                 ));
             }
             SwmiMessage::CallReject { call_id, itsi, cause, .. } => {
@@ -2599,6 +2638,32 @@ impl CcBsSubentity {
                 itsi,
                 "private SwMI floor decision delayed; sent D-TX-GRANTED(RequestQueued)"
             );
+        }
+    }
+
+    fn process_pending_private_keepalives(&mut self) {
+        let completed: Vec<_> = self
+            .pending_private_keepalives
+            .iter()
+            .filter_map(|(&(call_id, itsi, sequence), reporter)| {
+                reporter
+                    .is_in_final_state()
+                    .then_some((call_id, itsi, sequence, reporter.is_acknowledged()))
+            })
+            .collect();
+        for (call_id, itsi, sequence, acknowledged) in completed {
+            self.pending_private_keepalives.remove(&(call_id, itsi, sequence));
+            let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) else {
+                continue;
+            };
+            if let Err(error) = swmi.submit(SwmiMessage::PrivateCallKeepaliveResult {
+                call_id: call_id as u64,
+                itsi: itsi as u64,
+                sequence,
+                acknowledged,
+            }) {
+                tracing::warn!(call_id, itsi, sequence, ?error, "cannot report private hangtime reachability result to SwMI");
+            }
         }
     }
 
@@ -3265,6 +3330,8 @@ impl CcBsSubentity {
     fn release_private_call_local(&mut self, queue: &mut MessageQueue, call_id: u16, cause: DisconnectCause) {
         self.pending_private_floor_requests
             .retain(|(pending_call_id, _), _| *pending_call_id != call_id);
+        self.pending_private_keepalives
+            .retain(|(pending_call_id, _, _), _| *pending_call_id != call_id);
         let Some(call) = self.private_calls.remove(&call_id) else { return };
         let mut teardown_timeslots = HashSet::new();
         for (mask, itsi) in [(0x01, call.caller_itsi), (0x02, call.callee_itsi)] {
@@ -4384,6 +4451,39 @@ impl CcBsSubentity {
     /// Handle UL inactivity timeout from UMAC: a radio disappeared mid-transmission.
     /// Treat identically to rx_u_tx_ceased — force TX ceased, enter hangtime.
     fn handle_ul_inactivity_timeout(&mut self, queue: &mut MessageQueue, ts: u8) {
+        // Duplex private calls have no floor or hangtime. Their independently
+        // guarded UL circuit identifies a lost endpoint, so terminate the
+        // central call immediately rather than translating this into TX ceased.
+        let duplex_private = self.private_circuits.iter().find_map(|(&(call_id, itsi), circuit)| {
+            (circuit.ts == ts)
+                .then(|| {
+                    self.private_calls
+                        .get(&call_id)
+                        .filter(|call| call.connected && call.duplex)
+                        .map(|_| (call_id, itsi))
+                })
+                .flatten()
+        });
+        if let Some((call_id, itsi)) = duplex_private {
+            let cause = DisconnectCause::ExpiryOfTimer;
+            if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                if swmi
+                    .submit(SwmiMessage::PrivateCallRelease {
+                        call_id: call_id as u64,
+                        itsi: itsi as u64,
+                        cause: cause as u8,
+                    })
+                    .is_ok()
+                {
+                    tracing::warn!(call_id, itsi, ts, "UL inactivity timeout forwarded as duplex private call release");
+                    return;
+                }
+            }
+            tracing::warn!(call_id, itsi, ts, "UL inactivity timeout releasing duplex private call locally");
+            self.release_private_call_local(queue, call_id, cause);
+            return;
+        }
+
         // Find the active call on this timeslot with tx_active == true
         let call_entry = self
             .active_calls
@@ -4416,6 +4516,31 @@ impl CcBsSubentity {
                 "ignoring UL inactivity timeout for remotely served floor holder"
             );
             return;
+        }
+
+        // A radio-loss timeout is equivalent to U-TX CEASED.  For a central
+        // call, let the SwMI release the authoritative floor and start its
+        // central hangtime; otherwise the target BS would enter only local
+        // hangtime after a roaming speaker disappeared.
+        let command_id = self.next_swmi_command_id();
+        if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+            if swmi
+                .submit(SwmiMessage::FloorReleaseRequest {
+                    command_id,
+                    call_id: call_id as u64,
+                    itsi: source_issi as u64,
+                })
+                .is_ok()
+            {
+                tracing::warn!(
+                    call_id,
+                    source_issi,
+                    ts,
+                    command_id,
+                    "UL inactivity timeout forwarded to central SwMI"
+                );
+                return;
+            }
         }
 
         let call = self.active_calls.get_mut(&call_id).unwrap();
