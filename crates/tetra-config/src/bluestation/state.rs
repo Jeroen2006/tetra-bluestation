@@ -27,6 +27,17 @@ pub struct Subscriber {
     pub rua_assigned: Option<bool>,
 }
 
+/// A live, per-terminal downlink listening opportunity.  Call control owns
+/// the observations; LLC reads this small neutral representation again just
+/// before every acknowledged transmission.  Keeping it in shared state is
+/// what prevents a retry from inheriting a stale traffic timeslot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriberDeliveryRoute {
+    pub call_id: u16,
+    pub timeslot: u8,
+    pub usage: u8,
+}
+
 /// Centralized subscriber registry tracking locally registered ISSIs and their group affiliations.
 #[derive(Debug, Clone)]
 pub struct SubscriberRegistry {
@@ -267,6 +278,9 @@ pub struct StackState {
     pub authentication_required: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
+    /// Ordered, currently valid traffic-channel opportunities for individual
+    /// downlink signalling.  Empty means that LLC must use MCCH/EE delivery.
+    pub subscriber_delivery_routes: HashMap<u32, Vec<SubscriberDeliveryRoute>>,
     /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
     /// API. The worker reports each version to the SwMI.
     pub network_broadcast: RuntimeNetworkBroadcast,
@@ -357,6 +371,7 @@ impl Default for StackState {
             network_connected: false,
             authentication_required: false,
             subscribers: SubscriberRegistry::new(),
+            subscriber_delivery_routes: HashMap::new(),
             network_broadcast: RuntimeNetworkBroadcast {
                 version: 0,
                 neighbours: Default::default(),

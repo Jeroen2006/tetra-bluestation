@@ -57,6 +57,10 @@ pub struct ExpectedInAck {
     pub retransmission_buf: SapMsg,
     /// Number of retransmissions performed so far
     pub retransmit_count: u8,
+    /// Traffic timeslots already tried for this basic-link delivery.  A retry
+    /// must resolve the current CC view again, rather than replaying the
+    /// associated channel that was true when the PDU was first built.
+    pub tried_delivery_timeslots: HashSet<u8>,
 }
 
 /// Struct that maintains state for an ACK we still need to send back.
@@ -246,9 +250,45 @@ impl Llc {
     }
 
     /// Schedules a message that was not acked in time for a retransmission
-    fn submit_for_acknowledged_transmission(queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
+    fn submit_for_acknowledged_transmission(config: &SharedConfig, queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
-        let sapmsg = ack.retransmission_buf.clone();
+        let mut sapmsg = ack.retransmission_buf.clone();
+        if ack.retransmit_count > 0 {
+            let route = config
+                .state_read()
+                .subscriber_delivery_routes
+                .get(&ack.addr.ssi)
+                .and_then(|routes| {
+                    routes
+                        .iter()
+                        .find(|route| (2..=4).contains(&route.timeslot) && !ack.tried_delivery_timeslots.contains(&route.timeslot))
+                })
+                .copied();
+            if let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg {
+                req.associated_channel = route.map(|route| tetra_saps::tma::AssociatedChannel {
+                    call_id: route.call_id,
+                    timeslot: route.timeslot,
+                    usage: route.usage,
+                });
+                if let Some(route) = route {
+                    ack.tried_delivery_timeslots.insert(route.timeslot);
+                    ack.ts = route.timeslot;
+                    tracing::info!(
+                        issi = ack.addr.ssi,
+                        timeslot = route.timeslot,
+                        "retrying acknowledged downlink on refreshed listener timeslot"
+                    );
+                } else {
+                    // No other valid traffic listener remains.  UMAC will use
+                    // the ordinary MCCH/EE path instead of the stale slot.
+                    ack.ts = 1;
+                    tracing::debug!(
+                        issi = ack.addr.ssi,
+                        "retrying acknowledged downlink through MCCH after listener routes exhausted"
+                    );
+                }
+            }
+        }
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
         ack.tx_reporter.reset();
@@ -374,6 +414,11 @@ impl Llc {
             t_umac_done: None,
             retransmission_buf: sapmsg, // Clone the message to keep a copy for potential retransmission
             retransmit_count: 0,
+            tried_delivery_timeslots: prim
+                .associated_channel
+                .as_ref()
+                .map(|channel| HashSet::from([channel.timeslot]))
+                .unwrap_or_default(),
         });
 
         // The message will now be picked up for transmission at end-of-tick, if the ssi does not yet have
@@ -654,7 +699,7 @@ impl Llc {
                         }
                     );
 
-                    Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+                    Self::submit_for_acknowledged_transmission(&self.config, queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
                     had_activity = true;
                 } else {
                     // Exhausted retransmissions, flag for discard
@@ -710,7 +755,7 @@ impl Llc {
                 ack.ns,
                 ack.retransmission_buf.msg
             );
-            Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+            Self::submit_for_acknowledged_transmission(&self.config, queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
             ssi_blocked.insert(ack.addr.ssi);
             had_activity = true;
         }

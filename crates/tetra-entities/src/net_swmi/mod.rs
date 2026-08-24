@@ -415,6 +415,12 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             self.recovery_request_id = None;
                             self.endpoint.online.store(true, Ordering::Release);
                             self.stack_config.state_write().network_connected = true;
+                            // The initial advertisement is sent while LST is
+                            // active and therefore carries
+                            // system_wide_services = 0.  Publish it again now
+                            // that this cell is available to the SwMI, so its
+                            // neighbour-cell snapshot carries the live value.
+                            let _ = self.report_current_advertisement();
                             if self.endpoint.mm_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI MM endpoint closed; dropping LST recovery result");
                             }

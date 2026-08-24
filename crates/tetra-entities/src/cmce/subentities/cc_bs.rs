@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, SubscriberDeliveryRoute};
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
 use tetra_core::{Layer2Service, TimeslotOwner, TxReporter, TxState};
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
@@ -505,23 +505,34 @@ impl CcBsSubentity {
     }
 
     fn preferred_listener_channel(&self, issi: u32) -> Option<AssociatedChannel> {
+        self.listener_channels_for(issi).into_iter().next()
+    }
+
+    /// Return every currently usable channel for this MS in delivery order.
+    /// The first is the preferred route; the remaining entries let LLC make a
+    /// later BL retry on another live timeslot instead of pinning it to the
+    /// original observation.
+    fn listener_channels_for(&self, issi: u32) -> Vec<AssociatedChannel> {
         // A connected private call takes precedence over every scanned group.
         // Unlike group membership it is an explicit, per-terminal circuit,
         // so it remains the best target even before that MS has transmitted.
+        let mut result = Vec::new();
         if self.private_call_is_connected_for(issi) {
             if let Some(circuit) = self.private_circuits.iter().find_map(|(&(call_id, owner), circuit)| {
                 (owner == issi && self.private_calls.get(&call_id).is_some_and(|call| call.connected)).then_some(circuit)
             }) {
-                return Some(AssociatedChannel {
+                result.push(AssociatedChannel {
                     call_id: circuit.call_id,
                     timeslot: circuit.ts,
                     usage: circuit.usage,
                 });
             }
         }
-        self.listening_candidates
-            .get(&issi)?
-            .iter()
+        let mut candidates: Vec<_> = self
+            .listening_candidates
+            .get(&issi)
+            .into_iter()
+            .flat_map(|candidates| candidates.iter())
             .filter_map(|candidate| {
                 self.active_associated_channel(*candidate).map(|channel| {
                     let priority = match candidate.service {
@@ -531,8 +542,41 @@ impl CcBsSubentity {
                     (priority, candidate.confirmed, channel)
                 })
             })
-            .max_by_key(|(priority, confirmed, _)| (*priority, *confirmed))
-            .map(|(_, _, channel)| channel)
+            .collect();
+        candidates.sort_by_key(|(priority, confirmed, _)| (std::cmp::Reverse(*priority), std::cmp::Reverse(*confirmed)));
+        for (_, _, channel) in candidates {
+            if !result
+                .iter()
+                .any(|existing| existing.timeslot == channel.timeslot && existing.call_id == channel.call_id)
+            {
+                result.push(channel);
+            }
+        }
+        result
+    }
+
+    fn refresh_delivery_routes(&self) {
+        let routes: HashMap<u32, Vec<SubscriberDeliveryRoute>> = self
+            .listening_candidates
+            .keys()
+            .copied()
+            .chain(self.private_circuits.keys().map(|(_, issi)| *issi))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|issi| {
+                let routes = self
+                    .listener_channels_for(issi)
+                    .into_iter()
+                    .map(|channel| SubscriberDeliveryRoute {
+                        call_id: channel.call_id,
+                        timeslot: channel.timeslot,
+                        usage: channel.usage,
+                    })
+                    .collect();
+                (issi, routes)
+            })
+            .collect();
+        self.config.state_write().subscriber_delivery_routes = routes;
     }
 
     /// A group D-SETUP means every receivable local member is now likely to
@@ -614,6 +658,7 @@ impl CcBsSubentity {
     /// alive and falls back to MCCH, so a stale probability can never route a
     /// message onto a released slot.
     pub fn decorate_pending_downlinks(&self, queue: &mut MessageQueue) {
+        self.refresh_delivery_routes();
         for message in queue.iter_mut() {
             let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else {
                 continue;
