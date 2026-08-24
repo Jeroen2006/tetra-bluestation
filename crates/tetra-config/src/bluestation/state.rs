@@ -38,6 +38,138 @@ pub struct SubscriberDeliveryRoute {
     pub usage: u8,
 }
 
+/// A logical DM subscriber address reachable through a TMO gateway.  This is
+/// deliberately separate from `SubscriberRegistry`: a DM-MS route is not a
+/// direct TMO registration and must never replace one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DmMsRouteAddress {
+    pub ssi: u32,
+    pub mcc: Option<u16>,
+    pub mnc: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmoCarrierState {
+    pub carrier_number: u16,
+    pub frequency_band: Option<u8>,
+    pub offset: Option<u8>,
+    pub duplex_spacing: Option<u8>,
+    pub normal_reverse: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DmGatewaySession {
+    pub gateway_issi: u32,
+    pub dmo_carrier: Option<DmoCarrierState>,
+    pub dm_ms_addresses: HashSet<DmMsRouteAddress>,
+    pub last_seen: TdmaTime,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DmGatewayRegistry {
+    gateways: HashMap<u32, DmGatewaySession>,
+    routes: HashMap<DmMsRouteAddress, HashSet<u32>>,
+}
+
+impl DmGatewayRegistry {
+    pub fn activate(
+        &mut self,
+        gateway_issi: u32,
+        dmo_carrier: Option<DmoCarrierState>,
+        addresses: impl IntoIterator<Item = DmMsRouteAddress>,
+        now: TdmaTime,
+    ) {
+        self.deactivate(gateway_issi);
+        let dm_ms_addresses: HashSet<_> = addresses.into_iter().collect();
+        for address in &dm_ms_addresses {
+            self.routes.entry(*address).or_default().insert(gateway_issi);
+        }
+        self.gateways.insert(
+            gateway_issi,
+            DmGatewaySession {
+                gateway_issi,
+                dmo_carrier,
+                dm_ms_addresses,
+                last_seen: now,
+            },
+        );
+    }
+    pub fn deactivate(&mut self, gateway_issi: u32) {
+        let Some(session) = self.gateways.remove(&gateway_issi) else {
+            return;
+        };
+        for address in session.dm_ms_addresses {
+            if let Some(gateways) = self.routes.get_mut(&address) {
+                gateways.remove(&gateway_issi);
+                if gateways.is_empty() {
+                    self.routes.remove(&address);
+                }
+            }
+        }
+    }
+    pub fn add_addresses(&mut self, gateway_issi: u32, addresses: impl IntoIterator<Item = DmMsRouteAddress>, now: TdmaTime) {
+        let Some(session) = self.gateways.get_mut(&gateway_issi) else {
+            return;
+        };
+        session.last_seen = now;
+        for address in addresses {
+            session.dm_ms_addresses.insert(address);
+            self.routes.entry(address).or_default().insert(gateway_issi);
+        }
+    }
+    pub fn remove_addresses(&mut self, gateway_issi: u32, addresses: impl IntoIterator<Item = DmMsRouteAddress>, now: TdmaTime) {
+        let Some(session) = self.gateways.get_mut(&gateway_issi) else {
+            return;
+        };
+        session.last_seen = now;
+        for address in addresses {
+            session.dm_ms_addresses.remove(&address);
+            if let Some(gateways) = self.routes.get_mut(&address) {
+                gateways.remove(&gateway_issi);
+                if gateways.is_empty() {
+                    self.routes.remove(&address);
+                }
+            }
+        }
+    }
+    pub fn replace_addresses(&mut self, gateway_issi: u32, addresses: impl IntoIterator<Item = DmMsRouteAddress>, now: TdmaTime) {
+        let carrier = self.gateways.get(&gateway_issi).and_then(|session| session.dmo_carrier);
+        self.activate(gateway_issi, carrier, addresses, now);
+    }
+    pub fn touch(&mut self, gateway_issi: u32, now: TdmaTime) {
+        if let Some(session) = self.gateways.get_mut(&gateway_issi) {
+            session.last_seen = now;
+        }
+    }
+    pub fn update_carrier(&mut self, gateway_issi: u32, dmo_carrier: Option<DmoCarrierState>, now: TdmaTime) {
+        if let Some(session) = self.gateways.get_mut(&gateway_issi) {
+            session.dmo_carrier = dmo_carrier;
+            session.last_seen = now;
+        }
+    }
+    pub fn is_active(&self, gateway_issi: u32) -> bool {
+        self.gateways.contains_key(&gateway_issi)
+    }
+    pub fn gateways_for(&self, address: DmMsRouteAddress) -> Vec<u32> {
+        self.routes
+            .get(&address)
+            .map(|value| value.iter().copied().collect())
+            .unwrap_or_default()
+    }
+    /// Resolve a logical DM-MS address to one radio endpoint. The lowest
+    /// gateway ISSI wins when overlapping DM areas are advertised.
+    pub fn gateway_for_ssi(&self, ssi: u32) -> Option<(u32, DmMsRouteAddress)> {
+        self.gateways
+            .iter()
+            .flat_map(|(gateway_issi, session)| session.dm_ms_addresses.iter().map(move |address| (*gateway_issi, *address)))
+            .filter(|(_, address)| address.ssi == ssi)
+            .min_by_key(|(gateway_issi, _)| *gateway_issi)
+    }
+    pub fn session(&self, gateway_issi: u32) -> Option<&DmGatewaySession> {
+        self.gateways.get(&gateway_issi)
+    }
+}
+
 /// Centralized subscriber registry tracking locally registered ISSIs and their group affiliations.
 #[derive(Debug, Clone)]
 pub struct SubscriberRegistry {
@@ -278,6 +410,8 @@ pub struct StackState {
     pub authentication_required: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
+    /// Active external DMO gateways served by this BS.
+    pub dm_gateways: DmGatewayRegistry,
     /// Ordered, currently valid traffic-channel opportunities for individual
     /// downlink signalling.  Empty means that LLC must use MCCH/EE delivery.
     pub subscriber_delivery_routes: HashMap<u32, Vec<SubscriberDeliveryRoute>>,
@@ -371,6 +505,7 @@ impl Default for StackState {
             network_connected: false,
             authentication_required: false,
             subscribers: SubscriberRegistry::new(),
+            dm_gateways: DmGatewayRegistry::default(),
             subscriber_delivery_routes: HashMap::new(),
             network_broadcast: RuntimeNetworkBroadcast {
                 version: 0,

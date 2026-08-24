@@ -4,14 +4,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::net_swmi::SwmiMmEndpoint;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{DmMsRouteAddress, DmoCarrierState, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
-use tetra_swmi_protocol::{AttachmentOperation, AttachmentResult, EnergyEconomyAssignment, HandoverChannelAllocation, SwmiMessage};
+use tetra_swmi_protocol::{
+    AttachmentOperation, AttachmentResult, DmGatewayAddress, DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation,
+    SwmiMessage,
+};
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
@@ -35,14 +38,34 @@ use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
+use tetra_pdus::mm::pdus::d_mm_status::DMmStatusGatewayPayload;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
+use tetra_pdus::mm::pdus::u_mm_status::UMmStatusGatewayPayload;
 
 /// ETSI T351 = 10 seconds. TETRA has 18 TDMA frames of four slots per second.
 const T351_TIMESLOTS: i32 = 10 * 18 * 4;
+
+fn dm_ms_route_address(address: tetra_pdus::mm::fields::dm_ms_address::DmMsAddress) -> DmMsRouteAddress {
+    DmMsRouteAddress {
+        ssi: address.ssi,
+        mcc: address.mcc,
+        mnc: address.mnc,
+    }
+}
+
+fn dmo_carrier_state(carrier: tetra_pdus::mm::fields::dmo_carrier::DmoCarrier) -> DmoCarrierState {
+    DmoCarrierState {
+        carrier_number: carrier.carrier_number,
+        frequency_band: carrier.frequency_band,
+        offset: carrier.offset,
+        duplex_spacing: carrier.duplex_spacing,
+        normal_reverse: carrier.normal_reverse,
+    }
+}
 
 pub struct MmBs {
     config: SharedConfig,
@@ -271,6 +294,11 @@ impl MmBs {
         };
 
         self.config.state_write().subscribers.deregister(issi);
+        let was_gateway = self.config.state_read().dm_gateways.is_active(issi);
+        if was_gateway {
+            self.config.state_write().dm_gateways.deactivate(issi);
+            self.publish_dm_gateway_state(issi, false);
+        }
         if !client.groups.is_empty() {
             let groups: Vec<u32> = client.groups.keys().copied().collect();
             self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
@@ -702,20 +730,117 @@ impl MmBs {
                 tracing::info!(issi, scanning_enabled = enabled, "MS changed group scanning state");
                 handled = true;
             }
+            StatusUplink::RequestToStartDmGatewayOperation => {
+                let Some(UMmStatusGatewayPayload::Start { addresses, dmo_carrier }) = pdu.gateway_payload else {
+                    return;
+                };
+                if !self.config.state_read().subscribers.is_registered(issi) {
+                    tracing::warn!(issi, "unregistered terminal requested DM gateway operation");
+                    Self::send_d_mm_status_gateway(
+                        queue,
+                        issi,
+                        handle,
+                        StatusDownlink::RejectionToStartDmGatewayOperation,
+                        DMmStatusGatewayPayload::Empty,
+                    );
+                    return;
+                }
+                let addresses = addresses.into_iter().map(dm_ms_route_address).collect::<Vec<_>>();
+                self.config
+                    .state_write()
+                    .dm_gateways
+                    .activate(issi, dmo_carrier.map(dmo_carrier_state), addresses, self.current_time);
+                self.publish_dm_gateway_state(issi, true);
+                Self::send_d_mm_status_gateway(
+                    queue,
+                    issi,
+                    handle,
+                    StatusDownlink::AcceptanceToStartDmGatewayOperation,
+                    DMmStatusGatewayPayload::RejectedAddresses(Vec::new()),
+                );
+                handled = true;
+            }
+            StatusUplink::RequestToContinuedmGatewayOperation => {
+                let Some(UMmStatusGatewayPayload::Continue { dmo_carrier }) = pdu.gateway_payload else {
+                    return;
+                };
+                let retained = self.config.state_read().dm_gateways.is_active(issi);
+                if retained {
+                    self.config
+                        .state_write()
+                        .dm_gateways
+                        .update_carrier(issi, dmo_carrier.map(dmo_carrier_state), self.current_time);
+                    self.publish_dm_gateway_state(issi, true);
+                }
+                Self::send_d_mm_status_gateway(
+                    queue,
+                    issi,
+                    handle,
+                    if retained {
+                        StatusDownlink::AcceptanceToContinueDmGatewayOperation
+                    } else {
+                        StatusDownlink::RejectionToContinueDmGatewayOperation
+                    },
+                    if retained {
+                        DMmStatusGatewayPayload::RetainedAddressSet(true)
+                    } else {
+                        DMmStatusGatewayPayload::Empty
+                    },
+                );
+                handled = true;
+            }
+            StatusUplink::RequestToStopDmGatewayOperation => {
+                self.config.state_write().dm_gateways.deactivate(issi);
+                self.publish_dm_gateway_state(issi, false);
+                Self::send_d_mm_status_gateway(
+                    queue,
+                    issi,
+                    handle,
+                    StatusDownlink::AcceptanceToStopDmGatewayOperation,
+                    DMmStatusGatewayPayload::Empty,
+                );
+                handled = true;
+            }
+            StatusUplink::RequestToAddDmMsAddresses
+            | StatusUplink::RequestToRemoveDmMsAddresses
+            | StatusUplink::RequestToReplaceDmMsAddresses => {
+                let Some(UMmStatusGatewayPayload::Addresses(addresses)) = pdu.gateway_payload else {
+                    return;
+                };
+                let addresses = addresses.into_iter().map(dm_ms_route_address).collect::<Vec<_>>();
+                let mut state = self.config.state_write();
+                if !state.dm_gateways.is_active(issi) {
+                    tracing::warn!(issi, "DM-MS address update from inactive gateway");
+                    return;
+                }
+                match pdu.status_uplink {
+                    StatusUplink::RequestToAddDmMsAddresses => state.dm_gateways.add_addresses(issi, addresses, self.current_time),
+                    StatusUplink::RequestToRemoveDmMsAddresses => state.dm_gateways.remove_addresses(issi, addresses, self.current_time),
+                    StatusUplink::RequestToReplaceDmMsAddresses => state.dm_gateways.replace_addresses(issi, addresses, self.current_time),
+                    _ => unreachable!(),
+                }
+                drop(state);
+                self.publish_dm_gateway_state(issi, true);
+                Self::send_d_mm_status_gateway(
+                    queue,
+                    issi,
+                    handle,
+                    StatusDownlink::AcceptanceOfDmMsAddresses,
+                    DMmStatusGatewayPayload::RejectedAddresses(Vec::new()),
+                );
+                handled = true;
+            }
+            StatusUplink::AcceptanceToRemovalOfDmMsAddresses
+            | StatusUplink::AcceptanceToChangeRegistrationLabel
+            | StatusUplink::AcceptanceToStopDmGatewayOperation => {
+                self.config.state_write().dm_gateways.touch(issi, self.current_time);
+                handled = true;
+            }
             StatusUplink::DualWatchModeRequest
             | StatusUplink::TerminatingDualWatchModeRequest
             | StatusUplink::ChangeOfDualWatchModeResponse
             | StatusUplink::StartOfDirectModeOperation
-            | StatusUplink::MsFrequencyBandsInformation
-            | StatusUplink::RequestToStartDmGatewayOperation
-            | StatusUplink::RequestToContinuedmGatewayOperation
-            | StatusUplink::RequestToStopDmGatewayOperation
-            | StatusUplink::RequestToAddDmMsAddresses
-            | StatusUplink::RequestToRemoveDmMsAddresses
-            | StatusUplink::RequestToReplaceDmMsAddresses
-            | StatusUplink::AcceptanceToRemovalOfDmMsAddresses
-            | StatusUplink::AcceptanceToChangeRegistrationLabel
-            | StatusUplink::AcceptanceToStopDmGatewayOperation => {
+            | StatusUplink::MsFrequencyBandsInformation => {
                 unimplemented_log!("{:?}", pdu.status_uplink)
             }
             _ => {
@@ -1813,6 +1938,7 @@ impl MmBs {
         let pdu = DMmStatus {
             status_downlink: StatusDownlink::ChangeOfEnergySavingModeResponse,
             energy_saving_information: Some(esi),
+            gateway_payload: None,
         };
 
         let mut sdu = BitBuffer::new_autoexpand(32);
@@ -1838,6 +1964,88 @@ impl MmBs {
             }),
         };
         queue.push_back(msg);
+    }
+
+    fn send_d_mm_status_gateway(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        status_downlink: StatusDownlink,
+        gateway_payload: DMmStatusGatewayPayload,
+    ) {
+        let pdu = DMmStatus {
+            status_downlink,
+            energy_saving_information: None,
+            gateway_payload: Some(gateway_payload),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(128);
+        if let Err(error) = pdu.to_bitbuf(&mut sdu) {
+            tracing::warn!(?error, issi, "cannot encode D-MM STATUS gateway response");
+            return;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+    }
+
+    fn publish_dm_gateway_state(&mut self, gateway_issi: u32, active: bool) {
+        if !self.swmi.as_ref().is_some_and(|endpoint| endpoint.is_online()) {
+            return;
+        }
+        let state = self.config.state_read();
+        let session = state.dm_gateways.session(gateway_issi);
+        let (dmo_carrier, dm_ms_addresses) = session
+            .map(|session| {
+                let carrier = session.dmo_carrier.map(|carrier| DmGatewayCarrier {
+                    carrier_number: carrier.carrier_number,
+                    frequency_band: carrier.frequency_band,
+                    offset: carrier.offset,
+                    duplex_spacing: carrier.duplex_spacing,
+                    normal_reverse: carrier.normal_reverse,
+                });
+                let addresses = session
+                    .dm_ms_addresses
+                    .iter()
+                    .map(|address| DmGatewayAddress {
+                        ssi: address.ssi,
+                        mcc: address.mcc,
+                        mnc: address.mnc,
+                    })
+                    .collect();
+                (carrier, addresses)
+            })
+            .unwrap_or((None, Vec::new()));
+        drop(state);
+        let command_id = self.next_swmi_command_id();
+        if let Err(error) = self
+            .swmi
+            .as_ref()
+            .expect("SwMI checked above")
+            .submit(SwmiMessage::DmGatewayStateUpdate {
+                command_id,
+                gateway_issi: gateway_issi as u64,
+                active,
+                dmo_carrier,
+                dm_ms_addresses,
+            })
+        {
+            tracing::warn!(?error, gateway_issi, "cannot publish DM gateway state to SwMI");
+        }
     }
 
     fn feature_check_u_itsi_detach(pdu: &UItsiDetach) -> bool {
@@ -2122,18 +2330,13 @@ impl TetraEntityTrait for MmBs {
                         continue;
                     }
                     let rua_state = self.config.state_read().subscribers.clone();
-                    let subscribers = self
-                        .client_mgr
-                        .lst_recovery_snapshot(|issi| rua_state.rua_assignment_state(issi));
+                    let subscribers = self.client_mgr.lst_recovery_snapshot(|issi| rua_state.rua_assignment_state(issi));
                     let subscriber_count = subscribers.len();
                     let Some(endpoint) = self.swmi.as_ref() else {
                         self.pending_lst_recoveries.remove(&command_id);
                         continue;
                     };
-                    if let Err(error) = endpoint.submit(SwmiMessage::LstRecoverySnapshot {
-                        command_id,
-                        subscribers,
-                    }) {
+                    if let Err(error) = endpoint.submit(SwmiMessage::LstRecoverySnapshot { command_id, subscribers }) {
                         self.pending_lst_recoveries.remove(&command_id);
                         tracing::warn!(command_id, ?error, "cannot submit LST recovery snapshot to SwMI");
                     } else {
@@ -2169,10 +2372,7 @@ impl TetraEntityTrait for MmBs {
                             // TTR 001-17 figure 5: a D-LOCATION UPDATE COMMAND
                             // causes U-LOCATION UPDATE DEMAND, whose accept can
                             // carry the alpha-tag RUA assignment request.
-                            self.config
-                                .state_write()
-                                .subscribers
-                                .set_rua_assignment_state(issi, None);
+                            self.config.state_write().subscribers.set_rua_assignment_state(issi, None);
                             Self::send_d_location_update_command(queue, issi, 0);
                             tracing::info!(issi, command_id, "requested fresh RUA registration after LST mismatch");
                         }
@@ -2183,10 +2383,20 @@ impl TetraEntityTrait for MmBs {
                             continue;
                         };
                         if self.remove_local_subscriber(queue, issi) {
-                            tracing::warn!(command_id, issi, cause = rejection.cause, "SwMI rejected LST subscriber recovery; removed local state");
+                            tracing::warn!(
+                                command_id,
+                                issi,
+                                cause = rejection.cause,
+                                "SwMI rejected LST subscriber recovery; removed local state"
+                            );
                         }
                     }
-                    tracing::info!(command_id, accepted_count, rejected_count, "applied canonical LST recovery result from SwMI");
+                    tracing::info!(
+                        command_id,
+                        accepted_count,
+                        rejected_count,
+                        "applied canonical LST recovery result from SwMI"
+                    );
                 }
                 // Command id zero is reserved for the SwMI-to-old-serving-BS
                 // direction. It is deliberately not a normal U-ITSI DETACH:

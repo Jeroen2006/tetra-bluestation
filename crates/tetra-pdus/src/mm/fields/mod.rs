@@ -1,5 +1,7 @@
 pub mod class_of_ms;
 pub mod energy_saving_information;
+pub mod dm_ms_address;
+pub mod dmo_carrier;
 pub mod group_identity_attachment;
 pub mod group_identity_downlink;
 pub mod group_identity_location_accept;

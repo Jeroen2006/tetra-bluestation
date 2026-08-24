@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{DmMsRouteAddress, SharedConfig};
 use tetra_core::{
-    BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, TxReporter, TxState, tetra_entities::TetraEntity, unimplemented_log,
+    BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, TxReporter, TxState, tetra_entities::TetraEntity,
+    typed_pdu_fields::Type3FieldGeneric, unimplemented_log,
 };
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
@@ -10,6 +11,7 @@ use tetra_pdus::cmce::pdus::d_sds_data::DSdsData;
 use tetra_pdus::cmce::pdus::d_status::DStatus;
 use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
 use tetra_pdus::cmce::pdus::u_status::UStatus;
+use tetra_pdus::mm::fields::dm_ms_address::DmMsAddress;
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::lcmc::LcmcMleUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -83,15 +85,12 @@ impl SdsBsSubentity {
             return;
         }
         let state = match data[3] {
-            2 => Some(true),  // RUA Accept / dispatcher Book On acknowledgement
+            2 => Some(true),      // RUA Accept / dispatcher Book On acknowledgement
             3 | 4 => Some(false), // RUA Reject / RUA Cancel
             _ => None,
         };
         if let Some(assigned) = state {
-            self.config
-                .state_write()
-                .subscribers
-                .set_rua_assignment_state(issi, Some(assigned));
+            self.config.state_write().subscribers.set_rua_assignment_state(issi, Some(assigned));
             tracing::info!(issi, assigned, rua_pdu_type = data[3], "updated locally observed RUA state");
         }
     }
@@ -186,18 +185,19 @@ impl SdsBsSubentity {
                 status,
             } => {
                 tracing::info!(source_issi, destination_ssi, status, "SwMI status delivery received by BS");
-                let destination_type = if self.config.state_read().subscribers.is_registered(destination_ssi) {
-                    SsiType::Issi
+                if self.config.state_read().subscribers.is_registered(destination_ssi) {
+                    self.send_d_status(
+                        queue,
+                        source_issi as u32,
+                        destination_ssi,
+                        SsiType::Issi,
+                        PreCodedStatus::from(status),
+                    );
+                } else if let Some((gateway_issi, address)) = self.config.state_read().dm_gateways.gateway_for_ssi(destination_ssi) {
+                    self.send_d_status_to_gateway(queue, source_issi as u32, gateway_issi, address, PreCodedStatus::from(status));
                 } else {
-                    SsiType::Gssi
-                };
-                self.send_d_status(
-                    queue,
-                    source_issi as u32,
-                    destination_ssi,
-                    destination_type,
-                    PreCodedStatus::from(status),
-                );
+                    tracing::warn!(destination_ssi, "SwMI requested status delivery without a direct or gateway route");
+                }
             }
             _ => unreachable!("non-SDS SwMI action was delegated to SDS"),
         }
@@ -397,15 +397,23 @@ impl SdsBsSubentity {
         data: SdsUserData,
     ) {
         let destination_type = if destination_is_group { SsiType::Gssi } else { SsiType::Issi };
+        let gateway_route = (!destination_is_group)
+            .then(|| self.config.state_read().dm_gateways.gateway_for_ssi(destination_ssi))
+            .flatten();
         let local = if destination_is_group {
             self.config.state_read().subscribers.has_group_members(destination_ssi)
         } else {
-            self.config.state_read().subscribers.is_registered(destination_ssi)
+            self.config.state_read().subscribers.is_registered(destination_ssi) || gateway_route.is_some()
         };
         if local {
             let reporter = (!destination_is_group).then(TxReporter::new);
             let sds_tl_context = Self::sds_tl_context(&data);
-            if !self.send_d_sds_data(queue, source_issi, destination_ssi, destination_type, data, reporter.clone()) {
+            let delivered = if let Some((gateway_issi, address)) = gateway_route {
+                self.send_d_sds_data_to_gateway(queue, source_issi, gateway_issi, address, data, reporter.clone())
+            } else {
+                self.send_d_sds_data(queue, source_issi, destination_ssi, destination_type, data, reporter.clone())
+            };
+            if !delivered {
                 self.send_swmi_failure(
                     queue,
                     source_issi,
@@ -441,10 +449,13 @@ impl SdsBsSubentity {
         data: Vec<u8>,
     ) {
         let destination_type = if destination_is_group { SsiType::Gssi } else { SsiType::Issi };
+        let gateway_route = (!destination_is_group)
+            .then(|| self.config.state_read().dm_gateways.gateway_for_ssi(destination_ssi))
+            .flatten();
         let local = if destination_is_group {
             self.config.state_read().subscribers.has_group_members(destination_ssi)
         } else {
-            self.config.state_read().subscribers.is_registered(destination_ssi)
+            self.config.state_read().subscribers.is_registered(destination_ssi) || gateway_route.is_some()
         };
         let Some(user_data) = Self::user_data_from_wire(data_type, length_bits, data) else {
             self.report_delivery(transaction_id, destination_ssi, false, SDS_FAILURE_DELIVERY_FAILED);
@@ -455,7 +466,12 @@ impl SdsBsSubentity {
             return;
         }
         let reporter = (!destination_is_group && transaction_id != 0).then(TxReporter::new);
-        if !self.send_d_sds_data(queue, source_issi, destination_ssi, destination_type, user_data, reporter.clone()) {
+        let delivered = if let Some((gateway_issi, address)) = gateway_route {
+            self.send_d_sds_data_to_gateway(queue, source_issi, gateway_issi, address, user_data, reporter.clone())
+        } else {
+            self.send_d_sds_data(queue, source_issi, destination_ssi, destination_type, user_data, reporter.clone())
+        };
+        if !delivered {
             self.report_delivery(transaction_id, destination_ssi, false, SDS_FAILURE_DELIVERY_FAILED);
         } else if let Some(reporter) = reporter {
             self.track_delivery(Some(transaction_id), source_issi, destination_ssi, (None, None), reporter);
@@ -588,6 +604,49 @@ impl SdsBsSubentity {
         });
     }
 
+    fn send_d_status_to_gateway(
+        &self,
+        queue: &mut MessageQueue,
+        source_issi: u32,
+        gateway_issi: u32,
+        dm_ms_address: DmMsRouteAddress,
+        pre_coded_status: PreCodedStatus,
+    ) {
+        let pdu = DStatus {
+            calling_party_type_identifier: PartyTypeIdentifier::Ssi,
+            calling_party_address_ssi: Some(source_issi as u64),
+            calling_party_extension: None,
+            pre_coded_status,
+            external_subscriber_number: None,
+            dm_ms_address: dm_ms_type3(dm_ms_address),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(128);
+        if pdu.to_bitbuf(&mut sdu).is_err() {
+            return;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: Layer2Service::Acknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                associated_channel: None,
+                main_address: TetraAddress::new(gateway_issi, SsiType::Issi),
+                tx_reporter: None,
+            }),
+        });
+    }
+
     fn send_d_sds_data(
         &self,
         queue: &mut MessageQueue,
@@ -597,13 +656,54 @@ impl SdsBsSubentity {
         user_defined_data: SdsUserData,
         tx_reporter: Option<TxReporter>,
     ) -> bool {
+        self.send_d_sds_data_to(
+            queue,
+            source_issi,
+            destination_ssi,
+            destination_type,
+            None,
+            user_defined_data,
+            tx_reporter,
+        )
+    }
+
+    fn send_d_sds_data_to_gateway(
+        &self,
+        queue: &mut MessageQueue,
+        source_issi: u32,
+        gateway_issi: u32,
+        dm_ms_address: DmMsRouteAddress,
+        user_defined_data: SdsUserData,
+        tx_reporter: Option<TxReporter>,
+    ) -> bool {
+        self.send_d_sds_data_to(
+            queue,
+            source_issi,
+            gateway_issi,
+            SsiType::Issi,
+            Some(dm_ms_address),
+            user_defined_data,
+            tx_reporter,
+        )
+    }
+
+    fn send_d_sds_data_to(
+        &self,
+        queue: &mut MessageQueue,
+        source_issi: u32,
+        destination_ssi: u32,
+        destination_type: SsiType,
+        dm_ms_address: Option<DmMsRouteAddress>,
+        user_defined_data: SdsUserData,
+        tx_reporter: Option<TxReporter>,
+    ) -> bool {
         let pdu = DSdsData {
             calling_party_type_identifier: PartyTypeIdentifier::Ssi,
             calling_party_address_ssi: Some(source_issi as u64),
             calling_party_extension: None,
             user_defined_data,
             external_subscriber_number: None,
-            dm_ms_address: None,
+            dm_ms_address: dm_ms_address.and_then(dm_ms_type3),
         };
         let mut sdu = BitBuffer::new_autoexpand(128);
         if let Err(error) = pdu.to_bitbuf(&mut sdu) {
@@ -686,4 +786,25 @@ impl SdsBsSubentity {
         }
         true
     }
+}
+
+/// Convert the Annex-B DM-MS address to the CMCE type-3 payload.  The type-3
+/// wrapper supplies the field ID and length; its payload is exactly B.3.1.
+fn dm_ms_type3(address: DmMsRouteAddress) -> Option<Type3FieldGeneric> {
+    let mut bits = BitBuffer::new_autoexpand(49);
+    DmMsAddress {
+        ssi: address.ssi,
+        mcc: address.mcc,
+        mnc: address.mnc,
+    }
+    .to_bitbuf(&mut bits)
+    .ok()?;
+    let len = bits.get_len_written();
+    bits.seek(0);
+    Some(Type3FieldGeneric {
+        field_id: 6,
+        len,
+        data: bits.read_bits(len)?,
+        raw: Vec::new(),
+    })
 }

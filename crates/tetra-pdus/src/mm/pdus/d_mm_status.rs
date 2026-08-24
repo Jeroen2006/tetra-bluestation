@@ -5,84 +5,142 @@ use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use crate::mm::enums::status_downlink::StatusDownlink;
+use crate::mm::fields::dm_ms_address::DmMsAddress;
 use crate::mm::fields::energy_saving_information::EnergySavingInformation;
 
-/// Representation of the D-MM STATUS PDU (Clause 16.9.2.5.1).
-/// The infrastructure sends this message to the MS to request or indicate/reject a change of an operation mode.
-/// Response expected: -/U-MM STATUS
-/// Response to: -/U-MM STATUS
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DMmStatusGatewayPayload {
+    RejectedAddresses(Vec<DmMsAddress>),
+    RetainedAddressSet(bool),
+    RemoveAddresses(Vec<DmMsAddress>),
+    Empty,
+}
 
-// note 1: This information element shall indicate the requested service or a response to a request and the sub-type of the D-MM STATUS PDU.
-// note 2: This information element or set of information elements shall be as defined by the status downlink information element, refer to clauses 16.9.2.5.1 to 16.9.2.5.7.
-// note 3: This Status downlink element indicates which sub-PDU this D-MM STATUS PDU contains. If the receiving party does not support the indicated function but recognizes the PDU structure, it should set the value to Not-supported sub-PDU type element.
+/// D-MM STATUS (TS 100 392-2 16.9.2.5 and EN 300 396-5 annex B).
 #[derive(Debug)]
 pub struct DMmStatus {
-    /// Type1, 6 bits, See notes 1 and 3,
     pub status_downlink: StatusDownlink,
-    /// Energy saving information, present for ChangeOfEnergySavingModeRequest/Response
     pub energy_saving_information: Option<EnergySavingInformation>,
+    pub gateway_payload: Option<DMmStatusGatewayPayload>,
 }
 
 impl DMmStatus {
-    /// Parse from BitBuffer
     pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
         let pdu_type = buffer.read_field(4, "pdu_type")?;
         expect_pdu_type!(pdu_type, MmPduTypeDl::DMmStatus)?;
-
-        // Type1
-        let val = buffer.read_field(6, "status_downlink")?;
-        let status_downlink = StatusDownlink::try_from(val).map_err(|_| PduParseErr::InvalidValue {
+        let value = buffer.read_field(6, "status_downlink")?;
+        let status_downlink = StatusDownlink::try_from(value).map_err(|_| PduParseErr::InvalidValue {
             field: "status_downlink",
-            value: val,
+            value,
         })?;
-
-        let energy_saving_information = match status_downlink {
+        let (energy_saving_information, gateway_payload) = match status_downlink {
             StatusDownlink::ChangeOfEnergySavingModeRequest | StatusDownlink::ChangeOfEnergySavingModeResponse => {
-                Some(EnergySavingInformation::from_bitbuf(buffer)?)
+                (Some(EnergySavingInformation::from_bitbuf(buffer)?), None)
             }
-            _ => {
-                unimplemented!("D-MM-STATUS sub-PDU parsing for {:?}", status_downlink);
+            StatusDownlink::AcceptanceToStartDmGatewayOperation | StatusDownlink::AcceptanceOfDmMsAddresses => {
+                (None, Some(DMmStatusGatewayPayload::RejectedAddresses(read_addresses(buffer)?)))
             }
+            StatusDownlink::AcceptanceToContinueDmGatewayOperation => {
+                let retained = buffer.read_field(1, "retained_dm_ms_address_set")? != 0;
+                let reserved = buffer.read_field(7, "reserved")?;
+                if reserved != 0 {
+                    return Err(PduParseErr::InvalidValue {
+                        field: "reserved",
+                        value: reserved,
+                    });
+                }
+                (None, Some(DMmStatusGatewayPayload::RetainedAddressSet(retained)))
+            }
+            StatusDownlink::CommandToRemoveDmMsAddresses => (None, Some(DMmStatusGatewayPayload::RemoveAddresses(read_addresses(buffer)?))),
+            StatusDownlink::RejectionToStartDmGatewayOperation
+            | StatusDownlink::RejectionToContinueDmGatewayOperation
+            | StatusDownlink::AcceptanceToStopDmGatewayOperation
+            | StatusDownlink::CommandToChangeRegistrationLabel
+            | StatusDownlink::CommandToStopDmGatewayOperation => (None, Some(DMmStatusGatewayPayload::Empty)),
+            _ => (None, None),
         };
-
-        Ok(DMmStatus {
+        Ok(Self {
             status_downlink,
             energy_saving_information,
+            gateway_payload,
         })
     }
 
-    /// Serialize this PDU into the given BitBuffer.
     pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
-        // PDU Type
         buffer.write_bits(MmPduTypeDl::DMmStatus.into_raw(), 4);
-        // Type1
         buffer.write_bits(self.status_downlink.into_raw(), 6);
-
         match self.status_downlink {
-            StatusDownlink::ChangeOfEnergySavingModeRequest | StatusDownlink::ChangeOfEnergySavingModeResponse => {
-                if let Some(ref esi) = self.energy_saving_information {
-                    esi.to_bitbuf(buffer)?;
-                } else {
-                    return Err(PduParseErr::FieldNotPresent {
-                        field: Some("energy_saving_information"),
-                    });
+            StatusDownlink::ChangeOfEnergySavingModeRequest | StatusDownlink::ChangeOfEnergySavingModeResponse => self
+                .energy_saving_information
+                .as_ref()
+                .ok_or(PduParseErr::FieldNotPresent {
+                    field: Some("energy_saving_information"),
+                })?
+                .to_bitbuf(buffer)?,
+            _ => {
+                if let Some(payload) = &self.gateway_payload {
+                    write_gateway_payload(self.status_downlink, payload, buffer)?;
                 }
             }
-            _ => {
-                unimplemented!("D-MM-STATUS sub-PDU serialization for {:?}", self.status_downlink);
-            }
         }
-
         Ok(())
     }
+}
+
+fn read_addresses(buffer: &mut BitBuffer) -> Result<Vec<DmMsAddress>, PduParseErr> {
+    let count = buffer.read_field(4, "number_of_dm_ms_addresses")? as usize;
+    (0..count).map(|_| DmMsAddress::from_bitbuf(buffer)).collect()
+}
+fn write_addresses(addresses: &[DmMsAddress], buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+    if addresses.len() > 15 {
+        return Err(PduParseErr::InvalidValue {
+            field: "number_of_dm_ms_addresses",
+            value: addresses.len() as u64,
+        });
+    }
+    buffer.write_bits(addresses.len() as u64, 4);
+    for address in addresses {
+        address.to_bitbuf(buffer)?;
+    }
+    Ok(())
+}
+fn write_gateway_payload(status: StatusDownlink, payload: &DMmStatusGatewayPayload, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+    match (status, payload) {
+        (
+            StatusDownlink::AcceptanceToStartDmGatewayOperation | StatusDownlink::AcceptanceOfDmMsAddresses,
+            DMmStatusGatewayPayload::RejectedAddresses(addresses),
+        ) => write_addresses(addresses, buffer)?,
+        (StatusDownlink::AcceptanceToContinueDmGatewayOperation, DMmStatusGatewayPayload::RetainedAddressSet(retained)) => {
+            buffer.write_bits(*retained as u64, 1);
+            buffer.write_bits(0, 7);
+        }
+        (StatusDownlink::CommandToRemoveDmMsAddresses, DMmStatusGatewayPayload::RemoveAddresses(addresses)) => {
+            write_addresses(addresses, buffer)?
+        }
+        (
+            StatusDownlink::RejectionToStartDmGatewayOperation
+            | StatusDownlink::RejectionToContinueDmGatewayOperation
+            | StatusDownlink::AcceptanceToStopDmGatewayOperation
+            | StatusDownlink::CommandToChangeRegistrationLabel
+            | StatusDownlink::CommandToStopDmGatewayOperation,
+            DMmStatusGatewayPayload::Empty,
+        ) => {}
+        _ => {
+            return Err(PduParseErr::InvalidValue {
+                field: "gateway_status_payload",
+                value: status.into_raw(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for DMmStatus {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "DMmStatus {{ status_downlink: {} energy_saving_information: {:?} }}",
-            self.status_downlink, self.energy_saving_information,
+            "DMmStatus {{ status_downlink: {}, gateway_payload: {:?} }}",
+            self.status_downlink, self.gateway_payload
         )
     }
 }
