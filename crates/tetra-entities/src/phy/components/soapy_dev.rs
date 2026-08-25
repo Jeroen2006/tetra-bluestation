@@ -349,7 +349,7 @@ impl TxDsp {
 
         let d = self.block_count - current_block;
         // Skip TX blocks in the past or in too near future
-        let dmin = 2; // how many blocks in future minimum
+        let dmin = 4; // how many blocks in future minimum
         if d < dmin {
             let new_block_count = current_block + dmin;
             tracing::warn!(

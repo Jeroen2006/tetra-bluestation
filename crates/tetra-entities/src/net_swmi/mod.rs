@@ -398,7 +398,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::DeregistrationNotice { .. }
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
-                            | SwmiMessage::AuthenticationResult { .. }),
+                            | SwmiMessage::AuthenticationResult { .. }
+                            | SwmiMessage::LivelinessCheck { .. }),
                         ) => {
                             if let SwmiMessage::LstRecoveryRequest { command_id } = &message {
                                 self.recovery_request_id = Some(*command_id);

@@ -604,7 +604,7 @@ impl MmBs {
         // avoid a redundant clear-and-reattach cycle.
         if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups {
             tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
-            Self::send_d_location_update_command(queue, issi, handle);
+            Self::send_d_location_update_command(queue, issi, handle, true);
         }
     }
 
@@ -1834,11 +1834,16 @@ impl MmBs {
         });
     }
 
-    /// Sends a D-LOCATION UPDATE COMMAND to force the radio to re-register
-    /// with full group identity report
-    fn send_d_location_update_command(queue: &mut MessageQueue, issi: u32, handle: u32) {
+    /// Sends a D-LOCATION UPDATE COMMAND. Recovery paths can request a full
+    /// group report; SwMI liveliness checks deliberately do not disturb it.
+    fn send_d_location_update_command(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        group_identity_report: bool,
+    ) {
         let pdu = DLocationUpdateCommand {
-            group_identity_report: true,
+            group_identity_report,
             cipher_control: false,
             ciphering_parameters: None,
             address_extension: None,
@@ -2164,6 +2169,18 @@ impl TetraEntityTrait for MmBs {
         }
         while let Some(message) = self.swmi.as_ref().and_then(SwmiMmEndpoint::try_recv) {
             match message {
+                SwmiMessage::LivelinessCheck { itsi } => {
+                    let Ok(issi) = u32::try_from(itsi) else {
+                        tracing::warn!(itsi, "discarding liveliness check with invalid ISSI");
+                        continue;
+                    };
+                    if !self.config.state_read().subscribers.is_registered(issi) {
+                        tracing::debug!(issi, "ignoring liveliness check for unknown local terminal");
+                        continue;
+                    }
+                    Self::send_d_location_update_command(queue, issi, 0, false);
+                    tracing::debug!(issi, "sent D-LOCATION UPDATE COMMAND for SwMI liveliness check");
+                }
                 SwmiMessage::RegistrationDecision {
                     command_id,
                     itsi,
@@ -2375,7 +2392,7 @@ impl TetraEntityTrait for MmBs {
                             // causes U-LOCATION UPDATE DEMAND, whose accept can
                             // carry the alpha-tag RUA assignment request.
                             self.config.state_write().subscribers.set_rua_assignment_state(issi, None);
-                            Self::send_d_location_update_command(queue, issi, 0);
+                            Self::send_d_location_update_command(queue, issi, 0, true);
                             tracing::info!(issi, command_id, "requested fresh RUA registration after LST mismatch");
                         }
                     }
