@@ -1,19 +1,23 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::net_swmi::SwmiMmEndpoint;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use tetra_config::bluestation::{DmMsRouteAddress, DmoCarrierState, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
-use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
+use tetra_core::{
+    AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, assert_warn,
+    unimplemented_log,
+};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{
-    AttachmentOperation, AttachmentResult, DmGatewayAddress, DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation,
-    SwmiMessage,
+    AieLocationUpdateDecision, AieObservationEvent, AieObservationState, AttachmentOperation, AttachmentResult, DmGatewayAddress,
+    DmGatewayCarrier, EnergyEconomyAssignment, TerminalAieObservation,
+    HandoverChannelAllocation, SwmiMessage,
 };
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
@@ -30,6 +34,7 @@ use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+use tetra_pdus::mm::pdus::ck_change::UCkChangeResult;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::d_authentication_demand::DAuthenticationDemand;
 use tetra_pdus::mm::pdus::d_authentication_response::DAuthenticationResponse;
@@ -39,6 +44,7 @@ use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatusGatewayPayload;
+use tetra_pdus::mm::pdus::otar::{DOtar, UOtar};
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
@@ -48,6 +54,140 @@ use tetra_pdus::mm::pdus::u_mm_status::UMmStatusGatewayPayload;
 
 /// ETSI T351 = 10 seconds. TETRA has 18 TDMA frames of four slots per second.
 const T351_TIMESLOTS: i32 = 10 * 18 * 4;
+
+/// TTR 001-11 Table 6.2 on-air KSG numbers. These are protocol values, not
+/// the ordinal positions of the local TEA enum.
+const fn sc2_ksg_number(algorithm: tetra_config::bluestation::RuntimeSc2TeaAlgorithm) -> u8 {
+    match algorithm {
+        tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea1 => 0,
+        tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea3 => 2,
+    }
+}
+
+/// Keep only a bounded, metadata-only history.  In particular, neither an
+/// OTAR payload nor a sealed key is retained by the key-lifecycle tracker.
+const MAX_RECENT_OTAR_DELIVERIES: usize = 64;
+
+/// The response type which completes an OTAR transaction at the application
+/// layer.  This is deliberately separate from a basic-link acknowledgement:
+/// BL-ACK proves radio delivery, while a U-OTAR result reports provisioning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OtarTerminalResponse {
+    CckResult,
+    SckResult,
+    GckResult,
+    GskoResult,
+    KeyStatusResponse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OtarDownlinkKind {
+    CckProvide,
+    CckReject,
+    SckProvide,
+    SckReject,
+    GckProvide,
+    GckReject,
+    GskoProvide,
+    GskoReject,
+    KeyStatusDemand,
+}
+
+impl OtarDownlinkKind {
+    fn from_pdu(pdu: &DOtar) -> Self {
+        match pdu {
+            DOtar::CckProvide(_) => Self::CckProvide,
+            DOtar::CckReject(_) => Self::CckReject,
+            DOtar::SckProvide(_) => Self::SckProvide,
+            DOtar::SckReject(_) => Self::SckReject,
+            DOtar::GckProvide(_) => Self::GckProvide,
+            DOtar::GckReject(_) => Self::GckReject,
+            DOtar::GskoProvide(_) => Self::GskoProvide,
+            DOtar::GskoReject(_) => Self::GskoReject,
+            DOtar::KeyStatusDemand(_) => Self::KeyStatusDemand,
+        }
+    }
+
+    fn expected_response(self) -> Option<OtarTerminalResponse> {
+        match self {
+            Self::CckProvide => Some(OtarTerminalResponse::CckResult),
+            Self::SckProvide => Some(OtarTerminalResponse::SckResult),
+            Self::GckProvide => Some(OtarTerminalResponse::GckResult),
+            Self::GskoProvide => Some(OtarTerminalResponse::GskoResult),
+            Self::KeyStatusDemand => Some(OtarTerminalResponse::KeyStatusResponse),
+            Self::CckReject | Self::SckReject | Self::GckReject | Self::GskoReject => None,
+        }
+    }
+
+    /// TTR 001-11 6.2.17 explicitly permits only the GSKO bootstrap
+    /// downlinks clear after an SC2 registration.  All other OTAR requests
+    /// need the terminal's active SC2 context (or a non-SC2 policy).
+    fn is_clear_gsko_bootstrap(self) -> bool {
+        matches!(self, Self::GskoProvide | Self::GskoReject)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OtarDeliveryStatus {
+    Queued,
+    AirTransmitted,
+    LinkAcknowledged,
+    AwaitingTerminalResult,
+    TerminalResult { success: bool },
+    LinkFailed { state: TxState },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletedOtarDelivery {
+    command_id: u64,
+    issi: u32,
+    kind: OtarDownlinkKind,
+    status: OtarDeliveryStatus,
+}
+
+/// The only mutable BS-side delivery state for a D-OTAR.  The opaque D-OTAR
+/// payload is intentionally not copied here: LLC owns its retransmission
+/// buffer and the result tracker contains identifiers only.
+#[derive(Debug)]
+struct PendingOtarDelivery {
+    command_id: u64,
+    issi: u32,
+    air_handle: u32,
+    kind: OtarDownlinkKind,
+    expected_response: Option<OtarTerminalResponse>,
+    tx_reporter: TxReporter,
+    status: OtarDeliveryStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GskoBootstrapStatus {
+    Requested,
+    Providing {
+        command_id: u64,
+        version_number: u16,
+        cmg_gssi: u32,
+    },
+    Provisioned {
+        version_number: u16,
+        cmg_gssi: u32,
+    },
+    Rejected {
+        command_id: u64,
+        cmg_gssi: u32,
+        reason: u8,
+    },
+    Failed {
+        command_id: u64,
+    },
+}
+
+/// A CK result is retained as operational metadata only; SCK bytes remain in
+/// the AIE provider and are never copied into MM state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CkChangeResultStatus {
+    change_of_security_class: u8,
+    selected_sck_count: usize,
+}
 
 fn dm_ms_route_address(address: tetra_pdus::mm::fields::dm_ms_address::DmMsAddress) -> DmMsRouteAddress {
     DmMsRouteAddress {
@@ -90,6 +230,25 @@ pub struct MmBs {
     /// Recovery request IDs awaiting one canonical SwMI result. These are
     /// session-scoped; a stale result from an older connection is ignored.
     pending_lst_recoveries: HashSet<u64>,
+    /// D-OTAR transmissions currently owned by LLC. This is key-free: the
+    /// encoded, potentially sealed payload remains solely in LLC's retry
+    /// buffer and is never logged by MM.
+    pending_otar_deliveries: HashMap<u64, PendingOtarDelivery>,
+    /// Bounded radio/application outcomes for diagnostics and future SwMI
+    /// lifecycle reporting. The entries contain no payload or key material.
+    recent_otar_deliveries: VecDeque<CompletedOtarDelivery>,
+    /// Per-terminal GSKO bootstrap state. A GSKO itself is never stored at
+    /// the BS; only its version and CMG association are tracked.
+    gsko_bootstraps: HashMap<u32, GskoBootstrapStatus>,
+    /// Last validated SC2/TMO U-CK CHANGE RESULT per ISSI. Activation policy
+    /// remains SwMI-owned; this prevents the BS from silently changing its
+    /// advertised SCK merely because it observed an uplink result.
+    ck_change_results: HashMap<u32, CkChangeResultStatus>,
+    /// A clear D-LOCATION UPDATE ACCEPT can contain the sealed SCK that turns
+    /// the terminal into an SC2 peer. Do not enable the BS-side binding at
+    /// queue admission: its clear BL-ACK must still be accepted. The receipt
+    /// reaches `Transmitted` only after the complete air PDU was sent.
+    pending_sc2_activations: HashMap<u32, TxReporter>,
     current_time: TdmaTime,
 }
 
@@ -102,6 +261,10 @@ struct PendingRegistration {
     has_group_identity_location_demand: bool,
     location_attachment: Option<PendingAttachment>,
     authentication_successful: bool,
+    /// SwMI-selected SC2 information for the final D-LOCATION UPDATE ACCEPT.
+    /// The Authentication Downlink is opaque at the BS because it can carry a
+    /// TAA1-protected SCK provision.
+    aie: AieLocationUpdateDecision,
     /// Present only when the MM SDU arrived inside MLE U-PREPARE. The source
     /// cell merely carries the forward-registration exchange; subscriber
     /// state belongs to this target serving cell.
@@ -125,25 +288,237 @@ struct PendingLocationAttachment {
 }
 
 impl MmBs {
-    fn authentication_uplink(field: &Type3FieldGeneric) -> Option<([u8; 10], bool)> {
-        // Authentication uplink is CK-request (one bit) followed by optional
-        // RAND2.  Decode the final 80 bits without truncating the type-3 IE.
-        if field.len < 80 {
+    /// Select an explicit downlink policy while the MM transaction still
+    /// knows whether this terminal completed the SC2 bootstrap. Registration
+    /// constructors deliberately use `clear`; OTAR uses the stricter helper
+    /// below. A terminal without a binding must never be guessed capable of
+    /// protected normal OTAR.
+    fn downlink_aie_request(&self, issi: u32) -> AieRequest {
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
+            AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
+        } else {
+            AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)
+        }
+    }
+
+    /// Derive D-OTAR protection from the actual OTAR form, rather than using
+    /// a blanket clear exception. In SC2-only mode a normal SCK/GCK/CCK
+    /// transaction cannot be sent until the terminal has an active context.
+    fn otar_downlink_aie_request(&self, issi: u32, kind: OtarDownlinkKind) -> Result<AieRequest, &'static str> {
+        let state = self.config.state_read();
+        if !state.aie.enabled || kind.is_clear_gsko_bootstrap() {
+            return Ok(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        }
+        if state.aie_sessions.terminal(issi).is_some() {
+            return Ok(AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource));
+        }
+        if state.aie.sc1_allowed {
+            // This is compatibility policy, not an SC2 bootstrap exception.
+            return Ok(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        }
+        Err("SC2-only OTAR downlink has no active terminal cipher context")
+    }
+
+    fn remember_otar_outcome(&mut self, delivery: CompletedOtarDelivery) {
+        if self.recent_otar_deliveries.len() == MAX_RECENT_OTAR_DELIVERIES {
+            self.recent_otar_deliveries.pop_front();
+        }
+        self.recent_otar_deliveries.push_back(delivery);
+    }
+
+    fn complete_otar_delivery(&mut self, command_id: u64, status: OtarDeliveryStatus) {
+        let Some(pending) = self.pending_otar_deliveries.remove(&command_id) else {
+            return;
+        };
+        if matches!(status, OtarDeliveryStatus::LinkFailed { .. }) && matches!(pending.kind, OtarDownlinkKind::GskoProvide) {
+            self.gsko_bootstraps
+                .insert(pending.issi, GskoBootstrapStatus::Failed { command_id });
+        }
+        self.remember_otar_outcome(CompletedOtarDelivery {
+            command_id,
+            issi: pending.issi,
+            kind: pending.kind,
+            status,
+        });
+    }
+
+    /// Poll only the lower-layer receipt. LLC performs its own ETSI basic-link
+    /// retransmissions; MM must not re-enqueue a second D-OTAR with a sealed
+    /// key because that would create duplicate provisioning transactions.
+    fn update_otar_delivery_statuses(&mut self) {
+        let command_ids = self.pending_otar_deliveries.keys().copied().collect::<Vec<_>>();
+        for command_id in command_ids {
+            let (issi, kind, status_change, complete) = {
+                let Some(pending) = self.pending_otar_deliveries.get_mut(&command_id) else {
+                    continue;
+                };
+                let tx_state = pending.tx_reporter.get_state();
+                let link_ack_expected = pending.tx_reporter.expects_ack();
+                let previous_status = pending.status;
+                let mut complete = None;
+
+                match tx_state {
+                    TxState::Pending => {}
+                    TxState::Discarded | TxState::Lost => {
+                        let failed = OtarDeliveryStatus::LinkFailed { state: tx_state };
+                        pending.status = failed;
+                        complete = Some(failed);
+                    }
+                    TxState::Transmitted if previous_status == OtarDeliveryStatus::Queued => {
+                        pending.status = OtarDeliveryStatus::AirTransmitted;
+                        if !link_ack_expected {
+                            if pending.expected_response.is_some() {
+                                pending.status = OtarDeliveryStatus::AwaitingTerminalResult;
+                            } else {
+                                complete = Some(OtarDeliveryStatus::AirTransmitted);
+                            }
+                        }
+                    }
+                    TxState::Transmitted => {}
+                    TxState::Acknowledged
+                        if !matches!(
+                            previous_status,
+                            OtarDeliveryStatus::LinkAcknowledged | OtarDeliveryStatus::AwaitingTerminalResult
+                        ) =>
+                    {
+                        pending.status = OtarDeliveryStatus::LinkAcknowledged;
+                        if pending.expected_response.is_some() {
+                            pending.status = OtarDeliveryStatus::AwaitingTerminalResult;
+                        } else {
+                            complete = Some(OtarDeliveryStatus::LinkAcknowledged);
+                        }
+                    }
+                    TxState::Acknowledged => {}
+                }
+
+                (
+                    pending.issi,
+                    pending.kind,
+                    (previous_status != pending.status).then_some(pending.status),
+                    complete,
+                )
+            };
+            if let Some(status) = status_change {
+                tracing::debug!(command_id, issi, ?kind, ?status, "D-OTAR delivery status changed");
+            }
+            if let Some(status) = complete {
+                self.complete_otar_delivery(command_id, status);
+            }
+        }
+    }
+
+    fn complete_otar_terminal_response(&mut self, issi: u32, air_handle: u32, response: OtarTerminalResponse, success: bool) {
+        let matching = self
+            .pending_otar_deliveries
+            .iter()
+            .filter_map(|(&command_id, pending)| {
+                (pending.issi == issi && pending.air_handle == air_handle && pending.expected_response == Some(response))
+                    .then_some(command_id)
+            })
+            .collect::<Vec<_>>();
+        let [command_id] = matching.as_slice() else {
+            if matching.len() > 1 {
+                tracing::warn!(
+                    issi,
+                    air_handle,
+                    ?response,
+                    candidates = matching.len(),
+                    "ambiguous U-OTAR result correlation"
+                );
+            } else {
+                tracing::debug!(issi, air_handle, ?response, "U-OTAR result has no pending BS delivery correlation");
+            }
+            return;
+        };
+        let command_id = *command_id;
+        tracing::debug!(
+            command_id,
+            issi,
+            air_handle,
+            ?response,
+            success,
+            "U-OTAR terminal result correlated"
+        );
+        if response == OtarTerminalResponse::GskoResult && !success {
+            self.gsko_bootstraps.insert(issi, GskoBootstrapStatus::Failed { command_id });
+        }
+        self.complete_otar_delivery(command_id, OtarDeliveryStatus::TerminalResult { success });
+    }
+
+    /// Decode Table A.35. The optional RAND2 is a Type-2 field, so even an
+    /// Authentication Uplink that only requests the CK contains two bits:
+    /// the request flag followed by the Type-2 presence flag. Do not discard
+    /// that normal `10` form as malformed; doing so would suppress the SCK
+    /// provision in the following D-LOCATION UPDATE ACCEPT.
+    fn authentication_uplink(field: &Type3FieldGeneric) -> Option<(bool, Option<[u8; 10]>)> {
+        if field.len != 2 && field.len != 82 {
             return None;
         }
-        let start = field.len - 80;
-        let mut rand = [0u8; 10];
-        for i in 0..80 {
-            let bit_index = start + i;
-            let bit = if bit_index < 64 {
-                (field.data >> (63 - bit_index)) & 1
-            } else {
-                let p = bit_index - 64;
-                field.raw.get(p / 8).map(|b| u64::from((b >> (7 - (p % 8))) & 1)).unwrap_or(0)
-            };
-            rand[i / 8] = (rand[i / 8] << 1) | bit as u8;
+        let mut bits = if field.raw.is_empty() {
+            let mut value = BitBuffer::new(field.len);
+            value.write_bits(field.data, field.len);
+            // `write_bits` advances the cursor. Rewind before decoding the
+            // two-bit Authentication Uplink; otherwise a normal `10` CK
+            // request is read at end-of-buffer and silently becomes `None`.
+            value.seek(0);
+            value
+        } else {
+            let mut value = BitBuffer::from_vec(field.raw.clone());
+            value.set_raw_end(field.len);
+            value
+        };
+        let ck_requested = bits.read_field(1, "ck_request_flag").ok()? != 0;
+        let random_challenge_present = bits.read_field(1, "rand_2_present").ok()? != 0;
+        let rand_2 = random_challenge_present
+            .then(|| {
+                if field.len != 82 {
+                    return None;
+                }
+                let mut value = [0_u8; 10];
+                bits.read_bits_into_slice(80, &mut value).map(|_| value)
+            })
+            .flatten();
+        if !random_challenge_present && field.len != 2 {
+            return None;
         }
-        Some((rand, true))
+        Some((ck_requested, rand_2))
+    }
+
+    /// Table A.46, SC2 form: KSG(4), security class=0, SCKN(5).
+    fn sc2_ciphering_parameters(&self) -> Option<u16> {
+        let state = self.config.state_read();
+        if !state.aie.enabled {
+            return None;
+        }
+        let sc2 = state.aie.sc2.as_ref()?;
+        let ksg = sc2_ksg_number(sc2.algorithm);
+        Some((u16::from(ksg) << 6) | u16::from(sc2.sckn))
+    }
+
+    fn validate_sc2_location_update(&self, pdu: &ULocationUpdateDemand) -> Result<(), (u8, u16)> {
+        let Some(expected) = self.sc2_ciphering_parameters() else {
+            return Ok(());
+        };
+        let state = self.config.state_read();
+        if !pdu.cipher_control || pdu.ciphering_parameters.is_none() {
+            return if state.aie.sc1_allowed {
+                Ok(())
+            } else {
+                Err((RejectCause::CipheringRequired as u8, expected))
+            };
+        }
+        let provided = pdu.ciphering_parameters.expect("checked present") as u16;
+        let expected_ksg = expected >> 6;
+        let provided_ksg = provided >> 6;
+        if provided_ksg != expected_ksg {
+            return Err((RejectCause::IdentifiedCipherKsgNotSupported as u8, expected));
+        }
+        // Security-class bit must be zero and the SC2 SCKN must agree.
+        if (provided & 0x3f) != (expected & 0x3f) {
+            return Err((RejectCause::IdentifiedCipherKeyNotAvailable as u8, expected));
+        }
+        Ok(())
     }
 
     pub fn new(
@@ -168,6 +543,11 @@ impl MmBs {
             pending_auth_commands: HashMap::new(),
             authenticated_registrations: HashSet::new(),
             pending_lst_recoveries: HashSet::new(),
+            pending_otar_deliveries: HashMap::new(),
+            recent_otar_deliveries: VecDeque::new(),
+            gsko_bootstraps: HashMap::new(),
+            ck_change_results: HashMap::new(),
+            pending_sc2_activations: HashMap::new(),
             current_time: TdmaTime::default(),
         }
     }
@@ -178,8 +558,169 @@ impl MmBs {
         command_id
     }
 
+    fn report_aie_observation(
+        &mut self,
+        issi: u32,
+        air_handle: u32,
+        event: AieObservationEvent,
+        state: AieObservationState,
+        air_interface_encrypted: Option<bool>,
+        cipher_control: Option<bool>,
+        ciphering_parameters: Option<u16>,
+        ck_requested: Option<bool>,
+        success: Option<bool>,
+        cause: Option<u16>,
+        detail: Option<String>,
+    ) {
+        if !self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
+            return;
+        }
+        let (algorithm, sckn, sck_vn) = {
+            let state = self.config.state_read();
+            match state.aie.sc2.as_ref() {
+                Some(sc2) => (
+                    Some(match sc2.algorithm {
+                        tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea1 => tetra_swmi_protocol::Sc2TeaAlgorithm::Tea1,
+                        tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea3 => tetra_swmi_protocol::Sc2TeaAlgorithm::Tea3,
+                    }),
+                    Some(sc2.sckn),
+                    Some(sc2.sck_vn),
+                ),
+                None => (None, None, None),
+            }
+        };
+        let command_id = self.next_swmi_command_id();
+        let message = SwmiMessage::TerminalAieObservation(TerminalAieObservation {
+            command_id,
+            itsi: u64::from(issi),
+            air_handle,
+            event,
+            state,
+            air_interface_encrypted,
+            cipher_control,
+            ciphering_parameters,
+            ck_requested,
+            algorithm,
+            sckn,
+            sck_vn,
+            success,
+            cause,
+            detail,
+        });
+        if self.swmi.as_ref().expect("SwMI online check above").submit(message).is_err() {
+            tracing::debug!(command_id, issi, "AIE observation could not be queued to SwMI");
+        }
+    }
+
+    fn packet_aie_state(air_interface_encrypted: bool) -> AieObservationState {
+        if air_interface_encrypted {
+            AieObservationState::Sc2
+        } else {
+            AieObservationState::Clear
+        }
+    }
+
+    /// A clear MM bootstrap is allowed for a terminal that already has an
+    /// active SC2 binding.  Report that terminal's effective security state as
+    /// SC2 while retaining `air_interface_encrypted = false` as the raw packet
+    /// fact.  This prevents a successful clear bootstrap/authentication from
+    /// overwriting the terminal's established SC2 state in the SwMI view.
+    fn effective_aie_state(&self, issi: u32, air_interface_encrypted: bool) -> AieObservationState {
+        if air_interface_encrypted {
+            return AieObservationState::Sc2;
+        }
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
+            AieObservationState::Sc2
+        } else {
+            AieObservationState::Clear
+        }
+    }
+
     fn authentication_correlation_key(issi: u32, air_handle: u32) -> (u32, u32) {
         (issi, air_handle)
+    }
+
+    /// The SCK itself remains in the shared AIE key-provider state. MM only
+    /// records the key-free identity after a successful SC2 registration.
+    fn activate_sc2_terminal(&self, issi: u32) {
+        let mut state = self.config.state_write();
+        if !state.aie.enabled {
+            return;
+        }
+        let Some(sc2) = state.aie.sc2.clone() else {
+            return;
+        };
+        state.aie_sessions.activate_terminal(issi, &sc2);
+    }
+
+    /// Keep an already encrypted location-update exchange encrypted. In
+    /// particular this covers D-AUTHENTICATION and D-LOCATION UPDATE ACCEPT
+    /// sent after UMAC has decoded an initial SC2 ESI. A clear bootstrap has
+    /// no binding yet and therefore remains clear until its accept is sent.
+    fn aie_request_for_terminal(&self, issi: u32) -> AieRequest {
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
+            AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
+        } else {
+            AieRequest::clear(AieSubject::System, AieScope::MacResource)
+        }
+    }
+
+    fn defer_sc2_activation(&mut self, issi: u32, aie: &AieLocationUpdateDecision, receipt: TxReporter) {
+        // Cipher Control announces the cell's selected SC2 parameters, but
+        // it does not itself give a previously clear MS an SCK.  Activating
+        // the BS binding in that case makes the cell reject the MS's next
+        // clear bootstrap retry even though it never received a key.  Only
+        // the full Table A.94 CK/SCK provision (228 bits) can transition a
+        // clear terminal into SC2 here.  An already ciphered registration
+        // already has its binding before this function is reached.
+        if aie.authentication_downlink_bit_len == Some(228) {
+            self.pending_sc2_activations.insert(issi, receipt);
+        }
+    }
+
+    /// TTR 001-11 6.2.23.1: following a clear location update the ciphering
+    /// state changes after the last D-LOCATION UPDATE ACCEPT repeat is sent,
+    /// or on its clear BL-ACK, whichever comes first. `Transmitted` is the
+    /// former event in this stack. A dropped/lost clear accept must never
+    /// leave an SC2 binding active.
+    fn update_sc2_activations(&mut self) {
+        let outcomes = self
+            .pending_sc2_activations
+            .iter()
+            .filter_map(|(&issi, receipt)| match receipt.get_state() {
+                TxState::Transmitted | TxState::Acknowledged => Some((issi, true, receipt.get_state())),
+                TxState::Discarded | TxState::Lost => Some((issi, false, receipt.get_state())),
+                TxState::Pending => None,
+            })
+            .collect::<Vec<_>>();
+        for (issi, activate, state) in outcomes {
+            self.pending_sc2_activations.remove(&issi);
+            if activate {
+                self.activate_sc2_terminal(issi);
+                self.report_aie_observation(
+                    issi,
+                    0,
+                    AieObservationEvent::TerminalActivation,
+                    AieObservationState::Sc2,
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    None,
+                    Some("SC2 terminal binding activated after delivered bootstrap".to_owned()),
+                );
+                tracing::debug!(issi, ?state, "activated SC2 after clear location-update accept transmission");
+            } else {
+                tracing::warn!(
+                    issi,
+                    ?state,
+                    "clear location-update accept was not delivered; SC2 activation cancelled"
+                );
+            }
+        }
     }
 
     /// The ESI startpoint is the activation/monitoring phase. It deliberately
@@ -293,7 +834,11 @@ impl MmBs {
             return false;
         };
 
-        self.config.state_write().subscribers.deregister(issi);
+        {
+            let mut state = self.config.state_write();
+            state.subscribers.deregister(issi);
+            state.aie_sessions.deactivate_terminal(issi);
+        }
         let was_gateway = self.config.state_read().dm_gateways.is_active(issi);
         if was_gateway {
             self.config.state_write().dm_gateways.deactivate(issi);
@@ -400,6 +945,32 @@ impl MmBs {
             tracing::error!("Unsupported critical features in ULocationUpdateDemand");
             return;
         }
+        if let Err((cause, parameters)) = self.validate_sc2_location_update(&pdu) {
+            let air_interface_encrypted = matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }));
+            self.report_aie_observation(
+                prim.received_address.ssi,
+                prim.handle,
+                AieObservationEvent::CipheringMismatch,
+                Self::packet_aie_state(air_interface_encrypted),
+                Some(air_interface_encrypted),
+                Some(pdu.cipher_control),
+                pdu.ciphering_parameters.map(|value| value as u16),
+                None,
+                Some(false),
+                Some(u16::from(cause)),
+                Some("location-update AIE parameters rejected".to_owned()),
+            );
+            Self::send_d_location_update_reject_with_ciphering_parameters(
+                queue,
+                prim.received_address.ssi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                cause,
+                parameters,
+            );
+            return;
+        }
 
         // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
         // startpoint. Current policy accepts the requested mode and selects
@@ -426,19 +997,24 @@ impl MmBs {
         });
         if self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online) {
             let command_id = self.next_swmi_command_id();
-            let authentication = pdu.authentication_uplink.as_ref().and_then(|field| {
-                Self::authentication_uplink(field).map(|(rand_2, mutual)| tetra_swmi_protocol::AuthenticationResponse {
-                    command_id,
-                    itsi: issi as u64,
-                    air_handle: prim.handle,
-                    response_1: None,
-                    response_2: None,
-                    rand_2: Some(rand_2),
-                    random_seed: None,
-                    mutual,
-                    authentication_result: None,
-                })
+            let (ck_requested, rand_2) = pdu
+                .authentication_uplink
+                .as_ref()
+                .and_then(Self::authentication_uplink)
+                .unwrap_or((false, None));
+            let authentication = rand_2.map(|rand_2| tetra_swmi_protocol::AuthenticationResponse {
+                command_id,
+                itsi: issi as u64,
+                air_handle: prim.handle,
+                response_1: None,
+                response_2: None,
+                rand_2: Some(rand_2),
+                random_seed: None,
+                mutual: true,
+                authentication_result: None,
             });
+            let air_interface_encrypted = matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }));
+            let ciphering_parameters = pdu.ciphering_parameters.map(|value| value as u16);
             let request = SwmiMessage::RegistrationAttempt {
                 command_id,
                 itsi: issi as u64,
@@ -448,8 +1024,31 @@ impl MmBs {
                 forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
                 energy_economy,
                 authentication,
+                aie: tetra_swmi_protocol::AieLocationUpdateRequest {
+                    // Cipher Control records the requested registration
+                    // policy; this separately records the bearer that was
+                    // actually used on air. A clear bootstrap may still ask
+                    // for ciphering-on, so do not conflate the two.
+                    air_interface_encrypted,
+                    cipher_control: pdu.cipher_control,
+                    ciphering_parameters,
+                    ck_requested,
+                },
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
+                self.report_aie_observation(
+                    issi,
+                    prim.handle,
+                    AieObservationEvent::Registration,
+                    self.effective_aie_state(issi, air_interface_encrypted),
+                    Some(air_interface_encrypted),
+                    Some(pdu.cipher_control),
+                    ciphering_parameters,
+                    Some(ck_requested),
+                    None,
+                    None,
+                    None,
+                );
                 self.config.state_write().subscribers.set_registration_delivery_pending(issi, true);
                 self.pending_registrations.insert(
                     command_id,
@@ -462,12 +1061,22 @@ impl MmBs {
                         has_group_identity_location_demand,
                         location_attachment,
                         authentication_successful: false,
+                        aie: AieLocationUpdateDecision::default(),
                         forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
                     },
                 );
                 self.registration_deadlines
                     .insert(command_id, self.current_time.add_timeslots(T351_TIMESLOTS));
-                tracing::info!(command_id, issi, "location update forwarded to SwMI");
+                // This confirms the CK-request transition without exposing
+                // RAND2, the subscriber key, or any sealed key material.
+                tracing::info!(
+                    command_id,
+                    issi,
+                    ck_requested,
+                    cipher_control = pdu.cipher_control,
+                    ciphering_parameters = pdu.ciphering_parameters,
+                    "location update forwarded to SwMI"
+                );
                 return;
             }
             tracing::warn!(command_id, issi, "SwMI request queue unavailable; using local-site trunking");
@@ -587,6 +1196,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -604,7 +1214,7 @@ impl MmBs {
         // avoid a redundant clear-and-reattach cycle.
         if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups {
             tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
-            Self::send_d_location_update_command(queue, issi, handle, true);
+            self.send_d_location_update_command(queue, issi, handle, true);
         }
     }
 
@@ -657,7 +1267,6 @@ impl MmBs {
                     };
                     if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
                         self.pending_energy_economy.insert(command_id, (issi, handle));
-                        handled = true;
                         return;
                     }
                     tracing::warn!(command_id, issi, "SwMI EE request queue unavailable; using local-site trunking");
@@ -666,7 +1275,7 @@ impl MmBs {
                 if assignment.mode != 0 {
                     self.activate_energy_economy_after_next_control(issi);
                 }
-                Self::send_d_mm_status_energy_saving(queue, issi, handle, Self::esi_from_assignment(assignment));
+                self.send_d_mm_status_energy_saving(queue, issi, handle, Self::esi_from_assignment(assignment));
                 handled = true;
             }
             StatusUplink::ChangeOfEnergySavingModeResponse => {
@@ -736,7 +1345,7 @@ impl MmBs {
                 };
                 if !self.config.state_read().subscribers.is_registered(issi) {
                     tracing::warn!(issi, "unregistered terminal requested DM gateway operation");
-                    Self::send_d_mm_status_gateway(
+                    self.send_d_mm_status_gateway(
                         queue,
                         issi,
                         handle,
@@ -751,7 +1360,7 @@ impl MmBs {
                     .dm_gateways
                     .activate(issi, dmo_carrier.map(dmo_carrier_state), addresses, self.current_time);
                 self.publish_dm_gateway_state(issi, true);
-                Self::send_d_mm_status_gateway(
+                self.send_d_mm_status_gateway(
                     queue,
                     issi,
                     handle,
@@ -772,7 +1381,7 @@ impl MmBs {
                         .update_carrier(issi, dmo_carrier.map(dmo_carrier_state), self.current_time);
                     self.publish_dm_gateway_state(issi, true);
                 }
-                Self::send_d_mm_status_gateway(
+                self.send_d_mm_status_gateway(
                     queue,
                     issi,
                     handle,
@@ -792,7 +1401,7 @@ impl MmBs {
             StatusUplink::RequestToStopDmGatewayOperation => {
                 self.config.state_write().dm_gateways.deactivate(issi);
                 self.publish_dm_gateway_state(issi, false);
-                Self::send_d_mm_status_gateway(
+                self.send_d_mm_status_gateway(
                     queue,
                     issi,
                     handle,
@@ -821,7 +1430,7 @@ impl MmBs {
                 }
                 drop(state);
                 self.publish_dm_gateway_state(issi, true);
-                Self::send_d_mm_status_gateway(
+                self.send_d_mm_status_gateway(
                     queue,
                     issi,
                     handle,
@@ -856,6 +1465,7 @@ impl MmBs {
                 MmPduTypeUl::UMmStatus,
                 Some((6, pdu.status_uplink.into())),
                 prim.received_address,
+                self.downlink_aie_request(issi),
             );
             tracing::debug!("-> {}", debug_str);
             queue.push_back(sapmsg);
@@ -1001,6 +1611,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1025,13 +1636,50 @@ impl MmBs {
             return;
         };
 
+        // TTR 001-11 clause 6.2.17 permits a deliberately small clear
+        // exception set after SC2 activation. Keep that decision at MM,
+        // where the actual MM PDU type is known: location update and its
+        // authentication exchange remain bootstrap procedures, while OTAR
+        // is narrowed further to its permitted result/GSKO variants by
+        // `rx_u_otar` below. All ordinary clear MM PDUs fail closed when
+        // SC1 fallback is disabled.
+        let is_clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
+            let state = self.config.state_read();
+            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.received_address.ssi).is_some()
+        };
+        if is_clear_from_bound_sc2_terminal
+            && !matches!(
+                pdu_type,
+                MmPduTypeUl::ULocationUpdateDemand | MmPduTypeUl::UAuthentication | MmPduTypeUl::UOtar
+            )
+        {
+            tracing::warn!(
+                issi = prim.received_address.ssi,
+                ?pdu_type,
+                "rejecting unexpected clear post-SC2 MM PDU"
+            );
+            return;
+        }
+        if matches!(
+            prim.air_interface_encryption,
+            Some(AieRequest::Sc2 {
+                subject: AieSubject::System,
+                ..
+            })
+        ) && prim.received_address.ssi_type == SsiType::Esi
+            && pdu_type != MmPduTypeUl::ULocationUpdateDemand
+        {
+            tracing::warn!(?pdu_type, "rejecting unbound encrypted SC2 MM PDU outside location update");
+            return;
+        }
+
         match pdu_type {
             MmPduTypeUl::UAuthentication => self.rx_u_authentication(queue, message),
             MmPduTypeUl::UItsiDetach => self.rx_u_itsi_detach(queue, message),
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
-            MmPduTypeUl::UCkChangeResult => unimplemented_log!("UCkChangeResult"),
-            MmPduTypeUl::UOtar => unimplemented_log!("UOtar"),
+            MmPduTypeUl::UCkChangeResult => self.rx_u_ck_change_result(message),
+            MmPduTypeUl::UOtar => self.rx_u_otar(message),
             MmPduTypeUl::UInformationProvide => unimplemented_log!("UInformationProvide"),
             MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
             MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => unimplemented_log!("UAttachDetachGroupIdentityAcknowledgement"),
@@ -1039,6 +1687,240 @@ impl MmBs {
             MmPduTypeUl::UDisableStatus => unimplemented_log!("UDisableStatus"),
             MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
         };
+    }
+
+    /// The BS validates and transports OTAR but never receives key material
+    /// from the SwMI.  This keeps TAA1-K, KSO and clear SCK/GSKO state in the
+    /// central key provider, while retaining the exact air-interface handle
+    /// needed to schedule the response.
+    fn rx_u_otar(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let pdu = match UOtar::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(issi = prim.received_address.ssi, error = ?error, "discarding malformed U-OTAR PDU");
+                self.report_aie_observation(
+                    prim.received_address.ssi,
+                    prim.handle,
+                    AieObservationEvent::ProtocolError,
+                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    Some("malformed U-OTAR PDU".to_owned()),
+                );
+                return;
+            }
+        };
+        let subtype = match &pdu {
+            UOtar::CckDemand(_) => "cck-demand",
+            UOtar::CckResult(_) => "cck-result",
+            UOtar::SckDemand(_) => "sck-demand",
+            UOtar::SckResult(_) => "sck-result",
+            UOtar::GckDemand(_) => "gck-demand",
+            UOtar::GckResult(_) => "gck-result",
+            UOtar::GskoDemand(_) => "gsko-demand",
+            UOtar::GskoResult(_) => "gsko-result",
+            UOtar::KeyStatusResponse(_) => "key-status-response",
+        };
+        let is_clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
+            let state = self.config.state_read();
+            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.received_address.ssi).is_some()
+        };
+        if is_clear_from_bound_sc2_terminal
+            && !matches!(
+                pdu,
+                UOtar::CckResult(_) | UOtar::SckResult(_) | UOtar::GskoDemand(_) | UOtar::GskoResult(_)
+            )
+        {
+            tracing::warn!(
+                issi = prim.received_address.ssi,
+                subtype,
+                "rejecting clear U-OTAR variant outside SC2 bootstrap allow-list"
+            );
+            self.report_aie_observation(
+                prim.received_address.ssi,
+                prim.handle,
+                AieObservationEvent::CipheringMismatch,
+                AieObservationState::Clear,
+                Some(false),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(1),
+                Some("clear U-OTAR rejected while SC2 is required".to_owned()),
+            );
+            return;
+        }
+        // Correlate the terminal-level provision/key-status response before
+        // forwarding the opaque PDU. A BL-ACK is not considered equivalent to
+        // this result: a terminal can acknowledge radio delivery and still
+        // reject the sealed key or report a different key status.
+        match &pdu {
+            UOtar::CckResult(result) => self.complete_otar_terminal_response(
+                prim.received_address.ssi,
+                prim.handle,
+                OtarTerminalResponse::CckResult,
+                result.provision_result == 0 && result.future_provision_result.is_none_or(|code| code == 0),
+            ),
+            UOtar::SckResult(result) => self.complete_otar_terminal_response(
+                prim.received_address.ssi,
+                prim.handle,
+                OtarTerminalResponse::SckResult,
+                result.results.iter().all(|entry| entry.provision_result == 0),
+            ),
+            UOtar::GckResult(result) => self.complete_otar_terminal_response(
+                prim.received_address.ssi,
+                prim.handle,
+                OtarTerminalResponse::GckResult,
+                result.results.iter().all(|entry| entry.provision_result == 0),
+            ),
+            UOtar::GskoDemand(_) => {
+                self.gsko_bootstraps
+                    .insert(prim.received_address.ssi, GskoBootstrapStatus::Requested);
+            }
+            UOtar::GskoResult(result) => {
+                let success = result.provision_result == 0;
+                self.complete_otar_terminal_response(prim.received_address.ssi, prim.handle, OtarTerminalResponse::GskoResult, success);
+                if success {
+                    self.gsko_bootstraps.insert(
+                        prim.received_address.ssi,
+                        GskoBootstrapStatus::Provisioned {
+                            version_number: result.version_number,
+                            cmg_gssi: result.cmg_gssi,
+                        },
+                    );
+                }
+            }
+            UOtar::KeyStatusResponse(_) => self.complete_otar_terminal_response(
+                prim.received_address.ssi,
+                prim.handle,
+                OtarTerminalResponse::KeyStatusResponse,
+                true,
+            ),
+            UOtar::CckDemand(_) | UOtar::SckDemand(_) | UOtar::GckDemand(_) => {}
+        }
+        let (event, success, cause) = match &pdu {
+            UOtar::KeyStatusResponse(_) => (AieObservationEvent::KeyStatus, Some(true), None),
+            UOtar::CckResult(result) => {
+                let success = result.provision_result == 0 && result.future_provision_result.is_none_or(|code| code == 0);
+                (AieObservationEvent::Otar, Some(success), (!success).then_some(u16::from(result.provision_result)))
+            }
+            UOtar::SckResult(result) => {
+                let cause = result.results.iter().find_map(|entry| (entry.provision_result != 0).then_some(u16::from(entry.provision_result)));
+                (AieObservationEvent::Otar, Some(cause.is_none()), cause)
+            }
+            UOtar::GckResult(result) => {
+                let cause = result.results.iter().find_map(|entry| (entry.provision_result != 0).then_some(u16::from(entry.provision_result)));
+                (AieObservationEvent::Otar, Some(cause.is_none()), cause)
+            }
+            UOtar::GskoResult(result) => (AieObservationEvent::Otar, Some(result.provision_result == 0), (!result.provision_result.eq(&0)).then_some(u16::from(result.provision_result))),
+            UOtar::CckDemand(_) | UOtar::SckDemand(_) | UOtar::GckDemand(_) | UOtar::GskoDemand(_) => (AieObservationEvent::Otar, None, None),
+        };
+        self.report_aie_observation(
+            prim.received_address.ssi,
+            prim.handle,
+            event,
+            self.effective_aie_state(prim.received_address.ssi, matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            None,
+            None,
+            None,
+            success,
+            cause,
+            Some(format!("U-OTAR {subtype}")),
+        );
+        let mut wire = BitBuffer::new_autoexpand(64);
+        if let Err(error) = pdu.to_bitbuf(&mut wire) {
+            tracing::warn!(issi = prim.received_address.ssi, error = ?error, "cannot reencode validated U-OTAR PDU");
+            return;
+        }
+        let payload_bit_len = match u16::try_from(wire.get_len()) {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(issi = prim.received_address.ssi, "U-OTAR PDU exceeds SwMI transport limit");
+                return;
+            }
+        };
+        let command_id = self.next_swmi_command_id();
+        let Some(endpoint) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) else {
+            tracing::warn!(issi = prim.received_address.ssi, "discarding U-OTAR PDU while SwMI is unavailable");
+            return;
+        };
+        let request = SwmiMessage::OtarUplink {
+            command_id,
+            itsi: prim.received_address.ssi as u64,
+            air_handle: prim.handle,
+            payload_bit_len,
+            payload: wire.into_bytes(),
+        };
+        if endpoint.submit(request).is_err() {
+            tracing::warn!(command_id, issi = prim.received_address.ssi, "SwMI OTAR queue unavailable");
+            return;
+        }
+        // Keep PDU logs metadata-only: the payload may contain sealed keys.
+        tracing::debug!(command_id, issi = prim.received_address.ssi, subtype, "U-OTAR forwarded to SwMI");
+    }
+
+    fn rx_u_ck_change_result(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let result = match UCkChangeResult::from_bitbuf(&mut prim.sdu) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(issi = prim.received_address.ssi, error = ?error, "discarding malformed U-CK CHANGE RESULT");
+                self.report_aie_observation(
+                    prim.received_address.ssi,
+                    prim.handle,
+                    AieObservationEvent::ProtocolError,
+                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    Some("malformed U-CK CHANGE RESULT".to_owned()),
+                );
+                return;
+            }
+        };
+        let selected_sck_count = result.selected_scks.len();
+        self.ck_change_results.insert(
+            prim.received_address.ssi,
+            CkChangeResultStatus {
+                change_of_security_class: result.change_of_security_class,
+                selected_sck_count,
+            },
+        );
+        // This result does not activate a key locally. The SwMI alone decides
+        // the activation time and distributes the corresponding cell config.
+        tracing::debug!(
+            issi = prim.received_address.ssi,
+            change_of_security_class = result.change_of_security_class,
+            selected_sck_count,
+            "validated U-CK CHANGE RESULT"
+        );
+        self.report_aie_observation(
+            prim.received_address.ssi,
+            prim.handle,
+            AieObservationEvent::CkChange,
+            self.effective_aie_state(prim.received_address.ssi, matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            None,
+            None,
+            None,
+            Some(true),
+            None,
+            Some(format!("validated U-CK CHANGE RESULT with {selected_sck_count} selected SCK(s)")),
+        );
     }
 
     fn rx_u_authentication(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1056,6 +1938,19 @@ impl MmBs {
                     error = ?error,
                     sdu = %prim.sdu.dump_bin(),
                     "invalid U-AUTHENTICATION"
+                );
+                self.report_aie_observation(
+                    prim.received_address.ssi,
+                    prim.handle,
+                    AieObservationEvent::ProtocolError,
+                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    None,
+                    Some("invalid U-AUTHENTICATION".to_owned()),
                 );
                 return;
             }
@@ -1092,12 +1987,38 @@ impl MmBs {
                 mutual = pdu.mutual,
                 "U-AUTHENTICATION RESULT forwarded to SwMI"
             );
+            self.report_aie_observation(
+                prim.received_address.ssi,
+                prim.handle,
+                AieObservationEvent::Authentication,
+                self.effective_aie_state(prim.received_address.ssi, matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                None,
+                None,
+                None,
+                Some(authentication_result),
+                (!authentication_result).then_some(1),
+                Some(if authentication_result { "terminal authentication accepted" } else { "terminal authentication rejected" }.to_owned()),
+            );
         } else {
             tracing::info!(
                 command_id,
                 itsi = prim.received_address.ssi,
                 mutual = pdu.mutual,
                 "U-AUTHENTICATION RESPONSE forwarded to SwMI"
+            );
+            self.report_aie_observation(
+                prim.received_address.ssi,
+                prim.handle,
+                AieObservationEvent::Authentication,
+                self.effective_aie_state(prim.received_address.ssi, matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("terminal authentication response received".to_owned()),
             );
         }
     }
@@ -1192,6 +2113,7 @@ impl MmBs {
         energy_economy: EnergyEconomyAssignment,
         rua_requested: bool,
         handover_allocation: Option<HandoverChannelAllocation>,
+        aie: AieLocationUpdateDecision,
     ) {
         let Some(pending) = self.pending_registrations.get(&command_id) else {
             tracing::warn!(command_id, itsi, "received SwMI registration decision without pending air request");
@@ -1216,6 +2138,7 @@ impl MmBs {
             .pending_registrations
             .remove(&command_id)
             .expect("pending registration was checked above");
+        pending.aie = aie;
         pending.authentication_successful = self.authenticated_registrations.remove(&command_id);
         let auth_key = Self::authentication_correlation_key(pending.itsi, pending.air_handle);
         if self
@@ -1231,14 +2154,26 @@ impl MmBs {
                 .subscribers
                 .set_registration_delivery_pending(pending.itsi, false);
             tracing::info!(command_id, itsi, cause, "SwMI rejected location update");
-            Self::send_d_location_update_reject_with_cause(
-                queue,
-                pending.itsi,
-                pending.air_handle,
-                pending.location_update_type,
-                pending.address_extension,
-                cause as u8,
-            );
+            if let Some(parameters) = pending.aie.ciphering_parameters {
+                Self::send_d_location_update_reject_with_ciphering_parameters(
+                    queue,
+                    pending.itsi,
+                    pending.air_handle,
+                    pending.location_update_type,
+                    pending.address_extension,
+                    cause as u8,
+                    parameters,
+                );
+            } else {
+                Self::send_d_location_update_reject_with_cause(
+                    queue,
+                    pending.itsi,
+                    pending.air_handle,
+                    pending.location_update_type,
+                    pending.address_extension,
+                    cause as u8,
+                );
+            }
             return;
         }
 
@@ -1260,13 +2195,15 @@ impl MmBs {
                 timeslots: std::array::from_fn(|index| allocation.timeslot_bitmap & (1 << index) != 0),
                 usage: allocation.usage,
             });
-            Self::send_d_location_update_accept_with_handover(
+            let _ = Self::send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
                 pending.air_handle,
                 pending.location_update_type,
                 pending.energy_saving_information,
                 pending.authentication_successful,
+                &pending.aie,
+                self.aie_request_for_terminal(pending.itsi),
                 pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: 0,
                     group_identity_downlink: None,
@@ -1373,13 +2310,15 @@ impl MmBs {
             );
             let local_results = Self::local_attachment_results(&attachment);
             let (had_rejection, groups) = self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
-            Self::send_d_location_update_accept_with_handover(
+            let receipt = Self::send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
                 pending.air_handle,
                 pending.location_update_type,
                 pending.energy_saving_information,
                 pending.authentication_successful,
+                &pending.aie,
+                self.aie_request_for_terminal(pending.itsi),
                 Some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: u8::from(had_rejection),
                     group_identity_downlink: Some(groups),
@@ -1388,15 +2327,18 @@ impl MmBs {
                 rua_requested,
             );
             self.config.state_write().subscribers.mark_active(pending.itsi);
+            self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
             return;
         }
-        Self::send_d_location_update_accept_with_handover(
+        let receipt = Self::send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
             pending.air_handle,
             pending.location_update_type,
             pending.energy_saving_information,
             pending.authentication_successful,
+            &pending.aie,
+            self.aie_request_for_terminal(pending.itsi),
             pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
@@ -1405,6 +2347,7 @@ impl MmBs {
             rua_requested,
         );
         self.config.state_write().subscribers.mark_active(pending.itsi);
+        self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
         tracing::info!(
             command_id,
             itsi,
@@ -1438,7 +2381,7 @@ impl MmBs {
 
         let (had_rejection, accepted_downlink) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending, results);
-        Self::send_d_attachment_acknowledgement(queue, pending.itsi, pending.air_handle, had_rejection, accepted_downlink);
+        self.send_d_attachment_acknowledgement(queue, pending.itsi, pending.air_handle, had_rejection, accepted_downlink);
         tracing::info!(
             command_id,
             itsi,
@@ -1682,13 +2625,15 @@ impl MmBs {
         let (had_rejection, groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
-        Self::send_d_location_update_accept_with_handover(
+        let receipt = Self::send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
             registration.air_handle,
             registration.location_update_type,
             registration.energy_saving_information,
             registration.authentication_successful,
+            &registration.aie,
+            self.aie_request_for_terminal(registration.itsi),
             Some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: u8::from(had_rejection),
                 group_identity_downlink: Some(groups),
@@ -1697,6 +2642,7 @@ impl MmBs {
             pending.rua_requested,
         );
         self.config.state_write().subscribers.mark_active(registration.itsi);
+        self.defer_sc2_activation(registration.itsi, &registration.aie, receipt);
         tracing::info!(
             command_id,
             itsi,
@@ -1707,6 +2653,7 @@ impl MmBs {
     }
 
     fn send_d_attachment_acknowledgement(
+        &self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
@@ -1735,6 +2682,10 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                // A standalone group attachment is normal post-registration
+                // signalling.  Unlike a location-update bootstrap response,
+                // it must retain the terminal's active SC2 context.
+                aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1751,13 +2702,15 @@ impl MmBs {
         authentication_successful: bool,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
     ) {
-        Self::send_d_location_update_accept_with_handover(
+        let _ = Self::send_d_location_update_accept_with_handover(
             queue,
             issi,
             handle,
             location_update_type,
             energy_saving_information,
             authentication_successful,
+            &AieLocationUpdateDecision::default(),
+            AieRequest::clear(AieSubject::System, AieScope::MacResource),
             group_identity_location_accept,
             None,
             false,
@@ -1771,10 +2724,12 @@ impl MmBs {
         location_update_type: LocationUpdateType,
         energy_saving_information: Option<EnergySavingInformation>,
         authentication_successful: bool,
+        aie: &AieLocationUpdateDecision,
+        aie_request: AieRequest,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
         seamless_handover: Option<LmmMleSeamlessHandover>,
         rua_requested: bool,
-    ) {
+    ) -> TxReporter {
         let pdu = DLocationUpdateAccept {
             location_update_accept_type: location_update_type,
             ssi: Some(issi as u64),
@@ -1786,16 +2741,34 @@ impl MmBs {
             security_downlink: None,
             group_identity_location_accept,
             default_group_attachment_lifetime: None,
-            authentication_downlink: authentication_successful.then(|| Type3FieldGeneric {
-                field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
-                // Authentication Downlink has three mandatory bits:
-                // authentication result, TEI request, and CK provisioning.
-                // Accept the authentication without requesting a TEI or
-                // provisioning a cipher key.
-                len: 3,
-                data: 0b100,
-                raw: Vec::new(),
-            }),
+            authentication_downlink: aie
+                .authentication_downlink_bit_len
+                .map(|len| {
+                    let first = aie
+                        .authentication_downlink
+                        .get(..8)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u64::from_be_bytes)
+                        .unwrap_or_default();
+                    Type3FieldGeneric {
+                        field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                        len: usize::from(len),
+                        data: first,
+                        raw: aie.authentication_downlink.clone(),
+                    }
+                })
+                .or_else(|| {
+                    authentication_successful.then(|| Type3FieldGeneric {
+                        field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                        // Authentication Downlink has three mandatory bits:
+                        // authentication result, TEI request, and CK provisioning.
+                        // Accept the authentication without requesting a TEI or
+                        // provisioning a cipher key.
+                        len: 3,
+                        data: 0b100,
+                        raw: Vec::new(),
+                    })
+                }),
             group_identity_security_related_information: None,
             cell_type_control: None,
             proprietary: rua_requested.then(|| Type3FieldGeneric {
@@ -1812,9 +2785,10 @@ impl MmBs {
         sdu.seek(0);
         tracing::debug!(
             issi,
-            authentication_downlink = authentication_successful,
+            authentication_downlink = aie.authentication_downlink_bit_len.is_some() || authentication_successful,
             "sending D-LOCATION UPDATE ACCEPT"
         );
+        let tx_reporter = TxReporter::new();
         queue.push_back(SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -1827,25 +2801,23 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request,
                 is_null_pdu: false,
-                tx_reporter: None,
+                tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover,
             }),
         });
+        tx_reporter
     }
 
     /// Sends a D-LOCATION UPDATE COMMAND. Recovery paths can request a full
     /// group report; SwMI liveliness checks deliberately do not disturb it.
-    fn send_d_location_update_command(
-        queue: &mut MessageQueue,
-        issi: u32,
-        handle: u32,
-        group_identity_report: bool,
-    ) {
+    fn send_d_location_update_command(&self, queue: &mut MessageQueue, issi: u32, handle: u32, group_identity_report: bool) {
+        let ciphering_parameters = self.sc2_ciphering_parameters();
         let pdu = DLocationUpdateCommand {
             group_identity_report,
-            cipher_control: false,
-            ciphering_parameters: None,
+            cipher_control: ciphering_parameters.is_some(),
+            ciphering_parameters: ciphering_parameters.map(u64::from),
             address_extension: None,
             cell_type_control: None,
             proprietary: None,
@@ -1868,6 +2840,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1930,6 +2903,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1938,8 +2912,53 @@ impl MmBs {
         queue.push_back(msg);
     }
 
+    /// A class-2 negotiation failure must advertise the SwMI-selected
+    /// KSG/SCKN (Table A.46) so the MS can re-register with the accepted
+    /// parameters.  This is intentionally clear bootstrap signalling.
+    fn send_d_location_update_reject_with_ciphering_parameters(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+        reject_cause: u8,
+        ciphering_parameters: u16,
+    ) {
+        let pdu = DLocationUpdateReject {
+            location_update_type,
+            reject_cause,
+            cipher_control: true,
+            ciphering_parameters: Some(u64::from(ciphering_parameters)),
+            address_extension,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("serialize SC2 D-LOCATION UPDATE REJECT");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+        tracing::info!(issi, reject_cause, ciphering_parameters, "sent SC2 registration negotiation reject");
+    }
+
     /// Sends a D-MM-STATUS with ChangeOfEnergySavingModeResponse
-    fn send_d_mm_status_energy_saving(queue: &mut MessageQueue, issi: u32, handle: u32, esi: EnergySavingInformation) {
+    fn send_d_mm_status_energy_saving(&self, queue: &mut MessageQueue, issi: u32, handle: u32, esi: EnergySavingInformation) {
         let pdu = DMmStatus {
             status_downlink: StatusDownlink::ChangeOfEnergySavingModeResponse,
             energy_saving_information: Some(esi),
@@ -1964,6 +2983,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1973,6 +2993,7 @@ impl MmBs {
     }
 
     fn send_d_mm_status_gateway(
+        &self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
@@ -2003,6 +3024,7 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -2078,14 +3100,8 @@ impl MmBs {
             unimplemented_log!("Unsupported request_to_append_la == true");
             supported = false;
         }
-        if pdu.cipher_control == true {
-            unimplemented_log!("Unsupported cipher_control == true");
-            supported = false;
-        }
-        if pdu.ciphering_parameters.is_some() {
-            unimplemented_log!("Unsupported ciphering_parameters present");
-            supported = false;
-        }
+        // Cipher control and its ten-bit parameters are handled by the SC2
+        // negotiation path before the registration reaches the SwMI.
         if pdu.la_information.is_some() {
             unimplemented_log!("Unsupported la_information present");
         }
@@ -2144,6 +3160,8 @@ impl TetraEntityTrait for MmBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
+        self.update_sc2_activations();
+        self.update_otar_delivery_statuses();
         let timed_out: Vec<u64> = self
             .registration_deadlines
             .iter()
@@ -2178,19 +3196,20 @@ impl TetraEntityTrait for MmBs {
                         tracing::debug!(issi, "ignoring liveliness check for unknown local terminal");
                         continue;
                     }
-                    Self::send_d_location_update_command(queue, issi, 0, false);
+                    self.send_d_location_update_command(queue, issi, 0, false);
                     tracing::debug!(issi, "sent D-LOCATION UPDATE COMMAND for SwMI liveliness check");
                 }
                 SwmiMessage::RegistrationDecision {
                     command_id,
                     itsi,
                     air_handle,
+                    location_update_type: _,
                     accepted,
                     cause,
                     energy_economy,
                     rua_requested,
                     handover_allocation,
-                    ..
+                    aie,
                 } => self.apply_swmi_registration_decision(
                     queue,
                     command_id,
@@ -2201,6 +3220,7 @@ impl TetraEntityTrait for MmBs {
                     energy_economy,
                     rua_requested,
                     handover_allocation,
+                    aie,
                 ),
                 SwmiMessage::AuthenticationChallenge {
                     command_id,
@@ -2228,6 +3248,7 @@ impl TetraEntityTrait for MmBs {
                             stealing_permission: false,
                             stealing_repeats_flag: false,
                             encryption_flag: false,
+                            aie_request: self.aie_request_for_terminal(itsi as u32),
                             is_null_pdu: false,
                             tx_reporter: None,
                             seamless_handover: None,
@@ -2267,6 +3288,7 @@ impl TetraEntityTrait for MmBs {
                                 stealing_permission: false,
                                 stealing_repeats_flag: false,
                                 encryption_flag: false,
+                                aie_request: self.aie_request_for_terminal(itsi as u32),
                                 is_null_pdu: false,
                                 tx_reporter: None,
                                 seamless_handover: None,
@@ -2315,6 +3337,7 @@ impl TetraEntityTrait for MmBs {
                                 stealing_permission: false,
                                 stealing_repeats_flag: false,
                                 encryption_flag: false,
+                                aie_request: self.aie_request_for_terminal(itsi as u32),
                                 is_null_pdu: false,
                                 tx_reporter: None,
                                 seamless_handover: None,
@@ -2323,6 +3346,123 @@ impl TetraEntityTrait for MmBs {
                     }
                     self.pending_auth_commands
                         .insert(Self::authentication_correlation_key(itsi as u32, air_handle), command_id);
+                }
+                SwmiMessage::OtarDownlink {
+                    command_id,
+                    itsi,
+                    air_handle,
+                    address_ssi,
+                    acknowledged,
+                    payload_bit_len,
+                    payload,
+                } => {
+                    let Ok(issi) = u32::try_from(itsi) else {
+                        tracing::warn!(command_id, itsi, "discarding OTAR downlink with invalid ISSI");
+                        continue;
+                    };
+                    if address_ssi != issi {
+                        tracing::warn!(
+                            command_id,
+                            itsi,
+                            address_ssi,
+                            "discarding OTAR downlink with mismatched terminal address"
+                        );
+                        continue;
+                    }
+                    if usize::from(payload_bit_len) > payload.len().saturating_mul(8) {
+                        tracing::warn!(command_id, issi, "discarding OTAR downlink with invalid bit length");
+                        continue;
+                    }
+                    let mut sdu = BitBuffer::from_vec(payload);
+                    sdu.set_raw_end(usize::from(payload_bit_len));
+                    let mut check = BitBuffer::from_bitbuffer(&sdu);
+                    let pdu = match DOtar::from_bitbuf(&mut check) {
+                        Ok(pdu) => pdu,
+                        Err(error) => {
+                            tracing::warn!(command_id, issi, error = ?error, "discarding malformed SwMI D-OTAR PDU");
+                            continue;
+                        }
+                    };
+                    let kind = OtarDownlinkKind::from_pdu(&pdu);
+                    let aie_request = match self.otar_downlink_aie_request(issi, kind) {
+                        Ok(request) => request,
+                        Err(reason) => {
+                            tracing::warn!(command_id, issi, ?kind, reason, "rejecting unsafe clear D-OTAR in SC2-only mode");
+                            continue;
+                        }
+                    };
+                    if !acknowledged {
+                        // MLE's MM route currently supports acknowledged
+                        // basic-link service only. Rejecting this explicitly
+                        // is safer than reaching its assertion and claiming a
+                        // delivery status we cannot observe.
+                        tracing::warn!(command_id, issi, ?kind, "cannot schedule unacknowledged D-OTAR on the MM route");
+                        continue;
+                    }
+                    match &pdu {
+                        DOtar::GskoProvide(provide) => {
+                            self.gsko_bootstraps.insert(
+                                issi,
+                                GskoBootstrapStatus::Providing {
+                                    command_id,
+                                    version_number: provide.version_number,
+                                    cmg_gssi: provide.cmg_gssi,
+                                },
+                            );
+                        }
+                        DOtar::GskoReject(reject) => {
+                            self.gsko_bootstraps.insert(
+                                issi,
+                                GskoBootstrapStatus::Rejected {
+                                    command_id,
+                                    cmg_gssi: reject.cmg_gssi,
+                                    reason: reject.reject_reason,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                    let tx_reporter = TxReporter::new();
+                    self.pending_otar_deliveries.insert(
+                        command_id,
+                        PendingOtarDelivery {
+                            command_id,
+                            issi,
+                            air_handle,
+                            kind,
+                            expected_response: kind.expected_response(),
+                            tx_reporter: tx_reporter.clone(),
+                            status: OtarDeliveryStatus::Queued,
+                        },
+                    );
+                    sdu.seek(0);
+                    queue.push_back(SapMsg {
+                        sap: Sap::LmmSap,
+                        src: TetraEntity::Mm,
+                        dest: TetraEntity::Mle,
+                        msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                            sdu,
+                            handle: air_handle,
+                            address: TetraAddress::issi(address_ssi),
+                            layer2service: Layer2Service::Acknowledged,
+                            stealing_permission: false,
+                            stealing_repeats_flag: false,
+                            encryption_flag: false,
+                            aie_request,
+                            is_null_pdu: false,
+                            tx_reporter: Some(tx_reporter),
+                            seamless_handover: None,
+                        }),
+                    });
+                    tracing::debug!(
+                        command_id,
+                        issi,
+                        address_ssi,
+                        acknowledged,
+                        ?kind,
+                        encrypted = aie_request.is_encrypted(),
+                        "scheduled SwMI D-OTAR PDU"
+                    );
                 }
                 SwmiMessage::AttachmentDecision {
                     command_id,
@@ -2392,7 +3532,7 @@ impl TetraEntityTrait for MmBs {
                             // causes U-LOCATION UPDATE DEMAND, whose accept can
                             // carry the alpha-tag RUA assignment request.
                             self.config.state_write().subscribers.set_rua_assignment_state(issi, None);
-                            Self::send_d_location_update_command(queue, issi, 0, true);
+                            self.send_d_location_update_command(queue, issi, 0, true);
                             tracing::info!(issi, command_id, "requested fresh RUA registration after LST mismatch");
                         }
                     }
@@ -2453,7 +3593,7 @@ impl TetraEntityTrait for MmBs {
                         if energy_economy.mode != 0 {
                             self.activate_energy_economy_after_next_control(expected_issi);
                         }
-                        Self::send_d_mm_status_energy_saving(
+                        self.send_d_mm_status_energy_saving(
                             queue,
                             expected_issi,
                             expected_handle,
@@ -2515,7 +3655,18 @@ impl TetraEntityTrait for MmBs {
                         multiframe_number: info.multiframe_number,
                     })
                     .unwrap_or_default();
-                self.apply_swmi_registration_decision(queue, command_id, itsi as u64, air_handle, true, 0, energy_economy, false, None);
+                self.apply_swmi_registration_decision(
+                    queue,
+                    command_id,
+                    itsi as u64,
+                    air_handle,
+                    true,
+                    0,
+                    energy_economy,
+                    false,
+                    None,
+                    AieLocationUpdateDecision::default(),
+                );
             }
             let recover_attachments: Vec<(u64, u32, u32, Vec<AttachmentResult>)> = self
                 .pending_attachments
@@ -2592,7 +3743,15 @@ impl TetraEntityTrait for MmBs {
 
 #[cfg(test)]
 mod tests {
-    use super::MmBs;
+    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, sc2_ksg_number};
+    use tetra_config::bluestation::RuntimeSc2TeaAlgorithm;
+    use tetra_core::typed_pdu_fields::Type3FieldGeneric;
+
+    #[test]
+    fn sc2_ksg_numbers_match_the_on_air_table() {
+        assert_eq!(sc2_ksg_number(RuntimeSc2TeaAlgorithm::Tea1), 0b0000);
+        assert_eq!(sc2_ksg_number(RuntimeSc2TeaAlgorithm::Tea3), 0b0010);
+    }
 
     #[test]
     fn authentication_correlation_distinguishes_terminals_with_handle_zero() {
@@ -2600,5 +3759,37 @@ mod tests {
             MmBs::authentication_correlation_key(77491, 0),
             MmBs::authentication_correlation_key(77492, 0)
         );
+    }
+
+    #[test]
+    fn authentication_uplink_two_bit_sck_request_is_not_discarded() {
+        let field = Type3FieldGeneric {
+            field_id: 9,
+            len: 2,
+            data: 0b10,
+            raw: Vec::new(),
+        };
+        assert_eq!(MmBs::authentication_uplink(&field), Some((true, None)));
+    }
+
+    #[test]
+    fn only_gsko_bootstrap_downlinks_are_clear_otar_exceptions() {
+        assert!(OtarDownlinkKind::GskoProvide.is_clear_gsko_bootstrap());
+        assert!(OtarDownlinkKind::GskoReject.is_clear_gsko_bootstrap());
+        assert!(!OtarDownlinkKind::SckProvide.is_clear_gsko_bootstrap());
+        assert!(!OtarDownlinkKind::KeyStatusDemand.is_clear_gsko_bootstrap());
+    }
+
+    #[test]
+    fn otar_result_correlation_keeps_link_ack_and_terminal_result_distinct() {
+        assert_eq!(
+            OtarDownlinkKind::SckProvide.expected_response(),
+            Some(OtarTerminalResponse::SckResult)
+        );
+        assert_eq!(
+            OtarDownlinkKind::KeyStatusDemand.expected_response(),
+            Some(OtarTerminalResponse::KeyStatusResponse)
+        );
+        assert_eq!(OtarDownlinkKind::SckReject.expected_response(), None);
     }
 }

@@ -1,8 +1,8 @@
 use num;
 use num::complex::ComplexFloat;
 
-use tetra_core::{SoftBit, TdmaTime};
 use tetra_core::TrainingSequence;
+use tetra_core::{SoftBit, TdmaTime};
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 
@@ -261,9 +261,21 @@ impl Demodulator {
                 // Preserve calibrated decision distance for the FEC layer.
                 // Signed values use the same convention as Viterbi: + is 1.
                 let amplitude = diff.abs();
-                let scale = if amplitude > 0.0 { SoftBit::MAX as RealSample / amplitude } else { 0.0 };
-                soft_bits.push((-diff.im * scale).round().clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit);
-                soft_bits.push((-diff.re * scale).round().clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit);
+                let scale = if amplitude > 0.0 {
+                    SoftBit::MAX as RealSample / amplitude
+                } else {
+                    0.0
+                };
+                soft_bits.push(
+                    (-diff.im * scale)
+                        .round()
+                        .clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit,
+                );
+                soft_bits.push(
+                    (-diff.re * scale)
+                        .round()
+                        .clamp(-(SoftBit::MAX as RealSample), SoftBit::MAX as RealSample) as SoftBit,
+                );
             }
             previous_symbol = Some(symbol);
         }

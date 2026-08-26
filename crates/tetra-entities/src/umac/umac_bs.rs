@@ -3,10 +3,13 @@ use std::{
     panic,
 };
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, SharedConfig};
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
+use tetra_core::{
+    AieCipherRegion, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime,
+    TetraAddress, Todo, TxReporter, unimplemented_log,
+};
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -49,6 +52,19 @@ pub struct UmacBs {
     dltime: TdmaTime,
     system_wide_services: bool,
     authentication_required: bool,
+    aie: RuntimeAieConfig,
+    /// BS-local SC2 provider for all uplink context resolution and ciphering.
+    /// It is cloned into the downlink scheduler as well; both handles share
+    /// the same authoritative runtime state and never expose SCK bytes.
+    aie_provider: BsAieKeyProvider,
+    /// Uplink traffic/FACCH policy per RF timeslot. LMAC needs a copy for
+    /// speech decoding; UMAC retains it to decrypt MAC-U-SIGNAL after its
+    /// clear three-bit header has been parsed.
+    uplink_traffic_aie: [Option<AieRequest>; 4],
+    /// The current floor holder is the only identity available to an
+    /// unaddressed U-TX CEASED MAC-U-SIGNAL. Keep it at the UMAC/CMCE
+    /// boundary instead of forwarding a synthetic SSI 0.
+    traffic_floor_holder: [Option<u32>; 4],
     random_access: RandomAccessController,
 
     /// This MAC's endpoint ID, for addressing by the higher layers
@@ -94,6 +110,7 @@ struct DeferredMcch {
     pdu: MacResource,
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
+    aie_request: AieRequest,
 }
 
 impl UmacBs {
@@ -102,6 +119,8 @@ impl UmacBs {
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
         let authentication_required = Self::get_authentication_required_state(&config);
+        let aie = Self::get_aie_config(&config);
+        let aie_provider = BsAieKeyProvider::new(config.clone());
         let random_access = RandomAccessController::new(c.cell.random_access.clone());
         let precomps = Self::generate_precomps(&config);
         Self {
@@ -110,12 +129,16 @@ impl UmacBs {
             dltime: TdmaTime::default(),
             system_wide_services,
             authentication_required,
+            aie,
             random_access,
             endpoint_id: 1,
             defrag: BsDefrag::new(),
             pending_stch: None,
             // event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+            channel_scheduler: BsChannelScheduler::new_with_aie_provider(scrambling_code, precomps, aie_provider.clone()),
+            aie_provider,
+            uplink_traffic_aie: [None; 4],
+            traffic_floor_holder: [None; 4],
             last_ul_voice: [None; 4],
             private_media_timeslots: HashSet::new(),
             duplex_private_media_timeslots: HashSet::new(),
@@ -157,14 +180,15 @@ impl UmacBs {
     /// Needs to be re-invoked if any network parameter changes
     pub fn generate_precomps(config: &SharedConfig) -> PrecomputedUmacPdus {
         let c = config.config();
+        let aie = Self::get_aie_config(config);
 
         // TODO FIXME make more/all parameters configurable
         let ext_services = SysinfoExtendedServices {
-            auth_required: c.cell.authentication_required,
-            class1_supported: true,
-            class2_supported: true,
+            auth_required: Self::get_authentication_required_state(config),
+            class1_supported: aie.enabled && aie.sc1_allowed,
+            class2_supported: aie.enabled && aie.sc2.is_some(),
             class3_supported: false,
-            sck_n: Some(0),
+            sck_n: aie.sc2.as_ref().map(|sc2| sc2.sckn),
             dck_retrieval_during_cell_select: None,
             dck_retrieval_during_cell_reselect: None,
             linked_gck_crypto_periods: None,
@@ -209,7 +233,7 @@ impl UmacBs {
             rxlev_access_min: c.cell.rxlev_access_min,
             access_parameter: c.cell.access_parameter,
             radio_dl_timeout: 3, // 432 timeslots (~6s radio link timeout)
-            cck_id: None,
+            cipher_key_id_or_sck_vn: None,
             hyperframe_number: Some(0), // Updated dynamically in scheduler
             option_field: SysinfoOptFieldFlag::DefaultDefForAccCodeA,
             ts_common_frames: None,
@@ -228,7 +252,7 @@ impl UmacBs {
             rxlev_access_min: sysinfo1.rxlev_access_min,
             access_parameter: sysinfo1.access_parameter,
             radio_dl_timeout: sysinfo1.radio_dl_timeout,
-            cck_id: None,
+            cipher_key_id_or_sck_vn: None,
             hyperframe_number: Some(0), // Updated dynamically in scheduler
             option_field: SysinfoOptFieldFlag::ExtServicesBroadcast,
             ts_common_frames: None,
@@ -250,7 +274,7 @@ impl UmacBs {
                 voice_service: c.cell.voice_service,
                 circuit_mode_data_service: c.cell.circuit_mode_data_service,
                 sndcp_service: c.cell.sndcp_service,
-                aie_service: c.cell.aie_service,
+                aie_service: aie.enabled,
                 advanced_link: c.cell.advanced_link,
             },
         };
@@ -300,14 +324,74 @@ impl UmacBs {
     fn get_authentication_required_state(config: &SharedConfig) -> bool {
         let cfg = config.config();
         if cfg.swmi.is_some() {
-            let state = config.state_read();
-            if state.network_connected {
-                state.authentication_required
-            } else {
-                cfg.cell.authentication_required
-            }
+            config.state_read().authentication_required
         } else {
             cfg.cell.authentication_required
+        }
+    }
+
+    /// Bind a call leg to the currently installed SC2 identity.  This records
+    /// only its public identifier; SCK bytes remain in the central runtime
+    /// AIE provider state.  An unbound call is rejected by that provider,
+    /// never treated as permission to fall back to clear traffic.
+    fn bind_sc2_call(&self, subject: AieSubject) {
+        let AieSubject::Call { call_id, .. } = subject else {
+            return;
+        };
+        let mut state = self.config.state_write();
+        if !state.aie.enabled {
+            return;
+        }
+        let Some(sc2) = state.aie.sc2.clone() else {
+            return;
+        };
+        if let AieSubject::Call { issi: Some(issi), .. } = subject
+            && state.aie_sessions.terminal(issi).is_none()
+        {
+            tracing::warn!(
+                call_id,
+                issi,
+                "refusing SC2 call binding for a terminal without an active SC2 session"
+            );
+            return;
+        }
+        state.aie_sessions.bind_call(call_id, subject, &sc2);
+    }
+
+    fn unbind_sc2_call(&self, call_id: u16) {
+        self.config.state_write().aie_sessions.unbind_call(u32::from(call_id));
+    }
+
+    /// Install or remove the per-timeslot traffic policies at both sides of
+    /// the UMAC/LMAC boundary.  The values are key-free and LMAC resolves
+    /// them only using its exact TX/RX TDMA time.
+    fn set_traffic_aie(&mut self, queue: &mut MessageQueue, ts: u8, downlink: Option<AieRequest>, uplink: Option<AieRequest>) {
+        if !(1..=4).contains(&ts) {
+            return;
+        }
+        self.channel_scheduler.set_traffic_aie(ts, downlink);
+        self.uplink_traffic_aie[ts as usize - 1] = uplink;
+        queue.push_prio(
+            SapMsg {
+                sap: Sap::TmvSap,
+                src: self.self_component,
+                dest: TetraEntity::Lmac,
+                msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
+                    time: Some(self.dltime.forward_to_timeslot(ts)),
+                    downlink_traffic_aie: Some(downlink),
+                    uplink_traffic_aie: Some(uplink),
+                    ..Default::default()
+                }),
+            },
+            MessagePrio::Immediate,
+        );
+    }
+
+    fn get_aie_config(config: &SharedConfig) -> RuntimeAieConfig {
+        if config.config().swmi.is_some() {
+            config.state_read().aie.clone()
+        } else {
+            RuntimeAieConfig::default()
         }
     }
 
@@ -346,6 +430,14 @@ impl UmacBs {
         if required != self.authentication_required {
             self.authentication_required = required;
             self.channel_scheduler.set_authentication_required(required);
+        }
+    }
+
+    fn refresh_aie_config(&mut self) {
+        let aie = Self::get_aie_config(&self.config);
+        if aie != self.aie {
+            self.channel_scheduler.set_aie_config(&aie);
+            self.aie = aie;
         }
     }
 
@@ -570,7 +662,7 @@ impl UmacBs {
             unimplemented_log!("event labels not implemented");
             return;
         }
-        let addr = pdu.addr.unwrap();
+        let mut addr = pdu.addr.unwrap();
 
         let (mut pdu_len_bits, is_frag_start, second_half_stolen, is_null_pdu) = {
             if let Some(len_ind) = pdu.length_ind {
@@ -638,14 +730,42 @@ impl UmacBs {
             return;
         }
 
-        // Decrypt if needed
-        if pdu.encrypted {
-            unimplemented_log!("rx_mac_data: Encryption mode > 0");
-            return;
-        }
-
         // Handle reservation if present
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = prim.ul_time;
+        let aie_request = if pdu.encrypted {
+            // MAC-DATA's header and ESI are clear.  Resolve the ESI and
+            // decrypt only the remaining TM-SDU at the exact received UL
+            // TDMA time, before either defragmentation or LLC/FCS handling.
+            if addr.ssi_type != SsiType::Esi {
+                tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-DATA without an ESI");
+                return;
+            }
+            let (issi, context) = match self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(?error, "rejecting encrypted MAC-DATA with unknown or stale SC2 ESI");
+                    return;
+                }
+            };
+            addr = TetraAddress::issi(issi);
+            let payload_start = prim.pdu.get_pos();
+            let payload_len = prim.pdu.get_len_remaining();
+            if let Err(error) = self
+                .aie_provider
+                .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+            {
+                tracing::warn!(?error, issi, "rejecting MAC-DATA after SC2 context validation failed");
+                return;
+            }
+            AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+        } else {
+            // The strict clear allow-list is applied after the LLC header is
+            // available: a D-LOCATION UPDATE ACCEPT may still be confirmed
+            // by its one matching clear BL-ACK after SC2 activation. LLC
+            // accepts only that exact outstanding clear acknowledgement;
+            // MLE/MM reject all other clear post-SC2 control traffic.
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData)
+        };
         if let Some(res_req) = &pdu.reservation_req {
             // During a call, queue only the request. The associated FN18 may
             // be deferred by mandatory BSCH/BNCH; building the grant now
@@ -665,7 +785,7 @@ impl UmacBs {
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
         if is_frag_start {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
+            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, Some(aie_request));
         } else {
             // Pass directly to LLC
             let sdu = {
@@ -692,7 +812,7 @@ impl UmacBs {
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
-                        air_interface_encryption: pdu.encrypted as Todo,
+                        air_interface_encryption: Some(aie_request),
                         chan_change_response_req: false,
                         chan_change_handle: None,
                         chan_info: None,
@@ -733,7 +853,7 @@ impl UmacBs {
         };
 
         // Resolve event label (if supplied)
-        let addr = if let Some(_label) = pdu.event_label {
+        let mut addr = if let Some(_label) = pdu.event_label {
             tracing::warn!("event labels not implemented");
             return;
         } else if let Some(addr) = pdu.addr {
@@ -742,15 +862,7 @@ impl UmacBs {
             panic!()
         };
 
-        let msg_dltime = self.dltime.add_timeslots(-2);
-        let issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
-        let (active, registration_pending) = issi
-            .map(|issi| {
-                let state = self.config.state_read();
-                (state.subscribers.is_active(issi), state.subscribers.is_registration_pending(issi))
-            })
-            .unwrap_or((false, false));
-        self.random_access.observe_access(issi, msg_dltime, active, registration_pending);
+        let msg_dltime = prim.ul_time;
 
         // Compute len and extract flags
         let mut pdu_len_bits;
@@ -800,6 +912,74 @@ impl UmacBs {
             return;
         }
 
+        // An encrypted MAC-ACCESS has the same clear header/ESI and
+        // TM-SDU-only cipher boundary as MAC-DATA (TS 100 392-7 clauses
+        // 6.4.0, 6.4.2.2 and 6.5.2). TA61 is reversible, so an ESI identifies
+        // its ISSI directly with the active SCK even before this BS has a
+        // local subscriber session. Bind that key-free identity before the
+        // first fragment is queued, otherwise a MAC-ACCESS ACK/grant cannot
+        // be returned and the MS must retry the registration in clear.
+        let aie_request = if pdu.encrypted {
+            if addr.ssi_type != SsiType::Esi {
+                tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-ACCESS without an ESI");
+                return;
+            }
+            let payload_start = prim.pdu.get_pos();
+            let payload_len = prim.pdu.get_len_remaining();
+            match self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
+                // Ordinary post-registration SC2: resolve the existing
+                // session before forwarding its real ISSI to higher layers.
+                Ok((issi, context)) => {
+                    if let Err(error) = self
+                        .aie_provider
+                        .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+                    {
+                        tracing::warn!(?error, issi, "rejecting MAC-ACCESS after SC2 cipher failure");
+                        return;
+                    }
+                    addr = TetraAddress::issi(issi);
+                    AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+                }
+                // Only an unbound ESI may use the bootstrap path. Decode it
+                // with inverse TA61 and establish a provisional cipher
+                // binding; SwMI authentication/registration remains the
+                // authority for access.
+                Err(AieContextError::SubjectNotProvisioned) => {
+                    let (issi, context) = match self.aie_provider.bind_unbound_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(?error, "rejecting MAC-ACCESS with undecodable SC2 ESI");
+                            return;
+                        }
+                    };
+                    if let Err(error) = self
+                        .aie_provider
+                        .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+                    {
+                        tracing::warn!(?error, "rejecting MAC-ACCESS after SC2 bootstrap cipher failure");
+                        return;
+                    }
+                    addr = TetraAddress::issi(issi);
+                    AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "rejecting encrypted MAC-ACCESS with invalid SC2 ESI context");
+                    return;
+                }
+            }
+        } else {
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData)
+        };
+
+        let issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+        let (active, registration_pending) = issi
+            .map(|issi| {
+                let state = self.config.state_read();
+                (state.subscribers.is_active(issi), state.subscribers.is_registration_pending(issi))
+            })
+            .unwrap_or((false, false));
+        self.random_access.observe_access(issi, msg_dltime, active, registration_pending);
+
         if let Some(issi) = issi {
             // Preserve this context independently of the queued RA ACK. The
             // ACK itself is normally emitted before CMCE/SwMI has produced
@@ -815,18 +995,13 @@ impl UmacBs {
         // Message on uplink was sent two timeslots ago.
         let in_active_over =
             self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
-        if !in_active_over {
-            self.channel_scheduler.dl_enqueue_random_access_ack(msg_dltime.t, addr);
-        }
-
-        // Decrypt if needed
-        if pdu.encrypted {
-            unimplemented_log!("rx_mac_access: Encryption mode > 0");
-            return;
+        if !in_active_over && issi.is_some() {
+            self.channel_scheduler.dl_enqueue_random_access_ack(msg_dltime.t, addr, aie_request);
         }
 
         // Handle reservation if present
-        if let Some(res_req) = &pdu.reservation_req {
+        if let (Some(issi), Some(res_req)) = (issi, &pdu.reservation_req) {
+            let addr = TetraAddress::issi(issi);
             if in_active_over && (2..=4).contains(&msg_dltime.t) {
                 // Defer both grant construction and reservation until the
                 // actual associated FN18 is transmitted. This keeps the BS
@@ -843,7 +1018,7 @@ impl UmacBs {
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
         if pdu.is_frag_start() {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
+            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, Some(aie_request));
         } else {
             // Pass directly to LLC
             if prim.pdu.get_len_remaining() == 0 {
@@ -876,7 +1051,7 @@ impl UmacBs {
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
-                        air_interface_encryption: pdu.encrypted as Todo,
+                        air_interface_encryption: Some(aie_request),
                         chan_change_response_req: false,
                         chan_change_handle: None,
                         chan_info: None,
@@ -930,15 +1105,39 @@ impl UmacBs {
         tracing::debug!("rx_mac_frag_ul: pdu_len_bits: {} fill_bits: {}", pdu_len_bits, num_fill_bits);
 
         // Get slot owner from schedule
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = prim.ul_time;
         let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_frag_ul: Received MAC-FRAG-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
 
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented_log!("rx_mac_frag_ul: Encryption not supported");
+        if let Some(request) = self.defrag.get_aie_request(slot_owner, msg_dltime) {
+            if request.with_scope(AieScope::MacFragment).is_encrypted() {
+                let context = match self
+                    .aie_provider
+                    .resolve(request.with_scope(AieScope::MacFragment), AieDirection::Uplink, msg_dltime)
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        tracing::warn!(?error, issi = slot_owner, "rejecting encrypted MAC-FRAG-UL with stale SC2 context");
+                        return;
+                    }
+                };
+                let payload_start = prim.pdu.get_pos();
+                let payload_len = prim.pdu.get_len_remaining();
+                if let Err(error) = self
+                    .aie_provider
+                    .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+                {
+                    tracing::warn!(?error, issi = slot_owner, "rejecting MAC-FRAG-UL after SC2 cipher failure");
+                    return;
+                }
+            }
+        } else if !self.aie_provider.clear_uplink_allowed(slot_owner) {
+            // No active fragment context must not create a clear fallback for
+            // a bound SC2 terminal. insert_next will also reject the orphan.
+            tracing::warn!(issi = slot_owner, "rejecting orphan clear MAC-FRAG-UL from SC2-bound terminal");
             return;
         }
 
@@ -997,15 +1196,49 @@ impl UmacBs {
         );
 
         // Get slot owner from schedule, decrypt if needed
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = prim.ul_time;
         let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented!("rx_mac_end_ul: Encryption not supported");
-        }
+        let aie_request = if let Some(request) = self.defrag.get_aie_request(slot_owner, msg_dltime) {
+            if request.with_scope(AieScope::MacFragment).is_encrypted() {
+                let context = match self
+                    .aie_provider
+                    .resolve(request.with_scope(AieScope::MacFragment), AieDirection::Uplink, msg_dltime)
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        tracing::warn!(?error, issi = slot_owner, "rejecting encrypted MAC-END-UL with stale SC2 context");
+                        return;
+                    }
+                };
+                let payload_start = prim.pdu.get_pos();
+                let payload_len = prim.pdu.get_len_remaining();
+                if let Err(error) = self
+                    .aie_provider
+                    .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+                {
+                    tracing::warn!(?error, issi = slot_owner, "rejecting MAC-END-UL after SC2 cipher failure");
+                    return;
+                }
+                request
+            } else {
+                // The MAC header cannot identify the encapsulated protocol.
+                // Retain an in-progress clear bootstrap PDU until LLC/MLE/MM
+                // can apply their exact MM and OTAR allow-lists. In
+                // particular, this admits the clear U-OTAR GSKO DEMAND that
+                // follows a clear D-LOCATION UPDATE ACCEPT.
+                request
+            }
+        } else {
+            if !self.aie_provider.clear_uplink_allowed(slot_owner) {
+                tracing::warn!(issi = slot_owner, "rejecting orphan clear MAC-END-UL from SC2-bound terminal");
+                return;
+            }
+            AieRequest::clear(AieSubject::Individual { issi: slot_owner }, AieScope::MacFragment)
+        };
 
         // Insert last fragment and retrieve finalized block
         let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
@@ -1039,10 +1272,10 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,              // TODO FIXME
-                new_endpoint_id: None,       // TODO FIXME
-                css_endpoint_id: None,       // TODO FIXME
-                air_interface_encryption: 0, // TODO FIXME implement
+                endpoint_id: 0,        // TODO FIXME
+                new_endpoint_id: None, // TODO FIXME
+                css_endpoint_id: None, // TODO FIXME
+                air_interface_encryption: Some(aie_request),
                 chan_change_response_req: false,
                 chan_change_handle: None,
                 chan_info: None,
@@ -1116,15 +1349,44 @@ impl UmacBs {
         );
 
         // Get slot owner from schedule, decrypt if needed
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = prim.ul_time;
         let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_end_hu: Received MAC-END-HU for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
-            unimplemented!("rx_mac_end_hu: Encryption not supported");
-        }
+        // MAC-END-HU has no encryption-mode bit of its own. Its payload
+        // inherits the policy of the preceding MAC-ACCESS/MAC-DATA fragment;
+        // decrypt only the remaining TM-SDU region with the exact UL slot
+        // IV. The short MAC-END-HU header and fill bits stay clear.
+        let aie_request = if let Some(request) = self.defrag.get_aie_request(slot_owner, msg_dltime) {
+            let request = request.with_scope(AieScope::MacFragment);
+            if request.is_encrypted() {
+                let context = match self.aie_provider.resolve(request, AieDirection::Uplink, msg_dltime) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        tracing::warn!(?error, issi = slot_owner, "rejecting encrypted MAC-END-HU with stale SC2 context");
+                        return;
+                    }
+                };
+                let payload_start = prim.pdu.get_pos();
+                let payload_len = prim.pdu.get_len_remaining();
+                if let Err(error) = self
+                    .aie_provider
+                    .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+                {
+                    tracing::warn!(?error, issi = slot_owner, "rejecting MAC-END-HU after SC2 cipher failure");
+                    return;
+                }
+            }
+            request
+        } else {
+            if !self.aie_provider.clear_uplink_allowed(slot_owner) {
+                tracing::warn!(issi = slot_owner, "rejecting orphan clear MAC-END-HU from SC2-bound terminal");
+                return;
+            }
+            AieRequest::clear(AieSubject::Individual { issi: slot_owner }, AieScope::MacFragment)
+        };
 
         // Insert last fragment and retrieve finalized block
         let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
@@ -1158,10 +1420,10 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,              // TODO FIXME
-                new_endpoint_id: None,       // TODO FIXME
-                css_endpoint_id: None,       // TODO FIXME
-                air_interface_encryption: 0, // TODO FIXME implement
+                endpoint_id: 0,        // TODO FIXME
+                new_endpoint_id: None, // TODO FIXME
+                css_endpoint_id: None, // TODO FIXME
+                air_interface_encryption: Some(aie_request),
                 chan_change_response_req: false,
                 chan_change_handle: None,
                 chan_info: None,
@@ -1209,24 +1471,66 @@ impl UmacBs {
             return;
         }
 
+        // MAC-U-SIGNAL has no address field. Its three-bit header remains
+        // clear, while the TM-SDU is protected with the active traffic/FACCH
+        // context. The floor holder supplied by CMCE is therefore the only
+        // valid identity to attach to U-TX CEASED; forwarding SSI 0 caused
+        // CMCE to discard a genuine PTT release and wait for the UL timeout.
+        let ts = prim.ul_time.t;
+        if !(1..=4).contains(&ts) {
+            tracing::warn!(ts, "discarding MAC-U-SIGNAL on an invalid timeslot");
+            return;
+        }
+        let Some(issi) = self.traffic_floor_holder.get(ts as usize - 1).copied().flatten() else {
+            tracing::warn!(ts, "discarding MAC-U-SIGNAL without a current floor-holder identity");
+            return;
+        };
+        let request = self
+            .uplink_traffic_aie
+            .get(ts as usize - 1)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::Facch));
+        let payload_start = prim.pdu.get_pos();
+        let payload_len = prim.pdu.get_len_remaining();
+        if request.is_encrypted() {
+            let context = match self
+                .aie_provider
+                .resolve(request.with_scope(AieScope::Facch), AieDirection::Uplink, prim.ul_time)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(?error, ts, ul_time = %prim.ul_time, "discarding encrypted MAC-U-SIGNAL without a valid SC2 context");
+                    return;
+                }
+            };
+            if let Err(error) = self
+                .aie_provider
+                .cipher_uplink_mac(context, &mut prim.pdu, payload_start, payload_len)
+            {
+                tracing::warn!(?error, ts, issi, "discarding encrypted MAC-U-SIGNAL after SC2 decrypt failure");
+                return;
+            }
+        }
+
         let sdu = BitBuffer::from_bitbuffer_pos(&prim.pdu);
         tracing::debug!("rx_ul_mac_u_signal: forwarding {} bit TM-SDU to LLC", sdu.get_len());
 
         // Forward to LLC via TMA-SAP, same path as MAC-DATA.
-        // Address is not known from MAC-U-SIGNAL (no address field); use a placeholder.
-        // The CMCE layer identifies the call by call_identifier in the PDU, not by address.
+        // Address is not carried in MAC-U-SIGNAL, so carry the currently
+        // assigned floor-holder identity that scoped the traffic context.
         let m = SapMsg {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(sdu),
-                main_address: TetraAddress::issi(0), // Address unknown from MAC-U-SIGNAL
+                main_address: TetraAddress::issi(issi),
                 scrambling_code: prim.scrambling_code,
                 endpoint_id: 0,
                 new_endpoint_id: None,
                 css_endpoint_id: None,
-                air_interface_encryption: 0,
+                air_interface_encryption: Some(request.with_scope(AieScope::Facch)),
                 chan_change_response_req: false,
                 chan_change_handle: None,
                 chan_info: None,
@@ -1267,6 +1571,14 @@ impl UmacBs {
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
         let mut sdu = prim.pdu;
         let associated_channel = prim.associated_channel;
+        let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
+            AieRequest::clear(
+                AieSubject::Individual {
+                    issi: prim.main_address.ssi,
+                },
+                AieScope::MacResource,
+            )
+        });
 
         // ── FACCH/Stealing path ──────────────────────────────────────────
         // stealing_permission → STCH on traffic channel for time-critical signaling
@@ -1309,7 +1621,52 @@ impl UmacBs {
                     slot_granting_element: None,
                     chan_alloc_element: None,
                 };
+                // FACCH has the same SC2 MAC-RESOURCE addressing rules as
+                // an SCH/F resource, but its payload ciphering is deferred
+                // to LMAC where the actual burst time is known.  Resolving
+                // here is used only to validate the key identity and derive
+                // an encrypted short identity (IESI/GESI); no keystream is
+                // generated at this layer.
+                if let AieRequest::Sc2 { subject, .. } = aie_request {
+                    let context = match self.aie_provider.resolve(aie_request, AieDirection::Downlink, self.dltime) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            tracing::warn!(?error, ts, "dropping FACCH without a valid SC2 context");
+                            return;
+                        }
+                    };
+                    let Some(address) = mac_pdu.addr.as_mut() else {
+                        tracing::warn!(ts, "dropping SC2 FACCH without a MAC address");
+                        return;
+                    };
+                    let compatible = match subject {
+                        AieSubject::Individual { .. } => matches!(address.ssi_type, SsiType::Issi | SsiType::Ssi),
+                        AieSubject::Group { .. } => address.ssi_type == SsiType::Gssi,
+                        _ => false,
+                    };
+                    if !compatible {
+                        tracing::warn!(ts, address_type = ?address.ssi_type, "dropping FACCH with an incompatible SC2 address");
+                        return;
+                    }
+                    match self.aie_provider.encrypted_short_identity(context, address.ssi) {
+                        Ok(esi) => {
+                            address.ssi = esi;
+                            address.ssi_type = SsiType::Esi;
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, ts, "dropping FACCH with an invalid SC2 encrypted short identity");
+                            return;
+                        }
+                    }
+                    if let tetra_core::AieContext::Sc2 { key, .. } = context {
+                        mac_pdu.encryption_mode = 0b10 | (key.sck_vn as u8 & 1);
+                    }
+                }
                 let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu.get_len());
+                let cipher_region = aie_request.is_encrypted().then(|| {
+                    // STCH begins directly with MAC-RESOURCE on downlink.
+                    AieCipherRegion::new(mac_pdu.compute_header_len(), sdu.get_len())
+                });
 
                 let mut stch_block = BitBuffer::new(STCH_CAP);
                 mac_pdu.to_bitbuf(&mut stch_block);
@@ -1349,7 +1706,8 @@ impl UmacBs {
                     "queueing FACCH/STCH floor-control block"
                 );
 
-                self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                self.channel_scheduler
+                    .dl_enqueue_stealing(ts, stch_block, prim.tx_reporter, aie_request, cipher_region);
 
                 return;
             } else {
@@ -1412,6 +1770,7 @@ impl UmacBs {
                     pdu: pdu.clone(),
                     sdu: sdu.clone(),
                     tx_reporter: None,
+                    aie_request,
                 });
             }
         }
@@ -1447,6 +1806,7 @@ impl UmacBs {
                         pdu,
                         sdu,
                         tx_reporter: prim.tx_reporter,
+                        aie_request,
                     });
                     return;
                 }
@@ -1475,7 +1835,7 @@ impl UmacBs {
                     // can defer this queue entry by one or more multiframes.
                     tracing::debug!(?channel, "routing ordinary signalling through associated FN18 control queue");
                     self.channel_scheduler
-                        .dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                        .dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
                 } else {
                     tracing::debug!(
                         ?channel,
@@ -1484,14 +1844,14 @@ impl UmacBs {
                         "routing ordinary signalling through associated non-traffic signalling queue"
                     );
                     self.channel_scheduler
-                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter);
+                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
                 }
             } else {
                 tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
-                self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
+                self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter, aie_request);
             }
         } else {
-            self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
+            self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter, aie_request);
         }
 
         // let enqueue_ts = 1;
@@ -1717,7 +2077,7 @@ impl UmacBs {
         }
     }
 
-    fn rx_control_circuit_close(&mut self, _queue: &mut MessageQueue, prim: CallControl) {
+    fn rx_control_circuit_close(&mut self, queue: &mut MessageQueue, prim: CallControl) {
         let CallControl::Close(dir, ts) = prim else { panic!() };
 
         // Direction::Both needs to be split into separate DL and UL close operations
@@ -1743,6 +2103,10 @@ impl UmacBs {
                     tracing::warn!("  rx_control_circuit_close: No {:?} circuit to close for ts {}", d, ts);
                 }
             }
+        }
+        self.set_traffic_aie(queue, ts, None, None);
+        if (1..=4).contains(&ts) {
+            self.traffic_floor_holder[ts as usize - 1] = None;
         }
     }
 
@@ -1815,16 +2179,42 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = None;
                 }
             }
-            CallControl::FloorGranted { ts, source_issi, .. } => {
+            CallControl::FloorGranted {
+                call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            } => {
+                if (1..=4).contains(&ts) {
+                    self.traffic_floor_holder[ts as usize - 1] = Some(source_issi);
+                }
+                let subject = AieSubject::Call {
+                    call_id: u32::from(call_id),
+                    issi: Some(source_issi),
+                    gssi: Some(dest_gssi),
+                };
+                self.bind_sc2_call(subject);
+                // SC2 group traffic uses the active TMO SCK. GSKO/GCK remain
+                // separate OTAR/key-management flows; their absence must not
+                // cause an active SC2 group call to leak traffic in clear.
+                let downlink = self
+                    .aie
+                    .enabled
+                    .then(|| AieRequest::sc2(AieSubject::Group { gssi: dest_gssi }, AieScope::Traffic));
+                let uplink = self.aie.enabled.then(|| AieRequest::sc2(subject, AieScope::Traffic));
+                self.set_traffic_aie(queue, ts, downlink, uplink);
                 self.channel_scheduler.begin_floor_grant_transition(ts, source_issi);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
             }
-            CallControl::CallEnded { ts, .. } => {
+            CallControl::CallEnded { call_id, ts } => {
+                self.unbind_sc2_call(call_id);
+                self.set_traffic_aie(queue, ts, None, None);
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
+                    self.traffic_floor_holder[ts as usize - 1] = None;
                     self.last_ul_voice[ts as usize - 1] = None;
                     self.duplex_private_media_timeslots.remove(&ts);
                 }
@@ -1840,12 +2230,40 @@ impl UmacBs {
                     self.duplex_private_media_timeslots.insert(ts);
                 }
             }
-            CallControl::PrivateMediaStart { ts, .. } => {
+            CallControl::PrivateMediaStart {
+                call_id,
+                source_issi,
+                destination_issi,
+                ts,
+            } => {
+                let source = AieSubject::Call {
+                    call_id: u32::from(call_id),
+                    issi: Some(source_issi),
+                    gssi: None,
+                };
+                let destination = AieSubject::Call {
+                    call_id: u32::from(call_id),
+                    issi: Some(destination_issi),
+                    gssi: None,
+                };
+                self.bind_sc2_call(source);
+                self.bind_sc2_call(destination);
+                self.set_traffic_aie(
+                    queue,
+                    ts,
+                    self.aie.enabled.then(|| AieRequest::sc2(destination, AieScope::Traffic)),
+                    self.aie.enabled.then(|| AieRequest::sc2(source, AieScope::Traffic)),
+                );
                 self.private_media_timeslots.insert(ts);
             }
-            CallControl::PrivateMediaStop { ts, .. } => {
+            CallControl::PrivateMediaStop { call_id, ts } => {
+                self.unbind_sc2_call(call_id);
+                self.set_traffic_aie(queue, ts, None, None);
                 self.private_media_timeslots.remove(&ts);
                 self.duplex_private_media_timeslots.remove(&ts);
+                if (1..=4).contains(&ts) {
+                    self.traffic_floor_holder[ts as usize - 1] = None;
+                }
             }
 
             // UlInactivityTimeout is UMAC→CMCE only, UMAC won't receive it back
@@ -1901,6 +2319,7 @@ impl TetraEntityTrait for UmacBs {
         self.dltime = ts;
         self.refresh_system_wide_services();
         self.refresh_authentication_required();
+        self.refresh_aie_config();
         self.refresh_random_access_control(ts);
 
         if self.channel_scheduler.cur_dltime != ts && self.channel_scheduler.cur_dltime == (TdmaTime { t: 0, f: 0, m: 0, h: 0 }) {
@@ -1918,7 +2337,7 @@ impl TetraEntityTrait for UmacBs {
         while let Some(resource) = self.deferred_mcch.pop_front() {
             if resource.due.age(ts) >= 0 {
                 self.channel_scheduler
-                    .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter);
+                    .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter, resource.aie_request);
             } else {
                 retained.push_back(resource);
             }

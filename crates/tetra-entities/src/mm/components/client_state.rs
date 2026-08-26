@@ -150,10 +150,7 @@ impl MmClientMgr {
     /// Capture every currently attached local MS for one LST recovery
     /// transaction. The result is deterministic so reconnect diagnostics and
     /// protocol tests do not depend on `HashMap` iteration order.
-    pub fn lst_recovery_snapshot(
-        &self,
-        rua_assignment_state: impl Fn(u32) -> Option<bool>,
-    ) -> Vec<SubscriberRecoveryState> {
+    pub fn lst_recovery_snapshot(&self, rua_assignment_state: impl Fn(u32) -> Option<bool>) -> Vec<SubscriberRecoveryState> {
         let mut subscribers = self
             .clients
             .values()

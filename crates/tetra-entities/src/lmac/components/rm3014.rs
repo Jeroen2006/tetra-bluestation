@@ -108,17 +108,26 @@ fn bit_mask(bit: usize) -> u32 {
 pub fn tetra_rm3014_decode(codeword: u32) -> Result<Rm3014Decoded, Rm3014Uncorrectable> {
     let syndrome = compute_syndrome(codeword);
     if syndrome == 0 {
-        return Ok(Rm3014Decoded { data: (codeword >> 16) as u16, corrected_bits: 0 });
+        return Ok(Rm3014Decoded {
+            data: (codeword >> 16) as u16,
+            corrected_bits: 0,
+        });
     }
     for i in 0..30 {
         if COL_SYNDROMES[i] == syndrome {
-            return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i)) >> 16) as u16, corrected_bits: 1 });
+            return Ok(Rm3014Decoded {
+                data: ((codeword ^ bit_mask(i)) >> 16) as u16,
+                corrected_bits: 1,
+            });
         }
     }
     for i in 0..29 {
         for j in i + 1..30 {
             if COL_SYNDROMES[i] ^ COL_SYNDROMES[j] == syndrome {
-                return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i) ^ bit_mask(j)) >> 16) as u16, corrected_bits: 2 });
+                return Ok(Rm3014Decoded {
+                    data: ((codeword ^ bit_mask(i) ^ bit_mask(j)) >> 16) as u16,
+                    corrected_bits: 2,
+                });
             }
         }
     }
@@ -126,7 +135,10 @@ pub fn tetra_rm3014_decode(codeword: u32) -> Result<Rm3014Decoded, Rm3014Uncorre
         for j in i + 1..29 {
             for k in j + 1..30 {
                 if COL_SYNDROMES[i] ^ COL_SYNDROMES[j] ^ COL_SYNDROMES[k] == syndrome {
-                    return Ok(Rm3014Decoded { data: ((codeword ^ bit_mask(i) ^ bit_mask(j) ^ bit_mask(k)) >> 16) as u16, corrected_bits: 3 });
+                    return Ok(Rm3014Decoded {
+                        data: ((codeword ^ bit_mask(i) ^ bit_mask(j) ^ bit_mask(k)) >> 16) as u16,
+                        corrected_bits: 3,
+                    });
                 }
             }
         }

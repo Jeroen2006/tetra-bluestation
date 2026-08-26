@@ -1,0 +1,14 @@
+[package]
+name = "tetra-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+description = "TETRA air-interface encryption and key-management primitives"
+publish = false
+
+[lib]
+name = "tetra_crypto"
+path = "src/lib.rs"
+
+[dependencies]

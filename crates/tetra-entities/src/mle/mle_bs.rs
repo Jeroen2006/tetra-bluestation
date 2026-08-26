@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::mle::components::broadcast::MleBroadcast;
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
@@ -6,7 +6,9 @@ use crate::net_swmi::SwmiMleEndpoint;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_core::{
+    AieRequest, AieScope, AieSubject, BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log,
+};
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, fields::chan_alloc_req::CmceChanAllocReq};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
@@ -29,14 +31,22 @@ pub struct MleBs {
     broadcast: MleBroadcast,
     swmi: Option<SwmiMleEndpoint>,
     control: Option<ControlEndpoint>,
-    forward_registrations: HashMap<u32, String>,
+    // Keep the AIE policy of the incoming roaming procedure until its
+    // asynchronous MM/CMCE result returns.  AieRequest is key-free protocol
+    // metadata; the key itself remains solely in the BS AIE provider.
+    forward_registrations: HashMap<u32, ForwardRegistration>,
     forward_registration_deadlines: HashMap<u32, TdmaTime>,
-    pending_restores: HashSet<u32>,
+    pending_restores: HashMap<u32, Option<AieRequest>>,
     current_time: TdmaTime,
     /// First physical downlink slot at which the next CA broadcast may be
     /// queued.  The message is handed to UMAC one slot ahead, so this tracks
     /// the on-air timestamp rather than the current router timestamp.
     next_network_broadcast: Option<TdmaTime>,
+}
+
+#[derive(Clone, Copy)]
+struct ForwardRegistration {
+    incoming_aie: Option<AieRequest>,
 }
 
 /// CA broadcasts are offered once per five TETRA multiframes (about 5.1 s).
@@ -72,9 +82,55 @@ impl MleBs {
             control,
             forward_registrations: HashMap::new(),
             forward_registration_deadlines: HashMap::new(),
-            pending_restores: HashSet::new(),
+            pending_restores: HashMap::new(),
             current_time: TdmaTime::default(),
             next_network_broadcast: None,
+        }
+    }
+
+    /// Select the MAC AIE policy for CMCE downlink signalling at the last
+    /// common point before LLC. MM bootstrap PDUs use LMM-SAP and therefore
+    /// deliberately do not pass here. That keeps the narrowly permitted clear
+    /// registration/OTAR bootstrap separate from normal CMCE traffic.
+    ///
+    /// An encrypted SC2 MAC-RESOURCE carries an ESI. For a group PDU this is
+    /// a GESI: TA61 is applied to the GSSI by UMAC at the exact TX time. This
+    /// lets every group member select and decrypt the resource using the SCK.
+    /// Individual PDU handling remains fail-closed in an SC2-only cell.
+    fn cmce_downlink_aie(&self, address: TetraAddress) -> Option<AieRequest> {
+        let state = self.config.state_read();
+        if !state.aie.enabled {
+            return None;
+        }
+
+        match address.ssi_type {
+            // In an SC2-only cell CMCE has no permitted clear fallback for a
+            // registered ISSI.  Keep the request encrypted even while the
+            // terminal binding is not ready: the provider then rejects it at
+            // TX time rather than silently emitting (for example) D-STATUS
+            // in clear.  MM bootstrap traffic does not use this path.
+            SsiType::Issi
+                if state.aie_sessions.terminal(address.ssi).is_some()
+                    || (!state.aie.sc1_allowed && state.subscribers.is_registered(address.ssi)) =>
+            {
+                Some(AieRequest::sc2(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
+            }
+            SsiType::Gssi => Some(AieRequest::sc2(AieSubject::Group { gssi: address.ssi }, AieScope::MacResource)),
+            _ => None,
+        }
+    }
+
+    /// MLE roaming procedure replies use SC2 only when the corresponding
+    /// uplink procedure was protected and the MS has a local SC2 binding.
+    /// This preserves a clear bootstrap transaction as clear, while ensuring
+    /// that a protected U-PREPARE/U-RESTORE does not silently fall back to
+    /// clear merely because MLE crosses an asynchronous SAP boundary.
+    fn mle_reply_aie(&self, address: TetraAddress, incoming_aie: Option<AieRequest>) -> Option<AieRequest> {
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie_sessions.terminal(address.ssi).is_some() && matches!(incoming_aie, Some(AieRequest::Sc2 { .. })) {
+            Some(AieRequest::sc2(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
+        } else {
+            None
         }
     }
 
@@ -85,6 +141,7 @@ impl MleBs {
         address: TetraAddress,
         endpoint_id: EndpointId,
         link_id: LinkId,
+        incoming_aie: Option<AieRequest>,
     ) {
         // The MLE protocol discriminator has already been removed. Uplink
         // and downlink MLE PDU values overlap, so this must use the UL enum.
@@ -97,26 +154,26 @@ impl MleBs {
             return;
         };
         match pdu_type {
-            MlePduTypeUl::UPrepare => self.rx_u_prepare(queue, sdu, address),
-            MlePduTypeUl::URestore => self.rx_u_restore(queue, sdu, address, endpoint_id, link_id),
+            MlePduTypeUl::UPrepare => self.rx_u_prepare(queue, sdu, address, incoming_aie),
+            MlePduTypeUl::URestore => self.rx_u_restore(queue, sdu, address, endpoint_id, link_id, incoming_aie),
             MlePduTypeUl::UPrepareDa => tracing::debug!(issi = address.ssi, "U-PREPARE-DA is outside CA roaming scope"),
             other => tracing::debug!(?other, issi = address.ssi, "unsupported uplink MLE PDU"),
         }
     }
 
-    fn rx_u_prepare(&mut self, queue: &mut MessageQueue, sdu: BitBuffer, address: TetraAddress) {
+    fn rx_u_prepare(&mut self, queue: &mut MessageQueue, sdu: BitBuffer, address: TetraAddress, incoming_aie: Option<AieRequest>) {
         let mut input = sdu;
         let pdu = match UPrepare::from_bitbuf(&mut input) {
             Ok(pdu) => pdu,
             Err(error) => {
                 tracing::warn!(issi = address.ssi, ?error, "invalid U-PREPARE");
-                self.send_prepare_fail(queue, address, 1, None);
+                self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
                 return;
             }
         };
         let Some(cell_identifier_ca) = pdu.cell_identifier_ca else {
             // Type 3 has no preferred cell and no embedded forward-registration SDU.
-            self.send_new_cell(queue, address, 1, None, None);
+            self.send_new_cell(queue, address, 1, None, None, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         let Some(target_station_id) = self.broadcast.neighbour_station_id(cell_identifier_ca).map(str::to_owned) else {
@@ -125,35 +182,35 @@ impl MleBs {
                 cell_identifier_ca,
                 "U-PREPARE refers to a non-advertised CA neighbour"
             );
-            self.send_prepare_fail(queue, address, 1, None);
+            self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         let Some(mut embedded_mm) = pdu.sdu else {
             // Announced type 2 without forward registration.
-            self.send_new_cell(queue, address, 1, None, None);
+            self.send_new_cell(queue, address, 1, None, None, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         let Some(raw_type) = embedded_mm.peek_bits(4) else {
-            self.send_prepare_fail(queue, address, 1, None);
+            self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         if MmPduTypeUl::try_from(raw_type) != Ok(MmPduTypeUl::ULocationUpdateDemand) {
             tracing::warn!(issi = address.ssi, "U-PREPARE did not contain U-LOCATION UPDATE DEMAND");
-            self.send_prepare_fail(queue, address, 1, None);
+            self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
             return;
         }
         let mut validation = embedded_mm.clone();
         let Ok(location_update) = ULocationUpdateDemand::from_bitbuf(&mut validation) else {
-            self.send_prepare_fail(queue, address, 1, None);
+            self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         if location_update.location_update_type != LocationUpdateType::ServiceRestorationRoamingLocationUpdating {
             tracing::warn!(issi = address.ssi, ?location_update.location_update_type, "rejecting non-forward-registration U-PREPARE SDU");
-            self.send_prepare_fail(queue, address, 1, None);
+            self.send_prepare_fail(queue, address, 1, None, self.mle_reply_aie(address, incoming_aie));
             return;
         }
         embedded_mm.seek(0);
-        self.forward_registrations.insert(address.ssi, target_station_id.clone());
+        self.forward_registrations.insert(address.ssi, ForwardRegistration { incoming_aie });
         self.forward_registration_deadlines
             .insert(address.ssi, self.current_time.add_timeslots(T370_TIMESLOTS));
         queue.push_back(SapMsg {
@@ -164,27 +221,36 @@ impl MleBs {
                 sdu: embedded_mm,
                 handle: 0,
                 received_address: address,
+                air_interface_encryption: incoming_aie,
                 forward_registration_target_station_id: Some(target_station_id),
             }),
         });
     }
 
-    fn rx_u_restore(&mut self, queue: &mut MessageQueue, sdu: BitBuffer, address: TetraAddress, endpoint_id: EndpointId, link_id: LinkId) {
+    fn rx_u_restore(
+        &mut self,
+        queue: &mut MessageQueue,
+        sdu: BitBuffer,
+        address: TetraAddress,
+        endpoint_id: EndpointId,
+        link_id: LinkId,
+        incoming_aie: Option<AieRequest>,
+    ) {
         let mut input = sdu;
         let pdu = match URestore::from_bitbuf(&mut input) {
             Ok(pdu) => pdu,
             Err(error) => {
                 tracing::warn!(issi = address.ssi, ?error, "invalid U-RESTORE");
-                self.send_restore_fail(queue, address, 1);
+                self.send_restore_fail(queue, address, 1, self.mle_reply_aie(address, incoming_aie));
                 return;
             }
         };
         let Some(mut embedded_cmce) = pdu.sdu else {
-            self.send_restore_fail(queue, address, 1);
+            self.send_restore_fail(queue, address, 1, self.mle_reply_aie(address, incoming_aie));
             return;
         };
         embedded_cmce.seek(0);
-        self.pending_restores.insert(address.ssi);
+        self.pending_restores.insert(address.ssi, incoming_aie);
         queue.push_back(SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Mle,
@@ -201,7 +267,14 @@ impl MleBs {
         });
     }
 
-    fn send_mle_downlink(&self, queue: &mut MessageQueue, address: TetraAddress, mut pdu: BitBuffer, chan_alloc: Option<CmceChanAllocReq>) {
+    fn send_mle_downlink(
+        &self,
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        mut pdu: BitBuffer,
+        chan_alloc: Option<CmceChanAllocReq>,
+        air_interface_encryption: Option<AieRequest>,
+    ) {
         let pdu_len = pdu.get_len_remaining();
         let mut tl_sdu = BitBuffer::new_autoexpand(3 + pdu_len);
         tl_sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
@@ -219,7 +292,7 @@ impl MleBs {
                 stealing_permission: false,
                 subscriber_class: 0,
                 fcs_flag: false,
-                air_interface_encryption: None,
+                air_interface_encryption,
                 stealing_repeats_flag: None,
                 data_class_info: None,
                 req_handle: 0,
@@ -238,6 +311,7 @@ impl MleBs {
         channel_command_valid: u8,
         sdu: Option<BitBuffer>,
         chan_alloc: Option<CmceChanAllocReq>,
+        air_interface_encryption: Option<AieRequest>,
     ) {
         let mut bits = BitBuffer::new_autoexpand(64);
         if (DNewCell {
@@ -248,7 +322,7 @@ impl MleBs {
         .is_ok()
         {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, chan_alloc);
+            self.send_mle_downlink(queue, address, bits, chan_alloc, air_interface_encryption);
         }
     }
 
@@ -263,19 +337,32 @@ impl MleBs {
         }
     }
 
-    fn send_prepare_fail(&self, queue: &mut MessageQueue, address: TetraAddress, fail_cause: u8, sdu: Option<BitBuffer>) {
+    fn send_prepare_fail(
+        &self,
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        fail_cause: u8,
+        sdu: Option<BitBuffer>,
+        air_interface_encryption: Option<AieRequest>,
+    ) {
         let mut bits = BitBuffer::new_autoexpand(64);
         if (DPrepareFail { fail_cause, sdu }).to_bitbuf(&mut bits).is_ok() {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, None);
+            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption);
         }
     }
 
-    fn send_restore_fail(&self, queue: &mut MessageQueue, address: TetraAddress, fail_cause: u8) {
+    fn send_restore_fail(
+        &self,
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        fail_cause: u8,
+        air_interface_encryption: Option<AieRequest>,
+    ) {
         let mut bits = BitBuffer::new_autoexpand(16);
         if (DRestoreFail { fail_cause }).to_bitbuf(&mut bits).is_ok() {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, None);
+            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption);
         }
     }
 
@@ -313,6 +400,37 @@ impl MleBs {
         let main_address = prim.main_address;
         let endpoint_id = prim.endpoint_id;
         let link_id = prim.link_id;
+        let air_interface_encryption = prim.air_interface_encryption;
+
+        // With SC1 disabled, post-registration clear traffic is only
+        // meaningful for the MM bootstrap/transition allow-list. Do not let
+        // clear CMCE/SNDCP/MLE traffic of a bound SC2 terminal reach a
+        // higher-layer fallback path. LLC handles the one matching clear
+        // BL-ACK before it reaches MLE.
+        let is_clear_from_bound_sc2_terminal = matches!(air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
+            let state = self.config.state_read();
+            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(main_address.ssi).is_some()
+        };
+        if is_clear_from_bound_sc2_terminal && pdu_type != MleProtocolDiscriminator::Mm {
+            tracing::warn!(
+                issi = main_address.ssi,
+                ?pdu_type,
+                "rejecting unexpected clear post-SC2 uplink outside MM bootstrap allow-list"
+            );
+            return;
+        }
+        if matches!(
+            air_interface_encryption,
+            Some(AieRequest::Sc2 {
+                subject: AieSubject::System,
+                ..
+            })
+        ) && main_address.ssi_type == SsiType::Esi
+            && pdu_type != MleProtocolDiscriminator::Mm
+        {
+            tracing::warn!(?pdu_type, "rejecting unbound encrypted bootstrap outside MM location update");
+            return;
+        }
 
         // Dispatch to appropriate component (or to self if for MLE)
         match pdu_type {
@@ -321,6 +439,7 @@ impl MleBs {
                     sdu,
                     handle: 0,
                     received_address: main_address,
+                    air_interface_encryption,
                     forward_registration_target_station_id: None,
                 };
                 let msg = SapMsg {
@@ -366,7 +485,7 @@ impl MleBs {
                 };
                 queue.push_back(msg);
             }
-            MleProtocolDiscriminator::Mle => self.rx_tla_mle_pdu(queue, sdu, main_address, endpoint_id, link_id),
+            MleProtocolDiscriminator::Mle => self.rx_tla_mle_pdu(queue, sdu, main_address, endpoint_id, link_id, air_interface_encryption),
             MleProtocolDiscriminator::TetraManagementEntity => {
                 unimplemented_log!("MleProtocolDiscriminator::TetraManagementEntity");
             }
@@ -384,7 +503,7 @@ impl MleBs {
             panic!()
         };
 
-        if self.forward_registrations.contains_key(&prim.address.ssi) {
+        if let Some(forward_registration) = self.forward_registrations.get(&prim.address.ssi).copied() {
             let pdu_type = prim.sdu.peek_bits(4).and_then(|raw| MmPduTypeDl::try_from(raw).ok());
             match pdu_type {
                 Some(MmPduTypeDl::DLocationUpdateAccept) => {
@@ -392,13 +511,26 @@ impl MleBs {
                     self.forward_registration_deadlines.remove(&prim.address.ssi);
                     let chan_alloc = prim.seamless_handover.map(Self::seamless_handover_allocation);
                     let command = if chan_alloc.is_some() { 0 } else { 1 };
-                    self.send_new_cell(queue, prim.address, command, Some(prim.sdu.clone()), chan_alloc);
+                    self.send_new_cell(
+                        queue,
+                        prim.address,
+                        command,
+                        Some(prim.sdu.clone()),
+                        chan_alloc,
+                        self.mle_reply_aie(prim.address, forward_registration.incoming_aie),
+                    );
                     return;
                 }
                 Some(MmPduTypeDl::DLocationUpdateReject) => {
                     self.forward_registrations.remove(&prim.address.ssi);
                     self.forward_registration_deadlines.remove(&prim.address.ssi);
-                    self.send_prepare_fail(queue, prim.address, 1, Some(prim.sdu.clone()));
+                    self.send_prepare_fail(
+                        queue,
+                        prim.address,
+                        1,
+                        Some(prim.sdu.clone()),
+                        self.mle_reply_aie(prim.address, forward_registration.incoming_aie),
+                    );
                     return;
                 }
                 _ => {}
@@ -428,7 +560,7 @@ impl MleBs {
                 stealing_permission: false,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,
-                air_interface_encryption: None,
+                air_interface_encryption: Some(prim.aie_request),
                 stealing_repeats_flag: None,
                 data_class_info: None,
                 req_handle: 0, // TODO FIXME; should we pass the same handle here?
@@ -467,14 +599,20 @@ impl MleBs {
             panic!()
         };
 
-        if self.pending_restores.remove(&prim.main_address.ssi) {
+        if let Some(incoming_aie) = self.pending_restores.remove(&prim.main_address.ssi) {
             if prim.sdu.get_len_remaining() == 0 {
-                self.send_restore_fail(queue, prim.main_address, 1);
+                self.send_restore_fail(queue, prim.main_address, 1, self.mle_reply_aie(prim.main_address, incoming_aie));
             } else {
                 let mut bits = BitBuffer::new_autoexpand(64);
                 if (DRestoreAck { sdu: prim.sdu.clone() }).to_bitbuf(&mut bits).is_ok() {
                     bits.seek(0);
-                    self.send_mle_downlink(queue, prim.main_address, bits, prim.chan_alloc.take());
+                    self.send_mle_downlink(
+                        queue,
+                        prim.main_address,
+                        bits,
+                        prim.chan_alloc.take(),
+                        self.mle_reply_aie(prim.main_address, incoming_aie),
+                    );
                 }
             }
             return;
@@ -494,6 +632,10 @@ impl MleBs {
         let chan_alloc = prim.chan_alloc.take();
         // Preserve CMCE's likely-listening-channel decision through LLC.
         let associated_channel = prim.associated_channel.take();
+        // Resolve once before moving the address into the outgoing primitive.
+        // LLC/UMAC retain this request across fragmentation and bind the key at
+        // the exact transmission time.
+        let air_interface_encryption = self.cmce_downlink_aie(prim.main_address);
 
         let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
             // Unacknowledged service, send a TlUnitdataReqBl
@@ -509,7 +651,7 @@ impl MleBs {
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,
-                    air_interface_encryption: None,
+                    air_interface_encryption,
                     packet_data_flag: false,
                     n_tlsdu_repeats: 0,
                     data_class_info: None,
@@ -534,7 +676,7 @@ impl MleBs {
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,
-                    air_interface_encryption: None,
+                    air_interface_encryption,
                     stealing_repeats_flag: None,
                     data_class_info: None,
                     req_handle: 0, // TODO FIXME
@@ -574,9 +716,16 @@ impl TetraEntityTrait for MleBs {
             .collect();
         for issi in timed_out {
             self.forward_registration_deadlines.remove(&issi);
-            if self.forward_registrations.remove(&issi).is_some() {
+            if let Some(forward_registration) = self.forward_registrations.remove(&issi) {
                 tracing::warn!(issi, "U-PREPARE timed out at T370");
-                self.send_prepare_fail(queue, TetraAddress::issi(issi), 1, None);
+                let address = TetraAddress::issi(issi);
+                self.send_prepare_fail(
+                    queue,
+                    address,
+                    1,
+                    None,
+                    self.mle_reply_aie(address, forward_registration.incoming_aie),
+                );
             }
         }
         while let Some(snapshot) = self.swmi.as_ref().and_then(SwmiMleEndpoint::try_recv) {

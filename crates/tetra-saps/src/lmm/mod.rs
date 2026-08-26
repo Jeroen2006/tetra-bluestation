@@ -1,6 +1,6 @@
 // Clause 17.3.2 Service primitives for the LMM-SAP
 #![allow(unused)]
-use tetra_core::{BitBuffer, Layer2Service, MleHandle, TetraAddress, Todo, TxReporter};
+use tetra_core::{AieRequest, BitBuffer, Layer2Service, MleHandle, TetraAddress, Todo, TxReporter};
 
 /// This shall be used as a request to initiate the selection of a cell for communications. The
 /// request shall always be made after power on and may be made at any time thereafter.
@@ -152,6 +152,9 @@ pub struct LmmMleUnitdataReq {
     pub stealing_permission: bool,
     pub stealing_repeats_flag: bool,
     pub encryption_flag: bool,
+    /// Explicit, key-free air-interface policy for this downlink MM SDU.
+    /// Bootstrap/OTAR PDUs use `Clear`; protected traffic uses `Sc2`.
+    pub aie_request: AieRequest,
     pub is_null_pdu: bool, // Prio should be lowest and may not steal
     pub tx_reporter: Option<TxReporter>,
     /// Present only for a forward-registration D-LOCATION UPDATE ACCEPT that
@@ -164,6 +167,10 @@ pub struct LmmMleUnitdataInd {
     pub sdu: BitBuffer,
     pub handle: MleHandle,
     pub received_address: TetraAddress,
+    /// Key-free indication of the protection state with which this uplink
+    /// MM SDU was received. This lets MM enforce the SC2 clear-PDU
+    /// allow-list without exposing cipher material above MAC.
+    pub air_interface_encryption: Option<AieRequest>,
     /// Set only for an MM SDU embedded in MLE U-PREPARE.  The target is
     /// resolved from the serving cell's CA neighbour directory, not supplied
     /// by an unauthenticated mobile station.

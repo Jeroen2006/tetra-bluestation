@@ -114,12 +114,7 @@ impl<D: RxTxDev> PhyBs<D> {
         Some(selected)
     }
 
-    fn split_rxslot_and_send_to_lmac(
-        queue: &mut MessageQueue,
-        ul_time: TdmaTime,
-        burst: &RxBurstBits<'_>,
-        block_num: PhyBlockNum,
-    ) {
+    fn split_rxslot_and_send_to_lmac(queue: &mut MessageQueue, ul_time: TdmaTime, burst: &RxBurstBits<'_>, block_num: PhyBlockNum) {
         let train_seq = burst.train_type;
         match train_seq {
             TrainingSequence::NormalTrainSeq1 => {
@@ -131,11 +126,20 @@ impl<D: RxTxDev> PhyBs<D> {
                 blk.seek(0);
 
                 Self::send_rxblock_to_lmac(
-                    queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Both, blk,
-                    Self::collect_soft_bits(burst, &[
-                        NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS,
-                        NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS,
-                    ]),
+                    queue,
+                    ul_time,
+                    train_seq,
+                    BurstType::NUB,
+                    PhyBlockType::NUB,
+                    PhyBlockNum::Both,
+                    blk,
+                    Self::collect_soft_bits(
+                        burst,
+                        &[
+                            NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS,
+                            NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS,
+                        ],
+                    ),
                 );
             }
 
@@ -145,10 +149,26 @@ impl<D: RxTxDev> PhyBs<D> {
                 let blk1 = BitBuffer::from_bitarr(&burst.bits[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]);
                 let blk2 = BitBuffer::from_bitarr(&burst.bits[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]);
 
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block1, blk1,
-                    Self::collect_soft_bits(burst, &[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]));
-                Self::send_rxblock_to_lmac(queue, ul_time, train_seq, BurstType::NUB, PhyBlockType::NUB, PhyBlockNum::Block2, blk2,
-                    Self::collect_soft_bits(burst, &[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]));
+                Self::send_rxblock_to_lmac(
+                    queue,
+                    ul_time,
+                    train_seq,
+                    BurstType::NUB,
+                    PhyBlockType::NUB,
+                    PhyBlockNum::Block1,
+                    blk1,
+                    Self::collect_soft_bits(burst, &[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]),
+                );
+                Self::send_rxblock_to_lmac(
+                    queue,
+                    ul_time,
+                    train_seq,
+                    BurstType::NUB,
+                    PhyBlockType::NUB,
+                    PhyBlockNum::Block2,
+                    blk2,
+                    Self::collect_soft_bits(burst, &[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]),
+                );
             }
             TrainingSequence::ExtendedTrainSeq => {
                 assert!(burst.bits.len() == CUB_BITS);
@@ -164,11 +184,20 @@ impl<D: RxTxDev> PhyBs<D> {
                     other => panic!("CUB burst must belong to one subslot, got {:?}", other),
                 };
                 Self::send_rxblock_to_lmac(
-                    queue, ul_time, train_seq, BurstType::CUB, block_type, block_num, blk,
-                    Self::collect_soft_bits(burst, &[
-                        CUB_BLK1_OFFSET..CUB_BLK1_OFFSET + CUB_BLK_BITS,
-                        CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS,
-                    ]),
+                    queue,
+                    ul_time,
+                    train_seq,
+                    BurstType::CUB,
+                    block_type,
+                    block_num,
+                    blk,
+                    Self::collect_soft_bits(
+                        burst,
+                        &[
+                            CUB_BLK1_OFFSET..CUB_BLK1_OFFSET + CUB_BLK_BITS,
+                            CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS,
+                        ],
+                    ),
                 );
             }
 
@@ -272,12 +301,7 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(3, self.tick, rx_slot.slot.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(
-                        queue,
-                        self.dltime.add_timeslots(-2),
-                        &rx_slot.slot,
-                        PhyBlockNum::Both,
-                    );
+                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.slot, PhyBlockNum::Both);
                     slot_sent = true;
                 }
                 if rx_slot.subslot1.train_type != TrainingSequence::NotFound {
@@ -290,12 +314,7 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(1, self.tick, rx_slot.subslot1.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(
-                        queue,
-                        self.dltime.add_timeslots(-2),
-                        &rx_slot.subslot1,
-                        PhyBlockNum::Block1,
-                    );
+                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.subslot1, PhyBlockNum::Block1);
                     slot_sent = true;
                 }
                 if rx_slot.subslot2.train_type != TrainingSequence::NotFound {
@@ -308,12 +327,7 @@ impl<D: RxTxDev> PhyBs<D> {
                         let _ = ul_rx_sender.try_send(FileWriteMsg::WriteHeaderAndBlock(2, self.tick, rx_slot.subslot2.bits.to_vec()));
                     }
 
-                    Self::split_rxslot_and_send_to_lmac(
-                        queue,
-                        self.dltime.add_timeslots(-2),
-                        &rx_slot.subslot2,
-                        PhyBlockNum::Block2,
-                    );
+                    Self::split_rxslot_and_send_to_lmac(queue, self.dltime.add_timeslots(-2), &rx_slot.subslot2, PhyBlockNum::Block2);
                 }
             }
         }

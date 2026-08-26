@@ -2,9 +2,10 @@ mod common;
 
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_core::{AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tmv::TmvUnitdataReqSlot;
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
@@ -22,6 +23,7 @@ fn test_in_fragmented_sch_hu_and_sch_f() {
         pdu: BitBuffer::from_bitstr(test_vec1),
         block_num: PhyBlockNum::Block1,
         logical_channel: LogicalChannel::SchHu,
+        ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
     };
@@ -35,6 +37,7 @@ fn test_in_fragmented_sch_hu_and_sch_f() {
         pdu: BitBuffer::from_bitstr(test_vec2),
         block_num: PhyBlockNum::Both,
         logical_channel: LogicalChannel::SchF,
+        ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
     };
@@ -80,6 +83,7 @@ fn test_in_fragmented_sch_hu_and_sch_hu() {
         pdu: BitBuffer::from_bitstr(test_vec1),
         block_num: PhyBlockNum::Block1,
         logical_channel: LogicalChannel::SchHu,
+        ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
     };
@@ -93,6 +97,7 @@ fn test_in_fragmented_sch_hu_and_sch_hu() {
         pdu: BitBuffer::from_bitstr(test_vec2),
         block_num: PhyBlockNum::Block1,
         logical_channel: LogicalChannel::SchHu,
+        ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
     };
@@ -144,6 +149,7 @@ fn test_out_fragmented_resource() {
         stealing_permission: false,
         stealing_repeats_flag: false,
         encryption_flag: false,
+        aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
         is_null_pdu: false,
         tx_reporter: None,
         seamless_handover: None,
@@ -166,4 +172,66 @@ fn test_out_fragmented_resource() {
     test.run_stack(Some(8));
 
     tracing::info!("Validation of result not implemented");
+}
+
+#[test]
+fn sc2_mm_downlink_sets_esi_mode_and_ciphers_only_the_payload() {
+    let dltime = TdmaTime::default().add_timeslots(2);
+    let issi = 30_128;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let sc2 = tetra_config::bluestation::RuntimeSc2Aie::new(tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea1, 3, 7, [0x5a; 10]);
+    {
+        let mut state = test.config.state_write();
+        state.aie = tetra_config::bluestation::RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: Some(sc2.clone()),
+        };
+        state.aie_sessions.activate_terminal(issi, &sc2);
+    }
+    test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc, TetraEntity::Mle], vec![TetraEntity::Lmac]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mm,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+            // The content is intentionally arbitrary for this MAC-boundary
+            // regression test; LLC/MLE only transport it as an MM SDU.
+            sdu: BitBuffer::from_bitstr("00000000"),
+            handle: 0,
+            address: TetraAddress::issi(issi),
+            layer2service: Layer2Service::Acknowledged,
+            stealing_permission: false,
+            stealing_repeats_flag: false,
+            encryption_flag: true,
+            aie_request: AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource),
+            is_null_pdu: false,
+            tx_reporter: None,
+            seamless_handover: None,
+        }),
+    });
+    test.run_stack(Some(8));
+
+    let mut output = test.dump_sinks();
+    let mut slot = output
+        .iter_mut()
+        .find_map(|message| match &mut message.msg {
+            SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot { blk1: Some(block), .. }) => Some(block.mac_block.clone()),
+            _ => None,
+        })
+        .expect("UMAC must submit a downlink MAC block to LMAC");
+    slot.seek(0);
+    let resource = tetra_pdus::umac::pdus::mac_resource::MacResource::from_bitbuf(&mut slot).expect("clear MAC header remains decodable");
+    assert_eq!(resource.encryption_mode, 0b11, "odd SCK-VN selects SC2 encryption mode 11");
+    assert_eq!(
+        resource.addr.expect("address").ssi_type,
+        SsiType::Ssi,
+        "on-air ESI uses the SSI address form"
+    );
+    assert_ne!(
+        resource.addr.expect("address").ssi,
+        issi,
+        "clear ISSI must not be emitted in an SC2 resource"
+    );
 }

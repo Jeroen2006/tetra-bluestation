@@ -2,7 +2,7 @@ mod common;
 
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, PhyBlockNum, Sap, debug};
+use tetra_core::{BitBuffer, PhyBlockNum, Sap, TdmaTime, debug};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
@@ -27,6 +27,7 @@ fn test_umac_ms() {
             ),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::SchHd,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),
@@ -65,6 +66,7 @@ fn test_umac_frag() {
             ),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::SchHd,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),
@@ -82,6 +84,7 @@ fn test_umac_frag() {
             ),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::SchHd,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),
@@ -120,6 +123,7 @@ fn test_sysinfo() {
             ),
             block_num: PhyBlockNum::Block2,
             logical_channel: LogicalChannel::Bnch,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),
@@ -154,6 +158,7 @@ fn test_sync() {
             // pdu: BitBuffer::from_bitstr("000100000111100100111110000000000110011000000000000101111001"),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::Bsch,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),
@@ -186,6 +191,7 @@ fn test_resource() {
             ),
             block_num: PhyBlockNum::Both,
             logical_channel: LogicalChannel::SchF,
+            ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
         }),

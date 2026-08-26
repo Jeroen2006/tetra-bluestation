@@ -4,7 +4,7 @@ use std::panic;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, unimplemented_log};
+use tetra_core::{AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -20,6 +20,7 @@ use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 
 // Assigned-channel signalling has fewer opportunities to return a BL-ACK:
 // while the speaker owns FN1..17, the associated listener normally waits for
@@ -71,6 +72,9 @@ pub struct ScheduledOutAck {
     pub nr: u8,
     /// Timeslot on which the original message was received
     pub ts: u8,
+    /// Key-free AIE policy of the PDU being acknowledged.  A BL-ACK is not
+    /// allowed to downgrade an SC2-protected basic-link PDU to clear.
+    pub aie_request: AieRequest,
 }
 
 pub struct Llc {
@@ -104,12 +108,13 @@ impl Llc {
     }
 
     /// Schedule an ACK to be sent at a later time
-    pub fn schedule_outgoing_ack(&mut self, dltime: TdmaTime, addr: TetraAddress, ns: u8) {
+    pub fn schedule_outgoing_ack(&mut self, dltime: TdmaTime, addr: TetraAddress, ns: u8, aie_request: AieRequest) {
         self.scheduled_out_acks.push_back(ScheduledOutAck {
             t_start: dltime,
             nr: ns,
             addr,
             ts: dltime.t,
+            aie_request,
         });
     }
 
@@ -121,9 +126,9 @@ impl Llc {
     /// TODO: once bs_sched's identify_timeslots_for_ssi is implemented and DL signalling can
     /// land on non-ts1 slots, also match on the target timeslot to avoid bundling an ACK onto a
     /// BL-DATA heading to a different slot than where the ACK was scheduled.
-    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress) -> Option<u8> {
+    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, aie_request: AieRequest) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
-            if self.scheduled_out_acks[i].addr.ssi == addr.ssi {
+            if self.scheduled_out_acks[i].addr.ssi == addr.ssi && self.scheduled_out_acks[i].aie_request.same_protection_as(aie_request) {
                 let n = self.scheduled_out_acks[i].nr;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
@@ -152,14 +157,50 @@ impl Llc {
         None
     }
 
+    /// A clear post-SC2 MAC-DATA is accepted only when it is either the bare
+    /// BL-ACK that completes a clear bootstrap downlink, or carries an MM
+    /// PDU. The latter is not a general exception: MLE then permits only MM
+    /// and MM validates its narrow location-update/OTAR bootstrap allow-list.
+    /// The BL-ACK check remains against the exact outstanding clear basic-link
+    /// message and its sequence number; it is not a temporary all-clear
+    /// window.
+    fn clear_transition_ack_expected(&self, addr: TetraAddress, nr: u8) -> bool {
+        let state = self.config.state_read();
+        if !state.aie.enabled || state.aie.sc1_allowed || state.aie_sessions.terminal(addr.ssi).is_none() {
+            return false;
+        }
+        self.outbound_messages.iter().any(|expected| {
+            expected.addr.ssi == addr.ssi
+                && expected.ns == nr
+                && expected.t_submitted_to_umac.is_some()
+                && (expected.t_umac_done.is_some() || expected.tx_reporter.is_transmitted())
+                && matches!(
+                    &expected.retransmission_buf.msg,
+                    SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                        air_interface_encryption: Some(AieRequest::Clear { .. }) | None,
+                        ..
+                    })
+                )
+        })
+    }
+
     /// Process incoming ACK per ETSI 22.3.2.3(k).
     /// Matches by SSI and N(R) so that retransmitted BL-DATA entries are matched correctly.
-    fn process_incoming_ack(&mut self, addr: TetraAddress, nr: u8) {
+    fn process_incoming_ack(&mut self, addr: TetraAddress, nr: u8, aie_request: AieRequest) {
         // Get the expected ACK entry
-        let Some(expected_ack) = self.take_expected_ack_for_ssi(addr.ssi) else {
+        let Some(mut expected_ack) = self.take_expected_ack_for_ssi(addr.ssi) else {
             tracing::warn!("received unexpected ACK for SSI {} N(R) {}", addr.ssi, nr);
             return;
         };
+
+        // UMAC may receive the response in the scheduler turn immediately
+        // after it reported the downlink as transmitted, before LLC's normal
+        // retry tick has copied that report into `t_umac_done`. Treat that
+        // concrete reporter state as transmitted here so a clear bootstrap
+        // BL-ACK cannot race the deferred SC2 activation.
+        if expected_ack.t_umac_done.is_none() && expected_ack.tx_reporter.is_transmitted() {
+            expected_ack.t_umac_done = Some(self.dltime);
+        }
 
         // Check it was indeed already transmitted by the Umac
         if expected_ack.t_umac_done.is_none() {
@@ -169,6 +210,22 @@ impl Llc {
                 "received ACK for SSI {} N(R) {} that was not yet transmitted by Umac. Ignoring",
                 addr.ssi,
                 nr
+            );
+            self.outbound_messages.push_front(expected_ack);
+            return;
+        }
+
+        let expected_aie_request = match &expected_ack.retransmission_buf.msg {
+            SapMsgInner::TmaUnitdataReq(prim) => prim
+                .air_interface_encryption
+                .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource)),
+            _ => unreachable!("basic-link acknowledgement must retain a TMA request"),
+        };
+        if !expected_aie_request.same_protection_as(aie_request) {
+            tracing::warn!(
+                issi = addr.ssi,
+                nr,
+                "rejecting BL-ACK whose AIE status differs from its outstanding basic-link PDU"
             );
             self.outbound_messages.push_front(expected_ack);
             return;
@@ -340,7 +397,15 @@ impl Llc {
         }
 
         // If an ack still needs to be sent, get the relevant expected sequence number
-        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address);
+        let outgoing_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
+            AieRequest::clear(
+                AieSubject::Individual {
+                    issi: prim.main_address.ssi,
+                },
+                AieScope::MacResource,
+            )
+        });
+        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, outgoing_aie_request);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -468,6 +533,17 @@ impl Llc {
             panic!();
         };
 
+        // Supplementary LLC and layer-2 signalling PDUs are standard LLC
+        // types, even though this BS does not yet implement their services.
+        // Keep their subtype and sender for diagnostics, but never let an
+        // unsupported radio PDU take the complete base station down.
+        let (issi, llc_subtype) = if let SapMsgInner::TmaUnitdataInd(prim) = &message.msg {
+            let llc_subtype = prim.pdu.as_ref().and_then(|pdu| pdu.peek_bits(8)).map(|bits| (bits & 0x0f) as u8);
+            (prim.main_address.ssi, llc_subtype)
+        } else {
+            unreachable!("TMA indication checked above");
+        };
+
         // Call handler function
         match pdu_type {
             // All Basic Link types can be handled by the same function
@@ -488,11 +564,16 @@ impl Llc {
             | LlcPduType::AlAckAlRnr
             | LlcPduType::AlReconnect
             | LlcPduType::AlDisc => {
-                unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
+                tracing::warn!(issi, ?pdu_type, "discarding unsupported advanced-link LLC PDU");
             }
 
-            _ => {
-                panic!();
+            LlcPduType::SuppLlcPdu | LlcPduType::L2SigPdu => {
+                tracing::warn!(
+                    issi,
+                    ?pdu_type,
+                    llc_subtype,
+                    "discarding unsupported supplementary/layer-2 signalling LLC PDU"
+                );
             }
         }
     }
@@ -569,16 +650,55 @@ impl Llc {
             return;
         }
 
+        let clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
+            let state = self.config.state_read();
+            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.main_address.ssi).is_some()
+        };
+        if clear_from_bound_sc2_terminal {
+            let bare_ack_bits = if has_fcs { 36 } else { 4 };
+            let transition_ack = matches!(pdu_type, LlcPduType::BlAck | LlcPduType::BlAckFcs)
+                && pdu.get_len_remaining() <= bare_ack_bits
+                && nr.is_some_and(|ack_nr| self.clear_transition_ack_expected(prim.main_address, ack_nr));
+            let mm_bootstrap = matches!(
+                pdu.peek_bits(3).and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok()),
+                Some(MleProtocolDiscriminator::Mm)
+            );
+            if !transition_ack && !mm_bootstrap {
+                tracing::warn!(
+                    issi = prim.main_address.ssi,
+                    ?pdu_type,
+                    "rejecting clear post-SC2 basic-link PDU outside MM bootstrap and transition ACK allow-lists"
+                );
+                return;
+            }
+        }
+
         // If ns is present, we need to send an ACK
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         if let Some(ns) = ns {
             // Send ACK
-            self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns);
+            let incoming_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
+                AieRequest::clear(
+                    AieSubject::Individual {
+                        issi: prim.main_address.ssi,
+                    },
+                    AieScope::MacData,
+                )
+            });
+            self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns, incoming_aie_request);
         }
 
         // if nr is present, we have received an ACK on a previous message
         if let Some(nr) = nr {
-            self.process_incoming_ack(prim.main_address, nr);
+            let incoming_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
+                AieRequest::clear(
+                    AieSubject::Individual {
+                        issi: prim.main_address.ssi,
+                    },
+                    AieScope::MacData,
+                )
+            });
+            self.process_incoming_ack(prim.main_address, nr, incoming_aie_request);
         }
 
         if pdu_type == LlcPduType::BlAck || pdu_type == LlcPduType::BlAckFcs {
@@ -809,10 +929,10 @@ impl Llc {
                     main_address: ack.addr,
                     endpoint_id: 0, // todo fixme
                     stealing_permission: steal,
-                    subscriber_class: 0,            // TODO FIXME
-                    air_interface_encryption: None, // TODO FIXME
-                    stealing_repeats_flag: None,    // TODO FIXME
-                    data_category: None,            // TODO FIXME
+                    subscriber_class: 0, // TODO FIXME
+                    air_interface_encryption: Some(ack.aie_request.with_scope(AieScope::MacResource)),
+                    stealing_repeats_flag: None, // TODO FIXME
+                    data_category: None,         // TODO FIXME
                     chan_alloc,
                     associated_channel: None,
                     tx_reporter: None, // By definition, no higher layer entity is interested
@@ -909,5 +1029,54 @@ impl TetraEntityTrait for Llc {
         had_activity |= self.submit_udata_msgs_to_umac(queue);
 
         had_activity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> SharedConfig {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        SharedConfig::from_parts(config, None)
+    }
+
+    #[test]
+    fn sc2_bl_ack_keeps_the_received_aie_policy() {
+        let mut llc = Llc::new(test_config());
+        let addr = TetraAddress::issi(0x12_34_56);
+        let request = AieRequest::sc2(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData);
+        llc.schedule_outgoing_ack(TdmaTime::default(), addr, 1, request);
+
+        let mut queue = MessageQueue::new();
+        assert!(llc.submit_ack_replies_to_umac(&mut queue));
+        let message = queue.pop_front().expect("BL-ACK must be queued");
+        let SapMsgInner::TmaUnitdataReq(request) = message.msg else {
+            panic!("expected a TMA request")
+        };
+        assert!(matches!(
+            request.air_interface_encryption,
+            Some(AieRequest::Sc2 {
+                subject: AieSubject::Individual { issi },
+                scope: AieScope::MacResource,
+            }) if issi == addr.ssi
+        ));
+    }
+
+    #[test]
+    fn combined_bl_adata_never_mixes_clear_and_sc2_ack_status() {
+        let mut llc = Llc::new(test_config());
+        let addr = TetraAddress::issi(1234);
+        let sc2 = AieRequest::sc2(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData);
+        let clear = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        llc.schedule_outgoing_ack(TdmaTime::default(), addr, 0, sc2);
+
+        assert_eq!(llc.get_out_ack_seq_if_any(addr, clear), None);
+        assert_eq!(llc.scheduled_out_acks.len(), 1, "mismatched ACK remains separate");
+        assert_eq!(llc.get_out_ack_seq_if_any(addr, sc2), Some(0));
     }
 }

@@ -1379,6 +1379,25 @@ impl CcBsSubentity {
         );
         self.track_group_call_listeners(circuit.call_id);
 
+        // U-SETUP grants the initial floor to the originating MS. UMAC must
+        // see that same grant: besides entering traffic mode it installs the
+        // key-free SC2 traffic contexts at the UMAC/LMAC boundary. Previously
+        // only Brew (and, for a centrally allocated call, SwMI) was notified,
+        // leaving the first talk burst without AIE and therefore clear.
+        if caller_has_central_floor || another_central_speaker {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id: circuit.call_id,
+                    source_issi: central_floor_itsi.unwrap_or(calling_party.ssi),
+                    dest_gssi,
+                    ts: circuit.ts,
+                }),
+            });
+        }
+
         // Notify Brew entity about this local call if Brew is loaded and the SSI is cleared for Brew
         // It can then forward to TetraPack if the group is subscribed
         if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
@@ -2359,6 +2378,42 @@ impl CcBsSubentity {
                         }
                     }
                 }
+                // A same-cell simplex call deliberately has no
+                // `PrivateMediaStart` mapping: both radios share one RF
+                // timeslot and UMAC must loop the recovered uplink speech
+                // back locally rather than route it to a single private-media
+                // destination.  That used to leave the initial floor holder
+                // without a traffic AIE policy, however.  The initial holder
+                // may start speech immediately after D-CONNECT, before it
+                // ever sends U-TX DEMAND, so the later PrivateFloorGranted
+                // path is too late.  Install the same key-free floor/AIE
+                // context now without creating a media route.
+                if shared_simplex && initial_floor_itsi != 0 {
+                    let initial_floor_itsi = initial_floor_itsi as u32;
+                    if let Some(circuit) = self.private_circuits.get(&(call_id, initial_floor_itsi)) {
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Cmce,
+                            dest: TetraEntity::Umac,
+                            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                                call_id,
+                                source_issi: initial_floor_itsi,
+                                // A private call has no GSSI.  UMAC uses this
+                                // sentinel only to select its shared SCK
+                                // downlink context; it does not appear in a
+                                // MAC header or CMCE PDU.
+                                dest_gssi: 0,
+                                ts: circuit.ts,
+                            }),
+                        });
+                    } else {
+                        tracing::warn!(
+                            call_id,
+                            initial_floor_itsi,
+                            "ignoring initial private floor holder without a local circuit"
+                        );
+                    }
+                }
                 // A connected private call is the strongest listening
                 // evidence for both endpoints, including a silent callee.
                 // This makes individual SDS and later private signalling use
@@ -2568,11 +2623,7 @@ impl CcBsSubentity {
                     }
                 }
             }
-            SwmiMessage::PrivateCallKeepalive {
-                call_id,
-                itsi,
-                sequence,
-            } => {
+            SwmiMessage::PrivateCallKeepalive { call_id, itsi, sequence } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
                 let itsi = itsi as u32;
                 let Some(call) = self.private_calls.get(&call_id) else {
@@ -2612,7 +2663,13 @@ impl CcBsSubentity {
                 sdu.seek(0);
                 let reporter = TxReporter::new();
                 self.pending_private_keepalives.insert((call_id, itsi, sequence), reporter.clone());
-                tracing::debug!(call_id, itsi, sequence, ts = circuit.ts, "sending acknowledged private hangtime D-INFO reachability probe");
+                tracing::debug!(
+                    call_id,
+                    itsi,
+                    sequence,
+                    ts = circuit.ts,
+                    "sending acknowledged private hangtime D-INFO reachability probe"
+                );
                 queue.push_back(Self::build_sapmsg_associated(
                     sdu,
                     None,
@@ -2707,7 +2764,13 @@ impl CcBsSubentity {
                 sequence,
                 acknowledged,
             }) {
-                tracing::warn!(call_id, itsi, sequence, ?error, "cannot report private hangtime reachability result to SwMI");
+                tracing::warn!(
+                    call_id,
+                    itsi,
+                    sequence,
+                    ?error,
+                    "cannot report private hangtime reachability result to SwMI"
+                );
             }
         }
     }
@@ -3513,8 +3576,29 @@ impl CcBsSubentity {
             return;
         }
 
+        // A floor release is meaningful only from the current holder. Check
+        // this before informing the SwMI *and* before changing the local RF
+        // state, so a late/foreign U-TX CEASED cannot silence a live speaker.
+        let Some(active_call) = self.active_calls.get(&call_id) else {
+            tracing::warn!(call_id, "U-TX CEASED for unknown call");
+            return;
+        };
+        let itsi = prim.received_tetra_address.ssi;
+        if active_call.source_issi != itsi {
+            tracing::debug!(
+                call_id,
+                itsi,
+                floor_holder = active_call.source_issi,
+                "ignoring U-TX CEASED from non-floor holder"
+            );
+            return;
+        }
+        if !active_call.tx_active && active_call.hangtime_start.is_some() {
+            tracing::debug!(call_id, "U-TX CEASED: already in hangtime");
+            return;
+        }
+
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
-            let itsi = prim.received_tetra_address.ssi;
             let command_id = self.next_swmi_command_id();
             if self
                 .swmi
@@ -3528,21 +3612,16 @@ impl CcBsSubentity {
                 .is_ok()
             {
                 tracing::info!(call_id, itsi, command_id, "U-TX CEASED forwarded to central SwMI");
-                return;
             }
         }
 
-        // Look up the active call
+        // The active call was validated above. Re-borrow it mutably only
+        // after the SwMI submit, so the local RF transition is never delayed
+        // by the central round-trip.
         let Some(call) = self.active_calls.get_mut(&call_id) else {
-            tracing::warn!("U-TX CEASED for unknown call_id={}", call_id);
+            tracing::warn!(call_id, "U-TX CEASED call disappeared before local release");
             return;
         };
-
-        // Check if already in hangtime - ignore duplicate U-TX CEASED to avoid resetting timer
-        if !call.tx_active && call.hangtime_start.is_some() {
-            tracing::debug!("U-TX CEASED: already in hangtime for call_id={}, ignoring duplicate", call_id);
-            return;
-        }
 
         tracing::info!("U-TX CEASED: PTT released on call_id={}, entering hangtime", call_id);
 

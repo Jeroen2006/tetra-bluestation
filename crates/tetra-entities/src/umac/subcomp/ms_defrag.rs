@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, TdmaTime, TetraAddress, Todo};
+use tetra_core::{AieRequest, BitBuffer, TdmaTime, TetraAddress};
 
 use crate::umac::subcomp::defrag::{DefragBuffer, DefragBufferState};
 
@@ -35,7 +35,7 @@ impl MsDefrag {
     }
 
     /// Inserts a first fragment into a fragbuffer.
-    pub fn insert_first(&mut self, bitbuffer: &mut BitBuffer, t: TdmaTime, addr: TetraAddress, aie_info: Option<Todo>) {
+    pub fn insert_first(&mut self, bitbuffer: &mut BitBuffer, t: TdmaTime, addr: TetraAddress, aie_request: Option<AieRequest>) {
         // Reset target buffer if needed
         let ts = (t.t - 1) as usize;
         if self.buffers[ts].state != DefragBufferState::Inactive {
@@ -49,7 +49,7 @@ impl MsDefrag {
         self.buffers[ts].t_first = t;
         self.buffers[ts].t_last = t;
         self.buffers[ts].num_frags = 1;
-        self.buffers[ts].aie_info = aie_info;
+        self.buffers[ts].aie_request = aie_request;
 
         // Copy the bitbuffer data from pos to end into our fragbuffer
         self.buffers[ts].buffer.copy_bits(bitbuffer, bitbuffer.get_len_remaining());
@@ -126,14 +126,14 @@ impl MsDefrag {
         );
     }
 
-    /// Retrieves a reference to the AIE info associated with a defrag buffer
-    pub fn get_aie_info(&self, t: TdmaTime) -> Option<&Todo> {
+    /// Retrieves the key-free AIE policy associated with a defrag buffer.
+    pub fn get_aie_request(&self, t: TdmaTime) -> Option<AieRequest> {
         let ts = (t.t - 1) as usize;
         if self.buffers[ts].state != DefragBufferState::Active {
             tracing::warn!("Defrag buffer {} is not active", ts);
             return None;
         }
-        self.buffers[ts].aie_info.as_ref()
+        self.buffers[ts].aie_request
     }
 
     /// Transfers finalized defragbuf to caller, setting bitbuffer slot pos to start.

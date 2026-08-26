@@ -2,7 +2,7 @@ use std::panic;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, PhyBlockNum, Sap, TdmaTime, Todo, unimplemented_log};
+use tetra_core::{BitBuffer, PhyBlockNum, Sap, TdmaTime, unimplemented_log};
 use tetra_saps::tlmb::TlmbSysinfoInd;
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
@@ -381,7 +381,7 @@ impl UmacMs {
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
-                        air_interface_encryption: pdu.encryption_mode as Todo,
+                        air_interface_encryption: None,
                         chan_change_response_req: false,
                         chan_change_handle: None,
                         chan_info: None,
@@ -435,7 +435,7 @@ impl UmacMs {
         tracing::debug!("rx_mac_frag: pdu_len_bits: {} fill_bits: {}", pdu_len_bits, num_fill_bits);
 
         // Decrypt if needed
-        if let Some(_aie_info) = self.defrag.buffers[(self.dltime.t - 1) as usize].aie_info {
+        if let Some(_aie_request) = self.defrag.buffers[(self.dltime.t - 1) as usize].aie_request {
             // TODO FIXME implement
             unimplemented_log!("rx_mac_frag: Encryption not supported");
             return;
@@ -482,7 +482,7 @@ impl UmacMs {
         tracing::debug!("rx_mac_end: pdu_len_bits: {} fill_bits: {}", pdu_len_bits, num_fill_bits);
 
         // Decrypt if needed
-        if let Some(_aie_info) = self.defrag.buffers[(self.dltime.t - 1) as usize].aie_info {
+        if let Some(_aie_request) = self.defrag.buffers[(self.dltime.t - 1) as usize].aie_request {
             // TODO FIXME implement
             unimplemented!("rx_mac_end: Encryption not supported");
             // TODO FIXME Also re-parse chanalloc
@@ -509,10 +509,10 @@ impl UmacMs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,              // TODO FIXME
-                new_endpoint_id: None,       // TODO FIXME
-                css_endpoint_id: None,       // TODO FIXME
-                air_interface_encryption: 0, // TODO FIXME implement
+                endpoint_id: 0,        // TODO FIXME
+                new_endpoint_id: None, // TODO FIXME
+                css_endpoint_id: None, // TODO FIXME
+                air_interface_encryption: None,
                 chan_change_response_req: false,
                 chan_change_handle: None,
                 chan_info: None,

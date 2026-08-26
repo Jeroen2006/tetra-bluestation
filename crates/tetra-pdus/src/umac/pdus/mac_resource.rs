@@ -204,7 +204,11 @@ impl MacResource {
 
             addr_type = MacResourceAddrType::NullPdu;
         } else if let Some(addr) = self.addr {
-            if addr.ssi_type == SsiType::Ssi || addr.ssi_type == SsiType::Gssi || addr.ssi_type == SsiType::Issi {
+            if addr.ssi_type == SsiType::Ssi
+                || addr.ssi_type == SsiType::Gssi
+                || addr.ssi_type == SsiType::Issi
+                || addr.ssi_type == SsiType::Esi
+            {
                 if self.event_label.is_none() && self.usage_marker.is_none() {
                     addr_type = MacResourceAddrType::Ssi;
                 } else if self.event_label.is_some() && self.usage_marker.is_none() {

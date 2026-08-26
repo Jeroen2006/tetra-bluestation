@@ -1,4 +1,8 @@
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, PhysicalChannel, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig};
+use tetra_core::{
+    AieCipherRegion, AieContext, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, PhysicalChannel,
+    SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
+};
 use tetra_saps::{
     control::call_control::Circuit,
     tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel},
@@ -122,6 +126,10 @@ pub struct BsChannelScheduler {
     pending_ra_acks: [Vec<u32>; 4],
     /// Raw base-frame-length encoding for unreserved common access fields.
     random_access_frame_len: u8,
+    aie_provider: Option<BsAieKeyProvider>,
+    /// Key-free policy for the downlink speech portion of an active traffic
+    /// circuit. A missing policy is deliberately not converted to clear.
+    traffic_aie: [Option<AieRequest>; 4],
 }
 
 #[derive(Debug)]
@@ -130,14 +138,17 @@ pub enum DlSchedElem {
     Broadcast(Todo),
 
     /// A received MAC-ACCESS PDU still has to be acknowledged
-    RandomAccessAck(TetraAddress),
+    /// Address and protection state of the MAC-ACCESS being acknowledged.
+    /// A standalone response must retain SC2/ESI state; it may not create a
+    /// clear response merely because no upper-layer resource was queued.
+    RandomAccessAck(TetraAddress, AieRequest),
 
     /// A slotgrant response, which has to be transmitted with high priority or the delay numbers will be off
     /// ssi and BasicSlotgrant are provided.
     Grant(TetraAddress, BasicSlotgrant),
 
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
-    Resource(MacResource, BitBuffer, Option<TxReporter>),
+    Resource(MacResource, BitBuffer, Option<TxReporter>, AieRequest),
 
     /// A capacity request received on an active assigned channel. The grant
     /// and its corresponding future FN18 reservation must be built together,
@@ -150,7 +161,7 @@ pub enum DlSchedElem {
     /// Pre-built STCH block for FACCH/stealing a half-slot from the traffic channel.
     /// Contains a 124-bit MAC-RESOURCE control block, for example a short
     /// floor-control PDU.
-    Stealing(BitBuffer, Option<TxReporter>),
+    Stealing(BitBuffer, Option<TxReporter>, AieRequest, Option<AieCipherRegion>),
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -163,6 +174,14 @@ const EMPTY_SCHED: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4] = [EMPTY_SCHED_C
 
 impl BsChannelScheduler {
     pub fn new(scrambling_code: u32, precomps: PrecomputedUmacPdus) -> Self {
+        Self::new_inner(scrambling_code, precomps, None)
+    }
+
+    pub fn new_with_aie_provider(scrambling_code: u32, precomps: PrecomputedUmacPdus, aie_provider: BsAieKeyProvider) -> Self {
+        Self::new_inner(scrambling_code, precomps, Some(aie_provider))
+    }
+
+    fn new_inner(scrambling_code: u32, precomps: PrecomputedUmacPdus, aie_provider: Option<BsAieKeyProvider>) -> Self {
         BsChannelScheduler {
             cur_dltime: TdmaTime { t: 0, f: 0, m: 0, h: 0 }, // Intentionally invalid, updated in tick function
             scrambling_code,
@@ -176,6 +195,8 @@ impl BsChannelScheduler {
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             random_access_frame_len: 4,
+            aie_provider,
+            traffic_aie: [None; 4],
         }
     }
 
@@ -280,6 +301,41 @@ impl BsChannelScheduler {
         if ext_services.auth_required != required {
             ext_services.auth_required = required;
             tracing::info!(required, "BS SYSINFO authentication policy updated");
+        }
+    }
+
+    /// Replace the active AIE broadcast policy. SYSINFO 1 keeps the
+    /// hyperframe field; with SC2 active SYSINFO 2 uses the mutually exclusive
+    /// cipher-key field and carries the current 16-bit SCK-VN. The scheduler
+    /// already alternates SYSINFO 1/2, so both fields are continually sent.
+    pub fn set_aie_config(&mut self, aie: &RuntimeAieConfig) {
+        let Some(ext_services) = self.precomps.mac_sysinfo2.ext_services.as_mut() else {
+            tracing::warn!("cannot update AIE policy: Extended Services is not present");
+            return;
+        };
+        ext_services.class1_supported = aie.enabled && aie.sc1_allowed;
+        ext_services.class2_supported = aie.enabled && aie.sc2.is_some();
+        ext_services.class3_supported = false;
+        ext_services.sck_n = aie.sc2.as_ref().map(|sc2| sc2.sckn);
+        self.precomps.mle_sysinfo.bs_service_details.aie_service = aie.enabled;
+
+        self.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn = None;
+        if let Some(sc2) = aie.enabled.then(|| aie.sc2.as_ref()).flatten() {
+            // The 16-bit SYSINFO cipher-key field is an SCK Version Number
+            // when SC2 is advertised; it is a CCK identifier only for SC3.
+            self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = Some(sc2.sck_vn);
+            self.precomps.mac_sysinfo2.hyperframe_number = None;
+            tracing::info!(
+                sckn = sc2.sckn,
+                sck_vn = sc2.sck_vn,
+                algorithm = ?sc2.algorithm,
+                sc1_allowed = aie.sc1_allowed,
+                "BS SYSINFO AIE policy updated"
+            );
+        } else {
+            self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = None;
+            self.precomps.mac_sysinfo2.hyperframe_number = Some(self.cur_dltime.h);
+            tracing::info!("BS SYSINFO AIE policy disabled");
         }
     }
 
@@ -637,17 +693,17 @@ impl BsChannelScheduler {
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
-    pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress) {
+    pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress, aie_request: AieRequest) {
         tracing::debug!(
             "dl_enqueue_random_access_ack: ts {} enqueueing random access acknowledgementfor addr {}",
             ts,
             addr
         );
-        let elem = DlSchedElem::RandomAccessAck(addr);
+        let elem = DlSchedElem::RandomAccessAck(addr, aie_request.with_scope(AieScope::MacResource));
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
-    pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+    pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>, aie_request: AieRequest) {
         // Get all timeslots on which a relevant MS is listening
         // let timeslots: [u8; NUM_TIMESLOTS] = self.identify_timeslots_for_ssi(pdu.addr);
         tracing::warn!("identify_timeslots_for_ssi not implemented yet, defaulting to ts1");
@@ -671,11 +727,11 @@ impl BsChannelScheduler {
             if next_ts > 0 {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
-                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone());
+                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), aie_request);
                 self.dltx_queues[ts as usize - 1].push(elem);
             } else {
                 // This is the last ts on which we need to transmit this message
-                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
+                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request);
                 self.dltx_queues[ts as usize - 1].push(elem);
                 break;
             }
@@ -686,12 +742,26 @@ impl BsChannelScheduler {
     /// channel.  This is used for a tracked listener during hangtime: the MS
     /// is still tuned to that slot, but no speech is being carried so FN1-17
     /// are available and waiting for FN18 only adds avoidable latency.
-    pub fn dl_enqueue_tma_on_timeslot(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+    pub fn dl_enqueue_tma_on_timeslot(
+        &mut self,
+        ts: u8,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        aie_request: AieRequest,
+    ) {
         assert!((1..=4).contains(&ts), "invalid downlink timeslot");
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
     }
 
-    pub fn dl_enqueue_associated_tma(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+    pub fn dl_enqueue_associated_tma(
+        &mut self,
+        ts: u8,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        aie_request: AieRequest,
+    ) {
         assert!((2..=4).contains(&ts), "associated control must use an assigned timeslot");
         let queue = &mut self.assoc_dltx_queues[ts as usize - 1];
         tracing::debug!(
@@ -701,7 +771,7 @@ impl BsChannelScheduler {
             queued_before = queue.len(),
             "queued associated FN18 control resource"
         );
-        queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter));
+        queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
     }
 
     /// Deliver a capacity grant through the target channel's FN18 control
@@ -714,7 +784,12 @@ impl BsChannelScheduler {
         // while integrating a queued RandomAccessAck; on FN18 we build the
         // associated response directly, so it must be present here.
         let pdu = Self::dl_make_minimal_resource(&addr, Some(grant), true);
-        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, BitBuffer::new(0), None));
+        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(
+            pdu,
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        ));
     }
 
     /// Queue an associated-channel capacity request without reserving its
@@ -732,6 +807,75 @@ impl BsChannelScheduler {
         self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
     }
 
+    /// Bind the upper-layer policy to this exact scheduled downlink slot and
+    /// prepare the clear MAC header. SC2 resources use an ESI: this is an
+    /// IESI for individual control and a GESI for group control.
+    fn prepare_downlink_resource(&self, mut pdu: MacResource, request: AieRequest, time: TdmaTime) -> Result<MacResource, AieContextError> {
+        let context = self.resolve_downlink_context(request, time)?;
+        if let AieContext::Sc2 { key, .. } = context {
+            let Some(address) = pdu.addr.as_mut() else {
+                return Err(AieContextError::InvalidContext);
+            };
+            match request {
+                AieRequest::Sc2 { subject, .. } => {
+                    let expected_type = match subject {
+                        AieSubject::Individual { .. } => SsiType::Issi,
+                        AieSubject::Group { .. } => SsiType::Gssi,
+                        _ => return Err(AieContextError::InvalidContext),
+                    };
+                    if address.ssi_type != expected_type
+                        && !(matches!(subject, AieSubject::Individual { .. }) && address.ssi_type == SsiType::Ssi)
+                    {
+                        return Err(AieContextError::InvalidContext);
+                    }
+                    address.ssi = self
+                        .aie_provider
+                        .as_ref()
+                        .ok_or(AieContextError::Sc2Disabled)?
+                        .encrypted_short_identity(context, address.ssi)?;
+                    address.ssi_type = SsiType::Esi;
+                }
+                _ => return Err(AieContextError::InvalidContext),
+            }
+            pdu.encryption_mode = 0b10 | (key.sck_vn as u8 & 1);
+        }
+        Ok(pdu)
+    }
+
+    /// Cipher the exact payload region written by one MAC-RESOURCE,
+    /// MAC-FRAG, or MAC-END.  Each fragment resolves a fresh context at its
+    /// own slot, thereby resetting the KSS as required by phase modulation.
+    fn cipher_fresh_downlink_chunk(
+        &self,
+        fragger: &mut BsFragger,
+        mac_block: &mut BitBuffer,
+        time: TdmaTime,
+    ) -> Result<(), AieContextError> {
+        let Some(region) = fragger.take_cipher_region() else {
+            return Ok(());
+        };
+        let context = self.resolve_downlink_context(region.request, time)?;
+        if context.is_encrypted() {
+            self.aie_provider
+                .as_ref()
+                .ok_or(AieContextError::Sc2Disabled)?
+                .cipher_downlink_mac(context, mac_block, region.start, region.len)?;
+        }
+        Ok(())
+    }
+
+    fn resolve_downlink_context(&self, request: AieRequest, time: TdmaTime) -> Result<AieContext, AieContextError> {
+        match request {
+            AieRequest::Clear { subject, scope } => Ok(AieContext::clear(subject, AieDirection::Downlink, time, scope)),
+            AieRequest::Sc2 { .. } => {
+                self.aie_provider
+                    .as_ref()
+                    .ok_or(AieContextError::Sc2Disabled)?
+                    .resolve(request, AieDirection::Downlink, time)
+            }
+        }
+    }
+
     fn dl_build_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let item = {
             let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
@@ -745,7 +889,7 @@ impl BsChannelScheduler {
         };
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
-            DlSchedElem::Resource(mut pdu, sdu, reporter) => {
+            DlSchedElem::Resource(mut pdu, sdu, reporter, aie_request) => {
                 // Build the BL-ACK grant from the FN18 that is actually being
                 // transmitted. The queue can survive mandatory BSCH/BNCH
                 // frames, so an enqueue-time reservation may point one
@@ -772,13 +916,30 @@ impl BsChannelScheduler {
                     queued_after_pop = self.assoc_dltx_queues[ts.t as usize - 1].len(),
                     "building associated FN18 control block"
                 );
-                let mut fragger = BsFragger::new(pdu, sdu, reporter);
-                if !fragger.get_next_chunk(&mut buf) {
+                let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
+                    Ok(pdu) => pdu,
+                    Err(error) => {
+                        tracing::warn!(dltime = %ts, ?error, "dropping associated MAC resource without a valid AIE context");
+                        return None;
+                    }
+                };
+                let mut fragger = BsFragger::new_with_aie(pdu, sdu, reporter, aie_request);
+                let complete = fragger.get_next_chunk(&mut buf);
+                if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                    tracing::warn!(dltime = %ts, ?error, "dropping associated MAC resource after AIE cipher failure");
+                    return None;
+                }
+                if !complete {
                     self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
             }
             DlSchedElem::FragBuf(mut fragger) => {
-                if !fragger.get_next_chunk(&mut buf) {
+                let complete = fragger.get_next_chunk(&mut buf);
+                if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                    tracing::warn!(dltime = %ts, ?error, "dropping associated MAC fragment after AIE cipher failure");
+                    return None;
+                }
+                if !complete {
                     self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
             }
@@ -801,7 +962,8 @@ impl BsChannelScheduler {
                     "prepared associated FN18 grant at actual transmission time"
                 );
                 let pdu = Self::dl_make_minimal_resource(&addr, Some(grant), true);
-                let mut fragger = BsFragger::new(pdu, BitBuffer::new(0), None);
+                let request = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+                let mut fragger = BsFragger::new_with_aie(pdu, BitBuffer::new(0), None, request);
                 if !fragger.get_next_chunk(&mut buf) {
                     self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                 }
@@ -846,13 +1008,20 @@ impl BsChannelScheduler {
             || self.dltx_queues.iter().any(|queue| {
                 queue
                     .iter()
-                    .any(|element| matches!(element, DlSchedElem::RandomAccessAck(address) if address.ssi == ssi))
+                    .any(|element| matches!(element, DlSchedElem::RandomAccessAck(address, _) if address.ssi == ssi))
             })
     }
 
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
     /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
-    pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>) {
+    pub fn dl_enqueue_stealing(
+        &mut self,
+        ts: u8,
+        block: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        aie_request: AieRequest,
+        cipher_region: Option<AieCipherRegion>,
+    ) {
         tracing::info!(
             dltime = %self.cur_dltime,
             ts,
@@ -861,7 +1030,15 @@ impl BsChannelScheduler {
             queued_before = self.dltx_queues[ts as usize - 1].len(),
             "queued FACCH/STCH block"
         );
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter, aie_request, cipher_region));
+    }
+
+    /// Update the policy that accompanies ordinary TCH/S speech on a circuit.
+    /// The provider still resolves it in LMAC at the actual TX time.
+    pub fn set_traffic_aie(&mut self, ts: u8, request: Option<AieRequest>) {
+        if (1..=4).contains(&ts) {
+            self.traffic_aie[ts as usize - 1] = request;
+        }
     }
 
     fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
@@ -937,7 +1114,7 @@ impl BsChannelScheduler {
 
         for index in 0..queue.len() {
             let elem = &mut queue[index];
-            if let DlSchedElem::Resource(pdu, _sdu, _repeat) = elem {
+            if let DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request) = elem {
                 if let Some(pdu_ssi) = pdu.addr {
                     if pdu_ssi.ssi == addr.ssi {
                         // Found a resource for this address
@@ -976,7 +1153,7 @@ impl BsChannelScheduler {
 
         let mut i = 0;
         while i < queue.len() {
-            if matches!(queue[i], DlSchedElem::Grant(_, _) | DlSchedElem::RandomAccessAck(_)) {
+            if matches!(queue[i], DlSchedElem::Grant(_, _) | DlSchedElem::RandomAccessAck(..)) {
                 let elem = queue.remove(i);
                 taken.push(elem);
             } else {
@@ -1010,7 +1187,7 @@ impl BsChannelScheduler {
                 );
 
                 match elem {
-                    DlSchedElem::Resource(_, _, tx_reporter) => {
+                    DlSchedElem::Resource(_, _, tx_reporter, _) => {
                         // Report as discarded manually
                         if let Some(tx_reporter) = tx_reporter {
                             tx_reporter.mark_discarded();
@@ -1021,7 +1198,7 @@ impl BsChannelScheduler {
                         // Fragger self-marks any unsent fragments as discarded when dropped, so we don't need to do anything here.
                     }
 
-                    DlSchedElem::RandomAccessAck(addr) => {
+                    DlSchedElem::RandomAccessAck(addr, _) => {
                         // Save the SSI so the next STCH for this address can carry
                         // random_access_flag=true (ETSI 21.4.3.1)
                         self.pending_ra_acks[timeslot as usize - 1].push(addr.ssi);
@@ -1047,12 +1224,12 @@ impl BsChannelScheduler {
             // Try to find existing resource for this address
             let addr = match &elem {
                 DlSchedElem::Grant(addr, _) => addr,
-                DlSchedElem::RandomAccessAck(addr) => addr,
+                DlSchedElem::RandomAccessAck(addr, _) => addr,
                 _ => panic!(),
             };
             let mac_resource = self.dl_get_scheduled_resource_for_ssi(ts, addr);
             match mac_resource {
-                Some(DlSchedElem::Resource(pdu, _sdu, _repeat)) => {
+                Some(DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request)) => {
                     // Integrate grant into the resource
                     match &elem {
                         DlSchedElem::Grant(_, grant) => {
@@ -1063,7 +1240,7 @@ impl BsChannelScheduler {
                             );
                             pdu.slot_granting_element = Some(grant.clone());
                         }
-                        DlSchedElem::RandomAccessAck(_) => {
+                        DlSchedElem::RandomAccessAck(..) => {
                             tracing::debug!(
                                 "dl_integrate_sched_elems_for_timeslot: Integrating ack into resource for addr {}",
                                 addr
@@ -1075,28 +1252,30 @@ impl BsChannelScheduler {
                 }
                 None => {
                     // No resource for this address was found, create a new one
-
-                    let pdu = match &elem {
+                    let (pdu, aie_request) = match &elem {
                         DlSchedElem::Grant(_, grant) => {
                             tracing::debug!(
                                 "dl_integrate_sched_elems_for_timeslot: Creating new resource for addr {} with grant {:?}",
                                 addr,
                                 grant
                             );
-                            Self::dl_make_minimal_resource(addr, Some(grant.clone()), false)
+                            (
+                                Self::dl_make_minimal_resource(addr, Some(grant.clone()), false),
+                                AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+                            )
                         }
-                        DlSchedElem::RandomAccessAck(_) => {
+                        DlSchedElem::RandomAccessAck(_, aie_request) => {
                             tracing::debug!(
                                 "dl_integrate_sched_elems_for_timeslot: Creating new resource for addr {} with ack",
                                 addr
                             );
-                            Self::dl_make_minimal_resource(addr, None, true)
+                            (Self::dl_make_minimal_resource(addr, None, true), *aie_request)
                         }
                         _ => panic!(),
                     };
 
                     // Push new resource into the queue. These do not need a tx_reporter
-                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None);
+                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, aie_request);
                     self.dltx_queues[ts.t as usize - 1].push(dlsched_res);
                 }
                 _ => panic!(),
@@ -1117,12 +1296,25 @@ impl BsChannelScheduler {
                             unimplemented_log!("finalize_ts_for_tick: Broadcast scheduling not implemented");
                         }
 
-                        DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
+                        DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             // Create fragger, either to send the whole PDU or to start fragmentation
-                            let mut fragger = BsFragger::new(pdu, sdu, tx_reporter);
-                            if !fragger.get_next_chunk(&mut buf) {
+                            let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
+                                Ok(pdu) => pdu,
+                                Err(error) => {
+                                    tracing::warn!(dltime = %ts, ?error, "dropping MAC resource without a valid AIE context");
+                                    buf_opt = Some(buf);
+                                    continue;
+                                }
+                            };
+                            let mut fragger = BsFragger::new_with_aie(pdu, sdu, tx_reporter, aie_request);
+                            let complete = fragger.get_next_chunk(&mut buf);
+                            if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                                tracing::warn!(dltime = %ts, ?error, "dropping MAC resource after AIE cipher failure");
+                                return None;
+                            }
+                            if !complete {
                                 // Fragmentation was started and we have more chunks to send
                                 // Enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
@@ -1133,7 +1325,12 @@ impl BsChannelScheduler {
                         DlSchedElem::FragBuf(mut fragger) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
-                            if !fragger.get_next_chunk(&mut buf) {
+                            let complete = fragger.get_next_chunk(&mut buf);
+                            if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                                tracing::warn!(dltime = %ts, ?error, "dropping MAC fragment after AIE cipher failure");
+                                return None;
+                            }
+                            if !complete {
                                 // Fragmentation was continued and we still have more chunks to send
                                 // Re-enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
@@ -1141,7 +1338,7 @@ impl BsChannelScheduler {
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::Stealing(_, tx_reporter) => {
+                        DlSchedElem::Stealing(_, tx_reporter, ..) => {
                             // Stealing items should only appear on traffic timeslots; discard if found here
                             tracing::warn!(
                                 "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, discarding",
@@ -1192,14 +1389,34 @@ impl BsChannelScheduler {
     /// - tch_block: speech/silence (274 bits)
     /// - stch_block: STCH signaling (124 bits) for FACCH stealing (EN 300 392-2, clause 23.5)
     /// Also reports transmission, if a TxReporter was attached to the DlSchedElem::Stealing element
-    fn dl_build_traffic_block(&mut self, ts: TdmaTime) -> (BitBuffer, Option<BitBuffer>) {
+    fn dl_build_traffic_block(
+        &mut self,
+        ts: TdmaTime,
+    ) -> (
+        BitBuffer,
+        Option<AieRequest>,
+        Option<(BitBuffer, AieRequest, Option<AieCipherRegion>)>,
+    ) {
         // Get speech data or silence
         let tch_buf = if let Some(block) = self.circuits.take_block(ts.t) {
-            let mut buf = BitBuffer::from_vec(block);
-            // Raw ACELP speech (274 bits for TCH/S).
-            // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
-            buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
-            buf
+            if block.len().saturating_mul(8) < TCH_S_CAP {
+                // Network/media input is not allowed to make the RF timing
+                // task panic. A malformed frame is replaced by a TCH/S
+                // silence frame; the next valid frame may still be sent.
+                tracing::warn!(
+                    ts = ts.t,
+                    supplied_bits = block.len().saturating_mul(8),
+                    required_bits = TCH_S_CAP,
+                    "dropping short downlink TCH/S frame and transmitting silence"
+                );
+                BitBuffer::new(TCH_S_CAP)
+            } else {
+                let mut buf = BitBuffer::from_vec(block);
+                // Raw ACELP speech (274 bits for TCH/S).
+                // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
+                buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
+                buf
+            }
         } else {
             // No voice data queued — send silence frame (all zeros).
             // This is normal during hangtime or between voice bursts.
@@ -1211,7 +1428,7 @@ impl BsChannelScheduler {
             let q = &mut self.dltx_queues[ts.t as usize - 1];
             if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
                 match q.remove(i) {
-                    DlSchedElem::Stealing(buf, tx_reporter) => (Some(buf), tx_reporter),
+                    DlSchedElem::Stealing(buf, tx_reporter, request, region) => (Some((buf, request, region)), tx_reporter),
                     _ => unreachable!(),
                 }
             } else {
@@ -1229,7 +1446,7 @@ impl BsChannelScheduler {
             tx_reporter.mark_transmitted();
         }
 
-        (tch_buf, stch_opt)
+        (tch_buf, self.traffic_aie[ts.t as usize - 1], stch_opt)
     }
 
     /// Return first queued grant.
@@ -1257,7 +1474,7 @@ impl BsChannelScheduler {
         }
 
         // Return Resources last
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _))) {
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _, _))) {
             return Some(q.remove(i));
         }
 
@@ -1313,8 +1530,13 @@ impl BsChannelScheduler {
         // We finalize a FUTURE slot: cur_ts plus some number of timeslots
         let ts = self.cur_dltime.add_timeslots(MACSCHED_TX_AHEAD as i32);
         self.precomps.mac_sync.time = ts;
+        self.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn = None;
         self.precomps.mac_sysinfo1.hyperframe_number = Some(ts.h);
-        self.precomps.mac_sysinfo2.hyperframe_number = Some(ts.h);
+        if self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn.is_none() {
+            self.precomps.mac_sysinfo2.hyperframe_number = Some(ts.h);
+        } else {
+            self.precomps.mac_sysinfo2.hyperframe_number = None;
+        }
 
         let dl_circuit_active = self.circuits.is_active(Direction::Dl, ts.t) && ts.f != 18;
         let ul_circuit_active = self.circuits.is_active(Direction::Ul, ts.t) && ts.f != 18;
@@ -1378,15 +1600,17 @@ impl BsChannelScheduler {
                     logical_channel: LogicalChannel::SchF,
                     mac_block: buf,
                     scrambling_code: self.scrambling_code,
+                    air_interface_encryption: None,
+                    cipher_region: None,
                 }),
                 blk2: None,
                 bbk: None,
                 ul_phy_chan: PhysicalChannel::Tp,
             }
         } else if dl_is_traffic {
-            let (tch_buf, stch_opt) = self.dl_build_traffic_block(ts);
+            let (tch_buf, traffic_aie, stch_opt) = self.dl_build_traffic_block(ts);
 
-            if let Some(stch_buf) = stch_opt {
+            if let Some((stch_buf, stch_aie, stch_region)) = stch_opt {
                 // FACCH/Stealing: 1st half = STCH signaling, 2nd half = TCH speech.
                 // NDB uses NormalTrainSeq2 for independent half-slot demodulation (EN 300 392-2, clause 23.5).
                 tracing::info!(
@@ -1405,11 +1629,18 @@ impl BsChannelScheduler {
                         logical_channel: LogicalChannel::Stch,
                         mac_block: stch_buf,
                         scrambling_code: self.scrambling_code,
+                        air_interface_encryption: Some(stch_aie.with_scope(AieScope::Facch)),
+                        // MAC-U-SIGNAL (3b) and MAC-RESOURCE header stay clear.
+                        cipher_region: stch_region,
                     }),
                     blk2: Some(TmvUnitdataReq {
                         logical_channel: LogicalChannel::TchS,
                         mac_block: tch_buf,
                         scrambling_code: self.scrambling_code,
+                        air_interface_encryption: traffic_aie.map(|request| request.with_scope(AieScope::Traffic)),
+                        // TCH/S AIE applies to the 274-bit traffic SDU
+                        // before channel coding, not to the 432 coded bits.
+                        cipher_region: traffic_aie.map(|_| tetra_core::AieCipherRegion::new(0, TCH_S_CAP)),
                     }),
                     bbk: None,
                     ul_phy_chan: ul_phy,
@@ -1422,6 +1653,8 @@ impl BsChannelScheduler {
                         logical_channel: LogicalChannel::TchS,
                         mac_block: tch_buf,
                         scrambling_code: self.scrambling_code,
+                        air_interface_encryption: traffic_aie.map(|request| request.with_scope(AieScope::Traffic)),
+                        cipher_region: traffic_aie.map(|_| tetra_core::AieCipherRegion::new(0, TCH_S_CAP)),
                     }),
                     blk2: None,
                     bbk: None,
@@ -1442,6 +1675,8 @@ impl BsChannelScheduler {
                         logical_channel: LogicalChannel::SchF,
                         mac_block: buf,
                         scrambling_code: self.scrambling_code,
+                        air_interface_encryption: None,
+                        cipher_region: None,
                     }),
                     blk2: None,
                     bbk: None,
@@ -1457,6 +1692,8 @@ impl BsChannelScheduler {
                             logical_channel: LogicalChannel::SchF,
                             mac_block: self.generate_hangtime_idle_schf(),
                             scrambling_code: self.scrambling_code,
+                            air_interface_encryption: None,
+                            cipher_region: None,
                         }),
                         blk2: None,
                         bbk: None,
@@ -1521,6 +1758,8 @@ impl BsChannelScheduler {
                 logical_channel: LogicalChannel::Bnch,
                 mac_block: buf,
                 scrambling_code: self.scrambling_code,
+                air_interface_encryption: None,
+                cipher_region: None,
             })
         } else if elem.blk2.is_none() {
             // Full-slot block (TCH or SCH/F): just verify it fills both half slots
@@ -1728,6 +1967,8 @@ impl BsChannelScheduler {
             logical_channel: LogicalChannel::Aach,
             mac_block: aach_bb,
             scrambling_code: self.scrambling_code,
+            air_interface_encryption: None,
+            cipher_region: None,
         }
     }
 
@@ -1750,6 +1991,8 @@ impl BsChannelScheduler {
                             logical_channel: LogicalChannel::SchHd,
                             mac_block: buf1,
                             scrambling_code: self.scrambling_code,
+                            air_interface_encryption: None,
+                            cipher_region: None,
                         }
                     }
                     1 => {
@@ -1761,6 +2004,8 @@ impl BsChannelScheduler {
                             logical_channel: LogicalChannel::SchF,
                             mac_block: buf,
                             scrambling_code: self.scrambling_code,
+                            air_interface_encryption: None,
+                            cipher_region: None,
                         }
                     }
                     _ => panic!(), // never happens
@@ -1775,6 +2020,8 @@ impl BsChannelScheduler {
                     logical_channel: LogicalChannel::Bsch,
                     mac_block: buf,
                     scrambling_code: scrambler::SCRAMB_INIT,
+                    air_interface_encryption: None,
+                    cipher_region: None,
                 }
             }
             _ => panic!(), // never happens
@@ -1900,7 +2147,7 @@ mod tests {
             rxlev_access_min: 3,
             access_parameter: 7,
             radio_dl_timeout: 3,
-            cck_id: None,
+            cipher_key_id_or_sck_vn: None,
             hyperframe_number: Some(0),
             option_field: SysinfoOptFieldFlag::DefaultDefForAccCodeA,
             ts_common_frames: None,
@@ -1919,7 +2166,7 @@ mod tests {
             rxlev_access_min: sysinfo1.rxlev_access_min,
             access_parameter: sysinfo1.access_parameter,
             radio_dl_timeout: sysinfo1.radio_dl_timeout,
-            cck_id: sysinfo1.cck_id,
+            cipher_key_id_or_sck_vn: sysinfo1.cipher_key_id_or_sck_vn,
             hyperframe_number: sysinfo1.hyperframe_number,
             option_field: SysinfoOptFieldFlag::ExtServicesBroadcast,
             ts_common_frames: None,
@@ -1976,6 +2223,31 @@ mod tests {
         let mut sched = BsChannelScheduler::new(1, precomps);
         sched.set_dl_time(TdmaTime::default().add_timeslots(2));
         sched
+    }
+
+    #[test]
+    fn sc2_sysinfo_alternates_hyperframe_and_cipher_key_field() {
+        let mut sched = get_testing_slotter();
+        sched.set_aie_config(&RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: Some(tetra_config::bluestation::RuntimeSc2Aie::new(
+                tetra_config::bluestation::RuntimeSc2TeaAlgorithm::Tea3,
+                30,
+                7,
+                [0x5a; 10],
+            )),
+        });
+
+        assert_eq!(sched.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn, None);
+        assert!(sched.precomps.mac_sysinfo1.hyperframe_number.is_some());
+        assert_eq!(sched.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn, Some(7));
+        assert_eq!(sched.precomps.mac_sysinfo2.hyperframe_number, None);
+        let ext = sched.precomps.mac_sysinfo2.ext_services.as_ref().expect("Extended Services");
+        assert!(!ext.class1_supported);
+        assert!(ext.class2_supported);
+        assert_eq!(ext.sck_n, Some(30));
+        assert!(sched.precomps.mle_sysinfo.bs_service_details.aie_service);
     }
 
     #[test]
@@ -2174,6 +2446,7 @@ mod tests {
             BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
             BitBuffer::new(0),
             Some(reporter),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
         );
 
         // In multiframe 1, frame 18 slot 2 is the mandatory BSCH position.
@@ -2297,7 +2570,12 @@ mod tests {
         };
         let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
         let sdu = BitBuffer::new(0);
-        sched.dl_enqueue_tma(pdu, sdu, None);
+        sched.dl_enqueue_tma(
+            pdu,
+            sdu,
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
 
         let grant = BasicSlotgrant {
             capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
@@ -2305,7 +2583,11 @@ mod tests {
         };
 
         sched.dl_enqueue_grant(ts.t, addr, grant);
-        sched.dl_enqueue_random_access_ack(ts.t, addr);
+        sched.dl_enqueue_random_access_ack(
+            ts.t,
+            addr,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
 
         sched.dump_ul_schedule(true);
         sched.dump_dl_queue();
@@ -2375,7 +2657,13 @@ mod tests {
         );
 
         // Hangtime with a pending stolen block: still AssignedControl, no flap to UMt.
-        sched.dl_enqueue_stealing(2, BitBuffer::from_bitstr("10110000"), None);
+        sched.dl_enqueue_stealing(
+            2,
+            BitBuffer::from_bitstr("10110000"),
+            None,
+            AieRequest::clear(AieSubject::System, AieScope::Facch),
+            None,
+        );
         assert!(sched.has_pending_stealing(2), "stealing block should be queued");
         let aach = decode_aach(&sched, ts);
         assert!(

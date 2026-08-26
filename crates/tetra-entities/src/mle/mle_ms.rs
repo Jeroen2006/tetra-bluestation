@@ -122,6 +122,7 @@ impl MleMs {
                     sdu,
                     handle: 0, // handle,
                     received_address: prim.main_address,
+                    air_interface_encryption: prim.air_interface_encryption,
                     forward_registration_target_station_id: None,
                 };
                 let msg = SapMsg {
@@ -213,6 +214,7 @@ impl MleMs {
                     sdu,
                     handle: 0, // handle,
                     received_address: prim.main_address,
+                    air_interface_encryption: prim.air_interface_encryption,
                     forward_registration_target_station_id: None,
                 };
                 let msg = SapMsg {

@@ -197,7 +197,64 @@ fn neighbour_to_air(neighbour: &NeighbourCell) -> NeighbourCellInformationForCa 
             aie_service: flags & (1 << 9) != 0,
             advanced_link: flags & (1 << 10) != 0,
         }),
-        timeshare_security_parameters: None,
+        // TS 100 392-2 table 18.101: select the "security parameters
+        // included" form (00) followed by the three security-parameter
+        // bits from EN 300 392-7 table A.104a.  This must be present even
+        // when its value is zero: absence means that the MS inherits the
+        // serving cell's security class, rather than that this neighbour is
+        // explicitly SC2-only.
+        timeshare_security_parameters: Some(neighbour_security_parameters(&report.cell)),
         tdma_frame_offset: report.synchronized.then_some(report.tdma_frame_offset),
+    }
+}
+
+/// Encode the 5-bit "Timeshare cell information or security parameters" IE
+/// for a CA neighbour. The leading `00` selects the security-parameters form;
+/// the remaining bits are Authentication, SC1 support and SC2-or-SC3. SC2 is
+/// represented by the final bit being zero. No key material, SCKN or SCK-VN
+/// is broadcast in this field.
+fn neighbour_security_parameters(cell: &tetra_swmi_protocol::CellConfig) -> u8 {
+    let authentication_required = u8::from(cell.authentication_required);
+    let sc1_supported = u8::from(cell.aie.enabled && cell.aie.sc1_allowed);
+    // This stack currently supports SC2 only. In the normative field a zero
+    // here explicitly means SC2; a one would mean SC3.
+    let sc2_or_sc3 = 0_u8;
+
+    (authentication_required << 2) | (sc1_supported << 1) | sc2_or_sc3
+}
+
+#[cfg(test)]
+mod tests {
+    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm};
+
+    use super::neighbour_security_parameters;
+
+    fn sc2_cell(authentication_required: bool, sc1_allowed: bool) -> CellConfig {
+        CellConfig {
+            config_version: 1,
+            mcc: 204,
+            mnc: 2671,
+            location_area: 1,
+            authentication_required,
+            aie: CellAieConfig {
+                enabled: true,
+                sc1_allowed,
+                sc2: Some(Sc2AieConfig {
+                    algorithm: Sc2TeaAlgorithm::Tea3,
+                    sckn: 7,
+                    sck_vn: 23,
+                    key: None,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn ca_neighbour_security_parameters_advertise_sc2() {
+        // 00 = security-parameters form; 1 = authentication required;
+        // 0 = SC1 not supported; 0 = SC2 supported.
+        assert_eq!(neighbour_security_parameters(&sc2_cell(true, false)), 0b0_0100);
+        // With SC1 fallback available, only the SC1 bit changes.
+        assert_eq!(neighbour_security_parameters(&sc2_cell(false, true)), 0b0_0010);
     }
 }

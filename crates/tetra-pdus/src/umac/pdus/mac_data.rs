@@ -39,7 +39,10 @@ impl MacData {
                 let ssi = buf.read_field(24, "ssi")? as u32;
                 let addr = TetraAddress {
                     ssi,
-                    ssi_type: SsiType::Issi, // Uplink, always ISSI
+                    // In an encrypted SC2 MAC-DATA this is the clear ESI,
+                    // not the real ISSI.  UMAC resolves TA61 through its
+                    // key provider before the TM-SDU reaches LLC.
+                    ssi_type: if encrypted { SsiType::Esi } else { SsiType::Issi },
                 };
                 (Some(addr), None)
             }

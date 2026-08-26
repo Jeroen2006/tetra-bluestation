@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tetra_core::{BitBuffer, TdmaTime, TetraAddress, Todo};
+use tetra_core::{AieRequest, BitBuffer, TdmaTime, TetraAddress};
 
 use crate::umac::subcomp::defrag::{DefragBuffer, DefragBufferState};
 
@@ -39,7 +39,7 @@ impl BsDefrag {
     }
 
     /// Inserts a first fragment into a fragbuffer.
-    pub fn insert_first(&mut self, bitbuffer: &mut BitBuffer, t: TdmaTime, addr: TetraAddress, aie_info: Option<Todo>) {
+    pub fn insert_first(&mut self, bitbuffer: &mut BitBuffer, t: TdmaTime, addr: TetraAddress, aie_request: Option<AieRequest>) {
         // Check if buffer already exists for this ssi/timeslot
         // Remove and discard, if so.
         let ts = (t.t - 1) as usize;
@@ -58,7 +58,7 @@ impl BsDefrag {
         buf.t_first = t;
         buf.t_last = t;
         buf.num_frags = 1;
-        buf.aie_info = aie_info;
+        buf.aie_request = aie_request;
 
         // Copy the bitbuffer data from pos to end into our fragbuffer
         buf.buffer.copy_bits(bitbuffer, bitbuffer.get_len_remaining());
@@ -135,8 +135,8 @@ impl BsDefrag {
         Some(buf)
     }
 
-    /// Retrieves a read-only reference to the AIE info associated with a DefragBuffer
-    pub fn get_aie_info(&self, ssi: u32, t: TdmaTime) -> Option<&Todo> {
+    /// Retrieves the key-free AIE policy associated with a DefragBuffer.
+    pub fn get_aie_request(&self, ssi: u32, t: TdmaTime) -> Option<AieRequest> {
         let ts = (t.t - 1) as usize;
         let buf = match self.buffers[ts].get(&ssi) {
             Some(b) => b,
@@ -149,7 +149,7 @@ impl BsDefrag {
             tracing::warn!("defrag_buffer for ts {} ssi {} not active", t.t, ssi);
             return None;
         };
-        buf.aie_info.as_ref()
+        buf.aie_request
     }
 }
 

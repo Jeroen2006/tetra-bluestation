@@ -18,8 +18,10 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
-use tetra_config::bluestation::{CfgSwmi, RuntimeNetworkBroadcast, SharedConfig};
-use tetra_swmi_protocol::{CellConfig, NeighbourCellSnapshot, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL};
+use tetra_config::bluestation::{CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2TeaAlgorithm, SharedConfig};
+use tetra_swmi_protocol::{
+    CellConfig, NeighbourCellSnapshot, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
+};
 
 use crate::network::transports::{
     NetworkTransport,
@@ -27,6 +29,35 @@ use crate::network::transports::{
 };
 
 pub mod entity;
+
+fn runtime_aie_config(cell: &CellConfig) -> Result<RuntimeAieConfig, &'static str> {
+    if !cell.aie.enabled {
+        return Ok(RuntimeAieConfig {
+            enabled: false,
+            sc1_allowed: cell.aie.sc1_allowed,
+            sc2: None,
+        });
+    }
+    let Some(sc2) = cell.aie.sc2 else {
+        return Err("active SwMI AIE configuration is missing SC2 settings");
+    };
+    let Some(key) = sc2.key else {
+        return Err("active SwMI SC2 configuration is missing SCK material");
+    };
+    Ok(RuntimeAieConfig {
+        enabled: true,
+        sc1_allowed: cell.aie.sc1_allowed,
+        sc2: Some(RuntimeSc2Aie::new(
+            match sc2.algorithm {
+                Sc2TeaAlgorithm::Tea1 => RuntimeSc2TeaAlgorithm::Tea1,
+                Sc2TeaAlgorithm::Tea3 => RuntimeSc2TeaAlgorithm::Tea3,
+            },
+            sc2.sckn,
+            sc2.sck_vn,
+            key,
+        )),
+    })
+}
 
 pub fn build_websocket_transport(config: &CfgSwmi) -> Result<WebSocketTransport, String> {
     let custom_root_certs = load_swmi_ca_certificate(config)?;
@@ -241,6 +272,7 @@ struct LocalRadioProfile {
 
 impl LocalRadioProfile {
     const SYSTEM_WIDE_SERVICES_FLAG: u16 = 1 << 5;
+    const AIE_SERVICE_FLAG: u16 = 1 << 9;
 
     fn from_config(config: &SharedConfig) -> Self {
         let cfg = config.config();
@@ -277,8 +309,13 @@ impl LocalRadioProfile {
     /// serving cell's effective state.  In particular, a BS with a configured
     /// SwMI uses the live connection state for `system_wide_services`, rather
     /// than the local fallback configuration value.
-    fn effective_service_flags(&self, network_connected: bool) -> u16 {
-        (self.service_flags & !Self::SYSTEM_WIDE_SERVICES_FLAG) | (u16::from(network_connected) << 5)
+    fn effective_service_flags(&self, network_connected: bool, aie_enabled: bool) -> u16 {
+        // AIE is an SwMI-owned runtime policy. Do not reuse the static local
+        // cell setting here, otherwise a neighbour snapshot can advertise an
+        // active SC2 cell with its Air Interface Encryption Service bit clear.
+        (self.service_flags & !(Self::SYSTEM_WIDE_SERVICES_FLAG | Self::AIE_SERVICE_FLAG))
+            | (u16::from(network_connected) << 5)
+            | (u16::from(aie_enabled) << 9)
     }
 
     fn report(&self, cell: CellConfig, runtime: &RuntimeNetworkBroadcast, network_connected: bool) -> SystemInfoReport {
@@ -292,7 +329,7 @@ impl LocalRadioProfile {
             reverse_operation: self.reverse_operation,
             colour_code: self.colour_code,
             system_code: self.system_code,
-            service_flags: self.effective_service_flags(network_connected),
+            service_flags: self.effective_service_flags(network_connected, cell.aie.enabled),
             ms_txpwr_max_cell: self.ms_txpwr_max_cell,
             rxlev_access_min: self.rxlev_access_min,
             subscriber_class: self.subscriber_class,
@@ -358,30 +395,71 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                 for incoming in self.transport.receive_reliable() {
                     match SwmiMessage::decode(&incoming.payload) {
                         Ok(SwmiMessage::CellConfig { command_id, cell }) => {
+                            // A CellConfig also arrives during initial LST
+                            // recovery.  Once that recovery is complete,
+                            // though, it is a live policy update (for example
+                            // an SCK/SCK-VN rotation), not a loss of SwMI
+                            // service.  Do not take system-wide services down
+                            // for an already-online connection.
+                            let was_online = self.endpoint.online.load(Ordering::Acquire);
+                            let aie = match runtime_aie_config(&cell) {
+                                Ok(aie) => aie,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        config_version = cell.config_version,
+                                        error,
+                                        "rejecting incomplete SwMI AIE configuration"
+                                    );
+                                    let _ = self.send(SwmiMessage::Receipt {
+                                        command_id,
+                                        accepted: false,
+                                        code: 2,
+                                    });
+                                    continue;
+                                }
+                            };
                             tracing::info!(
                                 config_version = cell.config_version,
                                 mcc = cell.mcc,
                                 mnc = cell.mnc,
                                 location_area = cell.location_area,
                                 authentication_required = cell.authentication_required,
+                                aie_enabled = aie.enabled,
+                                sc1_allowed = aie.sc1_allowed,
+                                sckn = aie.sc2.as_ref().map(|sc2| sc2.sckn),
+                                sck_vn = aie.sc2.as_ref().map(|sc2| sc2.sck_vn),
+                                algorithm = ?aie.sc2.as_ref().map(|sc2| sc2.algorithm),
                                 "SwMI cell configuration received"
                             );
                             // The central SwMI is authoritative for the serving
                             // cell policy.  UMAC reads this mutable value and
                             // updates the broadcast Extended Services field.
-                            self.stack_config.state_write().authentication_required = cell.authentication_required;
+                            {
+                                let mut state = self.stack_config.state_write();
+                                state.authentication_required = cell.authentication_required;
+                                state.aie = aie;
+                                // A changed SCKN/SCK-VN may not leave an old
+                                // per-terminal/call binding usable. The SCK
+                                // itself remains only in `state.aie`.
+                                let current_sc2 = if state.aie.enabled { state.aie.sc2.clone() } else { None };
+                                state.aie_sessions.retain_current_key(current_sc2.as_ref());
+                                if !was_online {
+                                    state.network_connected = false;
+                                }
+                            }
                             self.current_cell_config = Some(cell);
-                            // This session remains in LST until the SwMI has
-                            // reconciled the local subscriber snapshot.
-                            self.stack_config.state_write().network_connected = false;
                             let accepted = self.report_current_advertisement();
                             let _ = self.send(SwmiMessage::Receipt {
                                 command_id,
                                 accepted,
                                 code: if accepted { 0 } else { 1 },
                             });
-                            self.endpoint.online.store(false, Ordering::Release);
-                            self.stack_config.state_write().network_connected = false;
+                            if !was_online {
+                                // This session remains in LST until the SwMI
+                                // has reconciled the local subscriber snapshot.
+                                self.endpoint.online.store(false, Ordering::Release);
+                                self.stack_config.state_write().network_connected = false;
+                            }
                         }
                         Ok(SwmiMessage::Receipt {
                             command_id,
@@ -399,6 +477,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::AuthenticationChallenge { .. }
                             | SwmiMessage::AuthenticationResponseDemand { .. }
                             | SwmiMessage::AuthenticationResult { .. }
+                            | SwmiMessage::OtarDownlink { .. }
                             | SwmiMessage::LivelinessCheck { .. }),
                         ) => {
                             if let SwmiMessage::LstRecoveryRequest { command_id } = &message {
@@ -504,7 +583,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
         id
     }
     fn report_current_advertisement(&mut self) -> bool {
-        let Some(cell) = self.current_cell_config else {
+        let Some(cell) = self.current_cell_config.clone() else {
             return false;
         };
         let runtime = self.stack_config.state_read().network_broadcast.clone();
@@ -539,7 +618,33 @@ impl<T: NetworkTransport> SwmiWorker<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::LocalRadioProfile;
+    use super::{LocalRadioProfile, runtime_aie_config};
+    use tetra_config::bluestation::RuntimeSc2TeaAlgorithm;
+    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm};
+
+    #[test]
+    fn runtime_aie_config_retains_the_tea_algorithm_from_swmi() {
+        let runtime = runtime_aie_config(&CellConfig {
+            config_version: 1,
+            mcc: 204,
+            mnc: 2671,
+            location_area: 42,
+            authentication_required: false,
+            aie: CellAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: Some(Sc2AieConfig {
+                    algorithm: Sc2TeaAlgorithm::Tea3,
+                    sckn: 30,
+                    sck_vn: 7,
+                    key: Some([0x5a; 10]),
+                }),
+            },
+        })
+        .expect("valid AIE configuration");
+
+        assert_eq!(runtime.sc2.expect("SC2 settings").algorithm, RuntimeSc2TeaAlgorithm::Tea3);
+    }
 
     #[test]
     fn neighbour_service_flags_follow_the_effective_swmi_connection_state() {
@@ -561,7 +666,8 @@ mod tests {
             tdma_frame_offset: 0,
         };
 
-        assert_eq!(profile.effective_service_flags(false), 0b000_0100_0011);
-        assert_eq!(profile.effective_service_flags(true), 0b000_0110_0011);
+        assert_eq!(profile.effective_service_flags(false, false), 0b000_0100_0011);
+        assert_eq!(profile.effective_service_flags(true, false), 0b000_0110_0011);
+        assert_eq!(profile.effective_service_flags(true, true), 0b100_0110_0011);
     }
 }

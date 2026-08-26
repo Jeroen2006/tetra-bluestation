@@ -296,7 +296,12 @@ pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
 /// Decode traffic plane from type5 to type1 bits (ACELP codec order). Reverse of `encode_tp()`:
 /// descramble → deinterleave → split UEP → Class0 copy, Class1+2 depuncture+Viterbi → CRC → reassemble → reorder.
 /// Returns (Option<BitBuffer>, bool): 274 ACELP bits if successful, CRC check result for Class 2.
-pub fn decode_tp_with_soft(lchan: LogicalChannel, type5_block: BitBuffer, soft_type5: Option<&[SoftBit]>, scrambling_code: u32) -> (Option<BitBuffer>, bool) {
+pub fn decode_tp_with_soft(
+    lchan: LogicalChannel,
+    type5_block: BitBuffer,
+    soft_type5: Option<&[SoftBit]>,
+    scrambling_code: u32,
+) -> (Option<BitBuffer>, bool) {
     assert_eq!(lchan, LogicalChannel::TchS);
 
     let params = errorcontrol_params::get_params(lchan);
@@ -357,11 +362,28 @@ pub fn decode_tp_with_soft(lchan: LogicalChannel, type5_block: BitBuffer, soft_t
 
         let soft: Vec<SoftBit> = if let Some(soft_type3) = &soft_type3 {
             let mut output = vec![0 as SoftBit; (CLASS1_BITS + CLASS2_TYPE2) * 3];
-            convenc::tetra_rcpc_depunct_soft(RcpcPunctMode::Rate112_168, &soft_type3[CLASS0_BITS..CLASS0_BITS + CLASS1_TYPE3], CLASS1_TYPE3, &mut output[..CLASS1_BITS * 3]);
-            convenc::tetra_rcpc_depunct_soft(RcpcPunctMode::Rate72_162, &soft_type3[CLASS0_BITS + CLASS1_TYPE3..CLASS0_BITS + CLASS1_TYPE3 + CLASS2_TYPE3], CLASS2_TYPE3, &mut output[CLASS1_BITS * 3..]);
+            convenc::tetra_rcpc_depunct_soft(
+                RcpcPunctMode::Rate112_168,
+                &soft_type3[CLASS0_BITS..CLASS0_BITS + CLASS1_TYPE3],
+                CLASS1_TYPE3,
+                &mut output[..CLASS1_BITS * 3],
+            );
+            convenc::tetra_rcpc_depunct_soft(
+                RcpcPunctMode::Rate72_162,
+                &soft_type3[CLASS0_BITS + CLASS1_TYPE3..CLASS0_BITS + CLASS1_TYPE3 + CLASS2_TYPE3],
+                CLASS2_TYPE3,
+                &mut output[CLASS1_BITS * 3..],
+            );
             output
         } else {
-            combined_mother.iter().map(|&bit| match bit { 0x00 => -1, 0x01 => 1, _ => 0 }).collect()
+            combined_mother
+                .iter()
+                .map(|&bit| match bit {
+                    0x00 => -1,
+                    0x01 => 1,
+                    _ => 0,
+                })
+                .collect()
         };
 
         let decoder = viterbi::TetraCodecViterbiDecoder::new();
@@ -486,6 +508,8 @@ mod tests {
             mac_block: bb,
             logical_channel: lchan,
             scrambling_code: scramb_code,
+            air_interface_encryption: None,
+            cipher_region: None,
         };
         let type5 = encode_cp(prim_req);
         // println!("type5:   {}", type5.dump_bin());
@@ -520,6 +544,8 @@ mod tests {
             mac_block: bb,
             logical_channel: lchan,
             scrambling_code: scramb_code,
+            air_interface_encryption: None,
+            cipher_region: None,
         };
         let type5 = encode_cp(prim_req);
         let prim_ind = TpUnitdataInd {
@@ -595,6 +621,8 @@ mod tests {
             mac_block: bb,
             logical_channel: lchan,
             scrambling_code: scramb_code,
+            air_interface_encryption: None,
+            cipher_region: None,
         };
         let type5 = encode_cp(prim_req);
         let prim_ind = TpUnitdataInd {
@@ -626,6 +654,8 @@ mod tests {
             mac_block: bb,
             logical_channel: lchan,
             scrambling_code: scramb_code,
+            air_interface_encryption: None,
+            cipher_region: None,
         };
         let type5 = encode_tp(prim_req, 1);
         assert_eq!(type5.get_len(), 432);

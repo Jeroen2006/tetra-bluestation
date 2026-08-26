@@ -28,8 +28,6 @@ pub struct DLocationUpdateCommand {
     pub proprietary: Option<u64>,
 }
 
-#[allow(unreachable_code)] // TODO FIXME review, finalize and remove this
-#[allow(unused_variables)]
 impl DLocationUpdateCommand {
     /// Parse from BitBuffer
     pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
@@ -40,21 +38,20 @@ impl DLocationUpdateCommand {
         let group_identity_report = buffer.read_field(1, "group_identity_report")? != 0;
         // Type1
         let cipher_control = buffer.read_field(1, "cipher_control")? != 0;
-        // Conditional
-        unimplemented!();
-        let ciphering_parameters = if true { Some(0) } else { None };
+        // Conditional.  Ciphering parameters are present exactly when the
+        // command requests ciphering on (EN 300 392-7, 16.9.2.8).
+        let ciphering_parameters = cipher_control.then(|| buffer.read_field(10, "ciphering_parameters")).transpose()?;
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;
 
         // Type2
         let address_extension = typed::parse_type2_generic(obit, buffer, 24, "address_extension")?;
-        // Conditional
-        unimplemented!();
-        let cell_type_control = if obit { Some(0) } else { None };
-        // Conditional
-        unimplemented!();
-        let proprietary = if obit { Some(0) } else { None };
+        // Conditional Type-3 fields.  They appear in numerical order after
+        // the Type-2 address extension and are followed by the terminating
+        // M-bit when any optional element is present.
+        let cell_type_control = typed::parse_type3_generic(obit, buffer, 13u64)?.map(|field| field.data);
+        let proprietary = typed::parse_type3_generic(obit, buffer, 15u64)?.map(|field| field.data);
 
         // Read trailing obit (if not previously encountered)
         obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
@@ -74,6 +71,12 @@ impl DLocationUpdateCommand {
 
     /// Serialize this PDU into the given BitBuffer.
     pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        if self.cipher_control != self.ciphering_parameters.is_some() {
+            return Err(PduParseErr::InvalidValue {
+                field: "ciphering_parameters",
+                value: self.ciphering_parameters.unwrap_or_default(),
+            });
+        }
         // PDU Type
         buffer.write_bits(MmPduTypeDl::DLocationUpdateCommand.into_raw(), 4);
         // Type1
@@ -86,7 +89,7 @@ impl DLocationUpdateCommand {
         }
 
         // Check if any optional field present and place o-bit
-        let obit = self.address_extension.is_some();
+        let obit = self.address_extension.is_some() || self.cell_type_control.is_some() || self.proprietary.is_some();
         delimiters::write_obit(buffer, obit as u8);
         if !obit {
             return Ok(());
@@ -95,14 +98,23 @@ impl DLocationUpdateCommand {
         // Type2
         typed::write_type2_generic(obit, buffer, self.address_extension, 24);
 
-        // Conditional
-        if let Some(ref value) = self.cell_type_control {
-            buffer.write_bits(*value, 3);
-        }
-        // Conditional
-        if let Some(ref value) = self.proprietary {
-            buffer.write_bits(*value, 3);
-        }
+        // Conditional Type-3 fields.  Cell type control and proprietary are
+        // three-bit payloads in this PDU, so construct their Type-3 headers
+        // through the common writer rather than writing naked payload bits.
+        let cell_type_control = self.cell_type_control.map(|data| Type3FieldGeneric {
+            field_id: 13,
+            len: 3,
+            data,
+            raw: Vec::new(),
+        });
+        typed::write_type3_generic(obit, buffer, &cell_type_control, 13u64)?;
+        let proprietary = self.proprietary.map(|data| Type3FieldGeneric {
+            field_id: 15,
+            len: 3,
+            data,
+            raw: Vec::new(),
+        });
+        typed::write_type3_generic(obit, buffer, &proprietary, 15u64)?;
         // Write terminating m-bit
         delimiters::write_mbit(buffer, 0);
         Ok(())
@@ -121,5 +133,47 @@ impl fmt::Display for DLocationUpdateCommand {
             self.cell_type_control,
             self.proprietary,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ciphering_on_roundtrips() {
+        let pdu = DLocationUpdateCommand {
+            group_identity_report: false,
+            cipher_control: true,
+            ciphering_parameters: Some(0b10_0101_0110),
+            address_extension: Some(0x12_3456),
+            cell_type_control: Some(0b101),
+            proprietary: Some(0b011),
+        };
+        let mut encoded = BitBuffer::new_autoexpand(96);
+        pdu.to_bitbuf(&mut encoded).expect("serialize");
+        encoded.seek(0);
+        let decoded = DLocationUpdateCommand::from_bitbuf(&mut encoded).expect("parse");
+        assert_eq!(decoded.group_identity_report, pdu.group_identity_report);
+        assert_eq!(decoded.cipher_control, pdu.cipher_control);
+        assert_eq!(decoded.ciphering_parameters, pdu.ciphering_parameters);
+        assert_eq!(decoded.address_extension, pdu.address_extension);
+        assert_eq!(decoded.cell_type_control, pdu.cell_type_control);
+        assert_eq!(decoded.proprietary, pdu.proprietary);
+        assert_eq!(encoded.get_len_remaining(), 0);
+    }
+
+    #[test]
+    fn cipher_control_and_parameters_must_agree() {
+        let pdu = DLocationUpdateCommand {
+            group_identity_report: false,
+            cipher_control: false,
+            ciphering_parameters: Some(1),
+            address_extension: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut encoded = BitBuffer::new_autoexpand(32);
+        assert!(pdu.to_bitbuf(&mut encoded).is_err());
     }
 }

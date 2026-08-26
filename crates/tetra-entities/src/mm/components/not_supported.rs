@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, Layer2Service, Sap, TetraAddress, tetra_entities::TetraEntity};
+use tetra_core::{AieRequest, BitBuffer, Layer2Service, Sap, TetraAddress, tetra_entities::TetraEntity};
 use tetra_saps::{SapMsg, SapMsgInner, lmm::LmmMleUnitdataReq};
 
 use tetra_pdus::mm::{enums::mm_pdu_type_ul::MmPduTypeUl, pdus::mm_pdu_function_not_supported::MmPduFunctionNotSupported};
@@ -8,6 +8,7 @@ pub fn make_ul_mm_pdu_function_not_supported(
     pdu_type: MmPduTypeUl,
     pdu_subtype: Option<(usize, u64)>,
     ssi: TetraAddress,
+    aie_request: AieRequest,
 ) -> (SapMsg, String) {
     // Create PDU
     let pdu = MmPduFunctionNotSupported {
@@ -35,6 +36,7 @@ pub fn make_ul_mm_pdu_function_not_supported(
             stealing_permission: false,
             stealing_repeats_flag: false,
             encryption_flag: false,
+            aie_request,
             is_null_pdu: false,
             tx_reporter: None,
             seamless_handover: None,

@@ -43,7 +43,12 @@ impl MacAccess {
         let (addr, event_label) = match addr_type {
             0 => {
                 let address = TetraAddress {
-                    ssi_type: SsiType::Issi, // Uplink, always ISSI
+                    // Clause 6.5.2 reserves the encryption bit in an uplink
+                    // signalling MAC header. In SC2 SCK mode an encrypted
+                    // individual MAC-ACCESS carries the clear ESI, not the
+                    // real ISSI. Keep that distinction at the PDU boundary
+                    // so UMAC can resolve it through the BS key provider.
+                    ssi_type: if encrypted { SsiType::Esi } else { SsiType::Issi },
                     ssi: buf.read_field(24, "ssi")? as u32,
                 };
                 (Some(address), None)
@@ -108,7 +113,7 @@ impl MacAccess {
         if let Some(addr) = self.addr {
             assert!((addr.ssi_type == SsiType::Esi) == self.encrypted);
             match addr.ssi_type {
-                SsiType::Ssi | SsiType::Issi | SsiType::Gssi => {
+                SsiType::Ssi | SsiType::Issi | SsiType::Gssi | SsiType::Esi => {
                     buf.write_bits(0, 2);
                     buf.write_bits(addr.ssi as u64, 24);
                 }
@@ -174,5 +179,33 @@ impl fmt::Display for MacAccess {
             write!(f, " reservation_req: {}", v)?;
         }
         write!(f, " }}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_access_roundtrip_preserves_esi_type() {
+        let original = MacAccess {
+            fill_bits: false,
+            encrypted: true,
+            addr: Some(TetraAddress {
+                ssi_type: SsiType::Esi,
+                ssi: 0x00ab_cdef,
+            }),
+            event_label: None,
+            length_ind: Some(8),
+            frag_flag: None,
+            reservation_req: None,
+        };
+        let mut wire = BitBuffer::new_autoexpand(40);
+        original.to_bitbuf(&mut wire);
+        wire.seek(0);
+
+        let parsed = MacAccess::from_bitbuf(&mut wire).expect("encrypted MAC-ACCESS must decode");
+        assert!(parsed.encrypted);
+        assert_eq!(parsed.addr.expect("address").ssi_type, SsiType::Esi);
     }
 }

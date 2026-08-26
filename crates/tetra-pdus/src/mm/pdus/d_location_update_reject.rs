@@ -15,7 +15,7 @@ use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 
 // note 1: Information element "Ciphering parameters" is not present if "Cipher control" is set to "0", "ciphering off".
 // note 2: Information element "Ciphering parameters" is present if "Cipher control" is set to "1", "ciphering on".
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DLocationUpdateReject {
     /// Type1, 3 bits, Location update type
     pub location_update_type: LocationUpdateType,
@@ -33,8 +33,6 @@ pub struct DLocationUpdateReject {
     pub proprietary: Option<Type3FieldGeneric>,
 }
 
-#[allow(unreachable_code)] // TODO FIXME review, finalize and remove this
-#[allow(unused_variables)]
 impl DLocationUpdateReject {
     /// Parse from BitBuffer
     pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
@@ -48,9 +46,9 @@ impl DLocationUpdateReject {
         let reject_cause = buffer.read_field(5, "reject_cause")? as u8;
         // Type1
         let cipher_control = buffer.read_field(1, "cipher_control")? != 0;
-        // Conditional
-        unimplemented!();
-        let ciphering_parameters = if true { Some(0) } else { None };
+        // Conditional: this element is present exactly when ciphering is
+        // enabled (EN 300 392-7, 16.9.2.9).
+        let ciphering_parameters = cipher_control.then(|| buffer.read_field(10, "ciphering_parameters")).transpose()?;
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;
@@ -82,6 +80,12 @@ impl DLocationUpdateReject {
 
     /// Serialize this PDU into the given BitBuffer.
     pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        if self.cipher_control != self.ciphering_parameters.is_some() {
+            return Err(PduParseErr::Inconsistency {
+                field: "ciphering_parameters",
+                reason: "present exactly when cipher_control is set",
+            });
+        }
         // PDU Type
         buffer.write_bits(MmPduTypeDl::DLocationUpdateReject.into_raw(), 4);
         // Type1
@@ -114,6 +118,43 @@ impl DLocationUpdateReject {
         // Write terminating m-bit
         delimiters::write_mbit(buffer, 0);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ciphering_on_roundtrips() {
+        let pdu = DLocationUpdateReject {
+            location_update_type: LocationUpdateType::RoamingLocationUpdating,
+            reject_cause: 7,
+            cipher_control: true,
+            ciphering_parameters: Some(0b10_0101_0110),
+            address_extension: Some(0x12_3456),
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut buffer = BitBuffer::new_autoexpand(96);
+        pdu.to_bitbuf(&mut buffer).expect("serialize reject");
+        buffer.seek(0);
+        assert_eq!(DLocationUpdateReject::from_bitbuf(&mut buffer).expect("parse reject"), pdu);
+        assert_eq!(buffer.get_len_remaining(), 0);
+    }
+
+    #[test]
+    fn ciphering_parameters_must_match_control() {
+        let pdu = DLocationUpdateReject {
+            location_update_type: LocationUpdateType::RoamingLocationUpdating,
+            reject_cause: 7,
+            cipher_control: false,
+            ciphering_parameters: Some(1),
+            address_extension: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        assert!(pdu.to_bitbuf(&mut BitBuffer::new_autoexpand(32)).is_err());
     }
 }
 

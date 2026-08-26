@@ -25,7 +25,7 @@ fn test_udata_with_broken_mm_payload() {
         endpoint_id: 0,
         new_endpoint_id: None,
         css_endpoint_id: None,
-        air_interface_encryption: 0,
+        air_interface_encryption: None,
         chan_change_response_req: false,
         chan_change_handle: None,
         chan_info: None,

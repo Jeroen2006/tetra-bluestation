@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, SsiType, TdmaTime, TetraAddress, Todo};
+use tetra_core::{AieRequest, BitBuffer, SsiType, TdmaTime, TetraAddress};
 
 const DEFRAG_BUF_INITIAL_LEN: usize = 512;
 
@@ -15,7 +15,9 @@ pub struct DefragBuffer {
     pub t_first: TdmaTime,
     pub t_last: TdmaTime,
     pub num_frags: usize,
-    pub aie_info: Option<Todo>,
+    /// Key-free ciphering policy inherited by all fragments of this TM-SDU.
+    /// The exact TDMA time is deliberately resolved again per fragment.
+    pub aie_request: Option<AieRequest>,
     pub buffer: BitBuffer,
 }
 
@@ -30,7 +32,7 @@ impl DefragBuffer {
             t_first: TdmaTime::default(),
             t_last: TdmaTime::default(),
             num_frags: 0,
-            aie_info: None,
+            aie_request: None,
             buffer: BitBuffer::new_autoexpand(DEFRAG_BUF_INITIAL_LEN),
         }
     }
@@ -44,7 +46,7 @@ impl DefragBuffer {
         self.t_first = TdmaTime::default();
         self.t_last = TdmaTime::default();
         self.num_frags = 0;
-        self.aie_info = None;
+        self.aie_request = None;
         self.buffer = BitBuffer::new_autoexpand(DEFRAG_BUF_INITIAL_LEN);
     }
 }

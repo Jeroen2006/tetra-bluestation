@@ -1,6 +1,6 @@
 #![allow(unused)]
-use tetra_core::{BitBuffer, EndpointId, LinkId, TetraAddress, Todo, TxReporter};
 use crate::tma::AssociatedChannel;
+use tetra_core::{AieRequest, BitBuffer, EndpointId, LinkId, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
@@ -105,7 +105,7 @@ pub struct TlaTlDataReqBl {
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,
-    pub air_interface_encryption: Option<Todo>,
+    pub air_interface_encryption: Option<AieRequest>,
     pub stealing_repeats_flag: Option<bool>,
     pub data_class_info: Option<Todo>,
     pub req_handle: Todo,
@@ -137,7 +137,9 @@ pub struct TlaTlDataIndBl {
     pub tl_sdu: Option<BitBuffer>,
     pub scrambling_code: u32,
     pub fcs_flag: bool,
-    pub air_interface_encryption: Todo,
+    /// Key-free received AIE policy, preserved from TMA for upper-layer
+    /// clear-PDU and OTAR policy decisions.
+    pub air_interface_encryption: Option<AieRequest>,
     pub chan_change_resp_req: bool,
     pub chan_change_handle: Option<Todo>,
     pub chan_info: Option<Todo>,
@@ -256,7 +258,7 @@ pub struct TlaTlUnitdataReqBl {
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,
-    pub air_interface_encryption: Option<Todo>,
+    pub air_interface_encryption: Option<AieRequest>,
     // pub data_prio: Todo,
     pub packet_data_flag: bool,
     pub n_tlsdu_repeats: u8, // TODO check data type and purpose
@@ -291,7 +293,9 @@ pub struct TlaTlUnitdataIndBl {
     pub tl_sdu: Option<BitBuffer>,
     pub scrambling_code: u32,
     pub fcs_flag: bool,
-    pub air_interface_encryption: Todo,
+    /// Key-free received AIE policy, preserved from TMA for upper-layer
+    /// clear-PDU and OTAR policy decisions.
+    pub air_interface_encryption: Option<AieRequest>,
     pub chan_change_resp_req: bool,
     pub chan_change_handle: Option<Todo>,
     pub chan_info: Option<Todo>,

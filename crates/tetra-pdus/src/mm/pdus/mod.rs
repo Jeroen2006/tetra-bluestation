@@ -1,5 +1,6 @@
 pub mod d_attach_detach_group_identity;
 pub mod d_attach_detach_group_identity_acknowledgement;
+pub mod ck_change;
 pub mod d_authentication_demand;
 pub mod d_authentication_response;
 pub mod d_authentication_result;
@@ -9,6 +10,7 @@ pub mod d_location_update_proceeding;
 pub mod d_location_update_reject;
 pub mod d_mm_status;
 pub mod mm_pdu_function_not_supported;
+pub mod otar;
 pub mod u_attach_detach_group_identity;
 pub mod u_attach_detach_group_identity_acknowledgement;
 pub mod u_authentication;

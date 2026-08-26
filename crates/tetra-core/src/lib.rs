@@ -8,6 +8,7 @@ pub const GIT_VERSION: &str = git_version::git_version!(fallback = "unknown");
 pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", env!("CARGO_PKG_VERSION"), GIT_VERSION);
 
 pub mod address;
+pub mod aie;
 pub mod bitbuffer;
 pub mod debug;
 pub mod direction;
@@ -25,6 +26,7 @@ pub mod typed_pdu_fields;
 
 // Re-export commonly used items
 pub use address::*;
+pub use aie::*;
 pub use bitbuffer::BitBuffer;
 pub use direction::Direction;
 pub use pdu_parse_error::PduParseErr;

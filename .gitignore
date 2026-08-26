@@ -6,3 +6,5 @@ docs/
 docs/*
 !docs/swmi-architecture-plan.md
 !docs/test-infrastructure-access.md
+!docs/sc2/
+!docs/sc2/**

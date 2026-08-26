@@ -1,7 +1,7 @@
 use std::cmp::min;
 
 use crate::umac::subcomp::fillbits;
-use tetra_core::{BitBuffer, TxReporter};
+use tetra_core::{AieRequest, AieScope, BitBuffer, TxReporter};
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START;
 use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource};
@@ -14,6 +14,18 @@ pub struct BsFragger {
     is_fully_transmitted: bool,
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
+    aie_request: AieRequest,
+    /// The exact region produced by the most recent chunk.  The scheduler
+    /// binds `aie_request` to the actual TDMA slot and ciphers only this
+    /// range; headers and fill bits remain outside it.
+    last_cipher_region: Option<MacCipherRegion>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MacCipherRegion {
+    pub request: AieRequest,
+    pub start: usize,
+    pub len: usize,
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
@@ -23,7 +35,17 @@ const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32;
 const MIN_SLOT_CAP_FOR_FRAG: usize = 16;
 
 impl BsFragger {
+    /// Compatibility constructor for deliberately clear control resources.
     pub fn new(resource: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) -> Self {
+        Self::new_with_aie(
+            resource,
+            sdu,
+            tx_reporter,
+            AieRequest::clear(tetra_core::AieSubject::System, AieScope::MacResource),
+        )
+    }
+
+    pub fn new_with_aie(resource: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>, aie_request: AieRequest) -> Self {
         assert!(sdu.get_pos() == 0, "SDU must be at the start of the buffer");
         // We set the length field now. If we do fragmentation, we'll set it to -1 later.
         // resource.update_len_and_fill_ind(sdu.get_len());
@@ -34,7 +56,13 @@ impl BsFragger {
             is_fully_transmitted: false,
             sdu,
             tx_reporter,
+            aie_request,
+            last_cipher_region: None,
         }
+    }
+
+    pub fn take_cipher_region(&mut self) -> Option<MacCipherRegion> {
+        self.last_cipher_region.take()
     }
 
     /// Writes MAC-RESOURCE to dest_buf, starting fragmentation if needed.
@@ -50,6 +78,7 @@ impl BsFragger {
             "Null PDU cannot have SDU data"
         );
 
+        let chunk_start = mac_block.get_pos();
         // Compute len of full resource, including sdu and fill bits
         let mut hdr_len_bits = self.resource.compute_header_len();
         let sdu_len_bits = self.sdu.get_len_remaining();
@@ -83,6 +112,13 @@ impl BsFragger {
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_len_bits);
             fillbits::addition::write(mac_block, Some(num_fill_bits));
+            let clear_header =
+                self.resource.compute_header_len() - self.resource.chan_alloc_element.as_ref().map_or(0, ChanAllocElement::compute_len);
+            self.last_cipher_region = Some(MacCipherRegion {
+                request: self.aie_request.with_scope(AieScope::MacResource),
+                start: chunk_start + clear_header,
+                len: self.resource.compute_header_len() + sdu_len_bits - clear_header,
+            });
 
             // We're done with this packet
             self.mac_hdr_is_written = true;
@@ -140,6 +176,13 @@ impl BsFragger {
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_space_bits);
             fillbits::addition::write(mac_block, None);
+            let clear_header =
+                self.resource.compute_header_len() - self.resource.chan_alloc_element.as_ref().map_or(0, ChanAllocElement::compute_len);
+            self.last_cipher_region = Some(MacCipherRegion {
+                request: self.aie_request.with_scope(AieScope::MacResource),
+                start: chunk_start + clear_header,
+                len: self.resource.compute_header_len() + sdu_space_bits - clear_header,
+            });
 
             // More fragments follow
             self.mac_hdr_is_written = true;
@@ -155,6 +198,7 @@ impl BsFragger {
         // Some sanity checks
         assert!(self.mac_hdr_is_written, "MAC header should be previously written");
 
+        let chunk_start = mac_block.get_pos();
         // Check if we can fit all in a MAC-END message
         let sdu_bits = self.sdu.get_len_remaining();
         let macend_len_bits = MacEndDl::compute_hdr_len(None, self.chan_alloc.clone()) + sdu_bits;
@@ -195,6 +239,13 @@ impl BsFragger {
                 mac_block.write_bit(1);
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
+            let clear_header = MacEndDl::compute_hdr_len(None, None);
+            let full_header = MacEndDl::compute_hdr_len(None, pdu.chan_alloc_element.clone());
+            self.last_cipher_region = Some(MacCipherRegion {
+                request: self.aie_request.with_scope(AieScope::MacFragment),
+                start: chunk_start + clear_header,
+                len: full_header + sdu_bits - clear_header,
+            });
             // We're done with this packet
             true
         } else if slot_cap_bits < MIN_SLOT_CAP_FOR_FRAG {
@@ -226,6 +277,11 @@ impl BsFragger {
                 mac_block.write_bit(1);
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
+            self.last_cipher_region = Some(MacCipherRegion {
+                request: self.aie_request.with_scope(AieScope::MacFragment),
+                start: chunk_start + macfrag_hdr_len,
+                len: sdu_bits_in_frag,
+            });
 
             false
         }
@@ -242,6 +298,7 @@ impl BsFragger {
             "mac_block must be full or byte aligned before writing"
         );
 
+        self.last_cipher_region = None;
         self.is_fully_transmitted = if !self.mac_hdr_is_written {
             // First chunk, write MAC-RESOURCE
             self.get_resource_chunk(mac_block)
@@ -276,7 +333,7 @@ impl Drop for BsFragger {
 mod tests {
     use crate::umac::subcomp::bs_sched::{SCH_F_CAP, SCH_HD_CAP};
     use tetra_core::{
-        TxState,
+        AieSubject, TxState,
         address::{SsiType, TetraAddress},
         debug,
     };
@@ -317,6 +374,65 @@ mod tests {
 
         assert!(done, "Should be done in single chunk");
         tracing::info!("MAC block: {}", mac_block.dump_bin());
+    }
+
+    #[test]
+    fn sc2_resource_region_keeps_header_and_fill_bits_clear() {
+        let resource = get_default_resource();
+        let clear_header = resource.compute_header_len();
+        let mut block = BitBuffer::new(SCH_F_CAP);
+        let mut fragger = BsFragger::new_with_aie(
+            resource,
+            BitBuffer::from_bitstr("101"),
+            None,
+            AieRequest::sc2(AieSubject::Individual { issi: 1234 }, AieScope::MacResource),
+        );
+
+        assert!(fragger.get_next_chunk(&mut block));
+        let region = fragger.take_cipher_region().expect("SC2 resource cipher region");
+        assert_eq!(region.start, clear_header, "MAC header including channel-allocation flag is clear");
+        assert_eq!(region.len, 3, "only TM-SDU bits are ciphered; alignment fill remains clear");
+        assert!(matches!(
+            region.request,
+            AieRequest::Sc2 {
+                scope: AieScope::MacResource,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sc2_fragment_chain_keeps_the_same_identity_and_switches_only_scope() {
+        let request = AieRequest::sc2(AieSubject::Individual { issi: 1234 }, AieScope::MacResource);
+        let mut fragger = BsFragger::new_with_aie(
+            get_default_resource(),
+            BitBuffer::from_bitstr(&"10101100".repeat(80)),
+            None,
+            request,
+        );
+        let mut chunks = 0;
+        loop {
+            let mut block = BitBuffer::new(SCH_HD_CAP);
+            let done = fragger.get_next_chunk(&mut block);
+            let region = fragger.take_cipher_region().expect("every fragment has a cipher region");
+            assert!(region.request.same_protection_as(request));
+            assert_eq!(
+                match region.request {
+                    AieRequest::Sc2 { scope, .. } => scope,
+                    AieRequest::Clear { .. } => panic!("SC2 policy must not downgrade during fragmentation"),
+                },
+                if chunks == 0 {
+                    AieScope::MacResource
+                } else {
+                    AieScope::MacFragment
+                }
+            );
+            chunks += 1;
+            if done {
+                break;
+            }
+        }
+        assert!(chunks >= 2, "test vector must exercise MAC-FRAG/MAC-END");
     }
 
     #[test]

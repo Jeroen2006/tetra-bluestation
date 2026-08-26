@@ -1,6 +1,6 @@
 pub mod enums;
 
-use tetra_core::{BitBuffer, PhyBlockNum, PhysicalChannel, TdmaTime, Todo};
+use tetra_core::{AieCipherRegion, AieRequest, BitBuffer, PhyBlockNum, PhysicalChannel, TdmaTime, Todo};
 
 use crate::tmv::enums::logical_chans::LogicalChannel;
 
@@ -10,6 +10,10 @@ pub struct TmvUnitdataReq {
     pub mac_block: BitBuffer,
     pub logical_channel: LogicalChannel,
     pub scrambling_code: u32,
+    /// Key-free AIE policy. LMAC binds it to the final physical TDMA time.
+    pub air_interface_encryption: Option<AieRequest>,
+    /// Type-1 region to cipher. MAC headers and fill remain clear.
+    pub cipher_region: Option<AieCipherRegion>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,10 @@ pub struct TmvUnitdataInd {
 
     pub logical_channel: LogicalChannel,
 
+    /// Exact TDMA time captured by PHY for this uplink block. UMAC must use
+    /// this for the SC2 IV, never an estimate from its scheduling clock.
+    pub ul_time: TdmaTime,
+
     /// If no CRC is present on this message type (for example, for AACH), crc_pass is set to True
     pub crc_pass: bool,
     pub scrambling_code: u32,
@@ -75,6 +83,11 @@ pub struct TmvConfigureReq {
     // pub monitoring_pattern_info: Option<Todo>,
     /// NOTE time not usually passed down but convenient for detecting fr18 etc.
     pub time: Option<TdmaTime>,
+    /// Active key-free traffic contexts for this radio slot. These are sent
+    /// independently of a TX block so uplink decrypting uses PHY's receive
+    /// time rather than a scheduler estimate.
+    pub downlink_traffic_aie: Option<Option<AieRequest>>,
+    pub uplink_traffic_aie: Option<Option<AieRequest>>,
 }
 
 #[derive(Debug, Clone)]

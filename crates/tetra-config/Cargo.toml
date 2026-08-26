@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 tetra-core = { workspace = true }
+tetra-crypto = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 chrono-tz = { workspace = true }

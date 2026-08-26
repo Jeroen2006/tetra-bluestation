@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, EndpointId, TetraAddress, Todo, TxReporter};
+use tetra_core::{AieRequest, BitBuffer, EndpointId, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
@@ -65,7 +65,9 @@ pub struct TmaUnitdataReq {
     // pub pdu_prio: Todo, // optional feature
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
-    pub air_interface_encryption: Option<Todo>,
+    /// Key-free policy selected by MM/MLE.  UMAC binds it to the final TDMA
+    /// time and asks the BS-local provider to cipher the selected bit range.
+    pub air_interface_encryption: Option<AieRequest>,
     pub stealing_repeats_flag: Option<bool>,
     pub data_category: Option<Todo>,
 
@@ -89,7 +91,10 @@ pub struct TmaUnitdataInd {
     pub endpoint_id: EndpointId,
     pub new_endpoint_id: Option<EndpointId>,
     pub css_endpoint_id: Option<EndpointId>,
-    pub air_interface_encryption: Todo,
+    /// Key-free ingress policy derived from the received MAC PDU.  It must
+    /// accompany basic-link acknowledgements so a BL-ACK uses the same AIE
+    /// state as the PDU it confirms.
+    pub air_interface_encryption: Option<AieRequest>,
     pub chan_change_response_req: bool,
     pub chan_change_handle: Option<Todo>,
     pub chan_info: Option<Todo>,
