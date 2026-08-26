@@ -9,3 +9,4 @@ docs/*
 !docs/sc2/
 !docs/sc2/**
 /docs
+*.lock
