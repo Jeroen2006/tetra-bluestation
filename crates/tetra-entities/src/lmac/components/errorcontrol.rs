@@ -197,10 +197,104 @@ fn speech_crc(class2_bits: &[u8]) -> [u8; 8] {
     result
 }
 
+/// Compute the four CRC parity bits used by the single speech frame that
+/// remains after frame stealing (EN 300 395-2, clause 5.6.1).
+fn stolen_speech_crc(class2_bits: &[u8]) -> [u8; 4] {
+    debug_assert_eq!(class2_bits.len(), 30);
+
+    // X^4 * I(X) modulo G(X) = X^4 + X + 1. Array indices are
+    // polynomial degrees, matching `speech_crc` above.
+    let mut remainder = [0u8; 34];
+    for (degree, &bit) in class2_bits.iter().enumerate() {
+        remainder[degree + 4] = bit & 1;
+    }
+    for degree in (4..34).rev() {
+        if remainder[degree] != 0 {
+            remainder[degree] ^= 1;
+            remainder[degree - 3] ^= 1;
+            remainder[degree - 4] ^= 1;
+        }
+    }
+
+    [remainder[0], remainder[1], remainder[2], remainder[3]]
+}
+
+/// Select speech frame B from the two codec-order frames supplied for a
+/// normal TCH/S slot. Frame A is discarded when STCH steals the first half
+/// slot (EN 300 392-2, clause 8.3.1.3.6).
+pub fn take_tch_s_frame_b(full_speech: &mut BitBuffer) -> BitBuffer {
+    assert_eq!(full_speech.get_len(), 274, "TCH/S source must contain two 137-bit speech frames");
+
+    let mut frame_b = [0u8; 137];
+    full_speech.seek(137);
+    full_speech.to_bitarr(&mut frame_b);
+    full_speech.seek(0);
+    BitBuffer::from_bitarr(&frame_b)
+}
+
+/// Encode the one 137-bit codec-order speech frame carried in the second
+/// half of an STCH+TCH/S slot.
+///
+/// EN 300 395-2, clause 5.6 defines a separate 216-bit codeword for frame
+/// stealing: class 0 is uncoded, class 1 uses rate 2/3, class 2 plus CRC and
+/// tail uses rate 8/17, followed by the STCH (216, 101) interleaver.
+pub fn encode_tch_s_half(mut speech_frame_b: BitBuffer, scrambling_code: u32) -> BitBuffer {
+    const CLASS0_BITS: usize = 51;
+    const CLASS1_BITS: usize = 56;
+    const CLASS2_BITS: usize = 30;
+    const CLASS2_TYPE2_BITS: usize = 38; // 30 data + 4 CRC + 4 tail
+
+    assert_eq!(speech_frame_b.get_len(), 137, "stolen TCH/S must contain one 137-bit speech frame");
+    speech_frame_b.seek(0);
+    let mut codec_bits = [0u8; 137];
+    speech_frame_b.to_bitarr(&mut codec_bits);
+    let channel_bits = tch_reorder::codec_frame_to_channel(&codec_bits);
+
+    let mut type3 = [0u8; MAX_TYPE345_HALFSLOT_BITS];
+    type3[..CLASS0_BITS].copy_from_slice(&channel_bits[..CLASS0_BITS]);
+    let mut type3_index = CLASS0_BITS;
+
+    // The convolutional state is continuous across classes 1 and 2 even
+    // though the puncturing rate changes at the class boundary.
+    let mut encoder = SpeechConvEncState::new();
+
+    let class1 = &channel_bits[CLASS0_BITS..CLASS0_BITS + CLASS1_BITS];
+    let mut class1_mother = [0u8; CLASS1_BITS * 3];
+    encoder.encode(class1, &mut class1_mother);
+    let mut class1_punctured = [0u8; 84];
+    convenc::get_punctured_rate(RcpcPunctMode::Rate112_168, &class1_mother, &mut class1_punctured);
+    type3[type3_index..type3_index + class1_punctured.len()].copy_from_slice(&class1_punctured);
+    type3_index += class1_punctured.len();
+
+    let class2_start = CLASS0_BITS + CLASS1_BITS;
+    let class2 = &channel_bits[class2_start..class2_start + CLASS2_BITS];
+    let mut class2_type2 = [0u8; CLASS2_TYPE2_BITS];
+    class2_type2[..CLASS2_BITS].copy_from_slice(class2);
+    class2_type2[CLASS2_BITS..CLASS2_BITS + 4].copy_from_slice(&stolen_speech_crc(class2));
+    // The final four tail bits remain zero.
+
+    let mut class2_mother = [0u8; CLASS2_TYPE2_BITS * 3];
+    encoder.encode(&class2_type2, &mut class2_mother);
+    let mut class2_punctured = [0u8; 81];
+    convenc::get_punctured_rate(RcpcPunctMode::Rate38_81, &class2_mother, &mut class2_punctured);
+    type3[type3_index..type3_index + class2_punctured.len()].copy_from_slice(&class2_punctured);
+    type3_index += class2_punctured.len();
+    debug_assert_eq!(type3_index, MAX_TYPE345_HALFSLOT_BITS);
+
+    let mut type4 = [0u8; MAX_TYPE345_HALFSLOT_BITS];
+    interleaver::block_interleave(MAX_TYPE345_HALFSLOT_BITS, 101, &type3, &mut type4);
+    let mut type5 = BitBuffer::from_bitarr(&type4);
+    scrambler::tetra_scramb_bits(scrambling_code, &mut type5);
+    type5
+}
+
 /// Encode traffic plane from type1 to type5 bits (EN 300 395-2): 274 ACELP bits → UEP encoding
 /// (class0 uncoded, class1/2 convenc+punct) → 432 bits → interleave → scramble.
-/// `blk_num`: 1 = full-slot (432 bits), 2 = half-slot stolen by STCH (returns second 216 bits, triggers BFI).
+/// `blk_num` must be 1. Frame-stealing TCH/S uses [`encode_tch_s_half`]
+/// because it is a separately encoded 137-bit speech frame, not half of this
+/// full-slot codeword.
 pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
+    assert_eq!(blk_num, 1, "frame-stealing TCH/S requires encode_tch_s_half");
     let lchan = prim.logical_channel;
     let params = errorcontrol_params::get_params(lchan);
 
@@ -280,17 +374,7 @@ pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
     // ── type-4 → type-5 (scrambling) ─────────────────────────────
     scrambler::tetra_scramb_bits(prim.scrambling_code, &mut type4);
 
-    if blk_num == 1 {
-        // Full slot: return all 432 type5 bits
-        type4
-    } else {
-        // Half slot (STCH stole first half): encode full 432-bit block, return second 216 bits.
-        // Interleaving spreads UEP classes across both halves, so missing first half causes BFI (acceptable at PTT boundaries).
-        let mut full_arr = [0u8; MAX_TYPE345_BITS];
-        type4.seek(0);
-        type4.to_bitarr(&mut full_arr[0..params.type345_bits]);
-        BitBuffer::from_bitarr(&full_arr[MAX_TYPE345_HALFSLOT_BITS..params.type345_bits])
-    }
+    type4
 }
 
 /// Decode traffic plane from type5 to type1 bits (ACELP codec order). Reverse of `encode_tp()`:
@@ -607,6 +691,85 @@ mod tests {
         data2[1] = 1;
         let crc2 = speech_crc(&data2);
         assert_eq!(&crc2[0..7], &[0, 1, 0, 0, 1, 0, 0], "X^8 mod G = X^4+X");
+    }
+
+    #[test]
+    fn test_stolen_speech_crc() {
+        assert_eq!(stolen_speech_crc(&[0u8; 30]), [0, 0, 0, 0]);
+
+        let mut data = [0u8; 30];
+        data[0] = 1;
+        // X^4 mod (X^4 + X + 1) = X + 1.
+        assert_eq!(stolen_speech_crc(&data), [1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn stolen_tch_s_uses_only_frame_b_and_emits_one_half_slot() {
+        let scrambling_code = scrambler::tetra_scramb_get_init(204, 1337, 1);
+        let frame_b: Vec<u8> = (0..137).map(|index| ((index * 5 + 1) % 2) as u8).collect();
+
+        let mut first_source = vec![0u8; 274];
+        first_source[137..].copy_from_slice(&frame_b);
+        let mut second_source = vec![1u8; 274];
+        second_source[137..].copy_from_slice(&frame_b);
+
+        let first = encode_tch_s_half(take_tch_s_frame_b(&mut BitBuffer::from_bitarr(&first_source)), scrambling_code);
+        let second = encode_tch_s_half(take_tch_s_frame_b(&mut BitBuffer::from_bitarr(&second_source)), scrambling_code);
+
+        assert_eq!(first.get_len(), 216);
+        assert_eq!(
+            first.to_bitstr(),
+            second.to_bitstr(),
+            "discarded speech frame A affected the stolen half"
+        );
+
+        let mut changed_source = first_source;
+        changed_source[137 + 34] ^= 1;
+        let changed = encode_tch_s_half(take_tch_s_frame_b(&mut BitBuffer::from_bitarr(&changed_source)), scrambling_code);
+        assert_ne!(
+            first.to_bitstr(),
+            changed.to_bitstr(),
+            "speech frame B did not affect the stolen half"
+        );
+    }
+
+    #[test]
+    fn stolen_tch_s_matches_en_300_395_2_impulse_vectors() {
+        // These vectors are derived directly from EN 300 395-2 table 6 and
+        // clauses 5.6.1 through 5.6.3.  A zero scrambling state deliberately
+        // leaves type-4 visible, so this is not a self-consistent
+        // encode/decode test that could hide the same error on both sides.
+        // Each input has one set codec bit: the first class-0, class-1 or
+        // class-2 bit in table 6 (B35, B58 and B18 respectively).
+        let vectors = [
+            (34, "000000000000000000000000040000000000000000000000000000"),
+            (57, "000800200000020008000000000000010004001000400000000000"),
+            (17, "00040008000000a0028000000800a0008001000000040050004005"),
+        ];
+
+        for (codec_index, expected_type4_hex) in vectors {
+            let mut codec_frame = [0u8; 137];
+            codec_frame[codec_index] = 1;
+            let encoded = encode_tch_s_half(BitBuffer::from_bitarr(&codec_frame), 0);
+            let mut encoded_bits = [0u8; 216];
+            let mut encoded = encoded;
+            encoded.seek(0);
+            encoded.to_bitarr(&mut encoded_bits);
+            let actual_hex: String = encoded_bits
+                .chunks(8)
+                .map(|chunk| {
+                    let byte = chunk.iter().fold(0u8, |value, bit| (value << 1) | (bit & 1));
+                    format!("{byte:02x}")
+                })
+                .collect();
+
+            assert_eq!(
+                actual_hex,
+                expected_type4_hex,
+                "half-slot vector failed for codec bit B{}",
+                codec_index + 1
+            );
+        }
     }
 
     /// Tests SCH/F encoding and decoding

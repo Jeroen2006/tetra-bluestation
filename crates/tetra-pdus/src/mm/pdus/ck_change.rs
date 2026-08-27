@@ -40,8 +40,9 @@ pub enum CkChangeTime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DCkChangeDemand {
     pub acknowledgement_required: bool,
-    /// 0 = no change; 2 = transition to SC2. Other values are rejected by
-    /// this SC2-focused codec.
+    /// 0 = no change (the normal SCK rollover form in TTR 001-11 table 8);
+    /// 2 = transition to SC2 (the initial-transition form in table 5).
+    /// Other values are rejected by this SC2-focused codec.
     pub change_of_security_class: u8,
     pub scks: Vec<SckChangeData>,
     pub time: CkChangeTime,
@@ -247,7 +248,10 @@ mod tests {
     fn sc2_demand_and_result_roundtrip() {
         let demand = DCkChangeDemand {
             acknowledgement_required: false,
-            change_of_security_class: 2,
+            // A normal TM-SCK rollover uses table 8: no security-class
+            // transition.  This catches accidental use of the table-5 SC2
+            // entry form in rollover callers.
+            change_of_security_class: 0,
             scks: vec![SckChangeData {
                 sck_number: 7,
                 version_number: 3,
@@ -266,12 +270,52 @@ mod tests {
         assert_eq!(buffer.get_len_remaining(), 0);
 
         let result = UCkChangeResult {
-            change_of_security_class: 2,
+            change_of_security_class: 0,
             selected_scks: demand.scks,
         };
         result.to_bitbuf(&mut buffer).expect("serialize result");
         buffer.seek(0);
         assert_eq!(UCkChangeResult::from_bitbuf(&mut buffer).expect("parse result"), result);
         assert_eq!(buffer.get_len_remaining(), 0);
+    }
+
+    #[test]
+    fn sc2_absolute_iv_demand_matches_ttr_001_11_table_8_bits() {
+        let demand = DCkChangeDemand {
+            acknowledgement_required: false,
+            change_of_security_class: 0,
+            scks: vec![SckChangeData {
+                sck_number: 11,
+                version_number: 4,
+            }],
+            time: CkChangeTime::AbsoluteIv {
+                // Absolute-IV TS1 is encoded as zero; FN/MN retain their
+                // one-based on-air values (FN5/MN54 here).
+                slot_number: 0,
+                frame_number: 5,
+                multiframe_number: 54,
+                hyperframe_number: 8,
+            },
+        };
+        let mut buffer = BitBuffer::new_autoexpand(96);
+        demand.to_bitbuf(&mut buffer).expect("serialize table-8 demand");
+        assert_eq!(
+            buffer.to_bitstr(),
+            concat!(
+                "0010",             // D-CK CHANGE DEMAND
+                "0",                // no L3 acknowledgement
+                "00",               // no security-class change
+                "000",              // SCK/SCKX
+                "0",                // TMO
+                "0001",             // one SCK
+                "01011",            // SCKN 11
+                "0000000000000100", // SCK-VN 4
+                "00",               // Absolute IV
+                "00",               // TS1
+                "00101",            // FN5
+                "110110",           // MN54
+                "0000000000001000"  // HN8
+            )
+        );
     }
 }

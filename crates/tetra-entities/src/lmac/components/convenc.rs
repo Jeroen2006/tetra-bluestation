@@ -10,7 +10,7 @@ pub enum RcpcPunctMode {
     Rate148_432 = 3,
     Rate112_168 = 4,
     Rate72_162 = 5,
-    Rate38_80 = 6,
+    Rate38_81 = 6,
 }
 
 /// State for the rate-1/2 “mother code” convolutional encoder.
@@ -236,7 +236,7 @@ fn get_puncturer(pu: RcpcPunctMode) -> Puncturer {
         RcpcPunctMode::Rate148_432 => PUNCTURERS[3],
         RcpcPunctMode::Rate112_168 => PUNCTURERS[4],
         RcpcPunctMode::Rate72_162 => PUNCTURERS[5],
-        RcpcPunctMode::Rate38_80 => PUNCTURERS[6],
+        RcpcPunctMode::Rate38_81 => PUNCTURERS[6],
     }
 }
 

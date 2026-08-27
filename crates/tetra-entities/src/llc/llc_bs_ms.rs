@@ -118,17 +118,51 @@ impl Llc {
         });
     }
 
+    /// Resolve the best channel on which the addressed MS is listening now.
+    /// A fresh MAC-ACCESS response deliberately stays on MCCH; otherwise an
+    /// active call route wins so MM/OTAR is not sent to a channel the MS has
+    /// stopped monitoring.  The lookup is repeated for every BL attempt.
+    fn delivery_route(
+        config: &SharedConfig,
+        issi: u32,
+        dltime: TdmaTime,
+        tried_timeslots: &HashSet<u8>,
+    ) -> Option<tetra_saps::tma::AssociatedChannel> {
+        let mut state = config.state_write();
+        if state.subscribers.direct_response_window_active(issi, dltime) {
+            return None;
+        }
+        state
+            .subscriber_delivery_routes
+            .get(&issi)
+            .and_then(|routes| {
+                routes
+                    .iter()
+                    .find(|route| (2..=4).contains(&route.timeslot) && !tried_timeslots.contains(&route.timeslot))
+            })
+            .map(|route| tetra_saps::tma::AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+            })
+    }
+
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
     /// ETSI 22.3.2.3 case d: when a waiting ACK and outgoing TL-DATA exist for the same link, the
-    /// LLC shall emit a combined BL-ADATA PDU. Matching by SSI alone is correct today because all
-    /// downlink signalling funnels to ts1 (see dl_enqueue_tma in bs_sched), so any pending ACK
-    /// for this SSI will ride the same slot as the outgoing data.
-    /// TODO: once bs_sched's identify_timeslots_for_ssi is implemented and DL signalling can
-    /// land on non-ts1 slots, also match on the target timeslot to avoid bundling an ACK onto a
-    /// BL-DATA heading to a different slot than where the ACK was scheduled.
-    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, aie_request: AieRequest) -> Option<u8> {
+    /// LLC shall emit a combined BL-ADATA PDU. The ACK must belong to both the
+    /// same SSI/protection context and the channel on which the MS is
+    /// listening; an FN18 ACK must never be bundled into MCCH BL-DATA.
+    fn get_out_ack_seq_if_any(
+        &mut self,
+        addr: TetraAddress,
+        timeslot: u8,
+        aie_request: AieRequest,
+    ) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
-            if self.scheduled_out_acks[i].addr.ssi == addr.ssi && self.scheduled_out_acks[i].aie_request.same_protection_as(aie_request) {
+            if self.scheduled_out_acks[i].addr.ssi == addr.ssi
+                && self.scheduled_out_acks[i].ts == timeslot
+                && self.scheduled_out_acks[i].aie_request.same_protection_as(aie_request)
+            {
                 let n = self.scheduled_out_acks[i].nr;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
@@ -311,22 +345,9 @@ impl Llc {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
         let mut sapmsg = ack.retransmission_buf.clone();
         if ack.retransmit_count > 0 {
-            let route = config
-                .state_read()
-                .subscriber_delivery_routes
-                .get(&ack.addr.ssi)
-                .and_then(|routes| {
-                    routes
-                        .iter()
-                        .find(|route| (2..=4).contains(&route.timeslot) && !ack.tried_delivery_timeslots.contains(&route.timeslot))
-                })
-                .copied();
+            let route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
             if let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg {
-                req.associated_channel = route.map(|route| tetra_saps::tma::AssociatedChannel {
-                    call_id: route.call_id,
-                    timeslot: route.timeslot,
-                    usage: route.usage,
-                });
+                req.associated_channel = route;
                 if let Some(route) = route {
                     ack.tried_delivery_timeslots.insert(route.timeslot);
                     ack.ts = route.timeslot;
@@ -396,6 +417,20 @@ impl Llc {
             panic!("Can't send BL-DATA for GSSI-addressed message. ");
         }
 
+        // MM does not own call-control routing.  Bind an otherwise ordinary
+        // acknowledged downlink to the live listener route here, before its
+        // first attempt.  Previously only a timed-out retry consulted this
+        // table, so in-call D-CK CHANGE/OTAR first went to MCCH and sat behind
+        // a missing BL-ACK for one or more multiframes.
+        if prim.associated_channel.is_none() {
+            prim.associated_channel = Self::delivery_route(
+                &self.config,
+                prim.main_address.ssi,
+                self.dltime,
+                &HashSet::new(),
+            );
+        }
+
         // If an ack still needs to be sent, get the relevant expected sequence number
         let outgoing_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
             AieRequest::clear(
@@ -405,7 +440,13 @@ impl Llc {
                 AieScope::MacResource,
             )
         });
-        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, outgoing_aie_request);
+        let delivery_timeslot = prim
+            .associated_channel
+            .as_ref()
+            .map(|channel| channel.timeslot)
+            .unwrap_or(1);
+        let out_ack_n =
+            self.get_out_ack_seq_if_any(prim.main_address, delivery_timeslot, outgoing_aie_request);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -1075,8 +1116,49 @@ mod tests {
         let clear = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
         llc.schedule_outgoing_ack(TdmaTime::default(), addr, 0, sc2);
 
-        assert_eq!(llc.get_out_ack_seq_if_any(addr, clear), None);
+        assert_eq!(llc.get_out_ack_seq_if_any(addr, 1, clear), None);
         assert_eq!(llc.scheduled_out_acks.len(), 1, "mismatched ACK remains separate");
-        assert_eq!(llc.get_out_ack_seq_if_any(addr, sc2), Some(0));
+        assert_eq!(llc.get_out_ack_seq_if_any(addr, 1, sc2), Some(0));
+    }
+
+    #[test]
+    fn acknowledged_downlink_uses_live_call_route_on_first_attempt() {
+        let config = test_config();
+        let issi = 0x12_34_56;
+        config.state_write().subscriber_delivery_routes.insert(
+            issi,
+            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 7,
+                timeslot: 2,
+                usage: 10,
+            }],
+        );
+
+        let route = Llc::delivery_route(&config, issi, TdmaTime::default(), &HashSet::new())
+            .expect("active call route");
+        assert_eq!(route.call_id, 7);
+        assert_eq!(route.timeslot, 2);
+        assert_eq!(route.usage, 10);
+    }
+
+    #[test]
+    fn direct_mac_access_response_stays_on_mcch() {
+        let config = test_config();
+        let issi = 0x12_34_56;
+        let now = TdmaTime::default();
+        {
+            let mut state = config.state_write();
+            state.subscribers.mark_direct_response_window(issi, now);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 7,
+                    timeslot: 2,
+                    usage: 10,
+                }],
+            );
+        }
+
+        assert!(Llc::delivery_route(&config, issi, now, &HashSet::new()).is_none());
     }
 }

@@ -106,6 +106,30 @@ impl TdmaTime {
         self.add_timeslots(slots_to_add)
     }
 
+    /// Returns true for the cell's TS1 BNCH opportunities that carry the
+    /// Extended Services SYSINFO variant, including SCKN and SCK-VN.
+    ///
+    /// Keeping this definition in tetra-core lets rollover planning and the
+    /// MAC scheduler use one definition of the security-SYSINFO boundary.
+    pub fn is_sc2_security_sysinfo_opportunity(self) -> bool {
+        self.t == 1 && matches!(self.f, 4 | 8 | 12 | 16)
+    }
+
+    /// Round forward to the first TS1 BNCH that carries SCKN and SCK-VN.
+    /// If `self` already identifies such a slot, it remains unchanged.
+    pub fn forward_to_sc2_security_sysinfo(self) -> TdmaTime {
+        let mut time = self;
+        // There are four such opportunities per 18-frame multiframe, so a
+        // match is guaranteed well inside one complete multiframe.
+        for _ in 0..(18 * 4) {
+            if time.is_sc2_security_sysinfo_opportunity() {
+                return time;
+            }
+            time = time.add_timeslots(1);
+        }
+        unreachable!("SC2 security SYSINFO opportunity missing from a multiframe")
+    }
+
     /// Returns true if this DL timeslot should contain a mandatory BSCH (SYNC) block
     pub fn is_mandatory_bsch(&self) -> bool {
         self.f == 18 && self.t == 4 - ((self.m + 1) % 4)
@@ -185,5 +209,17 @@ mod tests {
         for time_int in -10000..10000 {
             assert_eq!(TdmaTime::from_int(time_int).diff(TdmaTime::from_int(0)), time_int);
         }
+    }
+
+    #[test]
+    fn forward_to_sc2_security_sysinfo_uses_extended_services_bnch() {
+        let before = TdmaTime { h: 7, m: 8, f: 3, t: 4 };
+        assert_eq!(before.forward_to_sc2_security_sysinfo(), TdmaTime { h: 7, m: 8, f: 4, t: 1 });
+
+        let exact = TdmaTime { h: 7, m: 8, f: 8, t: 1 };
+        assert_eq!(exact.forward_to_sc2_security_sysinfo(), exact);
+
+        let after_last = TdmaTime { h: 7, m: 8, f: 16, t: 2 };
+        assert_eq!(after_last.forward_to_sc2_security_sysinfo(), TdmaTime { h: 7, m: 9, f: 4, t: 1 });
     }
 }

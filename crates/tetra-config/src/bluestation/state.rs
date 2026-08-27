@@ -1,5 +1,5 @@
 use crate::bluestation::{RuntimeNetworkBroadcast, SharedConfig};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tetra_core::{AieAlgorithm, AieContext, AieDirection, AieSubject, BitBuffer, Sc2KeyIdentifier, SoftBit, TdmaTime, TimeslotAllocator};
 
 /// The TEA variant selected by the SwMI for SC2 AIE.
@@ -47,12 +47,45 @@ impl std::fmt::Debug for RuntimeSc2Aie {
 
 /// AIE policy cached from the authenticated SwMI. `sc1_allowed` maps to the
 /// SC1-supported bit and a present SC2 record maps to the SC2/SCKN fields in
-/// SYSINFO. SCK-VN and the SCK itself are intentionally not broadcast.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// SYSINFO. SCK-VN is advertised in the SYSINFO cipher-key field; the SCK
+/// material itself never leaves this private runtime boundary.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeAieConfig {
     pub enabled: bool,
     pub sc1_allowed: bool,
     pub sc2: Option<RuntimeSc2Aie>,
+    /// A single prepared network-wide SC2 rollover. The future/retired SCKs
+    /// never leave this private runtime boundary.
+    pub rollover: Option<RuntimeSc2Rollover>,
+}
+
+/// BS-local state for a SwMI-announced SCK rollover. The target Network Time
+/// is common across cells; the actual application is the first local DL slot
+/// at or after it, so cells may differ by a bounded slot phase.
+#[derive(Clone, PartialEq)]
+pub struct RuntimeSc2Rollover {
+    pub rollover_id: u64,
+    pub activation_network_time: u64,
+    /// The serving cell's exact, locally chosen downlink slot for this
+    /// rollover. It is sent to MSs as Absolute IV and is deliberately not a
+    /// network-global value: neighbouring cells may have another TDMA phase.
+    local_activation_tdma: Option<TdmaTime>,
+    activated: bool,
+    future: RuntimeSc2Aie,
+    retired_rx: Option<(RuntimeSc2Aie, TdmaTime)>,
+}
+
+impl std::fmt::Debug for RuntimeSc2Rollover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSc2Rollover")
+            .field("rollover_id", &self.rollover_id)
+            .field("activation_network_time", &self.activation_network_time)
+            .field("local_activation_tdma", &self.local_activation_tdma)
+            .field("activated", &self.activated)
+            .field("future", &self.future)
+            .field("retired_rx", &self.retired_rx.as_ref().map(|(key, until)| (key, until)))
+            .finish()
+    }
 }
 
 /// Key-free SC2 identity bound to a registered terminal or active call. The
@@ -138,6 +171,16 @@ impl RuntimeAieSessions {
             !bindings.is_empty()
         });
     }
+
+    /// Move all existing terminal and call contexts to the newly active
+    /// network SCK without discarding registrations or calls at cutover.
+    pub fn rebind_all_to(&mut self, sc2: &RuntimeSc2Aie) {
+        let binding = RuntimeSc2Binding::from_sc2(sc2);
+        self.terminals.values_mut().for_each(|value| *value = binding);
+        self.calls
+            .values_mut()
+            .for_each(|bindings| bindings.values_mut().for_each(|value| *value = binding));
+    }
 }
 
 impl Default for RuntimeAieConfig {
@@ -146,8 +189,261 @@ impl Default for RuntimeAieConfig {
             enabled: false,
             sc1_allowed: true,
             sc2: None,
+            rollover: None,
         }
     }
+}
+
+impl RuntimeAieConfig {
+    /// Return the key-free SC2 identity which must be advertised for an
+    /// exact downlink air slot.  Downlink is prepared one slot ahead, so
+    /// callers cannot safely use only the software-current `sc2` field at a
+    /// rollover boundary.
+    pub fn downlink_sc2_identity_at(&self, time: TdmaTime) -> Option<Sc2KeyIdentifier> {
+        if !self.enabled {
+            return None;
+        }
+        self.sc2_for_air_time(AieDirection::Downlink, time)
+            .ok()
+            .map(|sc2| RuntimeSc2Binding::from_sc2(sc2).key)
+    }
+
+    /// Stage a future key from an authenticated SwMI command. The fixed
+    /// parity rule makes the MAC encryption-mode selector unambiguous during
+    /// the old-key uplink grace interval.
+    pub fn stage_rollover(
+        &mut self,
+        rollover_id: u64,
+        active: RuntimeSc2Binding,
+        future: RuntimeSc2Aie,
+        activation_network_time: u64,
+    ) -> Result<(), &'static str> {
+        if activation_network_time >= (1_u64 << 48) {
+            return Err("rollover network time exceeds 48 bits");
+        }
+        let current = active_sc2(self).map_err(|_| "SC2 is not enabled")?;
+        if RuntimeSc2Binding::from_sc2(current) != active {
+            return Err("rollover active identity does not match local SC2 state");
+        }
+        if let Some(existing) = &self.rollover {
+            if existing.rollover_id == rollover_id {
+                if existing.activation_network_time != activation_network_time || existing.future != future {
+                    return Err("repeated SC2 rollover command does not match staged key");
+                }
+                // The SwMI deliberately replays a prepare after WSS reconnect.
+                // Never reset an already activated local state back to staged.
+                return Ok(());
+            }
+            // A cancel can be lost while the SwMI connection is down. A new
+            // prepare which names the locally active identity proves that this
+            // old, unactivated target never became active in this cell, so it
+            // is safe to replace the stale staged state.
+            //
+            // The same proof also identifies the next, sequential rollover
+            // after this cell has activated the previous one: `current` is
+            // now the prior target. Its new Network-Time must be later than
+            // the retained transition, which is at least a full two seconds
+            // past the two-slot old-uplink grace period.
+            if existing.activated
+                && !tetra_network_time_units(activation_network_time)
+                    .zip(tetra_network_time_units(existing.activation_network_time))
+                    .is_some_and(|(new, old)| new > old)
+            {
+                return Err("new SC2 rollover overlaps the activated rollover");
+            }
+        }
+        if current.algorithm != future.algorithm {
+            return Err("rollover may not change the SC2 TEA algorithm");
+        }
+        if current.sckn == future.sckn {
+            return Err("rollover future SCK must use a different SCKN");
+        }
+        if future.sck_vn != current.sck_vn.wrapping_add(1) {
+            return Err("rollover SCK-VN must increment by exactly one");
+        }
+        self.rollover = Some(RuntimeSc2Rollover {
+            rollover_id,
+            activation_network_time,
+            local_activation_tdma: None,
+            activated: false,
+            future,
+            retired_rx: None,
+        });
+        Ok(())
+    }
+
+    pub fn rollover_is_activated(&self, rollover_id: u64) -> bool {
+        self.rollover
+            .as_ref()
+            .is_some_and(|rollover| rollover.rollover_id == rollover_id && rollover.activated)
+    }
+
+    pub fn staged_rollover_id(&self) -> Option<u64> {
+        self.rollover
+            .as_ref()
+            .filter(|rollover| !rollover.activated)
+            .map(|rollover| rollover.rollover_id)
+    }
+
+    /// Cancelling is valid only before this BS has crossed the target. The
+    /// future key may remain on terminals, but it is no longer a candidate
+    /// for activation in this cell.
+    pub fn cancel_staged_rollover(&mut self, rollover_id: u64) -> bool {
+        if self
+            .rollover
+            .as_ref()
+            .is_some_and(|rollover| rollover.rollover_id == rollover_id && !rollover.activated)
+        {
+            self.rollover = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Derive the serving cell's Absolute IV before announcing the rollover.
+    /// Network Time has a two-second unit and must not remain the on-air
+    /// cutover selector for a running traffic call: the MS and BS need one
+    /// identical TDMA slot, not two independently sampled wall clocks.
+    pub fn schedule_rollover_absolute_iv(&mut self, current_network_time: u64, current_tdma_time: TdmaTime) -> Option<(u64, TdmaTime)> {
+        let rollover = self.rollover.as_mut()?;
+        if rollover.activated {
+            return None;
+        }
+        if rollover.local_activation_tdma.is_some() {
+            return None;
+        }
+        let current = tetra_network_time_units(current_network_time)?;
+        let target = tetra_network_time_units(rollover.activation_network_time)?;
+        // 1 TDMA slot = 17/1200 s; round a Network-Time target upward to a
+        // downlink slot as required by EN 300 392-7 clause 4.5.5.6.
+        let slots = (target - current).max(0).saturating_mul(2400).saturating_add(16) / 17;
+        let slots = i32::try_from(slots).ok()?;
+        // EN 300 392-7 section 4.5.5.6 also requires the security information
+        // in MAC-SYSINFO to be synchronized with the key change. This stack's
+        // Extended Services SYSINFO (containing SCKN and SCK-VN) is sent on
+        // TS1 in frames 4, 8, 12 and 16. Use exactly such a BNCH boundary, not
+        // merely an arbitrary TS1 where SYSINFO1 may advertise no key
+        // identity. TS1 is reserved for cell control, so all voice channels
+        // start using the new key only after the matching identity was aired.
+        // The cell-local Absolute IV is authoritative; neighbouring cells may
+        // select a nearby opportunity independently.
+        let time = current_tdma_time.add_timeslots(slots).forward_to_sc2_security_sysinfo();
+        rollover.local_activation_tdma = Some(time);
+        Some((rollover.rollover_id, time))
+    }
+
+    /// Promote a staged key exactly once at its announced local Absolute IV.
+    /// The old key is receive-only for
+    /// two following UL slots mandated by EN 300 392-7 §4.5.5.4.
+    pub fn activate_rollover_if_due(&mut self, current_tdma_time: TdmaTime, sessions: &mut RuntimeAieSessions) -> Option<u64> {
+        let (rollover_id, future) = {
+            let rollover = self.rollover.as_ref()?;
+            if rollover.activated
+                || rollover
+                    .local_activation_tdma
+                    .is_none_or(|activation| activation.age(current_tdma_time) < 0)
+            {
+                return None;
+            }
+            (rollover.rollover_id, rollover.future.clone())
+        };
+        let old = self.sc2.replace(future)?;
+        let new_active = self.sc2.as_ref().expect("future key promoted");
+        sessions.rebind_all_to(new_active);
+        let rollover = self.rollover.as_mut().expect("rollover checked above");
+        // A concurrent state change is not possible while this method owns
+        // the configuration, but retaining the ID check keeps this update
+        // fail-closed if its calling model is ever changed.
+        if rollover.rollover_id != rollover_id {
+            return None;
+        }
+        rollover.retired_rx = Some((old, current_tdma_time.add_timeslots(2)));
+        rollover.activated = true;
+        Some(rollover_id)
+    }
+
+    /// Select the key for the actual on-air slot rather than for the software
+    /// instant at which the block happens to be constructed. UMAC/LMAC build
+    /// downlink one slot ahead, while TMO SCK changeover retains the old key
+    /// for exactly two uplink slots (EN 300 392-7 §4.5.5.4).
+    fn sc2_for_air_time(&self, direction: AieDirection, time: TdmaTime) -> Result<&RuntimeSc2Aie, AieContextError> {
+        let active = active_sc2(self)?;
+        let Some(rollover) = self.rollover.as_ref() else {
+            return Ok(active);
+        };
+        let Some(activation) = rollover.local_activation_tdma else {
+            return Ok(active);
+        };
+        let slots_after_activation = activation.age(time);
+        // Promotion changes `self.sc2` to the new key, but LMAC may still be
+        // draining a burst whose explicit air time precedes the Absolute IV.
+        // Such a burst must remain encrypted with the retired key.  Falling
+        // through to `active` here produces a short, scheduler-latency-sized
+        // patch of undecipherable downlink traffic at rollover.
+        if slots_after_activation < 0 && rollover.activated {
+            return rollover
+                .retired_rx
+                .as_ref()
+                .map(|(key, _)| key)
+                .ok_or(AieContextError::StaleKeyIdentity);
+        }
+        match direction {
+            // An on-air downlink at the Absolute IV must use the target SCK,
+            // even if it was assembled during the preceding scheduler tick.
+            AieDirection::Downlink if slots_after_activation >= 0 => Ok(&rollover.future),
+            // The old SCK is still expected for two uplink slots. Before
+            // state promotion `active` is old; afterwards it is retained as
+            // the bounded receive-only key.
+            AieDirection::Uplink if (0..2).contains(&slots_after_activation) => {
+                if rollover.activated {
+                    rollover
+                        .retired_rx
+                        .as_ref()
+                        .map(|(key, _)| key)
+                        .ok_or(AieContextError::StaleKeyIdentity)
+                } else {
+                    Ok(active)
+                }
+            }
+            // Entity tick order must not create a third key state. If an
+            // uplink is handled after the grace window but before MLE's local
+            // promotion turn, select the scheduled target directly.
+            AieDirection::Uplink if slots_after_activation >= 2 && !rollover.activated => Ok(&rollover.future),
+            _ => Ok(active),
+        }
+    }
+
+    /// The notification a newly registered or roamed MS must receive. Before
+    /// local cutover it repeats this cell's scheduled Absolute IV; after it
+    /// reports the new key as currently in use instead of replaying an
+    /// expired schedule.
+    pub fn rollover_notification(&self) -> Option<(RuntimeSc2Binding, Option<TdmaTime>)> {
+        let rollover = self.rollover.as_ref()?;
+        if rollover.activated {
+            Some((RuntimeSc2Binding::from_sc2(self.sc2.as_ref()?), None))
+        } else {
+            Some((RuntimeSc2Binding::from_sc2(&rollover.future), Some(rollover.local_activation_tdma?)))
+        }
+    }
+}
+
+/// Compare packed ETSI Network Time values chronologically by their UTC
+/// seconds-of-year and year fields. Offset/reserved fields do not determine
+/// the instant and may legitimately differ around DST transitions.
+fn tetra_network_time_units(value: u64) -> Option<i64> {
+    (value < (1_u64 << 48)).then_some(())?;
+    let year = 2000_i64 + i64::try_from((value >> 11) & 0x3f).ok()?;
+    let days_before_year = (2000..year)
+        .map(|year| {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                366
+            } else {
+                365
+            }
+        })
+        .sum::<i64>();
+    Some(days_before_year * 43_200 + i64::try_from(value >> 24).ok()?)
 }
 
 /// Errors from the one BS-local SC2 context/key provider.
@@ -185,12 +481,8 @@ impl BsAieKeyProvider {
             tetra_core::AieRequest::Clear { subject, scope } => Ok(tetra_core::AieContext::clear(subject, direction, time, scope)),
             tetra_core::AieRequest::Sc2 { subject, scope } => {
                 let state = self.config.state_read();
-                let sc2 = active_sc2(&state.aie)?;
+                let sc2 = state.aie.sc2_for_air_time(direction, time)?;
                 let binding = binding_for_subject(&state, subject, sc2)?;
-                let current = RuntimeSc2Binding::from_sc2(sc2);
-                if binding != current {
-                    return Err(AieContextError::StaleKeyIdentity);
-                }
                 Ok(tetra_core::AieContext::sc2(subject, direction, time, scope, binding.key))
             }
         }
@@ -218,17 +510,17 @@ impl BsAieKeyProvider {
         }
 
         let state = self.config.state_read();
-        let sc2 = active_sc2(&state.aie)?;
-        let current = RuntimeSc2Binding::from_sc2(sc2);
+        let sc2 = state.aie.sc2_for_air_time(AieDirection::Uplink, time)?;
         let raw = tetra_crypto::ta61_inverse(&sc2.key, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
         let issi = u32::from_be_bytes([0, raw[0], raw[1], raw[2]]);
-        if state.aie_sessions.terminal(issi) != Some(current) {
-            return Err(AieContextError::SubjectNotProvisioned);
+        if state.aie_sessions.terminal(issi).is_some() {
+            let key = RuntimeSc2Binding::from_sc2(sc2).key;
+            return Ok((
+                issi,
+                AieContext::sc2(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, key),
+            ));
         }
-        Ok((
-            issi,
-            AieContext::sc2(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, current.key),
-        ))
+        Err(AieContextError::SubjectNotProvisioned)
     }
 
     /// Decode an SC2 ESI and create the key-free terminal binding needed for
@@ -245,7 +537,7 @@ impl BsAieKeyProvider {
             return Err(AieContextError::InvalidContext);
         }
         let mut state = self.config.state_write();
-        let sc2 = active_sc2(&state.aie)?.clone();
+        let sc2 = state.aie.sc2_for_air_time(AieDirection::Uplink, time)?.clone();
         let raw = tetra_crypto::ta61_inverse(&sc2.key, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
         let issi = u32::from_be_bytes([0, raw[0], raw[1], raw[2]]);
         let binding = RuntimeSc2Binding::from_sc2(&sc2);
@@ -268,7 +560,7 @@ impl BsAieKeyProvider {
         len: usize,
     ) -> Result<(), AieContextError> {
         let state = self.config.state_read();
-        let sc2 = active_sc2(&state.aie)?.clone();
+        let sc2 = state.aie.sc2_for_air_time(AieDirection::Uplink, time)?.clone();
         drop(state);
         self.cipher_mac_with_sc2(time, &sc2, mac_block, start, len, 0, AieDirection::Uplink)
     }
@@ -281,11 +573,14 @@ impl BsAieKeyProvider {
             return Err(AieContextError::InvalidContext);
         }
         let state = self.config.state_read();
+        // This compatibility verifier has no TDMA timestamp in its API. The
+        // time-aware paths (`resolve_uplink_esi` and MAC/TCH decrypt) make
+        // the actual on-air key decision.
         let sc2 = active_sc2(&state.aie)?;
-        let expected = tetra_crypto::ta61(&sc2.key, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8]);
-        (u32::from_be_bytes([0, expected[0], expected[1], expected[2]]) == esi)
-            .then_some(())
-            .ok_or(AieContextError::InvalidContext)
+        (tetra_crypto::ta61(&sc2.key, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8])
+            == [(esi >> 16) as u8, (esi >> 8) as u8, esi as u8])
+        .then_some(())
+        .ok_or(AieContextError::InvalidContext)
     }
 
     /// A clear MAC-DATA from an already SC2-bound terminal is not a valid
@@ -345,9 +640,9 @@ impl BsAieKeyProvider {
         self.cipher_mac(context, block, start, len, 0, AieDirection::Uplink)
     }
 
-    /// Cipher a type-5 traffic range using its explicitly assigned KSS bit
-    /// offset. The currently supported TCH/S stolen-half offset is 216,
-    /// which is byte-aligned; unaligned future mappings need a dedicated API.
+    /// Cipher a traffic plaintext range using its explicitly assigned KSS bit
+    /// offset. For STCH+TCH/S, the 137 bits of speech frame B use KSS bits
+    /// 216 through 352 (EN 300 392-7, table 6.4).
     pub fn cipher_downlink_traffic_at_kss_offset(
         &self,
         context: AieContext,
@@ -463,11 +758,11 @@ impl BsAieKeyProvider {
             return Err(AieContextError::InvalidContext);
         }
         let state = self.config.state_read();
-        let sc2 = active_sc2(&state.aie)?.clone();
-        if RuntimeSc2Binding::from_sc2(&sc2).key != key || binding_for_subject(&state, subject, &sc2)?.key != key {
-            return Err(AieContextError::StaleKeyIdentity);
+        let sc2 = state.aie.sc2_for_air_time(expected_direction, time)?.clone();
+        if RuntimeSc2Binding::from_sc2(&sc2).key == key && binding_for_subject(&state, subject, &sc2)?.key == key {
+            return Ok((time, sc2));
         }
-        Ok((time, sc2))
+        Err(AieContextError::StaleKeyIdentity)
     }
 }
 
@@ -482,14 +777,22 @@ fn active_sc2(aie: &RuntimeAieConfig) -> Result<&RuntimeSc2Aie, AieContextError>
 /// traffic leg.  This is not a GCK/GSKO implementation: those remain needed
 /// for their own OTAR/provisioning flows, but they are not a precondition for
 /// using an already active SCK on a group traffic burst.
-fn binding_for_subject(state: &StackState, subject: AieSubject, active_sc2: &RuntimeSc2Aie) -> Result<RuntimeSc2Binding, AieContextError> {
+fn binding_for_subject(state: &StackState, subject: AieSubject, sc2: &RuntimeSc2Aie) -> Result<RuntimeSc2Binding, AieContextError> {
     match subject {
-        AieSubject::Individual { issi } => state.aie_sessions.terminal(issi).ok_or(AieContextError::SubjectNotProvisioned),
+        // Session state authorizes the subject. Its key identity deliberately
+        // follows the target air slot, because the cutover downlink slot is
+        // built before `rebind_all_to` promotes future sessions.
+        AieSubject::Individual { issi } => state
+            .aie_sessions
+            .terminal(issi)
+            .map(|_| RuntimeSc2Binding::from_sc2(sc2))
+            .ok_or(AieContextError::SubjectNotProvisioned),
         AieSubject::Call { call_id, .. } => state
             .aie_sessions
             .call(call_id, subject)
+            .map(|_| RuntimeSc2Binding::from_sc2(sc2))
             .ok_or(AieContextError::SubjectNotProvisioned),
-        AieSubject::Group { .. } => Ok(RuntimeSc2Binding::from_sc2(active_sc2)),
+        AieSubject::Group { .. } => Ok(RuntimeSc2Binding::from_sc2(sc2)),
         AieSubject::System => Err(AieContextError::UnsupportedSubject),
     }
 }
@@ -701,6 +1004,14 @@ impl SubscriberRegistry {
         self.active_subscribers.contains(&issi)
     }
 
+    /// Snapshot the terminals that completed registration delivery in this
+    /// cell.  Rollover MM uses the snapshot to send one cell-specific
+    /// Absolute-IV demand to every known listener without holding the shared
+    /// state lock while it queues radio messages.
+    pub fn active_issis(&self) -> Vec<u32> {
+        self.active_subscribers.iter().copied().collect()
+    }
+
     pub fn mark_active(&mut self, issi: u32) {
         self.active_subscribers.insert(issi);
         self.pending_registration_deliveries.remove(&issi);
@@ -904,6 +1215,10 @@ pub struct StackState {
     pub aie: RuntimeAieConfig,
     /// Key-free active SC2 sessions. The SCK itself stays only in `aie`.
     pub aie_sessions: RuntimeAieSessions,
+    /// Key-free rollover lifecycle reports waiting for the authenticated
+    /// SwMI worker. Keeping them in shared state lets the TDMA-owned MLE
+    /// activate at a slot boundary without putting secrets on a SAP.
+    pub sc2_rollover_events: VecDeque<RuntimeSc2RolloverEvent>,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
     /// Active external DMO gateways served by this BS.
@@ -914,6 +1229,13 @@ pub struct StackState {
     /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
     /// API. The worker reports each version to the SwMI.
     pub network_broadcast: RuntimeNetworkBroadcast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSc2RolloverEvent {
+    pub rollover_id: u64,
+    pub activated: bool,
+    pub local_network_time: u64,
 }
 
 #[cfg(test)]
@@ -932,6 +1254,177 @@ mod tests {
 
     fn test_sc2(sckn: u8, sck_vn: u16) -> RuntimeSc2Aie {
         RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea3, sckn, sck_vn, [0x5a; 10])
+    }
+
+    fn rollover_aie(sckn: u8, sck_vn: u16) -> RuntimeAieConfig {
+        RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: Some(test_sc2(sckn, sck_vn)),
+            rollover: None,
+        }
+    }
+
+    #[test]
+    fn staged_rollover_requires_a_different_sckn_and_the_next_sck_vn() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(4, 5), 1)
+            .expect("a different SCKN with the next SCK-VN is valid");
+
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        assert_eq!(
+            aie.stage_rollover(1, active, test_sc2(4, 17), 1),
+            Err("rollover SCK-VN must increment by exactly one")
+        );
+
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        assert_eq!(
+            aie.stage_rollover(1, active, test_sc2(3, 5), 1),
+            Err("rollover future SCK must use a different SCKN")
+        );
+    }
+
+    #[test]
+    fn staged_rollover_wraps_sck_vn_after_the_16_bit_maximum() {
+        let mut aie = rollover_aie(30, u16::MAX);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(0, 0), 1)
+            .expect("SCK-VN wraps modulo 16 bits");
+    }
+
+    #[test]
+    fn staged_rollover_accepts_sckn_31() {
+        let mut aie = rollover_aie(30, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(31, 5), 1)
+            .expect("SCKN 31 is a valid rollover target");
+    }
+
+    #[test]
+    fn new_prepare_replaces_an_unactivated_rollover_after_a_missed_cancel() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(10, active, test_sc2(4, 5), 1)
+            .expect("stage rollover that will be cancelled centrally");
+
+        // The cancel was missed while this BS was disconnected. The new
+        // preparation repeats the real active identity and must recover the
+        // local staged state rather than reject the new rollover ID.
+        aie.stage_rollover(11, active, test_sc2(5, 17), 2)
+            .expect("replace stale unactivated rollover");
+        assert_eq!(aie.staged_rollover_id(), Some(11));
+    }
+
+    #[test]
+    fn next_prepare_replaces_an_activated_rollover_after_its_uplink_grace() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(10, active, test_sc2(4, 5), 1 << 24).expect("stage rollover");
+        let activation = TdmaTime::default().add_timeslots(1);
+        aie.rollover.as_mut().expect("staged rollover").local_activation_tdma = Some(activation);
+        aie.activate_rollover_if_due(activation, &mut RuntimeAieSessions::default())
+            .expect("activate rollover");
+
+        let new_active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(11, new_active, test_sc2(5, 16), 2 << 24)
+            .expect("a later rollover may follow an activated rollover");
+        assert_eq!(aie.staged_rollover_id(), Some(11));
+    }
+
+    #[test]
+    fn rollover_selects_keys_by_air_slot_for_tx_ahead_and_uplink_grace() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        let activation = TdmaTime::default().add_timeslots(20);
+        aie.stage_rollover(1, active, test_sc2(4, 5), 1).expect("stage rollover");
+        aie.rollover.as_mut().expect("staged rollover").local_activation_tdma = Some(activation);
+
+        // The scheduler prepares this downlink one tick before it goes on
+        // air, but its real slot is the cutover slot and must use the future
+        // SCK. The paired two uplink slots still use the old SCK.
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Downlink, activation)
+                .expect("downlink key")
+                .sck_vn,
+            5
+        );
+        assert_eq!(
+            aie.downlink_sc2_identity_at(activation.add_timeslots(-1))
+                .expect("pre-cutover SYSINFO identity")
+                .sck_vn,
+            4
+        );
+        assert_eq!(
+            aie.downlink_sc2_identity_at(activation).expect("cutover SYSINFO identity").sck_vn,
+            5
+        );
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Uplink, activation)
+                .expect("first uplink grace key")
+                .sck_vn,
+            4
+        );
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Uplink, activation.add_timeslots(1))
+                .expect("second uplink grace key")
+                .sck_vn,
+            4
+        );
+
+        let mut sessions = RuntimeAieSessions::default();
+        aie.activate_rollover_if_due(activation, &mut sessions).expect("activate rollover");
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Downlink, activation.add_timeslots(-1))
+                .expect("retired key for a delayed pre-cutover downlink")
+                .sck_vn,
+            4
+        );
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Uplink, activation.add_timeslots(1))
+                .expect("retired uplink grace key")
+                .sck_vn,
+            4
+        );
+        assert_eq!(
+            aie.sc2_for_air_time(AieDirection::Uplink, activation.add_timeslots(2))
+                .expect("new uplink key after grace")
+                .sck_vn,
+            5
+        );
+    }
+
+    #[test]
+    fn rollover_absolute_iv_uses_security_sysinfo_before_voice_slots() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(4, 5), 0).expect("stage rollover");
+        let current = TdmaTime { h: 7, m: 8, f: 9, t: 2 };
+        let (_, activation) = aie.schedule_rollover_absolute_iv(0, current).expect("schedule local Absolute IV");
+        assert_eq!(activation, TdmaTime { h: 7, m: 8, f: 12, t: 1 });
+        assert!(activation.is_sc2_security_sysinfo_opportunity());
+    }
+
+    #[test]
+    fn rollover_absolute_iv_keeps_an_exact_security_sysinfo_boundary() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(4, 5), 0).expect("stage rollover");
+        let current = TdmaTime { h: 7, m: 8, f: 12, t: 1 };
+        let (_, activation) = aie.schedule_rollover_absolute_iv(0, current).expect("schedule local Absolute IV");
+        assert_eq!(activation, current);
+    }
+
+    #[test]
+    fn rollover_absolute_iv_advances_to_next_multiframe_after_frame_16() {
+        let mut aie = rollover_aie(3, 4);
+        let active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
+        aie.stage_rollover(1, active, test_sc2(4, 5), 0).expect("stage rollover");
+        let current = TdmaTime { h: 7, m: 8, f: 16, t: 2 };
+        let (_, activation) = aie.schedule_rollover_absolute_iv(0, current).expect("schedule local Absolute IV");
+        assert_eq!(activation, TdmaTime { h: 7, m: 9, f: 4, t: 1 });
     }
 
     #[test]
@@ -986,6 +1479,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
         }
@@ -1031,6 +1525,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea3, 3, 7, key)),
+            rollover: None,
         };
         let provider = BsAieKeyProvider::new(config);
         let esi_bytes = tetra_crypto::ta61(&key, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8]);
@@ -1072,6 +1567,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
         }
@@ -1083,15 +1579,15 @@ mod tests {
                 TdmaTime::default().add_timeslots(19),
             )
             .expect("active SC2 terminal resolves");
-        let mut second_half = BitBuffer::new(216);
+        let mut second_half = BitBuffer::new(137);
         provider
-            .cipher_downlink_traffic_at_kss_offset(context, &mut second_half, 0, 216, 216)
+            .cipher_downlink_traffic_at_kss_offset(context, &mut second_half, 0, 137, 216)
             .expect("TCH/S stolen-half offset is supported");
-        assert_ne!(second_half.to_bitstr(), "0".repeat(216));
+        assert_ne!(second_half.to_bitstr(), "0".repeat(137));
         provider
-            .cipher_downlink_traffic_at_kss_offset(context, &mut second_half, 0, 216, 216)
+            .cipher_downlink_traffic_at_kss_offset(context, &mut second_half, 0, 137, 216)
             .expect("XOR decrypt succeeds at the same offset");
-        assert_eq!(second_half.to_bitstr(), "0".repeat(216));
+        assert_eq!(second_half.to_bitstr(), "0".repeat(137));
     }
 
     #[test]
@@ -1102,6 +1598,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(sc2),
+            rollover: None,
         };
         let provider = BsAieKeyProvider::new(config);
         let context = provider
@@ -1129,6 +1626,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
         }
@@ -1239,6 +1737,7 @@ impl Default for StackState {
             authentication_required: false,
             aie: RuntimeAieConfig::default(),
             aie_sessions: RuntimeAieSessions::default(),
+            sc2_rollover_events: VecDeque::new(),
             subscribers: SubscriberRegistry::new(),
             dm_gateways: DmGatewayRegistry::default(),
             subscriber_delivery_routes: HashMap::new(),

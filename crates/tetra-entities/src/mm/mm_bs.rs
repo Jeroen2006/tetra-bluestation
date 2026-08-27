@@ -35,7 +35,7 @@ use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
-use tetra_pdus::mm::pdus::ck_change::UCkChangeResult;
+use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DCkChangeDemand, SckChangeData, UCkChangeResult};
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::d_authentication_demand::DAuthenticationDemand;
 use tetra_pdus::mm::pdus::d_authentication_response::DAuthenticationResponse;
@@ -68,6 +68,26 @@ const fn sc2_ksg_number(algorithm: tetra_config::bluestation::RuntimeSc2TeaAlgor
 /// Keep only a bounded, metadata-only history.  In particular, neither an
 /// OTAR payload nor a sealed key is retained by the key-lifecycle tracker.
 const MAX_RECENT_OTAR_DELIVERIES: usize = 64;
+/// EG terminals may monitor control signalling only once per 64 multiframes.
+/// Repeat the unacknowledged all-MS announcement every two such cycles until
+/// cutover, leaving room for scheduling and radio loss.
+const ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS: i32 = 128 * 18 * 4;
+const ROLLOVER_OTAR_RESULT_TIMEOUT_TIMESLOTS: i32 = 128 * 18 * 4;
+
+fn absolute_iv_time(time: TdmaTime) -> CkChangeTime {
+    CkChangeTime::AbsoluteIv {
+        // EN 300 392-7 §6.3.2.1: only the two-bit slot component is
+        // zero-based (slot 1 is encoded as 0). Frame and multiframe are the
+        // normal on-air counters, respectively 1..=18 and 1..=60. Sending
+        // either of those one lower makes an MS apply a D-CK CHANGE DEMAND
+        // at a different IV from the BS, corrupting encrypted traffic at
+        // the rollover boundary.
+        slot_number: time.t - 1,
+        frame_number: time.f,
+        multiframe_number: time.m,
+        hyperframe_number: time.h,
+    }
+}
 
 /// The response type which completes an OTAR transaction at the application
 /// layer.  This is deliberately separate from a basic-link acknowledgement:
@@ -136,6 +156,7 @@ enum OtarDeliveryStatus {
     AwaitingTerminalResult,
     TerminalResult { success: bool },
     LinkFailed { state: TxState },
+    TimedOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +179,7 @@ struct PendingOtarDelivery {
     expected_response: Option<OtarTerminalResponse>,
     tx_reporter: TxReporter,
     status: OtarDeliveryStatus,
+    result_deadline: TdmaTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,12 +272,24 @@ pub struct MmBs {
     /// queue admission: its clear BL-ACK must still be accepted. The receipt
     /// reaches `Transmitted` only after the complete air PDU was sent.
     pending_sc2_activations: HashMap<u32, TxReporter>,
+    /// Last all-MS rollover announcement. This is metadata only; the SCK
+    /// remains inside runtime AIE state.
+    last_rollover_broadcast: Option<(u64, TdmaTime)>,
+    /// Rollover for which every currently active terminal has received an
+    /// individual, link-acknowledged Absolute-IV demand.  Terminals that
+    /// register later are covered by `send_rollover_notification` on the
+    /// registration path.
+    last_rollover_individual_announcement: Option<u64>,
     current_time: TdmaTime,
 }
 
 struct PendingRegistration {
     itsi: u32,
     air_handle: u32,
+    /// Whether this exact U-LOCATION UPDATE DEMAND was successfully decoded
+    /// under SC2.  Registration responses must follow this bearer, rather
+    /// than a possibly stale terminal binding left by the previous SCK.
+    air_interface_encrypted: bool,
     location_update_type: LocationUpdateType,
     address_extension: Option<u64>,
     energy_saving_information: Option<EnergySavingInformation>,
@@ -328,6 +362,38 @@ impl MmBs {
         self.recent_otar_deliveries.push_back(delivery);
     }
 
+    fn rollover_otar_id(command_id: u64, issi: u32, kind: OtarDownlinkKind) -> Option<u64> {
+        (kind == OtarDownlinkKind::SckProvide
+            && (command_id & 0x00ff_ffff) == u64::from(issi)
+            && command_id >> 24 != 0)
+            .then_some(command_id >> 24)
+    }
+
+    fn report_rollover_otar_status(
+        &mut self,
+        command_id: u64,
+        issi: u32,
+        air_handle: u32,
+        kind: OtarDownlinkKind,
+        state: &str,
+        success: Option<bool>,
+    ) {
+        let Some(rollover_id) = Self::rollover_otar_id(command_id, issi, kind) else { return };
+        self.report_aie_observation(
+            issi,
+            air_handle,
+            AieObservationEvent::Otar,
+            self.effective_aie_state(issi, true),
+            Some(true),
+            None,
+            None,
+            None,
+            success,
+            None,
+            Some(format!("rollover-otar:{rollover_id}:{state}")),
+        );
+    }
+
     fn complete_otar_delivery(&mut self, command_id: u64, status: OtarDeliveryStatus) {
         let Some(pending) = self.pending_otar_deliveries.remove(&command_id) else {
             return;
@@ -350,7 +416,7 @@ impl MmBs {
     fn update_otar_delivery_statuses(&mut self) {
         let command_ids = self.pending_otar_deliveries.keys().copied().collect::<Vec<_>>();
         for command_id in command_ids {
-            let (issi, kind, status_change, complete) = {
+            let (issi, air_handle, kind, status_change, complete, rollover_event) = {
                 let Some(pending) = self.pending_otar_deliveries.get_mut(&command_id) else {
                     continue;
                 };
@@ -358,6 +424,7 @@ impl MmBs {
                 let link_ack_expected = pending.tx_reporter.expects_ack();
                 let previous_status = pending.status;
                 let mut complete = None;
+                let mut rollover_event = None;
 
                 match tx_state {
                     TxState::Pending => {}
@@ -365,6 +432,7 @@ impl MmBs {
                         let failed = OtarDeliveryStatus::LinkFailed { state: tx_state };
                         pending.status = failed;
                         complete = Some(failed);
+                        rollover_event = Some(("link-failed", Some(false)));
                     }
                     TxState::Transmitted if previous_status == OtarDeliveryStatus::Queued => {
                         pending.status = OtarDeliveryStatus::AirTransmitted;
@@ -386,18 +454,28 @@ impl MmBs {
                         pending.status = OtarDeliveryStatus::LinkAcknowledged;
                         if pending.expected_response.is_some() {
                             pending.status = OtarDeliveryStatus::AwaitingTerminalResult;
+                            rollover_event = Some(("link-ack", Some(true)));
                         } else {
                             complete = Some(OtarDeliveryStatus::LinkAcknowledged);
                         }
                     }
                     TxState::Acknowledged => {}
                 }
+                if pending.status == OtarDeliveryStatus::AwaitingTerminalResult
+                    && pending.result_deadline.age(self.current_time) >= 0
+                {
+                    pending.status = OtarDeliveryStatus::TimedOut;
+                    complete = Some(OtarDeliveryStatus::TimedOut);
+                    rollover_event = Some(("timeout", Some(false)));
+                }
 
                 (
                     pending.issi,
+                    pending.air_handle,
                     pending.kind,
                     (previous_status != pending.status).then_some(pending.status),
                     complete,
+                    rollover_event,
                 )
             };
             if let Some(status) = status_change {
@@ -405,6 +483,9 @@ impl MmBs {
             }
             if let Some(status) = complete {
                 self.complete_otar_delivery(command_id, status);
+            }
+            if let Some((event, success)) = rollover_event {
+                self.report_rollover_otar_status(command_id, issi, air_handle, kind, event, success);
             }
         }
     }
@@ -433,6 +514,11 @@ impl MmBs {
             return;
         };
         let command_id = *command_id;
+        let kind = self
+            .pending_otar_deliveries
+            .get(&command_id)
+            .expect("correlated pending OTAR delivery")
+            .kind;
         tracing::debug!(
             command_id,
             issi,
@@ -445,6 +531,7 @@ impl MmBs {
             self.gsko_bootstraps.insert(issi, GskoBootstrapStatus::Failed { command_id });
         }
         self.complete_otar_delivery(command_id, OtarDeliveryStatus::TerminalResult { success });
+        self.report_rollover_otar_status(command_id, issi, air_handle, kind, "key-result", Some(success));
     }
 
     /// Decode Table A.35. The optional RAND2 is a Type-2 field, so even an
@@ -549,6 +636,8 @@ impl MmBs {
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
             pending_sc2_activations: HashMap::new(),
+            last_rollover_broadcast: None,
+            last_rollover_individual_announcement: None,
             current_time: TdmaTime::default(),
         }
     }
@@ -668,17 +757,167 @@ impl MmBs {
         }
     }
 
-    fn defer_sc2_activation(&mut self, issi: u32, aie: &AieLocationUpdateDecision, receipt: TxReporter) {
+    /// Keep one registration/authentication transaction on the same clear or
+    /// encrypted bearer on which its U-LOCATION UPDATE DEMAND arrived.  In
+    /// particular, a clear CK request cannot receive its sealed current SCK
+    /// inside an SC2-encrypted D-LOCATION UPDATE ACCEPT: the MS is requesting
+    /// that key precisely because it cannot decrypt with it yet.
+    fn aie_request_for_registration(&self, issi: u32, air_interface_encrypted: bool) -> AieRequest {
+        if air_interface_encrypted {
+            self.aie_request_for_terminal(issi)
+        } else {
+            AieRequest::clear(AieSubject::System, AieScope::MacResource)
+        }
+    }
+
+    fn aie_request_for_registration_command(&self, command_id: u64, issi: u32) -> AieRequest {
+        let encrypted = self
+            .pending_registrations
+            .get(&command_id)
+            .is_some_and(|registration| registration.air_interface_encrypted);
+        self.aie_request_for_registration(issi, encrypted)
+    }
+
+    fn defer_sc2_activation(&mut self, issi: u32, aie: &AieLocationUpdateDecision, receipt: TxReporter) -> bool {
         // Cipher Control announces the cell's selected SC2 parameters, but
         // it does not itself give a previously clear MS an SCK.  Activating
         // the BS binding in that case makes the cell reject the MS's next
         // clear bootstrap retry even though it never received a key.  Only
-        // the full Table A.94 CK/SCK provision (228 bits) can transition a
+        // the full Table A.94 CK/SCK provision (228 bits for current-only or
+        // 369 bits when it also carries the future SCK) can transition a
         // clear terminal into SC2 here.  An already ciphered registration
         // already has its binding before this function is reached.
-        if aie.authentication_downlink_bit_len == Some(228) {
+        let deferred = matches!(aie.authentication_downlink_bit_len, Some(228 | 369));
+        if deferred {
             self.pending_sc2_activations.insert(issi, receipt);
         }
+        deferred
+    }
+
+    /// A target BS repeats the key-change indication after every successful
+    /// registration, including CA roaming. A past schedule is never replayed:
+    /// after local cutover the terminal is told that the selected SCK is
+    /// already in use.
+    fn send_rollover_notification(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
+        let Some((key, absolute_iv)) = self.config.state_read().aie.rollover_notification() else {
+            return false;
+        };
+        let pdu = DCkChangeDemand {
+            // TTR 001-11 §6.2.7.1 and table 8 require no layer-3
+            // acknowledgement for an imminent TM-SCK change. Keep the
+            // individual message on acknowledged basic link below, so radio
+            // delivery is still confirmed without asking the MS for the
+            // non-conforming U-CK CHANGE RESULT that some terminals reject.
+            acknowledgement_required: false,
+            // This is a TM-SCK rollover in an already SC2-protected cell,
+            // not a transition *to* SC2.  TTR 001-11 table 8 requires
+            // "No change of security class" (00); 10 belongs to the
+            // initial transition form in table 5 and makes terminals apply
+            // the wrong security-class procedure instead of a key rollover.
+            change_of_security_class: 0,
+            scks: vec![SckChangeData { sck_number: key.key.sckn, version_number: key.key.sck_vn }],
+            time: absolute_iv.map(absolute_iv_time).unwrap_or(CkChangeTime::CurrentlyInUse),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(96);
+        if let Err(error) = pdu.to_bitbuf(&mut sdu) {
+            tracing::warn!(issi, error = ?error, "cannot encode SC2 rollover notification");
+            return false;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: self.aie_request_for_terminal(issi),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+        tracing::debug!(
+            issi,
+            sckn = key.key.sckn,
+            sck_vn = key.key.sck_vn,
+            scheduled = absolute_iv.is_some(),
+            "queued individual SC2 rollover notification"
+        );
+        true
+    }
+
+    /// Network-wide on-air announcement for terminals that were already
+    /// registered when the operator staged the rollover. Roaming terminals
+    /// additionally receive the individual notification above after their
+    /// target-cell location update.
+    fn send_rollover_broadcast(&self, queue: &mut MessageQueue) -> bool {
+        let Some((key, absolute_iv)) = self.config.state_read().aie.rollover_notification() else {
+            return false;
+        };
+        let pdu = DCkChangeDemand {
+            acknowledgement_required: false,
+            // Table 8 (change of TM-SCK), not table 5 (transition to SC2).
+            change_of_security_class: 0,
+            scks: vec![SckChangeData {
+                sck_number: key.key.sckn,
+                version_number: key.key.sck_vn,
+            }],
+            time: absolute_iv.map(absolute_iv_time).unwrap_or(CkChangeTime::CurrentlyInUse),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(96);
+        if pdu.to_bitbuf(&mut sdu).is_err() {
+            tracing::warn!("cannot encode broadcast SC2 rollover demand");
+            return false;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                // A broadcast D-CK CHANGE has no application/link-layer
+                // acknowledgement. BL-DATA is individual-addressed only;
+                // using it for the all-MS GSSI would panic in LLC.
+                layer2service: Layer2Service::Unacknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+        tracing::info!(sckn = key.key.sckn, sck_vn = key.key.sck_vn, "queued broadcast SC2 rollover demand");
+        true
+    }
+
+    /// Send the cell's exact Absolute IV to every terminal already active at
+    /// prepare time.  Broadcast remains necessary for unknown/EE listeners,
+    /// but an in-call MS monitors its assigned channel rather than MCCH; LLC
+    /// therefore routes these acknowledged copies through the live FN18
+    /// associated-control opportunity.
+    fn send_rollover_notifications_to_active_terminals(&self, queue: &mut MessageQueue) -> Option<usize> {
+        let notification = self.config.state_read().aie.rollover_notification()?;
+        if notification.1.is_none() {
+            return None;
+        }
+        let mut issis = self.config.state_read().subscribers.active_issis();
+        issis.sort_unstable();
+        let sent = issis
+            .into_iter()
+            .filter(|&issi| self.send_rollover_notification(queue, issi, 0))
+            .count();
+        Some(sent)
     }
 
     /// TTR 001-11 6.2.23.1: following a clear location update the ciphering
@@ -686,7 +925,7 @@ impl MmBs {
     /// or on its clear BL-ACK, whichever comes first. `Transmitted` is the
     /// former event in this stack. A dropped/lost clear accept must never
     /// leave an SC2 binding active.
-    fn update_sc2_activations(&mut self) {
+    fn update_sc2_activations(&mut self, queue: &mut MessageQueue) {
         let outcomes = self
             .pending_sc2_activations
             .iter()
@@ -714,6 +953,12 @@ impl MmBs {
                     Some("SC2 terminal binding activated after delivered bootstrap".to_owned()),
                 );
                 tracing::debug!(issi, ?state, "activated SC2 after clear location-update accept transmission");
+                // A future SCK may have been provisioned in the same
+                // Authentication-downlink element (Table A.94).  Its
+                // Absolute-IV demand must follow only after this activation,
+                // so it is protected with the current SCK rather than being
+                // frozen as a clear PDU while the ACCEPT is still pending.
+                let _ = self.send_rollover_notification(queue, issi, 0);
             } else {
                 tracing::warn!(
                     issi,
@@ -861,27 +1106,30 @@ impl MmBs {
     /// central anchor has already moved, and a stale-cell deregistration must
     /// not be allowed to deregister the new serving cell.
     fn remove_local_subscriber(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
-        let Some(client) = self.client_mgr.remove_client(issi) else {
-            tracing::debug!(issi, "local subscriber cleanup ignored for unknown client");
-            return false;
-        };
-
-        {
+        let client = self.client_mgr.remove_client(issi);
+        let had_local_state = {
             let mut state = self.config.state_write();
+            let existed = state.subscribers.is_registered(issi) || state.aie_sessions.terminal(issi).is_some();
             state.subscribers.deregister(issi);
             state.aie_sessions.deactivate_terminal(issi);
-        }
+            existed
+        };
         let was_gateway = self.config.state_read().dm_gateways.is_active(issi);
         if was_gateway {
             self.config.state_write().dm_gateways.deactivate(issi);
             self.publish_dm_gateway_state(issi, false);
         }
-        if !client.groups.is_empty() {
-            let groups: Vec<u32> = client.groups.keys().copied().collect();
-            self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+        if let Some(client) = client.as_ref() {
+            if !client.groups.is_empty() {
+                let groups: Vec<u32> = client.groups.keys().copied().collect();
+                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+            }
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
         }
-        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
-        true
+        if client.is_none() && had_local_state {
+            tracing::debug!(issi, "removed stale subscriber/AIE state without an MM client");
+        }
+        client.is_some() || had_local_state || was_gateway
     }
 
     fn rx_u_itsi_detach(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1095,6 +1343,7 @@ impl MmBs {
                     PendingRegistration {
                         itsi: issi,
                         air_handle: prim.handle,
+                        air_interface_encrypted,
                         location_update_type: pdu.location_update_type,
                         address_extension: pdu.address_extension,
                         energy_saving_information: esi,
@@ -2243,7 +2492,7 @@ impl MmBs {
                 pending.energy_saving_information,
                 pending.authentication_successful,
                 &pending.aie,
-                self.aie_request_for_terminal(pending.itsi),
+                self.aie_request_for_registration(pending.itsi, pending.air_interface_encrypted),
                 pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: 0,
                     group_identity_downlink: None,
@@ -2358,7 +2607,7 @@ impl MmBs {
                 pending.energy_saving_information,
                 pending.authentication_successful,
                 &pending.aie,
-                self.aie_request_for_terminal(pending.itsi),
+                self.aie_request_for_registration(pending.itsi, pending.air_interface_encrypted),
                 Some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: u8::from(had_rejection),
                     group_identity_downlink: Some(groups),
@@ -2367,7 +2616,10 @@ impl MmBs {
                 rua_requested,
             );
             self.config.state_write().subscribers.mark_active(pending.itsi);
-            self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+            let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+            if !deferred {
+                let _ = self.send_rollover_notification(queue, pending.itsi, pending.air_handle);
+            }
             return;
         }
         let receipt = Self::send_d_location_update_accept_with_handover(
@@ -2378,7 +2630,7 @@ impl MmBs {
             pending.energy_saving_information,
             pending.authentication_successful,
             &pending.aie,
-            self.aie_request_for_terminal(pending.itsi),
+            self.aie_request_for_registration(pending.itsi, pending.air_interface_encrypted),
             pending.has_group_identity_location_demand.then_some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
@@ -2387,7 +2639,10 @@ impl MmBs {
             rua_requested,
         );
         self.config.state_write().subscribers.mark_active(pending.itsi);
-        self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+        let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+        if !deferred {
+            let _ = self.send_rollover_notification(queue, pending.itsi, pending.air_handle);
+        }
         tracing::info!(
             command_id,
             itsi,
@@ -2673,7 +2928,7 @@ impl MmBs {
             registration.energy_saving_information,
             registration.authentication_successful,
             &registration.aie,
-            self.aie_request_for_terminal(registration.itsi),
+            self.aie_request_for_registration(registration.itsi, registration.air_interface_encrypted),
             Some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: u8::from(had_rejection),
                 group_identity_downlink: Some(groups),
@@ -2682,7 +2937,10 @@ impl MmBs {
             pending.rua_requested,
         );
         self.config.state_write().subscribers.mark_active(registration.itsi);
-        self.defer_sc2_activation(registration.itsi, &registration.aie, receipt);
+        let deferred = self.defer_sc2_activation(registration.itsi, &registration.aie, receipt);
+        if !deferred {
+            let _ = self.send_rollover_notification(queue, registration.itsi, registration.air_handle);
+        }
         tracing::info!(
             command_id,
             itsi,
@@ -2826,6 +3084,7 @@ impl MmBs {
         tracing::debug!(
             issi,
             authentication_downlink = aie.authentication_downlink_bit_len.is_some() || authentication_successful,
+            downlink_encrypted = aie_request.is_encrypted(),
             "sending D-LOCATION UPDATE ACCEPT"
         );
         let tx_reporter = TxReporter::new();
@@ -3200,8 +3459,29 @@ impl TetraEntityTrait for MmBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
-        self.update_sc2_activations();
+        self.update_sc2_activations(queue);
         self.update_otar_delivery_statuses();
+        let staged_rollover_id = self.config.state_read().aie.staged_rollover_id();
+        if let Some(rollover_id) = staged_rollover_id {
+            let due = self.last_rollover_broadcast.is_none_or(|(last_id, last_time)| {
+                last_id != rollover_id
+                    || last_time.age(ts) >= ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS
+            });
+            if due && self.send_rollover_broadcast(queue) {
+                self.last_rollover_broadcast = Some((rollover_id, ts));
+                tracing::debug!(rollover_id, "repeated all-MS SC2 rollover announcement");
+            }
+            if self.last_rollover_individual_announcement != Some(rollover_id)
+                && let Some(sent) = self.send_rollover_notifications_to_active_terminals(queue)
+            {
+                self.last_rollover_individual_announcement = Some(rollover_id);
+                tracing::info!(
+                    rollover_id,
+                    terminals = sent,
+                    "queued individual SC2 rollover demands for active terminals"
+                );
+            }
+        }
         let timed_out: Vec<u64> = self
             .registration_deadlines
             .iter()
@@ -3293,7 +3573,7 @@ impl TetraEntityTrait for MmBs {
                             stealing_permission: false,
                             stealing_repeats_flag: false,
                             encryption_flag: false,
-                            aie_request: self.aie_request_for_terminal(itsi as u32),
+                            aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                             is_null_pdu: false,
                             tx_reporter: None,
                             seamless_handover: None,
@@ -3333,7 +3613,7 @@ impl TetraEntityTrait for MmBs {
                                 stealing_permission: false,
                                 stealing_repeats_flag: false,
                                 encryption_flag: false,
-                                aie_request: self.aie_request_for_terminal(itsi as u32),
+                                aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                                 is_null_pdu: false,
                                 tx_reporter: None,
                                 seamless_handover: None,
@@ -3382,7 +3662,7 @@ impl TetraEntityTrait for MmBs {
                                 stealing_permission: false,
                                 stealing_repeats_flag: false,
                                 encryption_flag: false,
-                                aie_request: self.aie_request_for_terminal(itsi as u32),
+                                aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                                 is_null_pdu: false,
                                 tx_reporter: None,
                                 seamless_handover: None,
@@ -3391,6 +3671,24 @@ impl TetraEntityTrait for MmBs {
                     }
                     self.pending_auth_commands
                         .insert(Self::authentication_correlation_key(itsi as u32, air_handle), command_id);
+                }
+                SwmiMessage::Sc2RolloverPrepare { rollover_id, .. } => {
+                    // MLE derives the serving-cell Absolute IV from the live
+                    // TDMA clock. HashMap entity order is intentionally not a
+                    // synchronization primitive. If this MM tick already
+                    // announced this same rollover, retain its markers;
+                    // clearing them here queued a duplicate batch on the next
+                    // tick and left all nine basic links needlessly blocked.
+                    // A marker for any older rollover is invalidated, while a
+                    // genuinely early prepare naturally leaves `None` and is
+                    // retried after MLE has installed the Absolute IV.
+                    if self.last_rollover_broadcast.is_some_and(|(id, _)| id != rollover_id) {
+                        self.last_rollover_broadcast = None;
+                    }
+                    if self.last_rollover_individual_announcement != Some(rollover_id) {
+                        self.last_rollover_individual_announcement = None;
+                    }
+                    tracing::debug!(rollover_id, "SC2 rollover prepare synchronized with serving-cell announcement state");
                 }
                 SwmiMessage::OtarDownlink {
                     command_id,
@@ -3433,6 +3731,20 @@ impl TetraEntityTrait for MmBs {
                         Ok(request) => request,
                         Err(reason) => {
                             tracing::warn!(command_id, issi, ?kind, reason, "rejecting unsafe clear D-OTAR in SC2-only mode");
+                            // A connected BS can receive proactive rollover
+                            // OTAR before its terminal contexts have been
+                            // recovered.  Tell the SwMI this attempt was not
+                            // admitted so it can retry after the terminal has
+                            // registered; silently dropping it leaves the
+                            // central sent-marker set until cutover.
+                            self.report_rollover_otar_status(
+                                command_id,
+                                issi,
+                                air_handle,
+                                kind,
+                                "link-failed",
+                                Some(false),
+                            );
                             continue;
                         }
                     };
@@ -3478,7 +3790,16 @@ impl TetraEntityTrait for MmBs {
                             expected_response: kind.expected_response(),
                             tx_reporter: tx_reporter.clone(),
                             status: OtarDeliveryStatus::Queued,
+                            result_deadline: self.current_time.add_timeslots(ROLLOVER_OTAR_RESULT_TIMEOUT_TIMESLOTS),
                         },
+                    );
+                    self.report_rollover_otar_status(
+                        command_id,
+                        issi,
+                        air_handle,
+                        kind,
+                        "announced",
+                        None,
                     );
                     sdu.seek(0);
                     queue.push_back(SapMsg {

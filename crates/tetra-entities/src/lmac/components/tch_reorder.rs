@@ -57,6 +57,32 @@ pub fn codec_to_channel(codec_bits: &[u8; 274]) -> [u8; 274] {
     channel
 }
 
+/// Convert one 137-bit ACELP speech frame from codec order to the class-wise
+/// channel order used when frame stealing is active.
+///
+/// EN 300 395-2, table 6 carries only speech frame B and orders its bits as
+/// class 0 (51 bits), class 1 (56 bits), then class 2 (30 bits).
+pub fn codec_frame_to_channel(codec_bits: &[u8; NUM_ACELP_BITS]) -> [u8; NUM_ACELP_BITS] {
+    let mut channel = [0u8; NUM_ACELP_BITS];
+    let mut out_idx = 0;
+
+    for &position in &CLASS0_POS {
+        channel[out_idx] = codec_bits[(position - 1) as usize];
+        out_idx += 1;
+    }
+    for &position in &CLASS1_POS {
+        channel[out_idx] = codec_bits[(position - 1) as usize];
+        out_idx += 1;
+    }
+    for &position in &CLASS2_POS {
+        channel[out_idx] = codec_bits[(position - 1) as usize];
+        out_idx += 1;
+    }
+
+    debug_assert_eq!(out_idx, NUM_ACELP_BITS);
+    channel
+}
+
 /// Convert 274 ACELP bits from channel order (type-1/type-2 bits) to codec order (STE format). Reverse of `codec_to_channel`.
 pub fn channel_to_codec(channel_bits: &[u8; 274]) -> [u8; 274] {
     let mut codec = [0u8; 274];
@@ -131,6 +157,18 @@ mod tests {
         }
         for (i, &c) in covered.iter().enumerate() {
             assert!(c, "position {} is not covered", i + 1);
+        }
+    }
+
+    #[test]
+    fn single_frame_reorder_follows_the_frame_stealing_table() {
+        for (channel_index, &codec_position) in CLASS0_POS.iter().chain(CLASS1_POS.iter()).chain(CLASS2_POS.iter()).enumerate() {
+            let mut codec = [0u8; NUM_ACELP_BITS];
+            codec[(codec_position - 1) as usize] = 1;
+            let channel = codec_frame_to_channel(&codec);
+
+            assert_eq!(channel[channel_index], 1);
+            assert_eq!(channel.iter().filter(|&&bit| bit != 0).count(), 1);
         }
     }
 }

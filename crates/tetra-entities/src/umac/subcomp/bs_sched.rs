@@ -51,6 +51,19 @@ const DEFAULT_ACCESS_FRAME_MARKER: BaseFrameLength = BaseFrameLength::Subslots2;
 /// Number of timeslots the scheduler operates on. May become larger when secondary carriers are supported.
 pub const NUM_TIMESLOTS: usize = 4;
 
+/// Select the SYSINFO variant for an actual BNCH transmission.
+///
+/// EN 300 392-2 table 9.33 maps the mandatory frame-18 BNCH across all four
+/// timeslots; the SYSINFO contents are not tied to that timeslot. Keep every
+/// frame-18 occurrence on the hyperframe/default-access variant for robust
+/// initial cell acquisition. On the additional BNCH opportunities in frames
+/// 1..=17, alternate per pair of TDMA frames. In particular, TS1 emits BNCH
+/// on its even frames in this scheduler, so FN2/FN6/FN10/FN14 carry default
+/// access while FN4/FN8/FN12/FN16 carry Extended Services plus SCKN/SCK-VN.
+fn use_default_access_sysinfo(time: TdmaTime) -> bool {
+    !time.is_sc2_security_sysinfo_opportunity() && (time.f == 18 || ((time.f - 1) / 2) % 2 == 0)
+}
+
 /// Close a signalling MAC block with a valid Null PDU and/or fill bits.
 ///
 /// A freshly allocated BitBuffer is zero-filled, but trailing zeroes are not a
@@ -306,36 +319,152 @@ impl BsChannelScheduler {
 
     /// Replace the active AIE broadcast policy. SYSINFO 1 keeps the
     /// hyperframe field; with SC2 active SYSINFO 2 uses the mutually exclusive
-    /// cipher-key field and carries the current 16-bit SCK-VN. The scheduler
-    /// already alternates SYSINFO 1/2, so both fields are continually sent.
+    /// cipher-key field and carries the current 16-bit SCK-VN. Variant
+    /// selection follows BNCH occurrences rather than timeslot identity.
     pub fn set_aie_config(&mut self, aie: &RuntimeAieConfig) {
+        self.set_aie_config_for_air_time(aie, self.cur_dltime);
+    }
+
+    /// Update SYSINFO for the slot which is actually going on air. UMAC
+    /// finalizes one future downlink slot per tick; at an Absolute-IV
+    /// boundary the target SCK must therefore be selected before the runtime
+    /// `sc2` field itself is promoted.
+    pub fn set_aie_config_for_air_time(&mut self, aie: &RuntimeAieConfig, air_time: TdmaTime) {
+        let sc2 = aie.downlink_sc2_identity_at(air_time);
         let Some(ext_services) = self.precomps.mac_sysinfo2.ext_services.as_mut() else {
             tracing::warn!("cannot update AIE policy: Extended Services is not present");
             return;
         };
+        let previous = (
+            ext_services.class1_supported,
+            ext_services.class2_supported,
+            ext_services.sck_n,
+            self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn,
+            self.precomps.mle_sysinfo.bs_service_details.aie_service,
+        );
         ext_services.class1_supported = aie.enabled && aie.sc1_allowed;
-        ext_services.class2_supported = aie.enabled && aie.sc2.is_some();
+        ext_services.class2_supported = sc2.is_some();
         ext_services.class3_supported = false;
-        ext_services.sck_n = aie.sc2.as_ref().map(|sc2| sc2.sckn);
+        ext_services.sck_n = sc2.map(|key| key.sckn);
         self.precomps.mle_sysinfo.bs_service_details.aie_service = aie.enabled;
 
         self.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn = None;
-        if let Some(sc2) = aie.enabled.then(|| aie.sc2.as_ref()).flatten() {
+        if let Some(sc2) = sc2 {
             // The 16-bit SYSINFO cipher-key field is an SCK Version Number
             // when SC2 is advertised; it is a CCK identifier only for SC3.
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = Some(sc2.sck_vn);
             self.precomps.mac_sysinfo2.hyperframe_number = None;
-            tracing::info!(
-                sckn = sc2.sckn,
-                sck_vn = sc2.sck_vn,
-                algorithm = ?sc2.algorithm,
-                sc1_allowed = aie.sc1_allowed,
-                "BS SYSINFO AIE policy updated"
-            );
         } else {
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = None;
-            self.precomps.mac_sysinfo2.hyperframe_number = Some(self.cur_dltime.h);
-            tracing::info!("BS SYSINFO AIE policy disabled");
+            self.precomps.mac_sysinfo2.hyperframe_number = Some(air_time.h);
+        }
+        let current = (
+            ext_services.class1_supported,
+            ext_services.class2_supported,
+            ext_services.sck_n,
+            self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn,
+            self.precomps.mle_sysinfo.bs_service_details.aie_service,
+        );
+        if current != previous {
+            if let Some(sc2) = sc2 {
+                tracing::info!(
+                    dltime = %air_time,
+                    sckn = sc2.sckn,
+                    sck_vn = sc2.sck_vn,
+                    algorithm = ?sc2.algorithm,
+                    sc1_allowed = aie.sc1_allowed,
+                    "BS SYSINFO AIE policy updated for air slot"
+                );
+            } else {
+                tracing::info!(dltime = %air_time, "BS SYSINFO AIE policy disabled for air slot");
+            }
+        }
+
+        // TTR 001-11 clause 6.2.7.1.1: an encrypted DUMMY PDU carrying the
+        // new Short SCK-VN makes an encrypting MS change the key immediately.
+        // Pure TCH/S has no MAC header, so listeners already in a call would
+        // otherwise have no on-channel two-bit selector at the exact
+        // Absolute-IV boundary and could remain on the old SCK until later
+        // signalling. Insert one DUMMY on every active traffic leg when the
+        // advertised SCK identity changes from one valid SC2 key to another.
+        if previous.1 && current.1 && (previous.2, previous.3) != (current.2, current.3) {
+            self.enqueue_sc2_changeover_dummies(air_time);
+        }
+    }
+
+    fn enqueue_sc2_changeover_dummies(&mut self, air_time: TdmaTime) {
+        let mut pending = Vec::new();
+
+        for timeslot in 2..=4 {
+            if !self.circuits.is_active(Direction::Dl, timeslot) {
+                continue;
+            }
+            let Some(traffic_request) = self.traffic_aie[timeslot as usize - 1] else {
+                continue;
+            };
+            let AieRequest::Sc2 { subject, .. } = traffic_request else {
+                continue;
+            };
+
+            // A DUMMY is addressed to the listening MS(s), not to the call
+            // object. Group traffic already has a group subject; a private
+            // traffic leg is converted to its destination ISSI for this
+            // control-only indication.
+            let (address, request) = match subject {
+                AieSubject::Group { gssi } => (
+                    TetraAddress::new(gssi, SsiType::Gssi),
+                    AieRequest::sc2(AieSubject::Group { gssi }, AieScope::MacResource),
+                ),
+                AieSubject::Individual { issi } | AieSubject::Call { issi: Some(issi), .. } => (
+                    TetraAddress::issi(issi),
+                    AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource),
+                ),
+                AieSubject::Call { gssi: Some(gssi), .. } => (
+                    TetraAddress::new(gssi, SsiType::Gssi),
+                    AieRequest::sc2(AieSubject::Group { gssi }, AieScope::MacResource),
+                ),
+                AieSubject::System
+                | AieSubject::Call {
+                    issi: None, gssi: None, ..
+                } => continue,
+            };
+
+            let mut resource = MacResource {
+                fill_bits: false,
+                pos_of_grant: 0,
+                encryption_mode: 0,
+                random_access_flag: false,
+                length_ind: 0,
+                addr: Some(address),
+                event_label: None,
+                usage_marker: self.circuits.get_usage(Direction::Dl, timeslot),
+                power_control_element: None,
+                slot_granting_element: None,
+                chan_alloc_element: None,
+            };
+            let fill_bits = resource.update_len_and_fill_ind(0);
+            let resource = match self.prepare_downlink_resource(resource, request, air_time) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    tracing::warn!(?error, dltime = %air_time, timeslot, "cannot build SC2 changeover DUMMY");
+                    continue;
+                }
+            };
+            let header_len = resource.compute_header_len();
+            let mut block = BitBuffer::new(SCH_HD_CAP);
+            resource.to_bitbuf(&mut block);
+            fillbits::addition::write(&mut block, Some(fill_bits));
+            finalize_downlink_mac_block(&mut block);
+
+            pending.push((timeslot, block, request, AieCipherRegion::new(header_len, 0)));
+        }
+
+        for (timeslot, block, request, region) in pending {
+            // This indication is tied to the Absolute IV and therefore takes
+            // priority over ordinary queued FACCH. The latter remains queued
+            // for the next traffic frame.
+            self.dltx_queues[timeslot as usize - 1].insert(0, DlSchedElem::Stealing(block, None, request, Some(region)));
+            tracing::info!(dltime = %air_time, timeslot, "queued encrypted SC2 changeover DUMMY on active traffic channel");
         }
     }
 
@@ -1746,8 +1875,9 @@ impl BsChannelScheduler {
 
             let mut buf = BitBuffer::new(124);
 
-            // Write MAC-SYSINFO (alternating sysinfo1/sysinfo2), followed by MLE-SYSINFO
-            if ts.t % 2 == 1 {
+            // SYSINFO variant scheduling is independent of the timeslot on
+            // which table 9.33 maps this BNCH occurrence.
+            if use_default_access_sysinfo(ts) {
                 self.precomps.mac_sysinfo1.to_bitbuf(&mut buf);
             } else {
                 self.precomps.mac_sysinfo2.to_bitbuf(&mut buf);
@@ -2237,6 +2367,7 @@ mod tests {
                 7,
                 [0x5a; 10],
             )),
+            rollover: None,
         });
 
         assert_eq!(sched.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn, None);
@@ -2248,6 +2379,156 @@ mod tests {
         assert!(ext.class2_supported);
         assert_eq!(ext.sck_n, Some(30));
         assert!(sched.precomps.mle_sysinfo.bs_service_details.aie_service);
+    }
+
+    #[test]
+    fn sysinfo_variant_follows_bnch_occurrence_not_timeslot() {
+        let at = |t, f| TdmaTime { t, f, m: 1, h: 0 };
+
+        // All timeslots use the same contents for a given BNCH frame.
+        assert_eq!(use_default_access_sysinfo(at(1, 4)), use_default_access_sysinfo(at(2, 4)));
+        // Actual additional TS1 BNCH opportunities alternate both required
+        // variants rather than permanently selecting by TS1.
+        assert!(use_default_access_sysinfo(at(1, 2)));
+        assert!(!use_default_access_sysinfo(at(1, 4)));
+        assert!(use_default_access_sysinfo(at(1, 6)));
+        assert!(!use_default_access_sysinfo(at(1, 8)));
+        // Rollover planning selects only the stable TS1 occurrences of the
+        // Extended Services variant, so its Absolute IV and the broadcast
+        // SCKN/SCK-VN update cannot drift apart.
+        for frame in [4, 8, 12, 16] {
+            let time = at(1, frame);
+            assert!(time.is_sc2_security_sysinfo_opportunity());
+            assert!(!use_default_access_sysinfo(time));
+        }
+        // Mandatory control-frame SYSINFO always retains hyperframe data for
+        // terminals acquiring or reacquiring the cell.
+        for t in 1..=4 {
+            assert!(use_default_access_sysinfo(at(t, 18)));
+        }
+    }
+
+    #[test]
+    fn sc2_changeover_dummy_is_an_addressed_decodable_stch_pdu() {
+        use tetra_config::bluestation::{RuntimeSc2Aie, RuntimeSc2TeaAlgorithm, SharedConfig};
+        use tetra_saps::{control::enums::circuit_mode_type::CircuitModeType, tp::TpUnitdataInd};
+
+        let parsed_config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example BS configuration");
+        let config = SharedConfig::from_parts(parsed_config, None);
+        let old_key = [0x11; 10];
+        let target_key = [0x22; 10];
+        let old = RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea1, 27, 18, old_key);
+        let target = RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea1, 28, 19, target_key);
+        {
+            let mut state = config.state_write();
+            state.aie = RuntimeAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: Some(old.clone()),
+                rollover: None,
+            };
+        }
+
+        let mut sched = get_testing_slotter();
+        sched.aie_provider = Some(BsAieKeyProvider::new(config.clone()));
+        sched.create_circuit(
+            Direction::Dl,
+            Circuit {
+                direction: Direction::Dl,
+                ts: 2,
+                usage: 15,
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            },
+        );
+        sched.set_traffic_aie(2, Some(AieRequest::sc2(AieSubject::Group { gssi: 91 }, AieScope::Traffic)));
+
+        let air_time = TdmaTime { t: 2, f: 12, m: 49, h: 7 };
+        let old_aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: Some(old),
+            rollover: None,
+        };
+        sched.set_aie_config_for_air_time(&old_aie, air_time.add_timeslots(-1));
+
+        // The scheduler only emits a transition DUMMY when both the previous
+        // and current policies are valid SC2 identities.  Promote the shared
+        // key provider and the advertised policy together, as production does
+        // at the Absolute-IV boundary.
+        {
+            let mut state = config.state_write();
+            state.aie = RuntimeAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: Some(target.clone()),
+                rollover: None,
+            };
+        }
+        let aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: Some(target),
+            rollover: None,
+        };
+        sched.set_aie_config_for_air_time(&aie, air_time);
+        sched.cur_dltime = air_time.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
+        let slot = sched.finalize_ts_for_tick();
+
+        assert_eq!(slot.ts, air_time);
+        let stch = slot.blk1.expect("changeover must steal the first half-slot");
+        let speech = slot.blk2.expect("second half-slot must remain TCH/S");
+        assert_eq!(stch.logical_channel, LogicalChannel::Stch);
+        assert_eq!(stch.mac_block.get_len(), SCH_HD_CAP);
+        assert_eq!(stch.cipher_region, Some(AieCipherRegion::new(49, 0)));
+        assert_eq!(speech.logical_channel, LogicalChannel::TchS);
+        assert_eq!(speech.mac_block.get_len(), TCH_S_CAP);
+
+        // Exercise the real STCH 124 -> 216 channel coding and decoding path,
+        // then parse the recovered MAC-RESOURCE.  This proves that the block
+        // is not merely the right length but is recognizable as an addressed
+        // DUMMY after its actual half-slot FEC/interleaving/scrambling.
+        let encoded = crate::lmac::components::errorcontrol::encode_cp(stch.clone());
+        assert_eq!(encoded.get_len(), 216);
+        let (decoded, crc_ok) = crate::lmac::components::errorcontrol::decode_cp(
+            LogicalChannel::Stch,
+            TpUnitdataInd {
+                ul_time: air_time,
+                train_type: tetra_core::TrainingSequence::NormalTrainSeq2,
+                burst_type: tetra_core::BurstType::NDB,
+                block_type: tetra_core::PhyBlockType::NDB,
+                block_num: PhyBlockNum::Block1,
+                soft_bits: None,
+                block: encoded,
+            },
+            Some(stch.scrambling_code),
+        );
+        assert!(crc_ok, "changeover DUMMY STCH CRC must survive the half-slot coding path");
+        let mut decoded = decoded.expect("decoded STCH");
+        decoded.seek(0);
+        let dummy = MacResource::from_bitbuf(&mut decoded).expect("decoded changeover DUMMY MAC-RESOURCE");
+
+        assert_eq!(
+            dummy.encryption_mode, 0b11,
+            "odd target SCK-VN must be present in the clear MAC header"
+        );
+        assert_eq!(dummy.length_ind, 7, "addressed DUMMY contains a header and no TM-SDU");
+        assert!(dummy.fill_bits);
+        assert_eq!(dummy.usage_marker, Some(15));
+        let esi = dummy.addr.expect("DUMMY must address the listening group").ssi;
+        let target_plain = tetra_crypto::ta61_inverse(&target_key, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
+        let old_plain = tetra_crypto::ta61_inverse(&old_key, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
+        assert_eq!(u32::from_be_bytes([0, target_plain[0], target_plain[1], target_plain[2]]), 91);
+        assert_ne!(
+            u32::from_be_bytes([0, old_plain[0], old_plain[1], old_plain[2]]),
+            91,
+            "the transition DUMMY must use the target-key GESI, not a stale old-key address"
+        );
     }
 
     #[test]

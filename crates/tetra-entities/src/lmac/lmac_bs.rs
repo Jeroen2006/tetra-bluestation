@@ -1,6 +1,9 @@
-use tetra_config::bluestation::{BsAieKeyProvider, SharedConfig, StackMode};
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, TdmaTime, TrainingSequence};
+use tetra_core::{
+    AieContext, AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, Sc2KeyIdentifier, TdmaTime,
+    TrainingSequence,
+};
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvCrcInd, TmvUnitdataInd};
 use tetra_saps::tp::{TpUnitdataInd, TpUnitdataReqSlot};
@@ -48,6 +51,9 @@ pub struct LmacBs {
     /// per-timeslot policy when call control activates the circuit.
     downlink_traffic_aie: [Option<AieRequest>; 4],
     uplink_traffic_aie: [Option<AieRequest>; 4],
+    /// Last SC2 identity actually used for TCH/S per physical timeslot. This
+    /// contains no key material and logs only a real identity transition.
+    last_downlink_traffic_key: [Option<Sc2KeyIdentifier>; 4],
 
     /// Traffic channels and associated state
     // ul_circuits: [Option<LmacTrafficChan>; 4],
@@ -91,11 +97,31 @@ impl LmacBs {
             aie_provider: BsAieKeyProvider::new(config.clone()),
             downlink_traffic_aie: [None; 4],
             uplink_traffic_aie: [None; 4],
+            last_downlink_traffic_key: [None; 4],
 
             dltime: TdmaTime::default(),
             uplink_phy_chan: [PhysicalChannel::Unallocated; 4],
             blk2_stolen: false,
             recent_common_crc_failures: VecDeque::with_capacity(32),
+        }
+    }
+
+    fn observe_downlink_traffic_key(&mut self, time: TdmaTime, context: AieContext) {
+        let AieContext::Sc2 { key, .. } = context else {
+            return;
+        };
+        let selected = &mut self.last_downlink_traffic_key[time.t as usize - 1];
+        if *selected != Some(key) {
+            tracing::info!(
+                dltime = %time,
+                timeslot = time.t,
+                sckn = key.sckn,
+                sck_vn = key.sck_vn,
+                algorithm = ?key.algorithm,
+                previous = ?*selected,
+                "downlink TCH/S SC2 identity changed at air slot"
+            );
+            *selected = Some(key);
         }
     }
 
@@ -523,9 +549,9 @@ impl LmacBs {
                 continue;
             }
             if blk.logical_channel.is_traffic() {
-                // Full TCH/S is ciphered below, before channel coding.  A
-                // stolen second half uses its separate Table 6.4 KSS mapping
-                // after `encode_tp` has selected that half.
+                // TCH/S is ciphered below, before channel coding. A stolen
+                // second half uses only speech frame B and its separate
+                // Table 6.4 KSS mapping.
                 continue;
             }
             let Some(region) = blk.cipher_region else {
@@ -578,6 +604,7 @@ impl LmacBs {
                             return;
                         }
                     };
+                    self.observe_downlink_traffic_key(prim.ts, context);
                     if let Err(error) = self
                         .aie_provider
                         .cipher_downlink_traffic(context, &mut blk1.mac_block, region.start, region.len)
@@ -595,23 +622,22 @@ impl LmacBs {
             if blk2.logical_channel.is_traffic() {
                 let request = blk2.air_interface_encryption;
                 let region = blk2.cipher_region;
-                let mut encoded = errorcontrol::encode_tp(blk2, 2);
+                let scrambling_code = blk2.scrambling_code;
+                let mut full_speech = blk2.mac_block;
+                let mut frame_b = errorcontrol::take_tch_s_frame_b(&mut full_speech);
                 if let Some(request) = request.filter(|request| request.is_encrypted()) {
                     let Some(region) = region else {
                         tracing::warn!("dropping encrypted stolen TCH/S without cipher region");
                         return;
                     };
-                    // `cipher_region` records the full 274-bit TCH/S source
-                    // SDU. The legacy half-slot encoder emits 216 physical
-                    // bits and applies the existing dedicated KSS offset.
-                    // A normatively complete 137-bit STCH+TCH/S mapper is a
-                    // separate FEC/interleaver change; this path must at
-                    // least not silently drop the encrypted FACCH burst.
-                    if region.start != 0 || region.len != 274 || encoded.get_len() != 216 {
+                    // The scheduler records the full two-frame TCH/S source.
+                    // Frame stealing discards frame A; frame B maps to KSS
+                    // bits 216..352 and is ciphered before its own FEC.
+                    if region.start != 0 || region.len != 274 || frame_b.get_len() != 137 {
                         tracing::warn!(
                             region_start = region.start,
                             region_len = region.len,
-                            encoded_len = encoded.get_len(),
+                            speech_frame_bits = frame_b.get_len(),
                             "dropping unsupported encrypted stolen TCH/S region"
                         );
                         return;
@@ -623,14 +649,16 @@ impl LmacBs {
                             return;
                         }
                     };
+                    self.observe_downlink_traffic_key(prim.ts, context);
                     if let Err(error) = self
                         .aie_provider
-                        .cipher_downlink_traffic_at_kss_offset(context, &mut encoded, 0, 216, 216)
+                        .cipher_downlink_traffic_at_kss_offset(context, &mut frame_b, 0, 137, 216)
                     {
                         tracing::warn!(?error, dltime = %prim.ts, "dropping stolen TCH/S after SC2 cipher failure");
                         return;
                     }
                 }
+                let encoded = errorcontrol::encode_tch_s_half(frame_b, scrambling_code);
                 prim_phy.blk2 = Some(encoded);
             } else {
                 prim_phy.blk2 = Some(errorcontrol::encode_cp(blk2));

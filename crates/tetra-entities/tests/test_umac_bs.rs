@@ -186,6 +186,7 @@ fn sc2_mm_downlink_sets_esi_mode_and_ciphers_only_the_payload() {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(sc2.clone()),
+            rollover: None,
         };
         state.aie_sessions.activate_terminal(issi, &sc2);
     }

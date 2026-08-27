@@ -39,7 +39,7 @@ use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::scrambler;
-use crate::umac::subcomp::bs_sched::{BsChannelScheduler, PrecomputedUmacPdus, TCH_S_CAP};
+use crate::umac::subcomp::bs_sched::{BsChannelScheduler, MACSCHED_TX_AHEAD, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::random_access::RandomAccessController;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
@@ -435,8 +435,12 @@ impl UmacBs {
 
     fn refresh_aie_config(&mut self) {
         let aie = Self::get_aie_config(&self.config);
+        // The scheduler builds one future downlink slot. Select the SYSINFO
+        // SCK identity for that air slot, not for this software tick, so its
+        // broadcast changes on the same Absolute IV as traffic ciphering.
+        self.channel_scheduler
+            .set_aie_config_for_air_time(&aie, self.dltime.add_timeslots(MACSCHED_TX_AHEAD as i32));
         if aie != self.aie {
-            self.channel_scheduler.set_aie_config(&aie);
             self.aie = aie;
         }
     }

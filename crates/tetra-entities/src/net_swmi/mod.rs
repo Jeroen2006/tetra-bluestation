@@ -18,9 +18,9 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
-use tetra_config::bluestation::{CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2TeaAlgorithm, SharedConfig};
+use tetra_config::bluestation::{CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm, SharedConfig};
 use tetra_swmi_protocol::{
-    CellConfig, NeighbourCellSnapshot, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
+    CellConfig, NeighbourCellSnapshot, Sc2RolloverStatus, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
 };
 
 use crate::network::transports::{
@@ -36,6 +36,7 @@ fn runtime_aie_config(cell: &CellConfig) -> Result<RuntimeAieConfig, &'static st
             enabled: false,
             sc1_allowed: cell.aie.sc1_allowed,
             sc2: None,
+            rollover: None,
         });
     }
     let Some(sc2) = cell.aie.sc2 else {
@@ -56,6 +57,7 @@ fn runtime_aie_config(cell: &CellConfig) -> Result<RuntimeAieConfig, &'static st
             sc2.sck_vn,
             key,
         )),
+        rollover: None,
     })
 }
 
@@ -461,6 +463,117 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 self.stack_config.state_write().network_connected = false;
                             }
                         }
+                        Ok(SwmiMessage::Sc2RolloverPrepare {
+                            command_id,
+                            rollover_id,
+                            active,
+                            future,
+                            activation_network_time,
+                        }) => {
+                            let result = (|| {
+                                let broadcast_ready = {
+                                    let state = self.stack_config.state_read();
+                                    state.network_broadcast.broadcast.time_enabled
+                                        && state.network_broadcast.broadcast.timezone.is_some()
+                                };
+                                if !broadcast_ready {
+                                    return Err("TETRA Network Time broadcast is not configured");
+                                }
+                                let key = future.key.ok_or("rollover future SCK is missing")?;
+                                let algorithm = match future.algorithm {
+                                    Sc2TeaAlgorithm::Tea1 => RuntimeSc2TeaAlgorithm::Tea1,
+                                    Sc2TeaAlgorithm::Tea3 => RuntimeSc2TeaAlgorithm::Tea3,
+                                };
+                                let active_algorithm = match active.algorithm {
+                                    Sc2TeaAlgorithm::Tea1 => tetra_core::AieAlgorithm::Tea1,
+                                    Sc2TeaAlgorithm::Tea3 => tetra_core::AieAlgorithm::Tea3,
+                                };
+                                let binding = RuntimeSc2Binding {
+                                    key: tetra_core::Sc2KeyIdentifier::new(active_algorithm, active.sckn, active.sck_vn)
+                                        .ok_or("invalid rollover active identity")?,
+                                };
+                                self.stack_config
+                                    .state_write()
+                                    .aie
+                                    .stage_rollover(
+                                        rollover_id,
+                                        binding,
+                                        RuntimeSc2Aie::new(algorithm, future.sckn, future.sck_vn, key),
+                                        activation_network_time,
+                                    )
+                            })();
+                            let (accepted, detail) = match result {
+                                Ok(()) => (true, None),
+                                Err(error) => {
+                                    tracing::warn!(command_id, rollover_id, error, "rejecting SC2 rollover prepare");
+                                    (false, Some(error.to_owned()))
+                                }
+                            };
+                            let already_activated = accepted
+                                && self
+                                    .stack_config
+                                    .state_read()
+                                    .aie
+                                    .rollover_is_activated(rollover_id);
+                            let local_network_time = self
+                                .stack_config
+                                .state_read()
+                                .network_broadcast
+                                .broadcast
+                                .timezone
+                                .as_deref()
+                                .and_then(crate::mle::components::network_time::encode_tetra_network_time);
+                            let _ = self.send(SwmiMessage::Receipt {
+                                command_id,
+                                accepted,
+                                code: if accepted { 0 } else { 2 },
+                            });
+                            let _ = self.send(SwmiMessage::Sc2RolloverStatus {
+                                command_id,
+                                rollover_id,
+                                status: if !accepted {
+                                    Sc2RolloverStatus::Rejected
+                                } else if already_activated {
+                                    Sc2RolloverStatus::Activated
+                                } else {
+                                    Sc2RolloverStatus::Prepared
+                                },
+                                local_cutover_network_time: local_network_time,
+                                detail,
+                            });
+                            if accepted
+                                && self
+                                    .endpoint
+                                    .mm_incoming
+                                    .send(SwmiMessage::Sc2RolloverPrepare {
+                                        command_id,
+                                        rollover_id,
+                                        active,
+                                        future,
+                                        activation_network_time,
+                                    })
+                                    .is_err()
+                            {
+                                tracing::warn!(rollover_id, "SwMI MM endpoint closed; cannot announce SC2 rollover on air");
+                            }
+                        }
+                        Ok(SwmiMessage::Sc2RolloverCancel { command_id, rollover_id }) => {
+                            let cancelled = self
+                                .stack_config
+                                .state_write()
+                                .aie
+                                .cancel_staged_rollover(rollover_id);
+                            let _ = self.send(SwmiMessage::Receipt {
+                                command_id,
+                                accepted: cancelled,
+                                code: if cancelled { 0 } else { 2 },
+                            });
+                            if cancelled {
+                                tracing::info!(rollover_id, "cancelled staged SC2 rollover");
+                            } else {
+                                tracing::warn!(rollover_id, "cannot cancel unknown or already active SC2 rollover");
+                            }
+                        }
                         Ok(SwmiMessage::Receipt {
                             command_id,
                             accepted,
@@ -553,6 +666,22 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                     if !self.send(message) {
                         break;
                     }
+                }
+                let rollover_events: Vec<RuntimeSc2RolloverEvent> = self
+                    .stack_config
+                    .state_write()
+                    .sc2_rollover_events
+                    .drain(..)
+                    .collect();
+                for event in rollover_events {
+                    let command_id = self.next_command_id();
+                    let _ = self.send(SwmiMessage::Sc2RolloverStatus {
+                        command_id,
+                        rollover_id: event.rollover_id,
+                        status: if event.activated { Sc2RolloverStatus::Activated } else { Sc2RolloverStatus::Failed },
+                        local_cutover_network_time: Some(event.local_network_time),
+                        detail: None,
+                    });
                 }
                 let advertisement_version = self.stack_config.state_read().network_broadcast.version;
                 if self.current_cell_config.is_some() && advertisement_version != self.last_advertisement_version {

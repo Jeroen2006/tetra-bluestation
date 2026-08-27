@@ -135,8 +135,14 @@ impl TetraEntityTrait for CmceBs {
                 SapMsgInner::LcmcMleUnitdataInd(_) => {
                     self.rx_lcmc_mle_unitdata_ind(queue, message);
                 }
-                _ => {
-                    panic!("Unexpected message on LcmcSap: {:?}", message.msg);
+                unexpected => {
+                    // A wrong or missing SC2 key can turn an encrypted
+                    // uplink payload into a plausible but unrelated MLE
+                    // discriminator.  In particular this may arrive as an
+                    // LTPD primitive on LCMC.  It is not valid CMCE input,
+                    // but it is radio noise from CMCE's point of view and
+                    // must never terminate the base station.
+                    tracing::warn!(?unexpected, "dropping unexpected primitive on CMCE LCMC SAP");
                 }
             },
             Sap::Control => match message.msg {

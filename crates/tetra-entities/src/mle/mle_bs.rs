@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::mle::components::broadcast::MleBroadcast;
+use crate::mle::components::{broadcast::MleBroadcast, network_time};
+use tetra_config::bluestation::RuntimeSc2RolloverEvent;
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::net_swmi::SwmiMleEndpoint;
 use crate::{MessageQueue, TetraEntityTrait};
@@ -12,7 +13,7 @@ use tetra_core::{
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, fields::chan_alloc_req::CmceChanAllocReq};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
+use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataIndBl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_ul::MlePduTypeUl;
@@ -373,11 +374,113 @@ impl MleBs {
                 self.rx_tla_data_ind_bl(queue, message);
             }
             SapMsgInner::TlaTlUnitdataIndBl(_) => {
-                // self.rx_tla_unitdata_ind_bl(queue, message);
-                panic!("BS can't receive TL-UNITDATA");
+                self.rx_tla_unitdata_ind_bl(queue, message);
             }
             _ => {
                 panic!();
+            }
+        }
+    }
+
+    /// TL-UNITDATA is the unacknowledged basic-link service.  It is valid on
+    /// a BS for MM/OTAR and key-change traffic (not only for MS-side SNDCP).
+    /// Treat its MLE protocol payload identically to TL-DATA while preserving
+    /// the fact that LLC did not provide a reliable-link acknowledgement.
+    fn rx_tla_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::TlaTlUnitdataIndBl(prim) = &mut message.msg else {
+            panic!()
+        };
+        let Some(mut sdu) = prim.tl_sdu.take() else {
+            tracing::warn!("dropping TL-UNITDATA without an SDU");
+            return;
+        };
+        if sdu.get_pos() != 0 {
+            tracing::warn!(position = sdu.get_pos(), "dropping TL-UNITDATA with a nonzero SDU position");
+            return;
+        }
+        let Some(bits) = sdu.read_bits(3) else {
+            tracing::warn!("dropping short TL-UNITDATA: {}", sdu.dump_bin());
+            return;
+        };
+        let Ok(pdu_type) = MleProtocolDiscriminator::try_from(bits) else {
+            tracing::warn!(bits, "dropping TL-UNITDATA with an invalid MLE protocol discriminator");
+            return;
+        };
+        let main_address = prim.main_address;
+        let endpoint_id = prim.endpoint_id;
+        let link_id = prim.link_id;
+        let air_interface_encryption = prim.air_interface_encryption;
+
+        let is_clear_from_bound_sc2_terminal = matches!(air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
+            let state = self.config.state_read();
+            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(main_address.ssi).is_some()
+        };
+        if is_clear_from_bound_sc2_terminal && pdu_type != MleProtocolDiscriminator::Mm {
+            tracing::warn!(
+                issi = main_address.ssi,
+                ?pdu_type,
+                "rejecting unexpected clear unacknowledged post-SC2 uplink outside MM bootstrap allow-list"
+            );
+            return;
+        }
+        if matches!(
+            air_interface_encryption,
+            Some(AieRequest::Sc2 {
+                subject: AieSubject::System,
+                ..
+            })
+        ) && main_address.ssi_type == SsiType::Esi
+            && pdu_type != MleProtocolDiscriminator::Mm
+        {
+            tracing::warn!(?pdu_type, "rejecting unbound encrypted unacknowledged bootstrap outside MM location update");
+            return;
+        }
+
+        match pdu_type {
+            MleProtocolDiscriminator::Mm => queue.push_back(SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+                    sdu,
+                    handle: 0,
+                    received_address: main_address,
+                    air_interface_encryption,
+                    forward_registration_target_station_id: None,
+                }),
+            }),
+            MleProtocolDiscriminator::Cmce => queue.push_back(SapMsg {
+                sap: Sap::LcmcSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+                    sdu,
+                    handle: 0,
+                    received_tetra_address: main_address,
+                    endpoint_id,
+                    link_id,
+                    chan_change_resp_req: false,
+                    chan_change_handle: None,
+                }),
+            }),
+            MleProtocolDiscriminator::Sndcp => queue.push_back(SapMsg {
+                sap: Sap::LcmcSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::LtpdMleUnitdataInd(LtpdMleUnitdataInd {
+                    sdu,
+                    endpoint_id,
+                    link_id,
+                    received_tetra_address: main_address,
+                    chan_change_resp_req: false,
+                    chan_change_handle: None,
+                }),
+            }),
+            MleProtocolDiscriminator::Mle => {
+                self.rx_tla_mle_pdu(queue, sdu, main_address, endpoint_id, link_id, air_interface_encryption)
+            }
+            MleProtocolDiscriminator::TetraManagementEntity => {
+                tracing::warn!("dropping unsupported TME TL-UNITDATA");
             }
         }
     }
@@ -544,31 +647,54 @@ impl MleBs {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
-        assert!(prim.layer2service != Layer2Service::Unacknowledged, "not implemented");
-
         // let (addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
         // assert_eq!(addr.ssi, prim.address.ssi);
-        let sapmsg = SapMsg {
-            sap: Sap::TlaSap,
-            src: TetraEntity::Mle,
-            dest: TetraEntity::Llc,
-            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                main_address: prim.address,
-                link_id: 0,
-                endpoint_id: 0,
-                tl_sdu: pdu,
-                stealing_permission: false,
-                subscriber_class: 0, // TODO fixme
-                fcs_flag: false,
-                air_interface_encryption: Some(prim.aie_request),
-                stealing_repeats_flag: None,
-                data_class_info: None,
-                req_handle: 0, // TODO FIXME; should we pass the same handle here?
-                graceful_degradation: None,
-                chan_alloc: None,
-                associated_channel: None,
-                tx_reporter: prim.tx_reporter.take(),
-            }),
+        let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
+            SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                    main_address: prim.address,
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: pdu,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: Some(prim.aie_request),
+                    packet_data_flag: false,
+                    n_tlsdu_repeats: 0,
+                    data_class_info: None,
+                    req_handle: 0,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            }
+        } else {
+            SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                    main_address: prim.address,
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: pdu,
+                    stealing_permission: false,
+                    subscriber_class: 0, // TODO fixme
+                    fcs_flag: false,
+                    air_interface_encryption: Some(prim.aie_request),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0, // TODO FIXME; should we pass the same handle here?
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            }
         };
         queue.push_back(sapmsg);
     }
@@ -709,6 +835,43 @@ impl TetraEntityTrait for MleBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
+        // The Network Time value is the common rollover target, but this BS
+        // is authoritative for its local TDMA slot. Activation therefore
+        // happens here at a real downlink tick rather than in the WSS worker.
+        let network_time = {
+            let state = self.config.state_read();
+            state
+                .network_broadcast
+                .broadcast
+                .time_enabled
+                .then(|| state.network_broadcast.broadcast.timezone.as_deref().and_then(network_time::encode_tetra_network_time))
+                .flatten()
+        };
+        if let Some(network_time) = network_time {
+            let mut state = self.config.state_write();
+            let (scheduled, rollover_id) = {
+                let tetra_config::bluestation::StackState {
+                    aie,
+                    aie_sessions: sessions,
+                    ..
+                } = &mut *state;
+                (
+                    aie.schedule_rollover_absolute_iv(network_time, ts),
+                    aie.activate_rollover_if_due(ts, sessions),
+                )
+            };
+            if let Some((rollover_id, absolute_iv)) = scheduled {
+                tracing::debug!(rollover_id, absolute_iv = %absolute_iv, "SC2 rollover uses serving-cell Absolute IV");
+            }
+            if let Some(rollover_id) = rollover_id {
+                state.sc2_rollover_events.push_back(RuntimeSc2RolloverEvent {
+                    rollover_id,
+                    activated: true,
+                    local_network_time: network_time,
+                });
+                tracing::info!(rollover_id, network_time, tdma_time = %ts, "SC2 rollover activated at local downlink slot");
+            }
+        }
         let timed_out: Vec<u32> = self
             .forward_registration_deadlines
             .iter()
