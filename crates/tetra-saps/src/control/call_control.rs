@@ -104,4 +104,14 @@ pub enum CallControl {
     UlInactivityTimeout {
         ts: u8,
     },
+    /// Ask CMCE to defer an SwMI liveliness check until the terminal is no
+    /// longer participating in a local group or private call. Sent by MM.
+    LivelinessCheckRequest {
+        itsi: u32,
+    },
+    /// CMCE has established that the terminal has no active local call and
+    /// MM may send its D-LOCATION UPDATE COMMAND. Sent by CMCE.
+    LivelinessCheckReady {
+        itsi: u32,
+    },
 }

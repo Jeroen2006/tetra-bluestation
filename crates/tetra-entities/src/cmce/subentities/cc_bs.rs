@@ -113,6 +113,9 @@ pub struct CcBsSubentity {
     /// SwMI-scheduled acknowledged D-INFO probes for simplex private-call
     /// hangtime. The LLC TxReporter is the authoritative BL-ACK outcome.
     pending_private_keepalives: HashMap<(u16, u32, u64), TxReporter>,
+    /// SwMI liveliness checks held until their target is no longer using a
+    /// local traffic circuit. A set coalesces duplicate checks per terminal.
+    pending_liveliness_checks: HashSet<u32>,
     next_swmi_command: u64,
     /// Point-to-point calls are intentionally kept separate from group
     /// `active_calls`: a same-cell P2P call has two radio circuits sharing
@@ -149,6 +152,7 @@ struct ReleasingCall {
     call_id: u16,
     ts: u8,
     dest_gssi: u32,
+    source_issi: u32,
     is_local: bool,
     brew_uuid: Option<uuid::Uuid>,
     sent_at: TdmaTime,
@@ -238,6 +242,7 @@ impl CcBsSubentity {
             pending_private_floor_requests: HashMap::new(),
             pending_restore_floor_indications: HashMap::new(),
             pending_private_keepalives: HashMap::new(),
+            pending_liveliness_checks: HashSet::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
             pending_private_setups: HashMap::new(),
@@ -441,6 +446,47 @@ impl CcBsSubentity {
                 && (call.caller_itsi == issi || call.callee_itsi == issi)
                 && self.private_circuits.contains_key(&(*call_id, issi))
         })
+    }
+
+    /// Whether an individually addressed MM command would interrupt this
+    /// terminal's current group/private traffic operation. Include release
+    /// tails because their D-RELEASE still has to use the traffic circuit.
+    fn terminal_has_active_call(&self, issi: u32) -> bool {
+        self.private_call_is_connected_for(issi)
+            || self.releasing_private_circuits.iter().any(|call| call.itsi == issi)
+            || self.active_calls.values().any(|call| {
+                call.source_issi == issi
+                    || self
+                        .subscriber_groups
+                        .get(&issi)
+                        .is_some_and(|groups| groups.contains(&call.dest_gssi) && self.group_is_receivable(issi, call.dest_gssi))
+            })
+            || self.releasing_calls.iter().any(|call| {
+                call.source_issi == issi
+                    || self
+                        .subscriber_groups
+                        .get(&issi)
+                        .is_some_and(|groups| groups.contains(&call.dest_gssi) && self.group_is_receivable(issi, call.dest_gssi))
+            })
+    }
+
+    fn release_deferred_liveliness_checks(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<u32> = self
+            .pending_liveliness_checks
+            .iter()
+            .copied()
+            .filter(|&issi| !self.terminal_has_active_call(issi))
+            .collect();
+        for issi in ready {
+            self.pending_liveliness_checks.remove(&issi);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::CmceCallControl(CallControl::LivelinessCheckReady { itsi: issi }),
+            });
+            tracing::debug!(issi, "released deferred SwMI liveliness check after call end");
+        }
     }
 
     fn record_listening_candidate(&mut self, issi: u32, candidate: ListeningCandidate) {
@@ -1713,6 +1759,7 @@ impl CcBsSubentity {
 
         // Drive deferred D-RELEASE teardown
         self.process_releasing_calls(queue);
+        self.release_deferred_liveliness_checks(queue);
 
         // The circuit manager may reap orphaned allocations, but active group
         // and private calls are owned by their call-control state. In
@@ -3074,6 +3121,7 @@ impl CcBsSubentity {
         };
         let ts = call.ts;
         let dest_gssi = call.dest_gssi;
+        let source_issi = call.source_issi;
         let is_local = matches!(call.origin, CallOrigin::Local { .. });
         // Prefer the live brew_uuid (current network speaker). Fall back to the origin uuid
         // for a Network call in hangtime, where rx_network_call_end cleared the field.
@@ -3090,6 +3138,7 @@ impl CcBsSubentity {
                     call_id,
                     ts,
                     dest_gssi,
+                    source_issi,
                     is_local,
                     brew_uuid,
                     sent_at: self.dltime,
@@ -4031,6 +4080,10 @@ impl CcBsSubentity {
             }
             CallControl::UlInactivityTimeout { ts } => {
                 self.handle_ul_inactivity_timeout(queue, ts);
+            }
+            CallControl::LivelinessCheckRequest { itsi } => {
+                self.pending_liveliness_checks.insert(itsi);
+                self.release_deferred_liveliness_checks(queue);
             }
             _ => {
                 tracing::warn!("Unexpected CallControl message: {:?}", call_control);

@@ -731,8 +731,12 @@ impl TetraEntityTrait for BrewEntity {
             }) => {
                 self.rx_network_call_ready(brew_uuid, call_id, ts, usage);
             }
-            // UlInactivityTimeout is UMAC→CMCE only; Brew handles FloorReleased instead
-            SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { .. }) => {}
+            // UlInactivityTimeout is UMAC→CMCE only; liveliness checks are MM↔CMCE.
+            SapMsgInner::CmceCallControl(
+                CallControl::UlInactivityTimeout { .. }
+                | CallControl::LivelinessCheckRequest { .. }
+                | CallControl::LivelinessCheckReady { .. },
+            ) => {}
             SapMsgInner::CmceCallControl(
                 CallControl::PrivateCallTrafficActive { .. } | CallControl::PrivateMediaStart { .. } | CallControl::PrivateMediaStop { .. },
             ) => {}

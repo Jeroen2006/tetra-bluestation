@@ -12,6 +12,7 @@ use tetra_core::{
     unimplemented_log,
 };
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::control::call_control::CallControl;
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{
@@ -737,6 +738,37 @@ impl MmBs {
         }
     }
 
+    fn energy_economy_for_omitted_request(
+        location_update_type: LocationUpdateType,
+        current: Option<EnergyEconomyAssignment>,
+    ) -> EnergyEconomyAssignment {
+        // ETSI TS 100 392-2 14.1.12: for periodic and demand location
+        // updating, an omitted Energy Saving Mode means that the previously
+        // negotiated mode in the same registered area remains active.
+        if matches!(
+            location_update_type,
+            LocationUpdateType::PeriodicLocationUpdating
+                | LocationUpdateType::DemandLocationUpdating
+                | LocationUpdateType::DisabledMsUpdating
+        ) {
+            current.unwrap_or_default()
+        } else {
+            EnergyEconomyAssignment::default()
+        }
+    }
+
+    fn current_energy_economy(&self, issi: u32) -> Option<EnergyEconomyAssignment> {
+        self.config
+            .state_read()
+            .subscribers
+            .energy_economy(issi)
+            .map(|(mode, frame_number, multiframe_number)| EnergyEconomyAssignment {
+                mode,
+                frame_number,
+                multiframe_number,
+            })
+    }
+
     fn esi_from_assignment(assignment: EnergyEconomyAssignment) -> EnergySavingInformation {
         EnergySavingInformation {
             energy_saving_mode: EnergySavingMode::try_from(assignment.mode as u64).expect("validated EE mode"),
@@ -972,18 +1004,26 @@ impl MmBs {
             return;
         }
 
-        // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
-        // startpoint. Current policy accepts the requested mode and selects
-        // the next MCCH phase from the local TDMA clock.
-        let energy_economy = self.energy_economy_assignment(pdu.energy_saving_mode.unwrap_or(EnergySavingMode::StayAlive));
-        let esi = pdu.energy_saving_mode.map(|_| Self::esi_from_assignment(energy_economy));
-
         // In network mode the SwMI owns registration policy. The air handle
         // stays at the BS and is echoed by the SwMI decision, so this router
         // thread never waits on WSS. Group operations are handled after the
         // registration decision; they must never make the registration itself
         // silently fall back to LST.
         let issi = prim.received_address.ssi;
+        // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
+        // startpoint. Current policy accepts the requested mode and selects
+        // the next MCCH phase from the local TDMA clock. For periodic/demand
+        // updates, an omitted mode is explicitly a request to retain the
+        // existing assignment; it is not a request for StayAlive.
+        let energy_economy = match pdu.energy_saving_mode {
+            Some(mode) => self.energy_economy_assignment(mode),
+            None => Self::energy_economy_for_omitted_request(
+                pdu.location_update_type,
+                self.current_energy_economy(issi),
+            ),
+        };
+        let esi = (energy_economy.mode != 0).then(|| Self::esi_from_assignment(energy_economy));
+
         let has_group_identity_location_demand = pdu.group_identity_location_demand.is_some();
         let location_attachment = pdu.group_identity_location_demand.as_ref().and_then(|demand| {
             let operations = demand.group_identity_uplink.clone()?;
@@ -3196,8 +3236,13 @@ impl TetraEntityTrait for MmBs {
                         tracing::debug!(issi, "ignoring liveliness check for unknown local terminal");
                         continue;
                     }
-                    self.send_d_location_update_command(queue, issi, 0, false);
-                    tracing::debug!(issi, "sent D-LOCATION UPDATE COMMAND for SwMI liveliness check");
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Mm,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::LivelinessCheckRequest { itsi: issi }),
+                    });
+                    tracing::debug!(issi, "queued SwMI liveliness check for CMCE call-state gating");
                 }
                 SwmiMessage::RegistrationDecision {
                     command_id,
@@ -3727,16 +3772,23 @@ impl TetraEntityTrait for MmBs {
         tracing::debug!("rx_prim: {:?}", message);
         // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
-        // There is only one SAP for MM
-        assert!(message.sap == Sap::LmmSap);
-
-        match message.msg {
-            SapMsgInner::LmmMleUnitdataInd(_) => {
-                self.rx_lmm_mle_unitdata_ind(queue, message);
-            }
-            _ => {
-                panic!();
-            }
+        match message.sap {
+            Sap::LmmSap => match message.msg {
+                SapMsgInner::LmmMleUnitdataInd(_) => self.rx_lmm_mle_unitdata_ind(queue, message),
+                message => panic!("unexpected MM LMM primitive: {:?}", message),
+            },
+            Sap::Control => match message.msg {
+                SapMsgInner::CmceCallControl(CallControl::LivelinessCheckReady { itsi }) => {
+                    if self.config.state_read().subscribers.is_registered(itsi) {
+                        self.send_d_location_update_command(queue, itsi, 0, false);
+                        tracing::debug!(itsi, "sent deferred D-LOCATION UPDATE COMMAND for SwMI liveliness check");
+                    } else {
+                        tracing::debug!(itsi, "discarding deferred liveliness check for no-longer-registered terminal");
+                    }
+                }
+                message => panic!("unexpected MM control primitive: {:?}", message),
+            },
+            sap => panic!("unexpected MM SAP: {:?}", sap),
         }
     }
 }
@@ -3746,6 +3798,7 @@ mod tests {
     use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, sc2_ksg_number};
     use tetra_config::bluestation::RuntimeSc2TeaAlgorithm;
     use tetra_core::typed_pdu_fields::Type3FieldGeneric;
+    use tetra_swmi_protocol::EnergyEconomyAssignment;
 
     #[test]
     fn sc2_ksg_numbers_match_the_on_air_table() {
@@ -3770,6 +3823,30 @@ mod tests {
             raw: Vec::new(),
         };
         assert_eq!(MmBs::authentication_uplink(&field), Some((true, None)));
+    }
+
+    #[test]
+    fn periodic_or_demand_update_without_energy_mode_retains_assignment() {
+        let current = Some(EnergyEconomyAssignment {
+            mode: 4,
+            frame_number: Some(12),
+            multiframe_number: Some(7),
+        });
+
+        assert_eq!(
+            MmBs::energy_economy_for_omitted_request(
+                tetra_pdus::mm::enums::location_update_type::LocationUpdateType::PeriodicLocationUpdating,
+                current,
+            ),
+            current.unwrap(),
+        );
+        assert_eq!(
+            MmBs::energy_economy_for_omitted_request(
+                tetra_pdus::mm::enums::location_update_type::LocationUpdateType::DemandLocationUpdating,
+                current,
+            ),
+            current.unwrap(),
+        );
     }
 
     #[test]
