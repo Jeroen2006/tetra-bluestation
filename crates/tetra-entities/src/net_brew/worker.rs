@@ -60,6 +60,10 @@ pub enum BrewEvent {
 
     /// Error from server
     ServerError { error_type: u8, data: Vec<u8> },
+
+    /// Brew service 0xf4/2 subscriber-profile response. Only `text` is
+    /// exposed to the call-control path as a TPI mnemonic name.
+    SubscriberProfile { issi: u32, text: String },
 }
 
 /// Commands the BrewEntity sends to the worker
@@ -103,6 +107,9 @@ pub enum BrewCommand {
 
     /// Send SDS report to Brew (delivery acknowledgement)
     SendSdsReport { uuid: Uuid, status: u8 },
+
+    /// Query Brew's subscriber directory for the active external speaker.
+    QuerySubscriberProfile { issi: u32 },
 
     /// Disconnect gracefully
     Disconnect,
@@ -377,6 +384,14 @@ impl<T: NetworkTransport> BrewWorker<T> {
                             tracing::debug!("BrewWorker: sent SDS_REPORT uuid={} status={}", uuid, status);
                         }
                     }
+                    BrewCommand::QuerySubscriberProfile { issi } => {
+                        let msg = build_query_subscribers(&[issi]);
+                        if let Err(e) = self.transport.send_reliable(&msg) {
+                            tracing::warn!(issi, "BrewWorker: subscriber-profile query failed: {e}");
+                        } else {
+                            tracing::debug!(issi, "BrewWorker: subscriber-profile query sent");
+                        }
+                    }
                     BrewCommand::Disconnect => {
                         self.graceful_teardown();
                         return Ok(());
@@ -410,7 +425,26 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     });
                 }
                 BrewMessage::Service(svc) => {
-                    tracing::debug!("BrewWorker: service type={}: {}", svc.service_type, svc.json_data);
+                    if svc.service_type != 2 {
+                        tracing::debug!("BrewWorker: service type={}: {}", svc.service_type, svc.json_data);
+                        return;
+                    }
+                    let Ok(profiles) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&svc.json_data) else {
+                        tracing::warn!("BrewWorker: invalid subscriber-profile response JSON");
+                        return;
+                    };
+                    for (issi, profile) in profiles {
+                        let Ok(issi) = issi.parse::<u32>() else { continue };
+                        let Some(text) = profile.get("text").and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        if !text.trim().is_empty() {
+                            let _ = self.event_sender.send(BrewEvent::SubscriberProfile {
+                                issi,
+                                text: text.to_owned(),
+                            });
+                        }
+                    }
                 }
             },
             Err(e) => {

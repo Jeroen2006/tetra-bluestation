@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use crate::mle::components::{broadcast::MleBroadcast, network_time};
-use tetra_config::bluestation::RuntimeSc2RolloverEvent;
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::net_swmi::SwmiMleEndpoint;
 use crate::{MessageQueue, TetraEntityTrait};
+use tetra_config::bluestation::RuntimeSc2RolloverEvent;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
@@ -432,7 +432,10 @@ impl MleBs {
         ) && main_address.ssi_type == SsiType::Esi
             && pdu_type != MleProtocolDiscriminator::Mm
         {
-            tracing::warn!(?pdu_type, "rejecting unbound encrypted unacknowledged bootstrap outside MM location update");
+            tracing::warn!(
+                ?pdu_type,
+                "rejecting unbound encrypted unacknowledged bootstrap outside MM location update"
+            );
             return;
         }
 
@@ -476,9 +479,7 @@ impl MleBs {
                     chan_change_handle: None,
                 }),
             }),
-            MleProtocolDiscriminator::Mle => {
-                self.rx_tla_mle_pdu(queue, sdu, main_address, endpoint_id, link_id, air_interface_encryption)
-            }
+            MleProtocolDiscriminator::Mle => self.rx_tla_mle_pdu(queue, sdu, main_address, endpoint_id, link_id, air_interface_encryption),
             MleProtocolDiscriminator::TetraManagementEntity => {
                 tracing::warn!("dropping unsupported TME TL-UNITDATA");
             }
@@ -659,7 +660,7 @@ impl MleBs {
                     link_id: 0,
                     endpoint_id: 0,
                     tl_sdu: pdu,
-                    stealing_permission: false,
+                    stealing_permission: prim.stealing_permission,
                     subscriber_class: 0,
                     fcs_flag: false,
                     air_interface_encryption: Some(prim.aie_request),
@@ -682,7 +683,7 @@ impl MleBs {
                     link_id: 0,
                     endpoint_id: 0,
                     tl_sdu: pdu,
-                    stealing_permission: false,
+                    stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,
                     air_interface_encryption: Some(prim.aie_request),
@@ -844,7 +845,14 @@ impl TetraEntityTrait for MleBs {
                 .network_broadcast
                 .broadcast
                 .time_enabled
-                .then(|| state.network_broadcast.broadcast.timezone.as_deref().and_then(network_time::encode_tetra_network_time))
+                .then(|| {
+                    state
+                        .network_broadcast
+                        .broadcast
+                        .timezone
+                        .as_deref()
+                        .and_then(network_time::encode_tetra_network_time)
+                })
                 .flatten()
         };
         if let Some(network_time) = network_time {

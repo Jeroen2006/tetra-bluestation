@@ -33,7 +33,7 @@ use tetra_saps::control::call_control::{CallControl, Circuit};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd};
+use tetra_saps::tma::{AssociatedChannel, TmaReport, TmaReportInd, TmaUnitdataInd};
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -1568,11 +1568,40 @@ impl UmacBs {
         unimplemented!();
     }
 
-    fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_ul_tma_unitdata_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_ul_tma_unitdata_req");
 
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
+        let all_ms_traffic_broadcast = prim.stealing_permission
+            && prim.main_address.ssi == 0x00ff_ffff
+            && prim.main_address.ssi_type == SsiType::Gssi
+            && prim.associated_channel.is_none()
+            && prim.chan_alloc.is_none();
+        if all_ms_traffic_broadcast {
+            let channels = self.channel_scheduler.active_downlink_traffic_channels();
+            for (timeslot, usage) in &channels {
+                let mut copy = prim.clone();
+                // The synthetic association is routing-only. call_id zero is
+                // never exposed on air; timeslot selects the TCH and usage is
+                // retained as route metadata (the all-MS on-air resource omits
+                // it below so that the PDU fits in one STCH half-slot).
+                copy.associated_channel = Some(AssociatedChannel {
+                    call_id: 0,
+                    timeslot: *timeslot,
+                    usage: *usage,
+                });
+                self.rx_ul_tma_unitdata_req(
+                    queue,
+                    SapMsg::new(Sap::TmaSap, TetraEntity::Llc, TetraEntity::Umac, SapMsgInner::TmaUnitdataReq(copy)),
+                );
+            }
+            tracing::info!(
+                channels = channels.len(),
+                "fanned all-MS D-CK CHANGE broadcast out over active traffic channels"
+            );
+            return;
+        }
         let mut sdu = prim.pdu;
         let associated_channel = prim.associated_channel;
         let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
@@ -1591,10 +1620,13 @@ impl UmacBs {
         if prim.stealing_permission {
             // Determine the target traffic timeslot for FACCH stealing.
             // If chan_alloc specifies a timeslot, use it; otherwise fall back to first active DL circuit.
-            let traffic_ts = prim
-                .chan_alloc
-                .as_ref()
-                .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
+            let traffic_ts = associated_channel
+                .map(|channel| channel.timeslot)
+                .or_else(|| {
+                    prim.chan_alloc
+                        .as_ref()
+                        .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
+                })
                 .or_else(|| (2..=4u8).find(|&t| self.channel_scheduler.circuit_is_active(Direction::Dl, t)));
 
             if let Some(ts) = traffic_ts {
@@ -1603,7 +1635,19 @@ impl UmacBs {
                 const STCH_CAP: usize = 124;
                 const NULL_PDU_LEN_BITS: usize = 16;
 
-                let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
+                let all_ms_address = prim.main_address.ssi == 0x00ff_ffff && prim.main_address.ssi_type == SsiType::Gssi;
+                // The traffic bearer already identifies the associated call.
+                // Do not add its usage marker to an all-MS broadcast: the six
+                // extra address bits make this 74-bit BL-UDATA resource 123
+                // bits long, whose mandatory octet-alignment fill would need
+                // 128 bits and cannot fit in a 124-bit STCH half-slot.
+                let usage_marker = if all_ms_address {
+                    None
+                } else {
+                    associated_channel
+                        .map(|channel| channel.usage)
+                        .or_else(|| prim.chan_alloc.as_ref().and_then(|ca| ca.usage))
+                };
                 // Per ETSI 21.4.3.1: "The random access flag shall be used for the BS to
                 // acknowledge a successful random access so as to prevent the MS sending
                 // further random access requests."
@@ -1666,10 +1710,26 @@ impl UmacBs {
                         mac_pdu.encryption_mode = 0b10 | (key.sck_vn as u8 & 1);
                     }
                 }
-                let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu.get_len());
+                let sdu_len = sdu.get_len();
+                let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
+                let header_len = mac_pdu.compute_header_len();
+                let encoded_len = header_len + sdu_len + num_fill_bits;
+                if encoded_len > STCH_CAP {
+                    tracing::warn!(
+                        ts,
+                        address = ?prim.main_address,
+                        header_bits = header_len,
+                        sdu_bits = sdu_len,
+                        fill_bits = num_fill_bits,
+                        encoded_bits = encoded_len,
+                        capacity_bits = STCH_CAP,
+                        "dropping signalling PDU that does not fit in one STCH half-slot"
+                    );
+                    return;
+                }
                 let cipher_region = aie_request.is_encrypted().then(|| {
                     // STCH begins directly with MAC-RESOURCE on downlink.
-                    AieCipherRegion::new(mac_pdu.compute_header_len(), sdu.get_len())
+                    AieCipherRegion::new(header_len, sdu_len)
                 });
 
                 let mut stch_block = BitBuffer::new(STCH_CAP);
@@ -1678,7 +1738,6 @@ impl UmacBs {
                 // Copy LLC PDU (BL-DATA) directly — no conversion needed.
                 // Both BL-DATA and BL-UDATA are valid D-LLC-PDU types per the spec.
                 sdu.seek(0);
-                let sdu_len = sdu.get_len();
                 stch_block.copy_bits(&mut sdu, sdu_len);
 
                 // ETSI 23.4.3.1 fill bit addition: a '1' immediately after the TM-SDU,
@@ -1758,24 +1817,64 @@ impl UmacBs {
         pdu.update_len_and_fill_ind(sdu.get_len());
 
         if group_ee_replay {
-            let assignments = self.config.state_read().subscribers.group_energy_economies(prim.main_address.ssi);
-            let mut scheduled = Vec::new();
+            let all_ms = prim.main_address.ssi == 0x00ff_ffff && prim.main_address.ssi_type == SsiType::Gssi;
+            let (assignments, rollover_activation, all_ms_rollover) = {
+                let state = self.config.state_read();
+                let rollover = all_ms.then(|| state.aie.rollover_notification()).flatten();
+                let assignments = if rollover.is_some() {
+                    state.subscribers.active_energy_economies()
+                } else {
+                    state.subscribers.group_energy_economies(prim.main_address.ssi)
+                };
+                (
+                    assignments,
+                    rollover.as_ref().and_then(|(_, activation)| *activation),
+                    rollover.is_some(),
+                )
+            };
+            // `(time, copy)` de-duplicates terminals sharing one EE phase,
+            // while retaining both independently decodable rollover copies.
+            let mut scheduled: Vec<(TdmaTime, usize)> = Vec::new();
             for (issi, mode, frame, multiframe) in assignments {
                 let Some(due) = self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe) else {
                     continue;
                 };
-                if due.age(self.dltime) <= 0 || scheduled.contains(&due) {
+                if due.age(self.dltime) <= 0 || rollover_activation.is_some_and(|activation| activation.diff(due) <= 0) {
                     continue;
                 }
-                tracing::debug!(gssi = prim.main_address.ssi, issi, due = %due, "queuing EE group-MCCH replay");
-                scheduled.push(due);
-                self.deferred_mcch.push_back(DeferredMcch {
-                    due,
-                    pdu: pdu.clone(),
-                    sdu: sdu.clone(),
-                    tx_reporter: None,
-                    aie_request,
-                });
+
+                let period_multiframes = 1_i32 << mode.saturating_sub(1);
+                let second = due.add_timeslots(period_multiframes * 18 * 4);
+                let second = if rollover_activation.is_none_or(|activation| activation.diff(second) > 0) {
+                    second
+                } else {
+                    // If only one EE occasion remains, put two all-MS PDUs in
+                    // that reception window instead of leaking an obsolete
+                    // Absolute-IV demand past cutover.
+                    due
+                };
+                let opportunities = if all_ms_rollover { vec![due, second] } else { vec![due] };
+                for (copy, opportunity) in opportunities.into_iter().enumerate() {
+                    if scheduled.contains(&(opportunity, copy)) {
+                        continue;
+                    }
+                    tracing::debug!(
+                        gssi = prim.main_address.ssi,
+                        issi,
+                        due = %opportunity,
+                        copy = copy + 1,
+                        rollover = all_ms_rollover,
+                        "queuing EE-aligned group-MCCH broadcast replay"
+                    );
+                    scheduled.push((opportunity, copy));
+                    self.deferred_mcch.push_back(DeferredMcch {
+                        due: opportunity,
+                        pdu: pdu.clone(),
+                        sdu: sdu.clone(),
+                        tx_reporter: None,
+                        aie_request,
+                    });
+                }
             }
         }
 
@@ -2277,6 +2376,7 @@ impl UmacBs {
             CallControl::NetworkCallStart { .. }
             | CallControl::NetworkCallReady { .. }
             | CallControl::NetworkCallEnd { .. }
+            | CallControl::NetworkTalkingPartyProfile { .. }
             | CallControl::LivelinessCheckRequest { .. }
             | CallControl::LivelinessCheckReady { .. } => {
                 tracing::trace!("rx_control: ignoring CMCE-Brew notification (not for UMAC)");

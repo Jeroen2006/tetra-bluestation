@@ -1192,6 +1192,16 @@ impl BsChannelScheduler {
         self.circuits.is_active(dir, ts)
     }
 
+    /// Return every active downlink traffic bearer and its usage marker.
+    /// An all-MS STCH broadcast must be copied to each of these channels;
+    /// choosing only the first active circuit leaves listeners on the other
+    /// group calls unaware of the pending key change.
+    pub fn active_downlink_traffic_channels(&self) -> Vec<(u8, u8)> {
+        (2..=4)
+            .filter_map(|timeslot| self.circuits.get_usage(Direction::Dl, timeslot).map(|usage| (timeslot, usage)))
+            .collect()
+    }
+
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
         // Clearing hangtime here is safe: if the circuit is gone, this timeslot is no longer in use.
         if (1..=4).contains(&ts) {

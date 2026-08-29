@@ -111,6 +111,9 @@ pub struct BrewEntity {
 
     /// Registered subscriber groups (ISSI -> set of GSSIs)
     subscriber_groups: HashMap<u32, HashSet<u32>>,
+    /// Brew directory cache: only the profile `text` field is retained.
+    subscriber_profile_text: HashMap<u32, String>,
+    profile_queries_in_flight: HashSet<u32>,
 
     /// Whether the worker is connected
     connected: bool,
@@ -156,6 +159,8 @@ impl BrewEntity {
             hanging_calls: HashMap::new(),
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
+            subscriber_profile_text: HashMap::new(),
+            profile_queries_in_flight: HashSet::new(),
             connected: false,
             worker_handle: Some(handle),
         }
@@ -184,6 +189,9 @@ impl BrewEntity {
                     priority,
                     service,
                 } => {
+                    if !self.subscriber_profile_text.contains_key(&source_issi) && self.profile_queries_in_flight.insert(source_issi) {
+                        let _ = self.command_sender.send(BrewCommand::QuerySubscriberProfile { issi: source_issi });
+                    }
                     tracing::info!("BrewEntity: GROUP_TX service={} (0=TETRA ACELP, expect 0)", service);
                     self.handle_group_call_start(queue, uuid, source_issi, dest_gssi, priority);
                 }
@@ -210,6 +218,22 @@ impl BrewEntity {
                 }
                 BrewEvent::ServerError { error_type, data } => {
                     tracing::error!("BrewEntity: server error type={} data={} bytes", error_type, data.len());
+                }
+                BrewEvent::SubscriberProfile { issi, text } => {
+                    self.profile_queries_in_flight.remove(&issi);
+                    self.subscriber_profile_text.insert(issi, text.clone());
+                    for call in self.active_calls.values().filter(|call| call.source_issi == issi) {
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Brew,
+                            dest: TetraEntity::Cmce,
+                            msg: SapMsgInner::CmceCallControl(CallControl::NetworkTalkingPartyProfile {
+                                brew_uuid: call.uuid,
+                                source_issi: issi,
+                                mnemonic_name: text.clone(),
+                            }),
+                        });
+                    }
                 }
             }
         }

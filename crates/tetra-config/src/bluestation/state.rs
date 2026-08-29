@@ -1200,6 +1200,25 @@ impl SubscriberRegistry {
             })
             .collect()
     }
+
+    /// EE phases for every terminal currently registered on this cell.  An
+    /// all-MS security broadcast is not a normal affiliated group, so using
+    /// `group_energy_economies(0x00ff_ffff)` would return no listeners and
+    /// silently bypass all sleeping terminals.
+    pub fn active_energy_economies(&self) -> Vec<(u32, u8, Option<u8>, Option<u8>)> {
+        self.subscribers
+            .values()
+            .filter(|subscriber| self.active_subscribers.contains(&subscriber.issi))
+            .map(|subscriber| {
+                (
+                    subscriber.issi,
+                    subscriber.energy_economy_mode,
+                    subscriber.energy_economy_frame_number,
+                    subscriber.energy_economy_multiframe_number,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Mutable, stack-editable state (mutex-protected).

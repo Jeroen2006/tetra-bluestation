@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::{SharedConfig, SubscriberDeliveryRoute};
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
 use tetra_core::{Layer2Service, TimeslotOwner, TxReporter, TxState};
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
@@ -8,6 +9,7 @@ use tetra_pdus::cmce::{
     enums::{
         call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_dl::CmcePduTypeDl,
         cmce_pdu_type_ul::CmcePduTypeUl, party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
+        type3_elem_id::CmceType3ElemId,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
@@ -42,7 +44,7 @@ use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
 };
-use tetra_swmi_protocol::{HandoverChannelAllocation, SwmiMessage};
+use tetra_swmi_protocol::{HandoverChannelAllocation, SwmiMessage, TalkingPartyProfile};
 
 // ETSI EN 300 392-9, table 3: notification indicator 0 is INFORM1 (LE
 // broadcast); 1 is INFORM2 (LE acknowledgement).
@@ -62,6 +64,8 @@ const PRIVATE_FLOOR_RESPONSE_GRACE_TIMESLOTS: i32 = 18 * 4;
 /// D-CALL RESTORE is sent on the MCCH.  Let the MS process its channel
 /// allocation before sending the FACCH D-TX GRANTED that names the speaker.
 const RESTORE_FLOOR_INDICATION_DELAY_TIMESLOTS: i32 = 18 * 4;
+/// SS-TPI is carried in the Facility element of the associated CMCE PDU.
+const SS_TPI_AIR_INTERFACE_ENABLED: bool = true;
 
 /// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {
@@ -95,6 +99,7 @@ pub struct CcBsSubentity {
     central_setup_call_ids: HashMap<(u32, u32), u16>,
     central_setup_call_floors: HashMap<(u32, u32), u32>,
     central_setup_call_priorities: HashMap<(u32, u32), u8>,
+    central_setup_talking_parties: HashMap<(u32, u32), Option<TalkingPartyProfile>>,
     /// GroupCallStart may arrive at CMCE before MM has applied the matching
     /// attachment decision because the SwMI worker fans messages out to two
     /// independent queues. Keep it until the local listener exists.
@@ -183,6 +188,8 @@ struct ActiveCall {
     /// Brew session UUID — set when a network speaker is active on this call,
     /// regardless of call origin. Cleared when the network speaker ends.
     brew_uuid: Option<uuid::Uuid>,
+    /// Current SwMI-resolved SS-TPI profile for the floor holder.
+    talking_party: Option<TalkingPartyProfile>,
 }
 
 #[derive(Clone)]
@@ -199,6 +206,7 @@ struct PrivateCallLocal {
     floor_itsi: u32,
     connected: bool,
     local_mask: u8,
+    talking_party: Option<TalkingPartyProfile>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -218,6 +226,96 @@ struct ListeningCandidate {
 }
 
 impl CcBsSubentity {
+    /// Build the SS-TPI INFORM carried in CMCE's Facility type-3 element.
+    /// Text is ISO-8859-1 (encoding 1), bounded by ETSI's 15-character
+    /// limit.  We include an explicit local SSI where the basic call PDU has
+    /// no talking-party identity (notably D-CONNECT/ACK); receivers that
+    /// already have the SSI simply obtain the matching mnemonic name.
+    fn tpi_facility(profile: Option<&TalkingPartyProfile>, include_identity: bool) -> Option<Type3FieldGeneric> {
+        let profile = profile?;
+        if profile.clir {
+            return None;
+        }
+        let name: Vec<u8> = profile
+            .mnemonic_name
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(15)
+            .map(|ch| u8::try_from(ch as u32).unwrap_or(b'?'))
+            .collect();
+        if name.is_empty() && !include_identity {
+            return None;
+        }
+        let mut bits = Vec::new();
+        let mut push = |value: u64, width: usize| {
+            for shift in (0..width).rev() {
+                bits.push(((value >> shift) & 1) as u8);
+            }
+        };
+        push(0b000011, 6); // SS-TPI
+        push(0b10001, 5); // INFORM
+        push(0, 1); // SS-CLIR not invoked
+        push(1, 7); // ISO/IEC 8859-1
+        push((name.len() * 8) as u64, 8);
+        for byte in name {
+            push(byte as u64, 8);
+        }
+        if include_identity {
+            push(0b01, 2); // SSI in this MNI
+            push(profile.issi as u64, 24);
+        }
+        // EN 300 392-2 clause 14.1.4 note 8: every supplementary-service PDU
+        // ends with an O-bit, even when it has no optional SS elements.  This
+        // bit was missing, causing receivers to interpret the end of a TPI
+        // mnemonic as the start of a further SS element.
+        push(0, 1); // O-bit: no optional SS elements follow
+        let len = bits.len();
+        let mut raw = vec![0u8; len.div_ceil(8)];
+        for (index, bit) in bits.into_iter().enumerate() {
+            raw[index / 8] |= bit << (7 - index % 8);
+        }
+        let first_bits = len.min(64);
+        let data = raw
+            .iter()
+            .take(first_bits.div_ceil(8))
+            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+            >> (first_bits.div_ceil(8) * 8 - first_bits);
+        Some(Type3FieldGeneric {
+            // `write_type3_generic` selects the wire ID from the PDU field;
+            // retain the matching value here too, so diagnostics are truthful.
+            field_id: CmceType3ElemId::Facility.into_raw(),
+            len,
+            data,
+            // The generic Type-3 writer uses `raw` only for payloads above
+            // 64 bits; keeping it empty below that avoids a bogus unsigned
+            // remainder calculation in that compatibility helper.
+            raw: (len > 64).then_some(raw).unwrap_or_default(),
+        })
+    }
+
+    fn group_tpi_facility(&self, call_id: u16, include_identity: bool) -> Option<Type3FieldGeneric> {
+        SS_TPI_AIR_INTERFACE_ENABLED
+            .then(|| {
+                Self::tpi_facility(
+                    self.active_calls.get(&call_id).and_then(|call| call.talking_party.as_ref()),
+                    include_identity,
+                )
+            })
+            .flatten()
+    }
+
+    fn private_tpi_facility(&self, call_id: u16, include_identity: bool) -> Option<Type3FieldGeneric> {
+        SS_TPI_AIR_INTERFACE_ENABLED
+            .then(|| {
+                Self::tpi_facility(
+                    self.private_calls.get(&call_id).and_then(|call| call.talking_party.as_ref()),
+                    include_identity,
+                )
+            })
+            .flatten()
+    }
+
     pub fn new(config: SharedConfig, swmi: Option<SwmiCmceEndpoint>) -> Self {
         CcBsSubentity {
             config,
@@ -237,6 +335,7 @@ impl CcBsSubentity {
             central_setup_call_ids: HashMap::new(),
             central_setup_call_floors: HashMap::new(),
             central_setup_call_priorities: HashMap::new(),
+            central_setup_talking_parties: HashMap::new(),
             pending_remote_swmi_calls: HashMap::new(),
             pending_preemptive_floor_grants: HashMap::new(),
             pending_private_floor_requests: HashMap::new(),
@@ -782,7 +881,17 @@ impl CcBsSubentity {
         for (call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged) in pending {
             self.pending_remote_swmi_calls.remove(&call_id);
             let announce_setup = !self.active_floor_holder_is_local_member(gssi, floor_itsi);
-            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged, announce_setup);
+            self.start_remote_swmi_call(
+                queue,
+                call_id,
+                owner_itsi,
+                gssi,
+                priority,
+                floor_itsi,
+                None,
+                acknowledged,
+                announce_setup,
+            );
         }
     }
 
@@ -993,7 +1102,7 @@ impl CcBsSubentity {
             basic_service_information: None,
             temporary_address: None,
             notification_indicator: None,
-            facility: None,
+            facility: self.group_tpi_facility(call_id, true),
             proprietary: None,
         };
 
@@ -1218,6 +1327,7 @@ impl CcBsSubentity {
         let central_call_id = self.central_setup_call_ids.remove(&setup_key);
         let central_floor_itsi = self.central_setup_call_floors.remove(&setup_key);
         let central_call_priority = self.central_setup_call_priorities.remove(&setup_key);
+        let central_talking_party = self.central_setup_talking_parties.remove(&setup_key).flatten();
         let assigned_call_priority = central_call_priority.unwrap_or(pdu.call_priority);
         // A new central call grants its initial floor to the setup caller. A
         // setup resumed for an existing call uses the floor state carried by
@@ -1372,6 +1482,9 @@ impl CcBsSubentity {
             calling_party_address_ssi: Some(calling_party.ssi),
             calling_party_extension: None,
             external_subscriber_number: None,
+            // Some deployed terminals reject a group D-SETUP carrying an SS
+            // facility.  Deliver SS-TPI safely in the following D-TX GRANTED
+            // instead; that PDU already identifies the active speaker.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -1418,6 +1531,7 @@ impl CcBsSubentity {
                 usage: circuit.usage,
                 priority: assigned_call_priority,
                 acknowledged: pdu.basic_service_information.communication_type == CommunicationType::P2MpAcked,
+                talking_party: central_talking_party,
                 tx_active: caller_has_central_floor || another_central_speaker,
                 hangtime_start: None,
                 brew_uuid: None,
@@ -2144,6 +2258,7 @@ impl CcBsSubentity {
                 gssi,
                 priority,
                 floor_itsi,
+                talking_party,
                 acknowledged,
                 ..
             } => {
@@ -2169,6 +2284,7 @@ impl CcBsSubentity {
                     self.central_setup_call_ids.insert(pending_key, call_id);
                     self.central_setup_call_floors.insert(pending_key, floor_itsi as u32);
                     self.central_setup_call_priorities.insert(pending_key, priority);
+                    self.central_setup_talking_parties.insert(pending_key, talking_party);
                     self.rx_u_setup(queue, request);
                 } else if !self.has_listener(gssi) {
                     self.pending_remote_swmi_calls
@@ -2189,6 +2305,7 @@ impl CcBsSubentity {
                         gssi,
                         priority,
                         floor_itsi,
+                        talking_party,
                         acknowledged,
                         announce_setup,
                     );
@@ -2225,8 +2342,15 @@ impl CcBsSubentity {
                     );
                 }
             }
-            SwmiMessage::FloorGranted { call_id, itsi } => {
+            SwmiMessage::FloorGranted {
+                call_id,
+                itsi,
+                talking_party,
+            } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
+                if let Some(call) = self.active_calls.get_mut(&call_id) {
+                    call.talking_party = talking_party;
+                }
                 if self
                     .pending_preemptive_floor_grants
                     .get(&call_id)
@@ -2303,6 +2427,7 @@ impl CcBsSubentity {
                         floor_itsi: 0,
                         connected: false,
                         local_mask: 0x01,
+                        talking_party: None,
                     },
                 );
                 self.send_d_call_proceeding(queue, &request, &pdu, call_id);
@@ -2327,6 +2452,7 @@ impl CcBsSubentity {
                     floor_itsi: 0,
                     connected: false,
                     local_mask: 0x02,
+                    talking_party: None,
                 };
                 self.private_calls
                     .entry(call_id)
@@ -2381,12 +2507,14 @@ impl CcBsSubentity {
             SwmiMessage::PrivateCallConnected {
                 call_id,
                 initial_floor_itsi,
+                talking_party,
                 ..
             } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
                 let Some(call) = self.private_calls.get_mut(&call_id) else { return };
                 call.connected = true;
                 call.floor_itsi = initial_floor_itsi as u32;
+                call.talking_party = talking_party;
                 let call = call.clone();
                 let shared_simplex = !call.duplex
                     && call.local_mask & 0x03 == 0x03
@@ -2499,6 +2627,7 @@ impl CcBsSubentity {
                     floor_itsi: initial_floor_itsi as u32,
                     connected: true,
                     local_mask: endpoint_mask,
+                    talking_party: None,
                 };
                 self.private_calls
                     .entry(call_id)
@@ -2599,13 +2728,18 @@ impl CcBsSubentity {
                     self.release_private_call_local(queue, call_id, cause);
                 }
             }
-            SwmiMessage::PrivateFloorGranted { call_id, itsi } => {
+            SwmiMessage::PrivateFloorGranted {
+                call_id,
+                itsi,
+                talking_party,
+            } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
                 self.pending_private_floor_requests.remove(&(call_id, itsi as u32));
                 let Some(call) = self.private_calls.get_mut(&call_id) else {
                     return;
                 };
                 call.floor_itsi = itsi as u32;
+                call.talking_party = talking_party;
                 let call = call.clone();
                 let mut resumed_timeslots = HashSet::new();
                 for recipient in [call.caller_itsi, call.callee_itsi] {
@@ -2865,12 +2999,12 @@ impl CcBsSubentity {
     }
 
     fn apply_central_floor_grant(&mut self, queue: &mut MessageQueue, call_id: u16, itsi: u32) {
-        let (dest_gssi, ts) = {
+        let (dest_gssi, ts, usage) = {
             let Some(call) = self.active_calls.get_mut(&call_id) else { return };
             call.source_issi = itsi;
             call.tx_active = true;
             call.hangtime_start = None;
-            (call.dest_gssi, call.ts)
+            (call.dest_gssi, call.ts, call.usage)
         };
         // Send the explicit response first. A group D-TX GRANTED is deliberately
         // after it, so a pending U-TX DEMAND cannot be cancelled by the
@@ -2892,6 +3026,7 @@ impl CcBsSubentity {
                 }),
             });
         }
+        self.send_group_tpi_fn18(queue, call_id, itsi, dest_gssi, ts, usage);
     }
 
     /// Allocate the local radio circuit for a centrally-started group call at
@@ -2904,6 +3039,7 @@ impl CcBsSubentity {
         gssi: u32,
         priority: u8,
         floor_itsi: u32,
+        talking_party: Option<TalkingPartyProfile>,
         acknowledged: bool,
         announce_setup: bool,
     ) {
@@ -2963,6 +3099,8 @@ impl CcBsSubentity {
             calling_party_address_ssi: Some(owner_itsi),
             calling_party_extension: None,
             external_subscriber_number: None,
+            // See the local setup path above: advertise the call first and
+            // send the mnemonic name in D-TX GRANTED on the traffic channel.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -3013,6 +3151,7 @@ impl CcBsSubentity {
                 usage: circuit.usage,
                 priority,
                 acknowledged,
+                talking_party,
                 tx_active: floor_itsi != 0,
                 hangtime_start: None,
                 brew_uuid: None,
@@ -3075,7 +3214,7 @@ impl CcBsSubentity {
                 return None;
             }
         } else {
-            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, priority, floor_itsi, acknowledged, false);
+            self.start_remote_swmi_call(queue, call_id, owner_itsi, gssi, priority, floor_itsi, None, acknowledged, false);
         }
 
         let (timeslot, usage) = self.active_calls.get(&call_id).map(|call| (call.ts, call.usage))?;
@@ -3457,7 +3596,7 @@ impl CcBsSubentity {
                 basic_service_information: None,
                 temporary_address: None,
                 notification_indicator: None,
-                facility: None,
+                facility: self.private_tpi_facility(call_id, true),
                 proprietary: None,
             };
             pdu.to_bitbuf(&mut sdu).expect("serialize private D-CONNECT");
@@ -3469,7 +3608,7 @@ impl CcBsSubentity {
                 // See D-CONNECT above: zero permits U-TX DEMAND.
                 transmission_request_permission: false,
                 notification_indicator: None,
-                facility: None,
+                facility: self.private_tpi_facility(call_id, true),
                 proprietary: None,
             };
             pdu.to_bitbuf(&mut sdu).expect("serialize private D-CONNECT ACKNOWLEDGE");
@@ -3775,6 +3914,7 @@ impl CcBsSubentity {
                     .submit(SwmiMessage::PrivateFloorGranted {
                         call_id: call_id as u64,
                         itsi: requesting_party.ssi as u64,
+                        talking_party: None,
                     })
                     .is_ok()
                 {
@@ -3856,6 +3996,7 @@ impl CcBsSubentity {
 
         // Grant the floor to the requesting MS
         let ts = call.ts;
+        let usage = call.usage;
         call.tx_active = true;
         call.hangtime_start = None;
         call.source_issi = requesting_party.ssi;
@@ -3889,6 +4030,7 @@ impl CcBsSubentity {
                 ts,
             }),
         });
+        self.send_group_tpi_fn18(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
         // Notify Brew of speaker change (local MS taking floor)
         if net_brew::is_brew_gssi_routable(&self.config, dest_addr.ssi) {
@@ -4078,6 +4220,32 @@ impl CcBsSubentity {
             CallControl::NetworkCallEnd { brew_uuid } => {
                 self.rx_network_call_end(queue, brew_uuid);
             }
+            CallControl::NetworkTalkingPartyProfile {
+                brew_uuid,
+                source_issi,
+                mnemonic_name,
+            } => {
+                let Some((&call_id, call)) = self
+                    .active_calls
+                    .iter_mut()
+                    .find(|(_, call)| call.brew_uuid == Some(brew_uuid) && call.source_issi == source_issi)
+                else {
+                    return;
+                };
+                call.talking_party = Some(TalkingPartyProfile {
+                    issi: source_issi,
+                    mnemonic_name: Some(mnemonic_name),
+                    clir: false,
+                });
+                // The profile arrives after the call announcement; repeat
+                // D-TX GRANTED so listening terminals can replace its ISSI
+                // with Brew's friendly `text` value.
+                let (gssi, ts, usage) = (call.dest_gssi, call.ts, call.usage);
+                let _ = call;
+                if SS_TPI_AIR_INTERFACE_ENABLED {
+                    self.send_group_tpi_fn18(queue, call_id, source_issi, gssi, ts, usage);
+                }
+            }
             CallControl::UlInactivityTimeout { ts } => {
                 self.handle_ul_inactivity_timeout(queue, ts);
             }
@@ -4175,6 +4343,7 @@ impl CcBsSubentity {
                     ts,
                 }),
             });
+            self.send_group_tpi_fn18(queue, call_id_val, source_issi, dest_gssi, ts, usage);
 
             // Respond to Brew with existing call resources, we already ensured it is cleared for brew
             queue.push_back(SapMsg {
@@ -4332,6 +4501,7 @@ impl CcBsSubentity {
                 usage,
                 priority: 0,
                 acknowledged: false,
+                talking_party: None,
                 tx_active: true,
                 hangtime_start: None,
                 brew_uuid: Some(brew_uuid),
@@ -4453,6 +4623,9 @@ impl CcBsSubentity {
             transmitting_party_address_ssi: Some(next_itsi as u64),
             transmitting_party_extension: None,
             external_subscriber_number: None,
+            // FACCH/STCH has 124 bits for the entire MAC resource.  A
+            // mnemonic-name INFORM does not fit there; sending one would make
+            // UMAC drop the floor-control PDU and leave the call in hangtime.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4476,6 +4649,8 @@ impl CcBsSubentity {
             transmitting_party_address_ssi: Some(source_issi as u64),
             transmitting_party_extension: None,
             external_subscriber_number: None,
+            // See `send_d_tx_granted_facch`: FACCH carries only the
+            // time-critical floor-control fields.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4506,7 +4681,9 @@ impl CcBsSubentity {
             transmitting_party_address_ssi: Some(source_issi as u64),
             transmitting_party_extension: None,
             external_subscriber_number: None,
-            facility: None,
+            // Unlike the FACCH grant, this is associated FN18 control with
+            // enough capacity for the SS-TPI INFORM.
+            facility: self.group_tpi_facility(call_id, false),
             dm_ms_address: None,
             proprietary: None,
         };
@@ -4527,6 +4704,16 @@ impl CcBsSubentity {
             None,
             channel,
         ));
+    }
+
+    /// The name-bearing SS-TPI INFORM is too large for a 124-bit FACCH/STCH
+    /// half-slot after LLC and MAC headers.  FN18 associated control has the
+    /// normal 268-bit control capacity and is received by every listener on
+    /// the active traffic channel.
+    fn send_group_tpi_fn18(&self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8, usage: u8) {
+        if self.group_tpi_facility(call_id, false).is_some() {
+            self.send_d_tx_granted_group_fn18(queue, call_id, source_issi, dest_gssi, ts, usage);
+        }
     }
 
     fn send_d_tx_granted_individual_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, ts: u8) {
@@ -4573,6 +4760,8 @@ impl CcBsSubentity {
             transmitting_party_address_ssi: Some(transmitting_issi as u64),
             transmitting_party_extension: None,
             external_subscriber_number: None,
+            // This individual FACCH grant is the response that lets the
+            // requesting terminal leave hangtime, so it must remain short.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4611,6 +4800,8 @@ impl CcBsSubentity {
             transmitting_party_address_ssi: Some(source_itsi as u64),
             transmitting_party_extension: None,
             external_subscriber_number: None,
+            // A private D-TX GRANTED also uses FACCH/STCH, where a mnemonic
+            // INFORM exceeds the one-half-slot capacity.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4754,6 +4945,8 @@ impl CcBsSubentity {
             call_identifier: call_id,
             transmission_request_permission: false, // ETSI 14.8.43: 0 = allowed to request transmission
             notification_indicator: None,
+            // D-TX CEASED is time-critical FACCH and must fit one STCH
+            // half-slot; SS-TPI is sent separately on associated control.
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4767,5 +4960,51 @@ impl CcBsSubentity {
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         let msg = Self::build_sapmsg_stealing(sdu, dest_addr, ts);
         queue.push_back(msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ss_tpi_inform_ends_with_its_required_o_bit() {
+        let profile = TalkingPartyProfile {
+            issi: 0x12_34_56,
+            mnemonic_name: Some("Alice".to_owned()),
+            clir: false,
+        };
+        let facility = CcBsSubentity::tpi_facility(Some(&profile), false).expect("TPI facility");
+
+        // 6 SS-Type + 5 PDU type + 1 CLIR + 7 encoding + 8 name length +
+        // 5 Latin-1 bytes + final O-bit.
+        assert_eq!(facility.len, 68);
+        assert_eq!(facility.raw.last().copied().unwrap() & 0b0001_0000, 0);
+
+        // Verify that the enclosing CMCE PDU labels it as a Facility and that
+        // its declared length contains the closing SS-PDU O-bit.
+        let pdu = DTxGranted {
+            call_identifier: 0x1234,
+            transmission_grant: 1,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1),
+            transmitting_party_address_ssi: Some(profile.issi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: Some(facility),
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        let mut encoded = BitBuffer::new_autoexpand(128);
+        pdu.to_bitbuf(&mut encoded).expect("serialize D-TX GRANTED");
+        encoded.seek(0);
+        let parsed = DTxGranted::from_bitbuf(&mut encoded).expect("parse D-TX GRANTED");
+        let parsed_facility = parsed.facility.expect("Facility must be retained");
+        assert_eq!(parsed_facility.field_id, CmceType3ElemId::Facility.into_raw());
+        assert_eq!(parsed_facility.len, 68);
+        assert_eq!(parsed_facility.raw.last().copied().unwrap() & 0b0001_0000, 0);
     }
 }

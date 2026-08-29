@@ -99,6 +99,13 @@ pub enum CallControl {
     NetworkCallEnd {
         brew_uuid: uuid::Uuid, // Identifies the call to end
     },
+    /// A Brew subscriber-profile reply for the current network speaker.
+    /// `mnemonic_name` is taken exclusively from Brew's `text` field.
+    NetworkTalkingPartyProfile {
+        brew_uuid: uuid::Uuid,
+        source_issi: u32,
+        mnemonic_name: String,
+    },
     /// UL inactivity detected on a traffic timeslot — no voice frames received
     /// for the timeout period. Sent by UMAC to CMCE.
     UlInactivityTimeout {
