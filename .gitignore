@@ -10,8 +10,14 @@ docs/*
 !docs/sc2/**
 /docs
 !docs/
+docs
+docs/
 docs/*
 !docs/tetra/
 docs/tetra/*
 !docs/tetra/TPI-ontwerp-en-implementatie.md
 *.lock
+tmp
+tmp/
+tmp/*
+Cargo.lock
