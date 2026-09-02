@@ -8,7 +8,6 @@ members = [
     "crates/tetra-config",
     "crates/tetra-pdus",
     "crates/tetra-entities",
-    "crates/tetra-crypto",
     
     # Binaries
     "bins/bluestation-bs",
@@ -26,11 +25,12 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 tetra-core = { path = "crates/tetra-core" }
+tetra-air-interface = { path = "../tetra-network-domain/crates/tetra-air-interface" }
 tetra-config = { path = "crates/tetra-config" }
 tetra-saps = { path = "crates/tetra-saps" }
 tetra-pdus = { path = "crates/tetra-pdus" }
 tetra-entities = { path = "crates/tetra-entities" }
-tetra-crypto = { path = "crates/tetra-crypto" }
+tetra-crypto = { path = "../tetra-network-domain/crates/tetra-crypto" }
 tetra-swmi-protocol = { path = "../tetra-network-domain/crates/tetra-swmi-protocol" }
 
 # External dependencies

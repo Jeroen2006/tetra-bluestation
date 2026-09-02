@@ -8,16 +8,17 @@ use tetra_config::bluestation::{DmMsRouteAddress, DmoCarrierState, SharedConfig}
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{
-    AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, assert_warn,
-    unimplemented_log,
+    AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, Sc3KeyType, SsiType, TdmaTime, TetraAddress, TxReporter, TxState,
+    assert_warn, unimplemented_log,
 };
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::control::call_control::CallControl;
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataReq};
+use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{
     AieLocationUpdateDecision, AieObservationEvent, AieObservationState, AttachmentOperation, AttachmentResult, DmGatewayAddress,
-    DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation, SwmiMessage, TerminalAieObservation,
+    DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation, Sc3RetrievalEvidence, SwmiMessage, TerminalAieObservation,
 };
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
@@ -33,8 +34,12 @@ use tetra_pdus::mm::fields::energy_saving_information::EnergySavingInformation;
 use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
+use tetra_pdus::mm::fields::group_identity_security_related_information::{
+    GckSelectNumber, GroupGckAssociation, GroupIdentitySecurityRelatedInformation,
+};
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
-use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DCkChangeDemand, SckChangeData, UCkChangeResult};
+use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DAllGcksChangeDemand, DCkChangeDemand, SckChangeData, UCkChangeResult};
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::d_authentication_demand::DAuthenticationDemand;
 use tetra_pdus::mm::pdus::d_authentication_response::DAuthenticationResponse;
@@ -46,6 +51,7 @@ use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatusGatewayPayload;
 use tetra_pdus::mm::pdus::otar::{DOtar, UOtar};
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
@@ -72,6 +78,10 @@ const MAX_RECENT_OTAR_DELIVERIES: usize = 64;
 /// two known EE monitoring occasions.  Repeat once per complete maximum EE
 /// cycle as well, covering terminals which register or change EE phase later.
 const ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS: i32 = 64 * 18 * 4;
+/// Linked GCK crypto periods use the same maximum-EE-cycle repetition as an
+/// SCK rollover. Unlike the short SYSINFO value, this PDU carries all 16 bits
+/// and therefore also repairs terminals returning after several periods.
+const GCK_VERSION_BROADCAST_INTERVAL_TIMESLOTS: i32 = 64 * 18 * 4;
 /// Repeat the exact same Absolute-IV demand in three separate rounds shortly
 /// before cutover.  Each round is sent on MCCH and as STCH on every active
 /// traffic channel.  Four frames of final lead time leaves the entity and
@@ -104,7 +114,9 @@ enum OtarTerminalResponse {
     SckResult,
     GckResult,
     GskoResult,
+    KeyDeleteResult,
     KeyStatusResponse,
+    CmgGtsiResult,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +129,9 @@ enum OtarDownlinkKind {
     GckReject,
     GskoProvide,
     GskoReject,
+    KeyDeleteDemand,
     KeyStatusDemand,
+    CmgGtsiProvide,
 }
 
 impl OtarDownlinkKind {
@@ -131,7 +145,9 @@ impl OtarDownlinkKind {
             DOtar::GckReject(_) => Self::GckReject,
             DOtar::GskoProvide(_) => Self::GskoProvide,
             DOtar::GskoReject(_) => Self::GskoReject,
+            DOtar::KeyDeleteDemand(_) => Self::KeyDeleteDemand,
             DOtar::KeyStatusDemand(_) => Self::KeyStatusDemand,
+            DOtar::CmgGtsiProvide(_) => Self::CmgGtsiProvide,
         }
     }
 
@@ -141,7 +157,9 @@ impl OtarDownlinkKind {
             Self::SckProvide => Some(OtarTerminalResponse::SckResult),
             Self::GckProvide => Some(OtarTerminalResponse::GckResult),
             Self::GskoProvide => Some(OtarTerminalResponse::GskoResult),
+            Self::KeyDeleteDemand => Some(OtarTerminalResponse::KeyDeleteResult),
             Self::KeyStatusDemand => Some(OtarTerminalResponse::KeyStatusResponse),
+            Self::CmgGtsiProvide => Some(OtarTerminalResponse::CmgGtsiResult),
             Self::CckReject | Self::SckReject | Self::GckReject | Self::GskoReject => None,
         }
     }
@@ -186,6 +204,21 @@ struct PendingOtarDelivery {
     tx_reporter: TxReporter,
     status: OtarDeliveryStatus,
     result_deadline: TdmaTime,
+}
+
+/// Latest D-LOCATION UPDATE ACCEPT delivery for one local terminal. LLC owns
+/// the encoded retransmission; MM retains only the shared link receipt and
+/// non-sensitive correlation metadata needed to commit the registration.
+#[derive(Debug)]
+struct PendingRegistrationDelivery {
+    command_id: Option<u64>,
+    issi: u32,
+    authentication_downlink: bool,
+    /// Accepted groups whose GCK association was included in the location
+    /// update accept. Repeat these as bounded figure-20 amendments only after
+    /// BL-ACK proves that registration completed on the air interface.
+    security_groups: Vec<u32>,
+    tx_reporter: TxReporter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +299,13 @@ pub struct MmBs {
     /// Bounded radio/application outcomes for diagnostics and future SwMI
     /// lifecycle reporting. The entries contain no payload or key material.
     recent_otar_deliveries: VecDeque<CompletedOtarDelivery>,
+    /// A registration is not active merely because its accept was queued.
+    /// Keep the newest delivery per ISSI pending until LLC observes BL-ACK.
+    pending_registration_deliveries: HashMap<u32, PendingRegistrationDelivery>,
+    /// Empty acknowledged BL-DATA presence probes requested by the SwMI.
+    /// These deliberately live outside MM registration state: a reachability
+    /// check must not mutate affiliations, security associations or roaming.
+    pending_liveliness_probes: HashMap<u32, TxReporter>,
     /// Per-terminal GSKO bootstrap state. A GSKO itself is never stored at
     /// the BS; only its version and CMG association are tracked.
     gsko_bootstraps: HashMap<u32, GskoBootstrapStatus>,
@@ -281,6 +321,8 @@ pub struct MmBs {
     /// Last all-MS rollover announcement. This is metadata only; the SCK
     /// remains inside runtime AIE state.
     last_rollover_broadcast: Option<(u64, TdmaTime)>,
+    /// Last periodic full current GCK-VN advertisement.
+    last_gck_version_broadcast: Option<(u16, TdmaTime)>,
     /// Bit mask of the three pre-cutover all-MS broadcast rounds already
     /// queued for the current rollover.  This replaces per-terminal D-CK
     /// CHANGE delivery; OTAR key provisioning remains individually tracked.
@@ -328,6 +370,31 @@ struct PendingLocationAttachment {
 }
 
 impl MmBs {
+    fn group_security_information(&self, gssis: impl IntoIterator<Item = u32>) -> Option<Vec<GroupIdentitySecurityRelatedInformation>> {
+        let state = self.config.state_read();
+        let sc3 = state.aie.sc3.as_ref()?;
+        if !sc3.linked_gck_crypto_periods() {
+            return None;
+        }
+        let associations = gssis
+            .into_iter()
+            // TTR 001-11 table 14 permits only an actual GCKN in group
+            // attachment signalling.  Although the underlying security
+            // specification defines 2^16 as "No GCKN selected", the SC3G
+            // interoperability profile reserves that value.  Emitting it
+            // automatically for every CCK-only or detached group can make an
+            // MS discard the complete D-ATTACH/DETACH acknowledgement.
+            .filter_map(|gssi| {
+                sc3.gckn_for_gssi(gssi).map(|gckn| GroupGckAssociation {
+                    gssi,
+                    selection: GckSelectNumber::Selected(gckn),
+                })
+            })
+            .take(30)
+            .collect::<Vec<_>>();
+        (!associations.is_empty()).then_some(vec![GroupIdentitySecurityRelatedInformation { associations }])
+    }
+
     /// Select an explicit downlink policy while the MM transaction still
     /// knows whether this terminal completed the SC2 bootstrap. Registration
     /// constructors deliberately use `clear`; OTAR uses the stricter helper
@@ -335,10 +402,29 @@ impl MmBs {
     /// protected normal OTAR.
     fn downlink_aie_request(&self, issi: u32) -> AieRequest {
         let state = self.config.state_read();
+        if state.aie.enabled && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+            return AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource);
+        }
         if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
             AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
         } else {
             AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)
+        }
+    }
+
+    /// Class-3 group-addressed signalling uses MGCK when the GSSI has an
+    /// association and CCK otherwise. The all-MS address deliberately has no
+    /// GCK association, so normative broadcasts such as the full GCK-VN use
+    /// CCK instead of being sent in clear (EN 300 392-7 clause 6.5).
+    fn group_downlink_aie_request(&self, gssi: u32) -> AieRequest {
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie.sc3.is_some() {
+            return AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
+        }
+        if state.aie.enabled && state.aie.sc2.is_some() {
+            AieRequest::sc2(AieSubject::Group { gssi }, AieScope::MacResource)
+        } else {
+            AieRequest::clear(AieSubject::Group { gssi }, AieScope::MacResource)
         }
     }
 
@@ -349,6 +435,9 @@ impl MmBs {
         let state = self.config.state_read();
         if !state.aie.enabled || kind.is_clear_gsko_bootstrap() {
             return Ok(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        }
+        if state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+            return Ok(AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource));
         }
         if state.aie_sessions.terminal(issi).is_some() {
             return Ok(AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource));
@@ -493,6 +582,125 @@ impl MmBs {
         }
     }
 
+    fn track_registration_delivery(
+        &mut self,
+        command_id: Option<u64>,
+        issi: u32,
+        authentication_downlink: bool,
+        security_groups: Vec<u32>,
+        tx_reporter: TxReporter,
+    ) {
+        self.config.state_write().subscribers.set_registration_delivery_pending(issi, true);
+        self.pending_registration_deliveries.insert(
+            issi,
+            PendingRegistrationDelivery {
+                command_id,
+                issi,
+                authentication_downlink,
+                security_groups,
+                tx_reporter,
+            },
+        );
+        tracing::info!(
+            command_id = ?command_id,
+            issi,
+            authentication_downlink,
+            "D-LOCATION UPDATE ACCEPT queued on MCCH; awaiting BL-ACK"
+        );
+    }
+
+    fn update_registration_delivery_statuses(&mut self, queue: &mut MessageQueue) {
+        let outcomes = self
+            .pending_registration_deliveries
+            .iter()
+            .filter_map(|(&issi, pending)| match pending.tx_reporter.get_state() {
+                TxState::Acknowledged => Some((issi, true)),
+                TxState::Discarded | TxState::Lost => Some((issi, false)),
+                TxState::Pending | TxState::Transmitted => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (issi, delivered) in outcomes {
+            let Some(pending) = self.pending_registration_deliveries.remove(&issi) else {
+                continue;
+            };
+            let state = pending.tx_reporter.get_state();
+            if delivered {
+                self.config.state_write().subscribers.mark_active(issi);
+                // SubscriberStateSync can restore the terminal's roaming
+                // scan/attachment list while D-LOCATION UPDATE ACCEPT is
+                // still awaiting its BL-ACK.  Those groups were not present
+                // in the original location-update transaction, but they do
+                // need the same post-registration GSSI -> GCKN amendment
+                // before a restored or late-entry group call is usable.
+                let mut security_groups = pending.security_groups;
+                security_groups.extend(
+                    self.client_mgr
+                        .get_client_by_issi(issi)
+                        .into_iter()
+                        .flat_map(|client| client.groups.keys().copied()),
+                );
+                security_groups.sort_unstable();
+                security_groups.dedup();
+                let association_count = self
+                    .group_security_information(security_groups.iter().copied())
+                    .map(|information| information.into_iter().map(|item| item.associations.len()).sum::<usize>())
+                    .unwrap_or_default();
+                self.send_group_security_association_amendments(queue, issi, 0, security_groups);
+                self.send_current_gck_version_to_terminal(queue, issi, 0);
+                tracing::info!(
+                    command_id = ?pending.command_id,
+                    issi = pending.issi,
+                    authentication_downlink = pending.authentication_downlink,
+                    association_count,
+                    "location update accepted and link-acknowledged on air interface"
+                );
+            } else {
+                let mut state_registry = self.config.state_write();
+                state_registry.subscribers.set_registration_delivery_pending(issi, false);
+                state_registry.subscribers.note_registration_delivery_failure();
+                tracing::warn!(
+                    command_id = ?pending.command_id,
+                    issi = pending.issi,
+                    ?state,
+                    "D-LOCATION UPDATE ACCEPT was not link-acknowledged; registration remains inactive"
+                );
+            }
+        }
+    }
+
+    /// Report completed ETSI basic-link presence probes to the SwMI. LLC owns
+    /// all retransmission timing; MM only observes the shared receipt and
+    /// never turns an unanswered probe into a registration procedure.
+    fn update_liveliness_probe_statuses(&mut self) {
+        let outcomes = self
+            .pending_liveliness_probes
+            .iter()
+            .filter_map(|(&issi, reporter)| match reporter.get_state() {
+                TxState::Acknowledged => Some((issi, true, TxState::Acknowledged)),
+                TxState::Discarded | TxState::Lost => Some((issi, false, reporter.get_state())),
+                TxState::Pending | TxState::Transmitted => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (issi, reachable, state) in outcomes {
+            self.pending_liveliness_probes.remove(&issi);
+            if let Some(swmi) = &self.swmi
+                && let Err(error) = swmi.submit(SwmiMessage::LivelinessResult {
+                    itsi: u64::from(issi),
+                    reachable,
+                })
+            {
+                tracing::warn!(issi, reachable, ?error, "cannot report terminal presence-probe result to SwMI");
+            }
+            if reachable {
+                tracing::debug!(issi, "terminal presence confirmed by empty BL-DATA acknowledgement");
+            } else {
+                tracing::warn!(issi, ?state, "terminal did not acknowledge empty BL-DATA presence probe");
+            }
+        }
+    }
+
     fn complete_otar_terminal_response(&mut self, issi: u32, air_handle: u32, response: OtarTerminalResponse, success: bool) {
         let matching = self
             .pending_otar_deliveries
@@ -576,19 +784,28 @@ impl MmBs {
         Some((ck_requested, rand_2))
     }
 
-    /// Table A.46, SC2 form: KSG(4), security class=0, SCKN(5).
-    fn sc2_ciphering_parameters(&self) -> Option<u16> {
+    /// Table A.46: KSG(4), security class, then either SCKN (SC2) or
+    /// capability bits (SC3). Downlink SC3 capability bits are zero.
+    fn aie_ciphering_parameters(&self) -> Option<u16> {
         let state = self.config.state_read();
         if !state.aie.enabled {
             return None;
         }
-        let sc2 = state.aie.sc2.as_ref()?;
-        let ksg = sc2_ksg_number(sc2.algorithm);
-        Some((u16::from(ksg) << 6) | u16::from(sc2.sckn))
+        if let Some(sc3) = state.aie.sc3.as_ref() {
+            let ksg: u8 = match sc3.algorithm {
+                tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea1 => 0,
+                tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea3 => 2,
+            };
+            return Some((u16::from(ksg) << 6) | (1 << 5));
+        }
+        state.aie.sc2.as_ref().map(|sc2| {
+            let ksg = sc2_ksg_number(sc2.algorithm);
+            (u16::from(ksg) << 6) | u16::from(sc2.sckn)
+        })
     }
 
-    fn validate_sc2_location_update(&self, pdu: &ULocationUpdateDemand) -> Result<(), (u8, u16)> {
-        let Some(expected) = self.sc2_ciphering_parameters() else {
+    fn validate_aie_location_update(&self, pdu: &ULocationUpdateDemand) -> Result<(), (u8, u16)> {
+        let Some(expected) = self.aie_ciphering_parameters() else {
             return Ok(());
         };
         let state = self.config.state_read();
@@ -605,8 +822,10 @@ impl MmBs {
         if provided_ksg != expected_ksg {
             return Err((RejectCause::IdentifiedCipherKsgNotSupported as u8, expected));
         }
-        // Security-class bit must be zero and the SC2 SCKN must agree.
-        if (provided & 0x3f) != (expected & 0x3f) {
+        // The security-class bit must agree. For SC2 the remaining five bits
+        // are SCKN and must match. For SC3 they are uplink capability flags,
+        // which the BS accepts independently of its zeroed downlink form.
+        if (provided & 0x20) != (expected & 0x20) || (expected & 0x20 == 0 && (provided & 0x1f) != (expected & 0x1f)) {
             return Err((RejectCause::IdentifiedCipherKeyNotAvailable as u8, expected));
         }
         Ok(())
@@ -636,10 +855,13 @@ impl MmBs {
             pending_lst_recoveries: HashSet::new(),
             pending_otar_deliveries: HashMap::new(),
             recent_otar_deliveries: VecDeque::new(),
+            pending_registration_deliveries: HashMap::new(),
+            pending_liveliness_probes: HashMap::new(),
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
             pending_sc2_activations: HashMap::new(),
             last_rollover_broadcast: None,
+            last_gck_version_broadcast: None,
             rollover_late_broadcast_mask: None,
             current_time: TdmaTime::default(),
         }
@@ -705,11 +927,15 @@ impl MmBs {
         }
     }
 
-    fn packet_aie_state(air_interface_encrypted: bool) -> AieObservationState {
-        if air_interface_encrypted {
-            AieObservationState::Sc2
-        } else {
-            AieObservationState::Clear
+    fn aie_request_is_encrypted(request: Option<&AieRequest>) -> bool {
+        matches!(request, Some(AieRequest::Sc2 { .. } | AieRequest::Sc3 { .. }))
+    }
+
+    fn packet_aie_state(request: Option<&AieRequest>) -> AieObservationState {
+        match request {
+            Some(AieRequest::Sc3 { .. }) => AieObservationState::Sc3,
+            Some(AieRequest::Sc2 { .. }) => AieObservationState::Sc2,
+            Some(AieRequest::Clear { .. }) | None => AieObservationState::Clear,
         }
     }
 
@@ -719,10 +945,13 @@ impl MmBs {
     /// fact.  This prevents a successful clear bootstrap/authentication from
     /// overwriting the terminal's established SC2 state in the SwMI view.
     fn effective_aie_state(&self, issi: u32, air_interface_encrypted: bool) -> AieObservationState {
+        let state = self.config.state_read();
+        if state.aie.enabled && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+            return AieObservationState::Sc3;
+        }
         if air_interface_encrypted {
             return AieObservationState::Sc2;
         }
-        let state = self.config.state_read();
         if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
             AieObservationState::Sc2
         } else {
@@ -753,6 +982,9 @@ impl MmBs {
     /// no binding yet and therefore remains clear until its accept is sent.
     fn aie_request_for_terminal(&self, issi: u32) -> AieRequest {
         let state = self.config.state_read();
+        if state.aie.enabled && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+            return AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource);
+        }
         if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
             AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
         } else {
@@ -859,6 +1091,100 @@ impl MmBs {
         let mcch = self.send_rollover_broadcast(queue, false);
         let traffic = self.send_rollover_broadcast(queue, true);
         mcch && traffic
+    }
+
+    /// Queue the TTR 001-11 table-1 full current GCK-VN advertisement. It is
+    /// broadcast-addressed and unacknowledged, protected with the class-3 CCK
+    /// as required for a group address without a GCK association, and copied
+    /// to active TCH/STCH bearers for terminals in calls.
+    fn send_gck_version_broadcast(&self, queue: &mut MessageQueue, gck_vn: u16, traffic_channels: bool) -> bool {
+        let pdu = DAllGcksChangeDemand {
+            acknowledgement_required: false,
+            gck_version_number: gck_vn,
+            time: CkChangeTime::CurrentlyInUse,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if pdu.to_bitbuf(&mut sdu).is_err() {
+            tracing::warn!(gck_vn, "cannot encode full current GCK-VN advertisement");
+            return false;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                layer2service: Layer2Service::Unacknowledged,
+                stealing_permission: traffic_channels,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: self.group_downlink_aie_request(0x00ff_ffff),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+        tracing::debug!(
+            gck_vn,
+            bearer = if traffic_channels { "all-active-TCH/STCH" } else { "MCCH" },
+            "queued full current GCK-VN advertisement"
+        );
+        true
+    }
+
+    fn send_gck_version_broadcast_round(&self, queue: &mut MessageQueue, gck_vn: u16) -> bool {
+        let mcch = self.send_gck_version_broadcast(queue, gck_vn, false);
+        let traffic = self.send_gck_version_broadcast(queue, gck_vn, true);
+        mcch && traffic
+    }
+
+    /// A newly registered MS can have missed the periodic clear broadcast
+    /// while it was powered off. Send the same normative Table-1 indication
+    /// individually under its DCK, both after registration and after GCK
+    /// provisioning, so a stale full GCK-VN cannot keep selecting an old key
+    /// version even though the current key material is already present.
+    fn send_current_gck_version_to_terminal(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
+        let gck_vn = {
+            let state = self.config.state_read();
+            state.aie.sc3.as_ref().filter(|sc3| sc3.gck_supported()).map(|sc3| sc3.gck_vn())
+        };
+        let Some(gck_vn) = gck_vn else {
+            return false;
+        };
+        let pdu = DAllGcksChangeDemand {
+            acknowledgement_required: false,
+            gck_version_number: gck_vn,
+            time: CkChangeTime::CurrentlyInUse,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if pdu.to_bitbuf(&mut sdu).is_err() {
+            tracing::warn!(issi, gck_vn, "cannot encode individual current GCK-VN advertisement");
+            return false;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+        tracing::info!(issi, gck_vn, "queued individual full current GCK-VN advertisement");
+        true
     }
 
     /// TTR 001-11 6.2.23.1: following a clear location update the ciphering
@@ -1165,13 +1491,13 @@ impl MmBs {
             tracing::error!("Unsupported critical features in ULocationUpdateDemand");
             return;
         }
-        if let Err((cause, parameters)) = self.validate_sc2_location_update(&pdu) {
-            let air_interface_encrypted = matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }));
+        if let Err((cause, parameters)) = self.validate_aie_location_update(&pdu) {
+            let air_interface_encrypted = prim.air_interface_encryption.is_some_and(AieRequest::is_encrypted);
             self.report_aie_observation(
                 prim.received_address.ssi,
                 prim.handle,
                 AieObservationEvent::CipheringMismatch,
-                Self::packet_aie_state(air_interface_encrypted),
+                Self::packet_aie_state(prim.air_interface_encryption.as_ref()),
                 Some(air_interface_encrypted),
                 Some(pdu.cipher_control),
                 pdu.ciphering_parameters.map(|value| value as u16),
@@ -1238,7 +1564,15 @@ impl MmBs {
                 mutual: true,
                 authentication_result: None,
             });
-            let air_interface_encrypted = matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }));
+            let air_interface_encrypted = prim.air_interface_encryption.is_some_and(AieRequest::is_encrypted);
+            let sc3_retrieval = prim
+                .air_interface_encryption
+                .and_then(AieRequest::sc3_key)
+                .filter(|key| key.key_type == Sc3KeyType::Dck)
+                .map(|key| Sc3RetrievalEvidence {
+                    cck_id: key.cck_id,
+                    dck_context_id: key.context_id,
+                });
             let ciphering_parameters = pdu.ciphering_parameters.map(|value| value as u16);
             let request = SwmiMessage::RegistrationAttempt {
                 command_id,
@@ -1259,6 +1593,7 @@ impl MmBs {
                     ciphering_parameters,
                     ck_requested,
                 },
+                sc3_retrieval,
             };
             if self.swmi.as_ref().expect("SwMI checked above").submit(request).is_ok() {
                 self.report_aie_observation(
@@ -1410,6 +1745,7 @@ impl MmBs {
         tracing::debug!("-> {} sdu {}", pdu_response, sdu.dump_bin());
 
         // Build and submit response prim
+        let tx_reporter = TxReporter::new();
         let msg = SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -1424,15 +1760,12 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
-                tx_reporter: None,
+                tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover: None,
             }),
         };
         queue.push_back(msg);
-        // The current stack has no lower-layer delivery callback for this
-        // acknowledged MM primitive. Queue admission is therefore the local
-        // confirmation point; retries before this point still count as RA load.
-        self.config.state_write().subscribers.mark_active(issi);
+        self.track_registration_delivery(None, issi, false, Vec::new(), tx_reporter);
 
         // If this is an unknown returning radio (not ITSI attach) that didn't
         // include groups in the registration, force a full group report via
@@ -1846,6 +2179,29 @@ impl MmBs {
         queue.push_back(msg);
     }
 
+    fn rx_u_attach_detach_group_identity_acknowledgement(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let pdu = match UAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(
+                    issi = prim.received_address.ssi,
+                    ?error,
+                    "failed parsing group-security attachment acknowledgement"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            issi = prim.received_address.ssi,
+            accepted = !pdu.group_identity_acknowledgement_type,
+            returned_groups = pdu.group_identity_uplink.as_ref().map_or(0, Vec::len),
+            "group-security attachment amendment acknowledged by terminal"
+        );
+    }
+
     fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         // unimplemented_log!("rx_lmm_mle_unitdata_ind for MM component");
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
@@ -1905,10 +2261,10 @@ impl MmBs {
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
             MmPduTypeUl::UCkChangeResult => self.rx_u_ck_change_result(message),
-            MmPduTypeUl::UOtar => self.rx_u_otar(message),
+            MmPduTypeUl::UOtar => self.rx_u_otar(queue, message),
             MmPduTypeUl::UInformationProvide => unimplemented_log!("UInformationProvide"),
             MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
-            MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => unimplemented_log!("UAttachDetachGroupIdentityAcknowledgement"),
+            MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => self.rx_u_attach_detach_group_identity_acknowledgement(message),
             MmPduTypeUl::UTeiProvide => unimplemented_log!("UTeiProvide"),
             MmPduTypeUl::UDisableStatus => unimplemented_log!("UDisableStatus"),
             MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
@@ -1919,7 +2275,7 @@ impl MmBs {
     /// from the SwMI.  This keeps TAA1-K, KSO and clear SCK/GSKO state in the
     /// central key provider, while retaining the exact air-interface handle
     /// needed to schedule the response.
-    fn rx_u_otar(&mut self, mut message: SapMsg) {
+    fn rx_u_otar(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
@@ -1931,8 +2287,8 @@ impl MmBs {
                     prim.received_address.ssi,
                     prim.handle,
                     AieObservationEvent::ProtocolError,
-                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
-                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Self::packet_aie_state(prim.air_interface_encryption.as_ref()),
+                    Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
                     None,
                     None,
                     None,
@@ -1952,7 +2308,9 @@ impl MmBs {
             UOtar::GckResult(_) => "gck-result",
             UOtar::GskoDemand(_) => "gsko-demand",
             UOtar::GskoResult(_) => "gsko-result",
+            UOtar::KeyDeleteResult(_) => "key-delete-result",
             UOtar::KeyStatusResponse(_) => "key-status-response",
+            UOtar::CmgGtsiResult(_) => "cmg-gtsi-result",
         };
         let is_clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
@@ -1961,7 +2319,7 @@ impl MmBs {
         if is_clear_from_bound_sc2_terminal
             && !matches!(
                 pdu,
-                UOtar::CckResult(_) | UOtar::SckResult(_) | UOtar::GskoDemand(_) | UOtar::GskoResult(_)
+                UOtar::CckResult(_) | UOtar::SckResult(_) | UOtar::GskoDemand(_) | UOtar::GskoResult(_) | UOtar::KeyDeleteResult(_)
             )
         {
             tracing::warn!(
@@ -2001,12 +2359,38 @@ impl MmBs {
                 OtarTerminalResponse::SckResult,
                 result.results.iter().all(|entry| entry.provision_result == 0),
             ),
-            UOtar::GckResult(result) => self.complete_otar_terminal_response(
-                prim.received_address.ssi,
-                prim.handle,
-                OtarTerminalResponse::GckResult,
-                result.results.iter().all(|entry| entry.provision_result == 0),
-            ),
+            UOtar::GckResult(result) => {
+                let all_accepted = !result.results.is_empty() && result.results.iter().all(|entry| entry.provision_result == 0);
+                self.complete_otar_terminal_response(
+                    prim.received_address.ssi,
+                    prim.handle,
+                    OtarTerminalResponse::GckResult,
+                    all_accepted,
+                );
+
+                // Some deployed terminals do not retain a GSSI -> GCKN
+                // association received just before the corresponding GCK was
+                // provisioned.  TTR 001-11 clause 6.2.8.2 permits the SwMI to
+                // send Group Identity Security Related Information in an
+                // unsolicited D-ATTACH/DETACH GROUP IDENTITY PDU.  Repeat the
+                // association only after the terminal explicitly confirms
+                // that it accepted that GCK.  This keeps the normative
+                // attachment acknowledgement as the primary association path
+                // while making key-first ordering deterministic for those
+                // terminals.
+                let accepted_gckns = result
+                    .results
+                    .iter()
+                    .filter(|entry| entry.provision_result == 0)
+                    .map(|entry| entry.gck_number)
+                    .collect::<HashSet<_>>();
+                if !accepted_gckns.is_empty() {
+                    self.send_group_security_association_refresh(queue, prim.received_address.ssi, prim.handle, &accepted_gckns);
+                }
+                if all_accepted {
+                    self.send_current_gck_version_to_terminal(queue, prim.received_address.ssi, prim.handle);
+                }
+            }
             UOtar::GskoDemand(_) => {
                 self.gsko_bootstraps
                     .insert(prim.received_address.ssi, GskoBootstrapStatus::Requested);
@@ -2030,10 +2414,24 @@ impl MmBs {
                 OtarTerminalResponse::KeyStatusResponse,
                 true,
             ),
+            UOtar::KeyDeleteResult(result) => self.complete_otar_terminal_response(
+                prim.received_address.ssi,
+                prim.handle,
+                OtarTerminalResponse::KeyDeleteResult,
+                result.is_success(),
+            ),
+            UOtar::CmgGtsiResult(_) => {
+                self.complete_otar_terminal_response(prim.received_address.ssi, prim.handle, OtarTerminalResponse::CmgGtsiResult, true)
+            }
             UOtar::CckDemand(_) | UOtar::SckDemand(_) | UOtar::GckDemand(_) => {}
         }
         let (event, success, cause) = match &pdu {
             UOtar::KeyStatusResponse(_) => (AieObservationEvent::KeyStatus, Some(true), None),
+            UOtar::KeyDeleteResult(result) => (
+                AieObservationEvent::Otar,
+                Some(result.is_success()),
+                (!result.is_success()).then_some(0),
+            ),
             UOtar::CckResult(result) => {
                 let success = result.provision_result == 0 && result.future_provision_result.is_none_or(|code| code == 0);
                 (
@@ -2061,6 +2459,7 @@ impl MmBs {
                 Some(result.provision_result == 0),
                 (!result.provision_result.eq(&0)).then_some(u16::from(result.provision_result)),
             ),
+            UOtar::CmgGtsiResult(_) => (AieObservationEvent::Otar, Some(true), None),
             UOtar::CckDemand(_) | UOtar::SckDemand(_) | UOtar::GckDemand(_) | UOtar::GskoDemand(_) => {
                 (AieObservationEvent::Otar, None, None)
             }
@@ -2071,9 +2470,9 @@ impl MmBs {
             event,
             self.effective_aie_state(
                 prim.received_address.ssi,
-                matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. })),
+                Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref()),
             ),
-            Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
             None,
             None,
             None,
@@ -2125,8 +2524,8 @@ impl MmBs {
                     prim.received_address.ssi,
                     prim.handle,
                     AieObservationEvent::ProtocolError,
-                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
-                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Self::packet_aie_state(prim.air_interface_encryption.as_ref()),
+                    Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
                     None,
                     None,
                     None,
@@ -2159,9 +2558,9 @@ impl MmBs {
             AieObservationEvent::CkChange,
             self.effective_aie_state(
                 prim.received_address.ssi,
-                matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. })),
+                Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref()),
             ),
-            Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+            Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
             None,
             None,
             None,
@@ -2191,8 +2590,8 @@ impl MmBs {
                     prim.received_address.ssi,
                     prim.handle,
                     AieObservationEvent::ProtocolError,
-                    Self::packet_aie_state(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
-                    Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                    Self::packet_aie_state(prim.air_interface_encryption.as_ref()),
+                    Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
                     None,
                     None,
                     None,
@@ -2241,9 +2640,9 @@ impl MmBs {
                 AieObservationEvent::Authentication,
                 self.effective_aie_state(
                     prim.received_address.ssi,
-                    matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. })),
+                    Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref()),
                 ),
-                Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
                 None,
                 None,
                 None,
@@ -2271,9 +2670,9 @@ impl MmBs {
                 AieObservationEvent::Authentication,
                 self.effective_aie_state(
                     prim.received_address.ssi,
-                    matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. })),
+                    Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref()),
                 ),
-                Some(matches!(prim.air_interface_encryption, Some(AieRequest::Sc2 { .. }))),
+                Some(Self::aie_request_is_encrypted(prim.air_interface_encryption.as_ref())),
                 None,
                 None,
                 None,
@@ -2456,7 +2855,7 @@ impl MmBs {
                 timeslots: std::array::from_fn(|index| allocation.timeslot_bitmap & (1 << index) != 0),
                 usage: allocation.usage,
             });
-            let _ = Self::send_d_location_update_accept_with_handover(
+            let _ = self.send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
                 pending.air_handle,
@@ -2469,6 +2868,7 @@ impl MmBs {
                     group_identity_accept_reject: 0,
                     group_identity_downlink: None,
                 }),
+                Vec::new(),
                 seamless_handover,
                 rua_requested,
             );
@@ -2570,8 +2970,9 @@ impl MmBs {
                 "SwMI unavailable while deciding location-update group attachment; using local-site trunking"
             );
             let local_results = Self::local_attachment_results(&attachment);
-            let (had_rejection, groups) = self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
-            let receipt = Self::send_d_location_update_accept_with_handover(
+            let (had_rejection, response_groups, security_groups) =
+                self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
+            let receipt = self.send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
                 pending.air_handle,
@@ -2582,19 +2983,26 @@ impl MmBs {
                 self.aie_request_for_registration(pending.itsi, pending.air_interface_encrypted),
                 Some(GroupIdentityLocationAccept {
                     group_identity_accept_reject: u8::from(had_rejection),
-                    group_identity_downlink: Some(groups),
+                    group_identity_downlink: (!response_groups.is_empty()).then_some(response_groups),
                 }),
+                security_groups.clone(),
                 None,
                 rua_requested,
             );
-            self.config.state_write().subscribers.mark_active(pending.itsi);
+            self.track_registration_delivery(
+                Some(command_id),
+                pending.itsi,
+                pending.authentication_successful,
+                security_groups,
+                receipt.clone(),
+            );
             let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
             if !deferred {
                 let _ = self.send_rollover_broadcast_round(queue);
             }
             return;
         }
-        let receipt = Self::send_d_location_update_accept_with_handover(
+        let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
             pending.air_handle,
@@ -2607,10 +3015,17 @@ impl MmBs {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
             }),
+            Vec::new(),
             None,
             rua_requested,
         );
-        self.config.state_write().subscribers.mark_active(pending.itsi);
+        self.track_registration_delivery(
+            Some(command_id),
+            pending.itsi,
+            pending.authentication_successful,
+            Vec::new(),
+            receipt.clone(),
+        );
         let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
         if !deferred {
             let _ = self.send_rollover_broadcast_round(queue);
@@ -2646,9 +3061,25 @@ impl MmBs {
             return;
         }
 
-        let (had_rejection, accepted_downlink) =
+        let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending, results);
-        self.send_d_attachment_acknowledgement(queue, pending.itsi, pending.air_handle, had_rejection, accepted_downlink);
+        // TTR 001-11 figure 19 defines the association in the ACK that answers
+        // the MS-initiated attachment. The common talkgroup-switch transaction
+        // has exactly one newly attached GSSI, so keep that association atomic
+        // with its acknowledgement. Larger scan-list updates still use bounded
+        // figure-20 amendments to avoid the previously observed fragmented ACK.
+        let inline_security = security_groups.len() == 1;
+        self.send_d_attachment_acknowledgement(
+            queue,
+            pending.itsi,
+            pending.air_handle,
+            had_rejection,
+            response_groups,
+            inline_security.then_some(security_groups.as_slice()).unwrap_or_default(),
+        );
+        if !inline_security {
+            self.send_group_security_association_amendments(queue, pending.itsi, pending.air_handle, security_groups);
+        }
         tracing::info!(
             command_id,
             itsi,
@@ -2684,62 +3115,119 @@ impl MmBs {
         }
         // This arrives before call replay during roaming, so UMAC has the
         // target-cell monitoring phase before it queues any MCCH setup.
+        // Reconciliation must be idempotent: tearing down unchanged groups
+        // creates a listener gap and makes the MS repeatedly replace its
+        // GSSI -> GCKN association after ordinary registration traffic.
         self.store_energy_economy(issi, energy_economy);
         let old_groups = self
             .client_mgr
             .get_client_by_issi(issi)
-            .map(|client| client.groups.keys().copied().collect::<Vec<_>>())
+            .map(|client| client.groups.clone())
             .unwrap_or_default();
-        if !old_groups.is_empty() {
-            let _ = self.client_mgr.client_detach_all_groups(issi);
-            {
-                let mut state = self.config.state_write();
-                for gssi in &old_groups {
-                    state.subscribers.deaffiliate(issi, *gssi);
-                }
+        let desired_groups = groups
+            .into_iter()
+            .filter(|group| !group.detach)
+            .map(|group| (group.gssi, group.class_of_usage))
+            .collect::<HashMap<_, _>>();
+
+        let mut detached = old_groups
+            .keys()
+            .filter(|gssi| !desired_groups.contains_key(gssi))
+            .copied()
+            .collect::<Vec<_>>();
+        detached.sort_unstable();
+        for gssi in &detached {
+            if let Err(error) = self.client_mgr.client_group_attach_with_class_of_usage(issi, *gssi, false, 0) {
+                tracing::warn!(issi, gssi, ?error, "unable to remove stale roaming affiliation");
+            } else {
+                self.config.state_write().subscribers.deaffiliate(issi, *gssi);
             }
-            self.emit_subscriber_update(queue, issi, old_groups, BrewSubscriberAction::Deaffiliate);
+        }
+        if !detached.is_empty() {
+            self.emit_subscriber_update(queue, issi, detached.clone(), BrewSubscriberAction::Deaffiliate);
         }
 
-        let mut restored = Vec::new();
-        for group in groups.into_iter().filter(|group| !group.detach) {
+        let mut added = Vec::new();
+        let mut class_updates = Vec::new();
+        let mut desired = desired_groups.iter().map(|(&gssi, &cou)| (gssi, cou)).collect::<Vec<_>>();
+        desired.sort_unstable_by_key(|(gssi, _)| *gssi);
+        for (gssi, class_of_usage) in desired {
+            if old_groups.get(&gssi).copied() == Some(class_of_usage) {
+                continue;
+            }
             match self
                 .client_mgr
-                .client_group_attach_with_class_of_usage(issi, group.gssi, true, group.class_of_usage)
+                .client_group_attach_with_class_of_usage(issi, gssi, true, class_of_usage)
             {
+                Ok(_) if old_groups.contains_key(&gssi) => class_updates.push(gssi),
                 Ok(_) => {
-                    self.config.state_write().subscribers.affiliate(issi, group.gssi);
-                    restored.push(group.gssi);
+                    self.config.state_write().subscribers.affiliate(issi, gssi);
+                    added.push(gssi);
                 }
-                Err(error) => tracing::warn!(issi, gssi = group.gssi, ?error, "unable to restore roaming affiliation"),
+                Err(error) => tracing::warn!(issi, gssi, ?error, "unable to restore roaming affiliation"),
             }
         }
-        let restored_count = restored.len();
-        if !restored.is_empty() {
-            self.emit_subscriber_update(queue, issi, restored, BrewSubscriberAction::Affiliate);
+        if !added.is_empty() {
+            self.emit_subscriber_update(queue, issi, added.clone(), BrewSubscriberAction::Affiliate);
         }
-        if self.client_mgr.set_client_scanning_enabled(issi, scanning_enabled).is_ok() {
-            self.config.state_write().subscribers.set_scanning_enabled(issi, scanning_enabled);
-            let update = MmSubscriberUpdate {
-                issi,
-                groups: Vec::new(),
-                action: BrewSubscriberAction::ScanningState,
-                class_of_usage: Vec::new(),
-                scanning_enabled: Some(scanning_enabled),
-            };
+        if !class_updates.is_empty() {
+            let class_of_usage = class_updates
+                .iter()
+                .map(|gssi| self.client_mgr.client_group_class_of_usage(issi, *gssi).unwrap_or(0))
+                .collect();
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Mm,
                 dest: TetraEntity::Cmce,
-                msg: SapMsgInner::MmSubscriberUpdate(update),
+                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                    issi,
+                    groups: class_updates.clone(),
+                    action: BrewSubscriberAction::Affiliate,
+                    class_of_usage,
+                    scanning_enabled: None,
+                }),
             });
         }
+
+        let scanning_changed = self.client_mgr.client_scanning_enabled(issi) != Some(scanning_enabled);
+        if scanning_changed && self.client_mgr.set_client_scanning_enabled(issi, scanning_enabled).is_ok() {
+            self.config.state_write().subscribers.set_scanning_enabled(issi, scanning_enabled);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                    issi,
+                    groups: Vec::new(),
+                    action: BrewSubscriberAction::ScanningState,
+                    class_of_usage: Vec::new(),
+                    scanning_enabled: Some(scanning_enabled),
+                }),
+            });
+        }
+
+        // Normally SubscriberStateSync precedes the registration BL-ACK and
+        // update_registration_delivery_statuses sends the complete Figure-20
+        // association set. If a delayed sync arrives after the terminal is
+        // already active, amend only genuinely new GCK groups here. This also
+        // closes the roaming race without rewriting unchanged associations.
+        let active = self.config.state_read().subscribers.is_active(issi);
+        let added_security_groups = self.group_security_information(added.iter().copied()).is_some();
+        if active && added_security_groups {
+            self.send_group_security_association_amendments(queue, issi, 0, added.iter().copied());
+            self.send_current_gck_version_to_terminal(queue, issi, 0);
+        }
+        let restored_count = desired_groups.len();
         tracing::info!(
             issi,
             groups = restored_count,
+            added = added.len(),
+            removed = detached.len(),
+            class_updates = class_updates.len(),
+            scanning_changed,
             scanning_enabled,
             ?energy_economy,
-            "restored roaming group-scanning state from SwMI"
+            "reconciled roaming group-scanning state from SwMI"
         );
     }
 
@@ -2751,10 +3239,9 @@ impl MmBs {
         has_rejection: bool,
         pending: &PendingAttachment,
         results: Vec<AttachmentResult>,
-    ) -> (bool, Vec<GroupIdentityDownlink>) {
-        let accepted_attachment = results.iter().any(|result| result.accepted && !result.operation.detach);
+    ) -> (bool, Vec<GroupIdentityDownlink>, Vec<u32>) {
         let mut had_rejection = has_rejection;
-        if pending.replace_all && accepted_attachment {
+        if pending.replace_all {
             let prior_groups = self
                 .client_mgr
                 .get_client_by_issi(pending.itsi)
@@ -2771,29 +3258,40 @@ impl MmBs {
             }
         }
 
-        let mut accepted_downlink = Vec::new();
+        let mut response_groups = Vec::new();
+        let mut security_groups = Vec::new();
         let mut affiliated = Vec::new();
         let mut deaffiliated = Vec::new();
         for (result, original) in results.into_iter().zip(&pending.operations) {
             if !result.accepted {
                 had_rejection = true;
-                // TS 100 392-2 §16.8.2 requires every rejected MS-initiated
-                // attachment to be named in a Group Identity Detachment
-                // Downlink element.  Omitting it makes an MS treat the group
-                // as accepted (or leaves its UI state stale), even though the
-                // aggregate accept/reject bit is set.
-                //
-                // Cause 1 is the SwMI's "unknown group" policy outcome and
-                // maps to detachment-downlink value 00.  The remaining policy
-                // failures deliberately use the same safe, non-attaching
-                // reason until richer per-policy air causes are modelled.
-                accepted_downlink.push(GroupIdentityDownlink {
-                    group_identity_attachment: None,
-                    group_identity_detachment_uplink: Some(0),
-                    gssi: Some(result.operation.gssi),
-                    address_extension: None,
-                    vgssi: None,
-                });
+                // TS 100 392-2 annex G requires every rejected operation to
+                // be explicit.  A rejected attachment is represented as a
+                // detachment, while a rejected detachment is represented as
+                // an attachment because the group remains attached.
+                let gssi = result.operation.gssi;
+                if result.operation.detach {
+                    let class_of_usage = self.client_mgr.client_group_class_of_usage(pending.itsi, gssi).unwrap_or(0);
+                    response_groups.push(GroupIdentityDownlink {
+                        group_identity_attachment: Some(GroupIdentityAttachment {
+                            group_identity_attachment_lifetime: 1,
+                            class_of_usage,
+                        }),
+                        group_identity_detachment_uplink: None,
+                        gssi: Some(gssi),
+                        address_extension: None,
+                        vgssi: None,
+                    });
+                    security_groups.push(gssi);
+                } else {
+                    response_groups.push(GroupIdentityDownlink {
+                        group_identity_attachment: None,
+                        group_identity_detachment_uplink: Some(0),
+                        gssi: Some(gssi),
+                        address_extension: None,
+                        vgssi: None,
+                    });
+                }
                 continue;
             }
             let gssi = result.operation.gssi;
@@ -2812,16 +3310,30 @@ impl MmBs {
                             affiliated.push(gssi);
                         }
                     }
-                    accepted_downlink.push(GroupIdentityDownlink {
-                        group_identity_attachment: (!detach).then_some(GroupIdentityAttachment {
-                            group_identity_attachment_lifetime: 1,
-                            class_of_usage: result.operation.class_of_usage,
-                        }),
-                        group_identity_detachment_uplink: detach.then_some(original.group_identity_detachment_uplink.unwrap_or(0)),
-                        gssi: Some(gssi),
-                        address_extension: None,
-                        vgssi: None,
-                    });
+                    // Re-advertise the GCK association for every accepted
+                    // attachment, including an idempotent retry. The terminal
+                    // may be retrying because it missed the first ACK even
+                    // though the BS already committed the local affiliation.
+                    // Multi-group retries remain bounded amendments, so this
+                    // does not reintroduce the former fragmented ACK.
+                    if !detach {
+                        security_groups.push(gssi);
+                        // A successful operation is implicitly accepted.  It
+                        // is only repeated in the acknowledgement when the
+                        // SwMI actually changed the requested class of usage.
+                        if changed && original.class_of_usage != Some(result.operation.class_of_usage) {
+                            response_groups.push(GroupIdentityDownlink {
+                                group_identity_attachment: Some(GroupIdentityAttachment {
+                                    group_identity_attachment_lifetime: 1,
+                                    class_of_usage: result.operation.class_of_usage,
+                                }),
+                                group_identity_detachment_uplink: None,
+                                gssi: Some(gssi),
+                                address_extension: None,
+                                vgssi: None,
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
                     had_rejection = true;
@@ -2841,7 +3353,7 @@ impl MmBs {
         if !deaffiliated.is_empty() {
             self.emit_subscriber_update(queue, pending.itsi, deaffiliated, BrewSubscriberAction::Deaffiliate);
         }
-        (had_rejection, accepted_downlink)
+        (had_rejection, response_groups, security_groups)
     }
 
     fn local_attachment_results(pending: &PendingAttachment) -> Vec<AttachmentResult> {
@@ -2889,10 +3401,10 @@ impl MmBs {
             );
             return;
         }
-        let (had_rejection, groups) =
+        let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
-        let receipt = Self::send_d_location_update_accept_with_handover(
+        let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
             registration.air_handle,
@@ -2903,12 +3415,19 @@ impl MmBs {
             self.aie_request_for_registration(registration.itsi, registration.air_interface_encrypted),
             Some(GroupIdentityLocationAccept {
                 group_identity_accept_reject: u8::from(had_rejection),
-                group_identity_downlink: Some(groups),
+                group_identity_downlink: (!response_groups.is_empty()).then_some(response_groups),
             }),
+            security_groups.clone(),
             None,
             pending.rua_requested,
         );
-        self.config.state_write().subscribers.mark_active(registration.itsi);
+        self.track_registration_delivery(
+            Some(command_id),
+            registration.itsi,
+            registration.authentication_successful,
+            security_groups,
+            receipt.clone(),
+        );
         let deferred = self.defer_sc2_activation(registration.itsi, &registration.aie, receipt);
         if !deferred {
             let _ = self.send_rollover_broadcast_round(queue);
@@ -2918,7 +3437,7 @@ impl MmBs {
             itsi,
             rejected = had_rejection,
             authentication_downlink = registration.authentication_successful,
-            "SwMI location update and group attachment accepted on air interface"
+            "SwMI location update and group attachment accepted; air-interface BL-ACK pending"
         );
     }
 
@@ -2929,13 +3448,17 @@ impl MmBs {
         handle: u32,
         has_rejection: bool,
         groups: Vec<GroupIdentityDownlink>,
+        security_groups: &[u32],
     ) {
         let pdu = DAttachDetachGroupIdentityAcknowledgement {
             group_identity_accept_reject: u8::from(has_rejection),
             reserved: false,
             proprietary: None,
-            group_identity_downlink: Some(groups),
-            group_identity_security_related_information: None,
+            group_identity_downlink: (!groups.is_empty()).then_some(groups),
+            // A single newly attached SC3G group follows the normative figure
+            // 19 path in this ACK. Multi-group lists are intentionally kept out
+            // of the ACK and sent as bounded figure-20 amendments by the caller.
+            group_identity_security_related_information: self.group_security_information(security_groups.iter().copied()),
         };
         let mut sdu = BitBuffer::new_autoexpand(32);
         pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-ATTACH/DETACH acknowledgement");
@@ -2963,7 +3486,106 @@ impl MmBs {
         });
     }
 
+    /// Re-advertise the currently attached GSSI associations whose GCK was
+    /// just accepted by the terminal.  TTR 001-11 figure 20 carries both the
+    /// Group identity downlink and its Group Identity Security Related
+    /// Information in this SwMI-initiated amendment.  Some terminals ignore a
+    /// security-only D-ATTACH/DETACH PDU even though they link-acknowledge it,
+    /// leaving the group locally unusable after accepting the GCK.
+    fn send_group_security_association_refresh(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32, accepted_gckns: &HashSet<u16>) {
+        let attached_groups = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let groups = {
+            let state = self.config.state_read();
+            let Some(sc3) = state.aie.sc3.as_ref() else {
+                return;
+            };
+            attached_groups
+                .into_iter()
+                .filter(|gssi| sc3.gckn_for_gssi(*gssi).is_some_and(|gckn| accepted_gckns.contains(&gckn)))
+                .collect::<Vec<_>>()
+        };
+        let associations = groups.len();
+        self.send_group_security_association_amendments(queue, issi, handle, groups);
+        tracing::info!(
+            issi,
+            ?accepted_gckns,
+            associations,
+            "queued group-security association refresh after accepted GCK provision"
+        );
+    }
+
+    /// Queue one transactional association amendment for all supplied SC3G
+    /// groups. TTR 001-11 table 14 permits up to thirty associations in one
+    /// security element, which covers the supported twenty-group scan list.
+    /// The LLC/MAC layers may fragment the PDU, but the MS then applies and
+    /// acknowledges the complete association set as one figure-20 operation.
+    fn send_group_security_association_amendments(
+        &self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        groups: impl IntoIterator<Item = u32>,
+    ) {
+        let mut seen = HashSet::new();
+        let requested_groups = groups.into_iter().filter(|gssi| seen.insert(*gssi)).take(30).collect::<Vec<_>>();
+        let Some(security) = self.group_security_information(requested_groups) else {
+            return;
+        };
+        let group_identity_downlink = security
+            .iter()
+            .flat_map(|information| &information.associations)
+            .map(|association| GroupIdentityDownlink {
+                group_identity_attachment: Some(GroupIdentityAttachment {
+                    group_identity_attachment_lifetime: 1,
+                    class_of_usage: self.client_mgr.client_group_class_of_usage(issi, association.gssi).unwrap_or(0),
+                }),
+                group_identity_detachment_uplink: None,
+                gssi: Some(association.gssi),
+                address_extension: None,
+                vgssi: None,
+            })
+            .collect::<Vec<_>>();
+        let pdu = DAttachDetachGroupIdentity {
+            group_identity_report: false,
+            // Figure 20 uses an MM acknowledgement for a SwMI-initiated
+            // attachment amendment. This gives the complete association set
+            // one transaction instead of relying only on lower-layer BL-ACKs.
+            group_identity_acknowledgement_request: true,
+            group_identity_attach_detach_mode: false,
+            proprietary: None,
+            group_report_response: None,
+            group_identity_downlink: Some(group_identity_downlink),
+            group_identity_security_related_information: Some(security),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut sdu).expect("serialize GCK association refresh");
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        });
+    }
+
     fn send_d_location_update_accept(
+        &self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
@@ -2972,7 +3594,7 @@ impl MmBs {
         authentication_successful: bool,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
     ) {
-        let _ = Self::send_d_location_update_accept_with_handover(
+        let _ = self.send_d_location_update_accept_with_handover(
             queue,
             issi,
             handle,
@@ -2982,12 +3604,14 @@ impl MmBs {
             &AieLocationUpdateDecision::default(),
             AieRequest::clear(AieSubject::System, AieScope::MacResource),
             group_identity_location_accept,
+            Vec::new(),
             None,
             false,
         );
     }
 
     fn send_d_location_update_accept_with_handover(
+        &self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
@@ -2997,9 +3621,11 @@ impl MmBs {
         aie: &AieLocationUpdateDecision,
         aie_request: AieRequest,
         group_identity_location_accept: Option<GroupIdentityLocationAccept>,
+        group_security_gssis: Vec<u32>,
         seamless_handover: Option<LmmMleSeamlessHandover>,
         rua_requested: bool,
     ) -> TxReporter {
+        let security = self.group_security_information(group_security_gssis);
         let pdu = DLocationUpdateAccept {
             location_update_accept_type: location_update_type,
             ssi: Some(issi as u64),
@@ -3039,7 +3665,7 @@ impl MmBs {
                         raw: Vec::new(),
                     })
                 }),
-            group_identity_security_related_information: None,
+            group_identity_security_related_information: security,
             cell_type_control: None,
             proprietary: rua_requested.then(|| Type3FieldGeneric {
                 field_id: MmType34ElemIdDl::Proprietary.into(),
@@ -3081,10 +3707,50 @@ impl MmBs {
         tx_reporter
     }
 
-    /// Sends a D-LOCATION UPDATE COMMAND. Recovery paths can request a full
-    /// group report; SwMI liveliness checks deliberately do not disturb it.
+    /// TTR 001-01 clause 14.2.4 presence check: an individually addressed
+    /// BL-DATA without a layer-3 TL-SDU. The MS answers with BL-ACK even though
+    /// no MM/CMCE PDU is present. Sending this directly to LLC is intentional;
+    /// routing it through MLE would prepend a protocol discriminator and turn
+    /// it into a malformed layer-3 PDU rather than an empty basic-link page.
+    fn send_liveliness_probe(&mut self, queue: &mut MessageQueue, issi: u32) {
+        if self.pending_liveliness_probes.contains_key(&issi) {
+            tracing::debug!(issi, "coalescing duplicate terminal presence probe");
+            return;
+        }
+
+        let tx_reporter = TxReporter::new();
+        queue.push_back(SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Llc,
+            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                main_address: TetraAddress::issi(issi),
+                link_id: 0,
+                endpoint_id: 0,
+                tl_sdu: BitBuffer::new_autoexpand(0),
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption: Some(self.downlink_aie_request(issi)),
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                associated_channel: None,
+                tx_reporter: Some(tx_reporter.clone()),
+            }),
+        });
+        self.pending_liveliness_probes.insert(issi, tx_reporter);
+        tracing::debug!(issi, "queued acknowledged empty BL-DATA terminal presence probe");
+    }
+
+    /// Sends a D-LOCATION UPDATE COMMAND for explicit MM recovery paths that
+    /// require a fresh group report. Presence checks must use
+    /// `send_liveliness_probe` instead, because this command starts a complete
+    /// location-update and security-state procedure in the MS.
     fn send_d_location_update_command(&self, queue: &mut MessageQueue, issi: u32, handle: u32, group_identity_report: bool) {
-        let ciphering_parameters = self.sc2_ciphering_parameters();
+        let ciphering_parameters = self.aie_ciphering_parameters();
         let pdu = DLocationUpdateCommand {
             group_identity_report,
             cipher_control: ciphering_parameters.is_some(),
@@ -3111,7 +3777,10 @@ impl MmBs {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
-                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                // A liveliness/recovery command is normal individual MM
+                // signalling, not a bootstrap exception. Protect it with the
+                // terminal's established DCK/SCK context when one exists.
+                aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -3431,8 +4100,24 @@ impl TetraEntityTrait for MmBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
+        self.update_registration_delivery_statuses(queue);
+        self.update_liveliness_probe_statuses();
         self.update_sc2_activations(queue);
         self.update_otar_delivery_statuses();
+        let active_gck_vn = {
+            let state = self.config.state_read();
+            state.aie.sc3.as_ref().filter(|sc3| sc3.gck_supported()).map(|sc3| sc3.gck_vn())
+        };
+        if let Some(gck_vn) = active_gck_vn {
+            let due = self.last_gck_version_broadcast.is_none_or(|(last_gck_vn, last_time)| {
+                last_gck_vn != gck_vn || last_time.age(ts) >= GCK_VERSION_BROADCAST_INTERVAL_TIMESLOTS
+            });
+            if due && self.send_gck_version_broadcast_round(queue, gck_vn) {
+                self.last_gck_version_broadcast = Some((gck_vn, ts));
+            }
+        } else {
+            self.last_gck_version_broadcast = None;
+        }
         let staged_rollover_id = self.config.state_read().aie.staged_rollover_id();
         if let Some(rollover_id) = staged_rollover_id {
             let activation = self
@@ -4080,8 +4765,7 @@ impl TetraEntityTrait for MmBs {
             Sap::Control => match message.msg {
                 SapMsgInner::CmceCallControl(CallControl::LivelinessCheckReady { itsi }) => {
                     if self.config.state_read().subscribers.is_registered(itsi) {
-                        self.send_d_location_update_command(queue, itsi, 0, false);
-                        tracing::debug!(itsi, "sent deferred D-LOCATION UPDATE COMMAND for SwMI liveliness check");
+                        self.send_liveliness_probe(queue, itsi);
                     } else {
                         tracing::debug!(itsi, "discarding deferred liveliness check for no-longer-registered terminal");
                     }
@@ -4095,10 +4779,31 @@ impl TetraEntityTrait for MmBs {
 
 #[cfg(test)]
 mod tests {
-    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, sc2_ksg_number};
-    use tetra_config::bluestation::RuntimeSc2TeaAlgorithm;
-    use tetra_core::typed_pdu_fields::Type3FieldGeneric;
-    use tetra_swmi_protocol::EnergyEconomyAssignment;
+    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, sc2_ksg_number};
+    use crate::MessageQueue;
+    use std::collections::HashSet;
+    use tetra_config::bluestation::{
+        RuntimeAieConfig, RuntimeSc2TeaAlgorithm, RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
+    };
+    use tetra_core::{
+        AieRequest, AieScope, AieSubject, Sap, SsiType, TxReporter, tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric,
+    };
+    use tetra_pdus::mm::fields::group_identity_security_related_information::GckSelectNumber;
+    use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+    use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DAllGcksChangeDemand};
+    use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
+    use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+    use tetra_saps::SapMsgInner;
+    use tetra_swmi_protocol::{AttachmentOperation, EnergyEconomyAssignment};
+
+    fn test_config() -> SharedConfig {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        SharedConfig::from_parts(config, None)
+    }
 
     #[test]
     fn sc2_ksg_numbers_match_the_on_air_table() {
@@ -4158,6 +4863,270 @@ mod tests {
     }
 
     #[test]
+    fn attachment_security_information_omits_cck_only_groups() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 7, vec![RuntimeSc3Gck::new(1, 7, [0x31; 10])], vec![(91, 1)])
+            .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mm = MmBs::new(config, None, None, None);
+
+        let information = mm
+            .group_security_information([91, 92])
+            .expect("GCK group must produce security information");
+        assert_eq!(information.len(), 1);
+        assert_eq!(information[0].associations.len(), 1);
+        assert_eq!(information[0].associations[0].gssi, 91);
+        assert_eq!(information[0].associations[0].selection, GckSelectNumber::Selected(1));
+        assert!(mm.group_security_information([92]).is_none());
+    }
+
+    #[test]
+    fn accepted_attachment_and_detachment_are_implicitly_acknowledged() {
+        let config = test_config();
+        let mut mm = MmBs::new(config, None, None, None);
+        let issi = 77_479;
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, 92, true, 3)
+            .expect("existing group must attach");
+        let pending = PendingAttachment {
+            itsi: issi,
+            air_handle: 0,
+            replace_all: false,
+            operations: vec![
+                GroupIdentityUplink {
+                    class_of_usage: Some(4),
+                    group_identity_detachment_uplink: None,
+                    gssi: Some(91),
+                    address_extension: None,
+                    vgssi: None,
+                },
+                GroupIdentityUplink {
+                    class_of_usage: None,
+                    group_identity_detachment_uplink: Some(2),
+                    gssi: Some(92),
+                    address_extension: None,
+                    vgssi: None,
+                },
+            ],
+        };
+        let results = MmBs::local_attachment_results(&pending);
+        let mut queue = MessageQueue::new();
+
+        let (had_rejection, response_groups, security_groups) =
+            mm.apply_swmi_attachment_state(&mut queue, 1, u64::from(issi), false, &pending, results);
+
+        assert!(!had_rejection);
+        assert!(response_groups.is_empty());
+        assert_eq!(security_groups, vec![91]);
+
+        let repeated_results = MmBs::local_attachment_results(&pending);
+        let (had_rejection, response_groups, security_groups) =
+            mm.apply_swmi_attachment_state(&mut queue, 2, u64::from(issi), false, &pending, repeated_results);
+        assert!(!had_rejection);
+        assert!(response_groups.is_empty());
+        assert_eq!(
+            security_groups,
+            vec![91],
+            "an identical attachment retry must replay the association in a bounded response"
+        );
+    }
+
+    #[test]
+    fn single_talkgroup_switch_carries_gck_association_in_attachment_ack() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1201, 2)])
+            .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mm = MmBs::new(config, None, None, None);
+        let mut queue = MessageQueue::new();
+
+        mm.send_d_attachment_acknowledgement(&mut queue, 430_893, 0, false, Vec::new(), &[1201]);
+
+        let message = queue.pop_front().expect("attachment ACK must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let pdu = DAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut request.sdu).expect("valid attachment ACK");
+        let security = pdu
+            .group_identity_security_related_information
+            .expect("figure-19 GCK association must be in the ACK");
+        assert_eq!(security[0].associations.len(), 1);
+        assert_eq!(security[0].associations[0].gssi, 1201);
+        assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(2));
+        assert!(queue.pop_front().is_none(), "single switch needs no follow-up amendment");
+    }
+
+    #[test]
+    fn accepted_gck_refreshes_matching_attached_group_associations() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2)])
+            .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let issi = 77_492;
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, 1202, true, 4)
+            .expect("test group must attach");
+        let mut queue = MessageQueue::new();
+
+        mm.send_group_security_association_refresh(&mut queue, issi, 0, &HashSet::from([2]));
+
+        let message = queue.pop_front().expect("association refresh must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid association refresh PDU");
+        assert!(pdu.group_identity_acknowledgement_request);
+        let groups = pdu.group_identity_downlink.expect("attachment amendment must be present");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].gssi, Some(1202));
+        assert_eq!(
+            groups[0]
+                .group_identity_attachment
+                .as_ref()
+                .expect("group must be attached")
+                .class_of_usage,
+            4
+        );
+        let security = pdu
+            .group_identity_security_related_information
+            .expect("security association must be present");
+        assert_eq!(security[0].associations[0].gssi, 1202);
+        assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(2));
+    }
+
+    #[test]
+    fn multi_group_security_amendments_use_one_transactional_pdu() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2), (1203, 2)])
+            .expect("valid multi-group SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let issi = 77_492;
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        for gssi in [1202, 1203] {
+            mm.client_mgr
+                .client_group_attach_with_class_of_usage(issi, gssi, true, 4)
+                .expect("test group must attach");
+        }
+        let mut queue = MessageQueue::new();
+
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202, 1203]);
+
+        let message = queue.pop_front().expect("one combined amendment must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid combined association amendment");
+        let groups = pdu.group_identity_downlink.expect("group amendment");
+        assert_eq!(groups.iter().filter_map(|group| group.gssi).collect::<Vec<_>>(), vec![1202, 1203]);
+        let security = pdu.group_identity_security_related_information.expect("security associations");
+        assert_eq!(
+            security[0]
+                .associations
+                .iter()
+                .map(|association| association.gssi)
+                .collect::<Vec<_>>(),
+            vec![1202, 1203]
+        );
+        assert!(queue.pop_front().is_none(), "the complete association set must use one PDU");
+    }
+
+    #[test]
+    fn registered_terminal_receives_full_current_gck_version() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2)])
+            .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let issi = 77_492;
+        let mm = MmBs::new(config, None, None, None);
+        let mut queue = MessageQueue::new();
+
+        assert!(mm.send_current_gck_version_to_terminal(&mut queue, issi, 0));
+
+        let message = queue.pop_front().expect("GCK-VN advertisement must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        assert_eq!(request.address.ssi, issi);
+        assert_eq!(request.address.ssi_type, tetra_core::SsiType::Issi);
+        let pdu = DAllGcksChangeDemand::from_bitbuf(&mut request.sdu).expect("valid full GCK-VN advertisement");
+        assert_eq!(pdu.gck_version_number, 1);
+        assert_eq!(pdu.time, CkChangeTime::CurrentlyInUse);
+    }
+
+    #[test]
+    fn full_gck_version_broadcast_uses_cck_protected_group_signalling() {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2)])
+            .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mm = MmBs::new(config, None, None, None);
+        let mut queue = MessageQueue::new();
+
+        assert!(mm.send_gck_version_broadcast(&mut queue, 1, false));
+
+        let message = queue.pop_front().expect("GCK-VN broadcast must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        assert_eq!(request.address.ssi, 0x00ff_ffff);
+        assert!(matches!(request.address.ssi_type, tetra_core::SsiType::Gssi));
+        assert!(matches!(
+            request.aie_request,
+            AieRequest::Sc3 {
+                subject: AieSubject::Group { gssi: 0x00ff_ffff },
+                scope: AieScope::MacResource,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn otar_result_correlation_keeps_link_ack_and_terminal_result_distinct() {
         assert_eq!(
             OtarDownlinkKind::SckProvide.expected_response(),
@@ -4167,6 +5136,284 @@ mod tests {
             OtarDownlinkKind::KeyStatusDemand.expected_response(),
             Some(OtarTerminalResponse::KeyStatusResponse)
         );
+        assert_eq!(
+            OtarDownlinkKind::KeyDeleteDemand.expected_response(),
+            Some(OtarTerminalResponse::KeyDeleteResult)
+        );
+        assert_eq!(
+            OtarDownlinkKind::CmgGtsiProvide.expected_response(),
+            Some(OtarTerminalResponse::CmgGtsiResult)
+        );
         assert_eq!(OtarDownlinkKind::SckReject.expected_response(), None);
+    }
+
+    #[test]
+    fn location_update_command_uses_the_registered_terminals_sc3_dck() {
+        let issi = 430_905;
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.install_dck(issi, RuntimeSc3Dck::new([0xd3; 16], [0x5a; 10], true, None));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mm = MmBs::new(config, None, None, None);
+        let mut queue = MessageQueue::new();
+
+        mm.send_d_location_update_command(&mut queue, issi, 0, false);
+
+        let message = queue.pop_front().expect("D-LOCATION UPDATE COMMAND must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        assert!(matches!(
+            request.aie_request,
+            AieRequest::Sc3 {
+                subject: AieSubject::Individual { issi: protected_issi },
+                scope: AieScope::MacResource,
+                ..
+            } if protected_issi == issi
+        ));
+    }
+
+    #[test]
+    fn liveliness_probe_is_empty_acknowledged_bl_data_and_does_not_enter_mm() {
+        let issi = 430_905;
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.install_dck(issi, RuntimeSc3Dck::new([0xd3; 16], [0x5a; 10], true, None));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mut mm = MmBs::new(config, None, None, None);
+        let mut queue = MessageQueue::new();
+
+        mm.send_liveliness_probe(&mut queue, issi);
+
+        let message = queue.pop_front().expect("presence probe must be queued");
+        assert_eq!(message.sap, Sap::TlaSap);
+        assert_eq!(message.src, TetraEntity::Mm);
+        assert_eq!(message.dest, TetraEntity::Llc);
+        let SapMsgInner::TlaTlDataReqBl(request) = message.msg else {
+            panic!("presence probe must bypass MLE and enter LLC as BL-DATA")
+        };
+        assert_eq!(request.main_address.ssi, issi);
+        assert!(matches!(request.main_address.ssi_type, SsiType::Issi));
+        assert_eq!(
+            request.tl_sdu.get_len_remaining(),
+            0,
+            "presence BL-DATA must not carry a layer-3 PDU"
+        );
+        assert!(!request.stealing_permission);
+        assert!(request.tx_reporter.is_some());
+        assert!(matches!(
+            request.air_interface_encryption,
+            Some(AieRequest::Sc3 {
+                subject: AieSubject::Individual { issi: protected_issi },
+                scope: AieScope::MacResource,
+                ..
+            }) if protected_issi == issi
+        ));
+        assert!(queue.pop_front().is_none());
+        assert!(mm.pending_registrations.is_empty());
+        assert!(mm.pending_registration_deliveries.is_empty());
+    }
+
+    #[test]
+    fn identical_roaming_state_sync_preserves_groups_without_events() {
+        let issi = 430_904;
+        let config = test_config();
+        config.state_write().subscribers.register(issi);
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, 1202, true, 4)
+            .expect("test group must attach");
+        mm.config.state_write().subscribers.affiliate(issi, 1202);
+        let groups = vec![AttachmentOperation {
+            gssi: 1202,
+            detach: false,
+            class_of_usage: 4,
+        }];
+        let energy_economy = EnergyEconomyAssignment {
+            mode: 0,
+            frame_number: None,
+            multiframe_number: None,
+        };
+        let mut queue = MessageQueue::new();
+
+        mm.apply_swmi_subscriber_state_sync(&mut queue, u64::from(issi), groups, true, energy_economy);
+
+        assert!(
+            queue.pop_front().is_none(),
+            "an identical snapshot must not deaffiliate, reaffiliate or amend GCK state"
+        );
+        assert_eq!(mm.client_mgr.client_group_class_of_usage(issi, 1202), Some(4));
+    }
+
+    #[test]
+    fn delayed_roaming_state_sync_amends_new_gck_group_after_registration_ack() {
+        let issi = 430_904;
+        let gssi = 1202;
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(gssi, 2)])
+            .expect("valid roaming SC3G snapshot");
+        {
+            let mut state = config.state_write();
+            state.aie = RuntimeAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: None,
+                sc3: Some(sc3),
+                rollover: None,
+            };
+            state.subscribers.register(issi);
+            state.subscribers.mark_active(issi);
+        }
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        let mut queue = MessageQueue::new();
+
+        mm.apply_swmi_subscriber_state_sync(
+            &mut queue,
+            u64::from(issi),
+            vec![AttachmentOperation {
+                gssi,
+                detach: false,
+                class_of_usage: 4,
+            }],
+            true,
+            EnergyEconomyAssignment {
+                mode: 0,
+                frame_number: None,
+                multiframe_number: None,
+            },
+        );
+
+        let association = queue
+            .iter_mut()
+            .find_map(|message| match &mut message.msg {
+                SapMsgInner::LmmMleUnitdataReq(request) => DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).ok(),
+                _ => None,
+            })
+            .expect("active target cell must amend a delayed GCK association");
+        let security = association
+            .group_identity_security_related_information
+            .expect("delayed roaming amendment must carry security information");
+        assert_eq!(security[0].associations[0].gssi, gssi);
+        assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(2));
+    }
+
+    #[test]
+    fn registration_becomes_active_only_after_link_ack() {
+        let issi = 430_905;
+        let config = test_config();
+        config.state_write().subscribers.register(issi);
+        let mut mm = MmBs::new(config.clone(), None, None, None);
+        let reporter = TxReporter::new();
+        let mut queue = MessageQueue::new();
+
+        mm.track_registration_delivery(Some(41), issi, true, Vec::new(), reporter.clone());
+        assert!(config.state_read().subscribers.is_registration_pending(issi));
+        assert!(!config.state_read().subscribers.is_active(issi));
+
+        reporter.mark_transmitted();
+        mm.update_registration_delivery_statuses(&mut queue);
+        assert!(config.state_read().subscribers.is_registration_pending(issi));
+        assert!(!config.state_read().subscribers.is_active(issi));
+
+        reporter.mark_acknowledged();
+        mm.update_registration_delivery_statuses(&mut queue);
+        assert!(!config.state_read().subscribers.is_registration_pending(issi));
+        assert!(config.state_read().subscribers.is_active(issi));
+    }
+
+    #[test]
+    fn registration_link_ack_includes_security_for_a_roaming_restored_group() {
+        let issi = 77_468;
+        let gssi = 91;
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(1, 1, [0x31; 10])], vec![(gssi, 1)])
+            .expect("valid linked SC3G snapshot");
+        {
+            let mut state = config.state_write();
+            state.aie = RuntimeAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: None,
+                sc3: Some(sc3),
+                rollover: None,
+            };
+            state.subscribers.register(issi);
+        }
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, gssi, true, 4)
+            .expect("test group must attach");
+        let reporter = TxReporter::new();
+        let mut queue = MessageQueue::new();
+
+        // The location update itself did not carry this group. It was restored
+        // from central roaming state while registration awaited its BL-ACK.
+        mm.track_registration_delivery(Some(41), issi, true, Vec::new(), reporter.clone());
+        reporter.mark_transmitted();
+        mm.update_registration_delivery_statuses(&mut queue);
+        assert!(queue.pop_front().is_none(), "association must wait for the registration BL-ACK");
+
+        reporter.mark_acknowledged();
+        mm.update_registration_delivery_statuses(&mut queue);
+
+        let message = queue.pop_front().expect("figure-20 association amendment must be queued first");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        assert!(request.sdu.get_len() < 200, "registration amendment must not fragment");
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid association amendment");
+        assert!(pdu.group_identity_acknowledgement_request);
+        let groups = pdu.group_identity_downlink.expect("group attachment amendment");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].gssi, Some(gssi));
+        let security = pdu
+            .group_identity_security_related_information
+            .expect("GCK association must be present");
+        assert_eq!(security[0].associations[0].gssi, gssi);
+        assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(1));
+
+        let version_message = queue.pop_front().expect("full current GCK-VN must follow the association");
+        let SapMsgInner::LmmMleUnitdataReq(mut version_request) = version_message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        DAllGcksChangeDemand::from_bitbuf(&mut version_request.sdu).expect("valid full current GCK-VN advertisement");
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn failed_registration_delivery_remains_inactive_and_is_counted() {
+        let issi = 430_905;
+        let config = test_config();
+        config.state_write().subscribers.register(issi);
+        let mut mm = MmBs::new(config.clone(), None, None, None);
+        let reporter = TxReporter::new();
+        let mut queue = MessageQueue::new();
+
+        mm.track_registration_delivery(Some(41), issi, true, Vec::new(), reporter.clone());
+        reporter.mark_transmitted();
+        reporter.mark_lost();
+        mm.update_registration_delivery_statuses(&mut queue);
+
+        let mut state = config.state_write();
+        assert!(!state.subscribers.is_registration_pending(issi));
+        assert!(!state.subscribers.is_active(issi));
+        assert_eq!(state.subscribers.take_registration_delivery_failures(), 1);
     }
 }

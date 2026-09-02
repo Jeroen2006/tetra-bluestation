@@ -4,6 +4,11 @@ use crate::control::enums::circuit_mode_type::CircuitModeType;
 
 #[derive(Debug, Clone)]
 pub struct Circuit {
+    /// CMCE call identifier owning this RF circuit.  Timeslots are recycled,
+    /// so UMAC must not let a delayed teardown for the previous call clear a
+    /// newly installed traffic/AIE context on the same slot.
+    pub call_id: u16,
+
     /// Direction
     pub direction: Direction,
 
@@ -36,8 +41,11 @@ pub enum CallControl {
     /// Signals to release a circuit
     /// Created by CMCE, sent to Umac
     /// Umac forwards to Lmac
-    /// Contains (Direction, timeslot) of associated circuit
-    Close(Direction, u8),
+    Close {
+        call_id: u16,
+        direction: Direction,
+        ts: u8,
+    },
     /// Floor granted: a speaker has been given transmission permission.
     /// Sent to UMAC to exit hangtime (resume traffic mode) and to Brew to start forwarding voice.
     FloorGranted {
@@ -64,6 +72,16 @@ pub enum CallControl {
     /// Sent only from CMCE to UMAC.
     PrivateCallTrafficActive {
         call_id: u16,
+        ts: u8,
+    },
+    /// A simplex private floor grant. On a shared same-cell RF circuit the
+    /// uplink speaker and downlink listener use different DCKs; on separate
+    /// endpoint circuits `destination_issi` is `None` and the already-bound
+    /// per-endpoint DCK policy is retained.
+    PrivateFloorGranted {
+        call_id: u16,
+        source_issi: u32,
+        destination_issi: Option<u32>,
         ts: u8,
     },
     /// Private-call media mapping.  Unlike group calls the destination is a

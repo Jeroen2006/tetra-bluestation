@@ -3,7 +3,7 @@ use std::{
     panic,
 };
 
-use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, SharedConfig};
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie, SharedConfig};
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
@@ -61,6 +61,10 @@ pub struct UmacBs {
     /// speech decoding; UMAC retains it to decrypt MAC-U-SIGNAL after its
     /// clear three-bit header has been parsed.
     uplink_traffic_aie: [Option<AieRequest>; 4],
+    /// CMCE call currently owning each physical traffic timeslot.  A call id
+    /// is the generation token for the slot: teardown and floor/media events
+    /// from an older call are ignored after the slot has been recycled.
+    traffic_call_owner: [Option<u16>; 4],
     /// The current floor holder is the only identity available to an
     /// unaddressed U-TX CEASED MAC-U-SIGNAL. Keep it at the UMAC/CMCE
     /// boundary instead of forwarding a synthetic SSI 0.
@@ -95,6 +99,10 @@ pub struct UmacBs {
     /// MCCH resources held until an EE terminal's next monitoring occasion.
     /// Associated traffic-channel and FACCH paths never enter this queue.
     deferred_mcch: VecDeque<DeferredMcch>,
+    /// Encrypted SC3 random-access bursts waiting for one on-demand DCK.
+    /// They retain their original UL air time and are replayed only after the
+    /// authenticated SwMI response has populated the bounded runtime cache.
+    pending_sc3_access: VecDeque<PendingSc3Access>,
 }
 
 struct PendingStch {
@@ -111,6 +119,12 @@ struct DeferredMcch {
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
     aie_request: AieRequest,
+}
+
+struct PendingSc3Access {
+    issi: u32,
+    expires_at: TdmaTime,
+    message: SapMsg,
 }
 
 impl UmacBs {
@@ -138,11 +152,13 @@ impl UmacBs {
             channel_scheduler: BsChannelScheduler::new_with_aie_provider(scrambling_code, precomps, aie_provider.clone()),
             aie_provider,
             uplink_traffic_aie: [None; 4],
+            traffic_call_owner: [None; 4],
             traffic_floor_holder: [None; 4],
             last_ul_voice: [None; 4],
             private_media_timeslots: HashSet::new(),
             duplex_private_media_timeslots: HashSet::new(),
             deferred_mcch: VecDeque::new(),
+            pending_sc3_access: VecDeque::new(),
         }
     }
 
@@ -187,14 +203,14 @@ impl UmacBs {
             auth_required: Self::get_authentication_required_state(config),
             class1_supported: aie.enabled && aie.sc1_allowed,
             class2_supported: aie.enabled && aie.sc2.is_some(),
-            class3_supported: false,
+            class3_supported: aie.enabled && aie.sc3.is_some(),
             sck_n: aie.sc2.as_ref().map(|sc2| sc2.sckn),
-            dck_retrieval_during_cell_select: None,
-            dck_retrieval_during_cell_reselect: None,
-            linked_gck_crypto_periods: None,
-            short_gck_vn: None,
+            dck_retrieval_during_cell_select: aie.sc3.as_ref().map(|sc3| sc3.dck_retrieval_during_initial_cell_selection),
+            dck_retrieval_during_cell_reselect: aie.sc3.as_ref().map(|sc3| sc3.dck_retrieval_during_cell_reselection),
+            linked_gck_crypto_periods: aie.sc3.as_ref().map(|sc3| sc3.linked_gck_crypto_periods()),
+            short_gck_vn: aie.sc3.as_ref().map(|sc3| (sc3.gck_vn() & 0x03) as u8),
             sdstl_addressing_method: 2,
-            gck_supported: false,
+            gck_supported: aie.sc3.as_ref().is_some_and(RuntimeSc3Aie::gck_supported),
             section: 0,
             section_data: 0,
         };
@@ -233,7 +249,7 @@ impl UmacBs {
             rxlev_access_min: c.cell.rxlev_access_min,
             access_parameter: c.cell.access_parameter,
             radio_dl_timeout: 3, // 432 timeslots (~6s radio link timeout)
-            cipher_key_id_or_sck_vn: None,
+            cipher_key_id_or_sck_vn: aie.sc3.as_ref().map(|sc3| sc3.cck_id),
             hyperframe_number: Some(0), // Updated dynamically in scheduler
             option_field: SysinfoOptFieldFlag::DefaultDefForAccCodeA,
             ts_common_frames: None,
@@ -393,6 +409,47 @@ impl UmacBs {
         } else {
             RuntimeAieConfig::default()
         }
+    }
+
+    fn active_aie_request(&self, subject: AieSubject, scope: AieScope) -> Option<AieRequest> {
+        self.aie.enabled.then(|| {
+            if self.aie.sc3.is_some() {
+                AieRequest::sc3(subject, scope)
+            } else {
+                AieRequest::sc2(subject, scope)
+            }
+        })
+    }
+
+    fn private_endpoint_traffic_subjects(call_id: u16, rf_endpoint_issi: u32) -> (AieSubject, AieSubject) {
+        let endpoint = AieSubject::Call {
+            call_id: u32::from(call_id),
+            issi: Some(rf_endpoint_issi),
+            gssi: None,
+        };
+        // Both directions on a dedicated endpoint circuit terminate at the
+        // same MS and therefore use that MS's DCK.
+        (endpoint, endpoint)
+    }
+
+    /// An EE replay must still be in the future and, during an AIE rollover,
+    /// must use an opportunity strictly before the activation boundary.
+    fn ee_replay_is_usable(due: TdmaTime, now: TdmaTime, rollover_activation: Option<TdmaTime>) -> bool {
+        due.age(now) < 0 && rollover_activation.is_none_or(|activation| activation.diff(due) > 0)
+    }
+
+    fn shared_private_traffic_subjects(call_id: u16, source_issi: u32, destination_issi: u32) -> (AieSubject, AieSubject) {
+        let downlink = AieSubject::Call {
+            call_id: u32::from(call_id),
+            issi: Some(destination_issi),
+            gssi: None,
+        };
+        let uplink = AieSubject::Call {
+            call_id: u32::from(call_id),
+            issi: Some(source_issi),
+            gssi: None,
+        };
+        (downlink, uplink)
     }
 
     fn refresh_random_access_control(&mut self, ts: TdmaTime) {
@@ -761,7 +818,12 @@ impl UmacBs {
                 tracing::warn!(?error, issi, "rejecting MAC-DATA after SC2 context validation failed");
                 return;
             }
-            AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+            match context {
+                tetra_core::AieContext::Sc3 { key, .. } => {
+                    AieRequest::sc3_with_key(AieSubject::Individual { issi }, AieScope::MacData, key)
+                }
+                _ => AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData),
+            }
         } else {
             // The strict clear allow-list is applied after the LLC header is
             // available: a D-LOCATION UPDATE ACCEPT may still be confirmed
@@ -839,6 +901,7 @@ impl UmacBs {
 
     fn rx_mac_access(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_mac_access");
+        let retry_message = message.clone();
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
@@ -942,7 +1005,12 @@ impl UmacBs {
                         return;
                     }
                     addr = TetraAddress::issi(issi);
-                    AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+                    match context {
+                        tetra_core::AieContext::Sc3 { key, .. } => {
+                            AieRequest::sc3_with_key(AieSubject::Individual { issi }, AieScope::MacData, key)
+                        }
+                        _ => AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData),
+                    }
                 }
                 // Only an unbound ESI may use the bootstrap path. Decode it
                 // with inverse TA61 and establish a provisional cipher
@@ -965,6 +1033,21 @@ impl UmacBs {
                     }
                     addr = TetraAddress::issi(issi);
                     AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+                }
+                Err(AieContextError::DckNotProvisioned(issi) | AieContextError::DckExpired(issi)) => {
+                    self.aie_provider.request_sc3_dck(issi);
+                    if self.pending_sc3_access.len() >= 32 {
+                        self.pending_sc3_access.pop_front();
+                    }
+                    if !self.pending_sc3_access.iter().any(|pending| pending.issi == issi) {
+                        self.pending_sc3_access.push_back(PendingSc3Access {
+                            issi,
+                            expires_at: self.dltime.add_timeslots(4 * 18),
+                            message: retry_message,
+                        });
+                    }
+                    tracing::info!(issi, "deferred encrypted SC3 MAC-ACCESS pending on-demand DCK");
+                    return;
                 }
                 Err(error) => {
                     tracing::warn!(?error, "rejecting encrypted MAC-ACCESS with invalid SC2 ESI context");
@@ -1675,7 +1758,7 @@ impl UmacBs {
                 // here is used only to validate the key identity and derive
                 // an encrypted short identity (IESI/GESI); no keystream is
                 // generated at this layer.
-                if let AieRequest::Sc2 { subject, .. } = aie_request {
+                if let AieRequest::Sc2 { subject, .. } | AieRequest::Sc3 { subject, .. } = aie_request {
                     let context = match self.aie_provider.resolve(aie_request, AieDirection::Downlink, self.dltime) {
                         Ok(context) => context,
                         Err(error) => {
@@ -1706,9 +1789,11 @@ impl UmacBs {
                             return;
                         }
                     }
-                    if let tetra_core::AieContext::Sc2 { key, .. } = context {
-                        mac_pdu.encryption_mode = 0b10 | (key.sck_vn as u8 & 1);
-                    }
+                    mac_pdu.encryption_mode = match context {
+                        tetra_core::AieContext::Sc2 { key, .. } => 0b10 | (key.sck_vn as u8 & 1),
+                        tetra_core::AieContext::Sc3 { key, .. } => 0b10 | (key.cck_id as u8 & 1),
+                        tetra_core::AieContext::Clear { .. } => 0,
+                    };
                 }
                 let sdu_len = sdu.get_len();
                 let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
@@ -1839,7 +1924,7 @@ impl UmacBs {
                 let Some(due) = self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe) else {
                     continue;
                 };
-                if due.age(self.dltime) <= 0 || rollover_activation.is_some_and(|activation| activation.diff(due) <= 0) {
+                if !Self::ee_replay_is_usable(due, self.dltime, rollover_activation) {
                     continue;
                 }
 
@@ -2138,10 +2223,32 @@ impl UmacBs {
     //     queue.push_back(m);
     // }
 
-    fn rx_control_circuit_open(&mut self, _queue: &mut MessageQueue, prim: CallControl) {
+    fn owns_traffic_slot(&self, call_id: u16, ts: u8) -> bool {
+        (1..=4).contains(&ts) && self.traffic_call_owner[ts as usize - 1] == Some(call_id)
+    }
+
+    fn rx_control_circuit_open(&mut self, queue: &mut MessageQueue, prim: CallControl) {
         let CallControl::Open(circuit) = prim else { panic!() };
+        let call_id = circuit.call_id;
         let ts = circuit.ts;
         let dir = circuit.direction;
+
+        if !(1..=4).contains(&ts) {
+            tracing::warn!(call_id, ts, "ignoring circuit open for invalid traffic timeslot");
+            return;
+        }
+
+        let previous_owner = self.traffic_call_owner[ts as usize - 1];
+        if previous_owner != Some(call_id) {
+            // Do not carry either the previous group's GCK policy or queued
+            // private-call state into the next generation of this slot.
+            self.set_traffic_aie(queue, ts, None, None);
+            self.channel_scheduler.set_hangtime(ts, false);
+            self.traffic_floor_holder[ts as usize - 1] = None;
+            self.last_ul_voice[ts as usize - 1] = None;
+            self.private_media_timeslots.remove(&ts);
+            self.duplex_private_media_timeslots.remove(&ts);
+        }
 
         // Direction::Both needs to be split into separate DL and UL operations
         // because the UMAC circuit manager tracks them independently.
@@ -2162,6 +2269,7 @@ impl UmacBs {
             }
 
             let c = Circuit {
+                call_id,
                 direction: d,
                 ts: circuit.ts,
                 usage: circuit.usage,
@@ -2178,10 +2286,29 @@ impl UmacBs {
 
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
         }
+        self.traffic_call_owner[ts as usize - 1] = Some(call_id);
+        tracing::info!(call_id, ts, ?previous_owner, "traffic timeslot owner installed");
     }
 
     fn rx_control_circuit_close(&mut self, queue: &mut MessageQueue, prim: CallControl) {
-        let CallControl::Close(dir, ts) = prim else { panic!() };
+        let CallControl::Close {
+            call_id,
+            direction: dir,
+            ts,
+        } = prim
+        else {
+            panic!()
+        };
+
+        if !self.owns_traffic_slot(call_id, ts) {
+            tracing::warn!(
+                call_id,
+                ts,
+                current_owner = ?self.traffic_call_owner.get(ts.saturating_sub(1) as usize).copied().flatten(),
+                "ignoring stale circuit close after traffic-timeslot recycling"
+            );
+            return;
+        }
 
         // Direction::Both needs to be split into separate DL and UL close operations
         let dirs: Vec<Direction> = match dir {
@@ -2209,8 +2336,13 @@ impl UmacBs {
         }
         self.set_traffic_aie(queue, ts, None, None);
         if (1..=4).contains(&ts) {
+            self.traffic_call_owner[ts as usize - 1] = None;
             self.traffic_floor_holder[ts as usize - 1] = None;
+            self.last_ul_voice[ts as usize - 1] = None;
+            self.private_media_timeslots.remove(&ts);
+            self.duplex_private_media_timeslots.remove(&ts);
         }
+        self.channel_scheduler.set_hangtime(ts, false);
     }
 
     /// Check for UL inactivity on traffic timeslots. If no voice frames have arrived
@@ -2271,11 +2403,15 @@ impl UmacBs {
             CallControl::Open(_) => {
                 self.rx_control_circuit_open(queue, prim);
             }
-            CallControl::Close(_, _) => {
+            CallControl::Close { .. } => {
                 self.rx_control_circuit_close(queue, prim);
             }
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
-            CallControl::FloorReleased { ts, .. } => {
+            CallControl::FloorReleased { call_id, ts } => {
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(call_id, ts, "ignoring stale floor release after traffic-timeslot recycling");
+                    return;
+                }
                 self.channel_scheduler.set_hangtime(ts, true);
                 // Stop checking UL inactivity during hangtime
                 if (1..=4).contains(&ts) {
@@ -2288,6 +2424,10 @@ impl UmacBs {
                 dest_gssi,
                 ts,
             } => {
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(call_id, ts, dest_gssi, "ignoring stale floor grant after traffic-timeslot recycling");
+                    return;
+                }
                 if (1..=4).contains(&ts) {
                     self.traffic_floor_holder[ts as usize - 1] = Some(source_issi);
                 }
@@ -2300,12 +2440,18 @@ impl UmacBs {
                 // SC2 group traffic uses the active TMO SCK. GSKO/GCK remain
                 // separate OTAR/key-management flows; their absence must not
                 // cause an active SC2 group call to leak traffic in clear.
-                let downlink = self
-                    .aie
-                    .enabled
-                    .then(|| AieRequest::sc2(AieSubject::Group { gssi: dest_gssi }, AieScope::Traffic));
-                let uplink = self.aie.enabled.then(|| AieRequest::sc2(subject, AieScope::Traffic));
+                let downlink = self.active_aie_request(AieSubject::Group { gssi: dest_gssi }, AieScope::Traffic);
+                let uplink = self.active_aie_request(subject, AieScope::Traffic);
                 self.set_traffic_aie(queue, ts, downlink, uplink);
+                tracing::info!(
+                    call_id,
+                    ts,
+                    gssi = dest_gssi,
+                    source_issi,
+                    downlink_policy = ?downlink,
+                    uplink_policy = ?uplink,
+                    "installed group traffic AIE contexts for current timeslot owner"
+                );
                 self.channel_scheduler.begin_floor_grant_transition(ts, source_issi);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
@@ -2314,15 +2460,29 @@ impl UmacBs {
             }
             CallControl::CallEnded { call_id, ts } => {
                 self.unbind_sc2_call(call_id);
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::debug!(
+                        call_id,
+                        ts,
+                        current_owner = ?self.traffic_call_owner.get(ts.saturating_sub(1) as usize).copied().flatten(),
+                        "ignoring stale call-ended slot cleanup"
+                    );
+                    return;
+                }
                 self.set_traffic_aie(queue, ts, None, None);
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
+                    self.traffic_call_owner[ts as usize - 1] = None;
                     self.traffic_floor_holder[ts as usize - 1] = None;
                     self.last_ul_voice[ts as usize - 1] = None;
                     self.duplex_private_media_timeslots.remove(&ts);
                 }
             }
-            CallControl::PrivateCallTrafficActive { ts, .. } => {
+            CallControl::PrivateCallTrafficActive { call_id, ts } => {
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(call_id, ts, "ignoring stale private traffic activation after timeslot recycling");
+                    return;
+                }
                 // Full-duplex P2P has no simplex floor or hangtime.  A
                 // restore must therefore keep its traffic slot active even
                 // though the central private floor holder is zero. It does
@@ -2333,35 +2493,94 @@ impl UmacBs {
                     self.duplex_private_media_timeslots.insert(ts);
                 }
             }
+            CallControl::PrivateFloorGranted {
+                call_id,
+                source_issi,
+                destination_issi,
+                ts,
+            } => {
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(call_id, ts, "ignoring stale private floor grant after timeslot recycling");
+                    return;
+                }
+                if (1..=4).contains(&ts) {
+                    self.traffic_floor_holder[ts as usize - 1] = Some(source_issi);
+                }
+
+                // A same-cell simplex call may deliberately share one RF
+                // circuit. SC2 can use its common SCK in both directions,
+                // but SC3 cannot: the uplink is protected with the floor
+                // holder's DCK and the downlink with the listening peer's
+                // DCK. Separate endpoint circuits already received their
+                // own bidirectional DCK binding through PrivateMediaStart.
+                if let Some(destination_issi) = destination_issi {
+                    let (downlink_subject, uplink_subject) = Self::shared_private_traffic_subjects(call_id, source_issi, destination_issi);
+                    self.bind_sc2_call(uplink_subject);
+                    self.bind_sc2_call(downlink_subject);
+                    self.set_traffic_aie(
+                        queue,
+                        ts,
+                        self.active_aie_request(downlink_subject, AieScope::Traffic),
+                        self.active_aie_request(uplink_subject, AieScope::Traffic),
+                    );
+                    tracing::info!(
+                        call_id,
+                        ts,
+                        uplink_issi = source_issi,
+                        downlink_issi = destination_issi,
+                        "installed shared private traffic AIE contexts"
+                    );
+                }
+                self.channel_scheduler.begin_floor_grant_transition(ts, source_issi);
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
+            }
             CallControl::PrivateMediaStart {
                 call_id,
                 source_issi,
                 destination_issi,
                 ts,
             } => {
-                let source = AieSubject::Call {
-                    call_id: u32::from(call_id),
-                    issi: Some(source_issi),
-                    gssi: None,
-                };
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(call_id, ts, "ignoring stale private-media start after timeslot recycling");
+                    return;
+                }
+                let (downlink_subject, uplink_subject) = Self::private_endpoint_traffic_subjects(call_id, source_issi);
                 let destination = AieSubject::Call {
                     call_id: u32::from(call_id),
                     issi: Some(destination_issi),
                     gssi: None,
                 };
-                self.bind_sc2_call(source);
+                self.bind_sc2_call(uplink_subject);
                 self.bind_sc2_call(destination);
                 self.set_traffic_aie(
                     queue,
                     ts,
-                    self.aie.enabled.then(|| AieRequest::sc2(destination, AieScope::Traffic)),
-                    self.aie.enabled.then(|| AieRequest::sc2(source, AieScope::Traffic)),
+                    // `source_issi` is the terminal attached to this RF
+                    // circuit. Incoming peer audio is transmitted on this
+                    // circuit and must therefore use that local endpoint's
+                    // DCK, not the remote media destination's DCK.
+                    self.active_aie_request(downlink_subject, AieScope::Traffic),
+                    self.active_aie_request(uplink_subject, AieScope::Traffic),
+                );
+                tracing::info!(
+                    call_id,
+                    ts,
+                    rf_endpoint_issi = source_issi,
+                    media_peer_issi = destination_issi,
+                    "installed dedicated private traffic AIE contexts"
                 );
                 self.private_media_timeslots.insert(ts);
             }
             CallControl::PrivateMediaStop { call_id, ts } => {
                 self.unbind_sc2_call(call_id);
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::debug!(call_id, ts, "ignoring stale private-media stop slot cleanup");
+                    return;
+                }
                 self.set_traffic_aie(queue, ts, None, None);
+                self.traffic_call_owner[ts as usize - 1] = None;
                 self.private_media_timeslots.remove(&ts);
                 self.duplex_private_media_timeslots.remove(&ts);
                 if (1..=4).contains(&ts) {
@@ -2452,6 +2671,22 @@ impl TetraEntityTrait for UmacBs {
         }
         self.deferred_mcch = retained;
 
+        let mut waiting = VecDeque::new();
+        let mut ready = Vec::new();
+        while let Some(pending) = self.pending_sc3_access.pop_front() {
+            if self.aie_provider.has_sc3_dck(pending.issi) {
+                ready.push(pending.message);
+            } else if pending.expires_at.age(ts) < 0 {
+                waiting.push_back(pending);
+            } else {
+                tracing::warn!(issi = pending.issi, "expired deferred SC3 MAC-ACCESS without a DCK response");
+            }
+        }
+        self.pending_sc3_access = waiting;
+        for message in ready {
+            self.rx_tmv_prim(queue, message);
+        }
+
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
 
@@ -2501,6 +2736,72 @@ fn pack_ul_acelp_bits(bits: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+    fn test_circuit(call_id: u16, ts: u8) -> Circuit {
+        Circuit {
+            call_id,
+            direction: Direction::Both,
+            ts,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        }
+    }
+
+    fn deliver_control(umac: &mut UmacBs, queue: &mut MessageQueue, control: CallControl) {
+        umac.rx_control(
+            queue,
+            SapMsg::new(
+                Sap::Control,
+                TetraEntity::Cmce,
+                TetraEntity::Umac,
+                SapMsgInner::CmceCallControl(control),
+            ),
+        );
+    }
+
+    #[test]
+    fn stale_teardown_cannot_clear_recycled_slots_group_key_policy() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let mut queue = MessageQueue::new();
+        let ts = 2;
+
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(10, ts)));
+        umac.set_traffic_aie(
+            &mut queue,
+            ts,
+            Some(AieRequest::sc3(AieSubject::Group { gssi: 1202 }, AieScope::Traffic)),
+            None,
+        );
+
+        // Recycle TS2 for TG91 before delayed lifecycle messages of call 10
+        // arrive. Both Close and CallEnded must be generation-aware.
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(11, ts)));
+        let tg91 = AieRequest::sc3(AieSubject::Group { gssi: 91 }, AieScope::Traffic);
+        umac.set_traffic_aie(&mut queue, ts, Some(tg91), None);
+        deliver_control(
+            &mut umac,
+            &mut queue,
+            CallControl::Close {
+                call_id: 10,
+                direction: Direction::Both,
+                ts,
+            },
+        );
+        deliver_control(&mut umac, &mut queue, CallControl::CallEnded { call_id: 10, ts });
+
+        assert_eq!(umac.traffic_call_owner[ts as usize - 1], Some(11));
+        assert_eq!(umac.channel_scheduler.traffic_aie(ts), Some(tg91));
+        assert!(umac.channel_scheduler.circuit_is_active(Direction::Dl, ts));
+        assert!(umac.channel_scheduler.circuit_is_active(Direction::Ul, ts));
+    }
 
     #[test]
     fn type_one_channel_allocation_keeps_target_carrier_and_cell_change() {
@@ -2516,5 +2817,97 @@ mod tests {
         assert_eq!(mac.carrier_num, 1521);
         assert!(mac.cell_change_flag);
         assert_eq!(mac.ts_assigned, [false, false, true, false]);
+    }
+
+    #[test]
+    fn private_dedicated_circuit_uses_the_rf_endpoints_dck_in_both_directions() {
+        let call_id = 23;
+        let endpoint = 430_892;
+        let (downlink, uplink) = UmacBs::private_endpoint_traffic_subjects(call_id, endpoint);
+        let expected = AieSubject::Call {
+            call_id: u32::from(call_id),
+            issi: Some(endpoint),
+            gssi: None,
+        };
+        assert_eq!(downlink, expected);
+        assert_eq!(uplink, expected);
+    }
+
+    #[test]
+    fn private_shared_simplex_circuit_uses_listener_dck_downlink_and_speaker_dck_uplink() {
+        let call_id = 23;
+        let speaker = 430_892;
+        let listener = 430_905;
+        let (downlink, uplink) = UmacBs::shared_private_traffic_subjects(call_id, speaker, listener);
+        assert!(matches!(downlink, AieSubject::Call { issi: Some(found), .. } if found == listener));
+        assert!(matches!(uplink, AieSubject::Call { issi: Some(found), .. } if found == speaker));
+    }
+
+    #[test]
+    fn ee_group_replay_accepts_only_a_future_pre_rollover_opportunity() {
+        let now = TdmaTime::default().add_timeslots(100);
+        let due = now.add_timeslots(20);
+        let activation = now.add_timeslots(40);
+
+        assert!(UmacBs::ee_replay_is_usable(due, now, None));
+        assert!(UmacBs::ee_replay_is_usable(due, now, Some(activation)));
+        assert!(!UmacBs::ee_replay_is_usable(now, now, None));
+        assert!(!UmacBs::ee_replay_is_usable(now.add_timeslots(-1), now, None));
+        assert!(!UmacBs::ee_replay_is_usable(activation, now, Some(activation)));
+        assert!(!UmacBs::ee_replay_is_usable(activation.add_timeslots(1), now, Some(activation)));
+    }
+
+    #[test]
+    fn group_mcch_for_an_active_affiliated_ee_terminal_queues_a_future_replay() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let config = SharedConfig::from_parts(config, None);
+        let mut umac = UmacBs::new(config.clone());
+        let issi = 430_905;
+        let gssi = 91;
+        {
+            let mut state = config.state_write();
+            state.subscribers.register(issi);
+            state.subscribers.affiliate(issi, gssi);
+            assert!(state.subscribers.set_energy_economy(issi, 1, Some(2), Some(1)));
+            state.subscribers.mark_active(issi);
+        }
+
+        let mut queue = MessageQueue::new();
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("00000000"),
+                    main_address: TetraAddress {
+                        ssi_type: SsiType::Gssi,
+                        ssi: gssi,
+                    },
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        assert_eq!(umac.deferred_mcch.len(), 1);
+        let replay = umac
+            .deferred_mcch
+            .front()
+            .expect("TG91 must be replayed at the EE monitoring occasion");
+        assert!(replay.due.age(umac.dltime) < 0, "queued EE replay must lie in the future");
     }
 }

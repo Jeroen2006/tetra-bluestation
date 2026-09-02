@@ -7,6 +7,7 @@ use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 use crate::mm::fields::group_identity_downlink::GroupIdentityDownlink;
+use crate::mm::fields::group_identity_security_related_information::GroupIdentitySecurityRelatedInformation;
 
 /// Representation of the D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT PDU (Clause 16.9.2.2).
 /// The infrastructure sends this message to the MS to acknowledge MS-initiated attachment/detachment of group identities.
@@ -25,7 +26,7 @@ pub struct DAttachDetachGroupIdentityAcknowledgement {
     /// Type4, See note,
     pub group_identity_downlink: Option<Vec<GroupIdentityDownlink>>,
     /// Type4, See ETSI EN 300 392-7 [8] and note,
-    pub group_identity_security_related_information: Option<Type4FieldGeneric>,
+    pub group_identity_security_related_information: Option<Vec<GroupIdentitySecurityRelatedInformation>>,
 }
 
 #[allow(unreachable_code)] // TODO FIXME review, finalize and remove this
@@ -55,8 +56,12 @@ impl DAttachDetachGroupIdentityAcknowledgement {
         )?;
 
         // Type4
-        let group_identity_security_related_information =
-            typed::parse_type4_generic(obit, buffer, MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation)?;
+        let group_identity_security_related_information = typed::parse_type4_struct(
+            obit,
+            buffer,
+            MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation,
+            GroupIdentitySecurityRelatedInformation::from_bitbuf,
+        )?;
 
         // Read trailing mbit (if not previously encountered)
         obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
@@ -104,11 +109,12 @@ impl DAttachDetachGroupIdentityAcknowledgement {
         )?;
 
         // Type4
-        typed::write_type4_todo(
+        typed::write_type4_struct(
             obit,
             buffer,
             &self.group_identity_security_related_information,
             MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation,
+            GroupIdentitySecurityRelatedInformation::to_bitbuf,
         )?;
 
         // Write terminating m-bit

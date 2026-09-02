@@ -419,6 +419,7 @@ mod tests {
             assert_eq!(
                 match region.request {
                     AieRequest::Sc2 { scope, .. } => scope,
+                    AieRequest::Sc3 { .. } => panic!("SC2 policy must not change class during fragmentation"),
                     AieRequest::Clear { .. } => panic!("SC2 policy must not downgrade during fragmentation"),
                 },
                 if chunks == 0 {

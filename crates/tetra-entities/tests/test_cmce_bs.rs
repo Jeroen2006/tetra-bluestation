@@ -209,23 +209,23 @@ fn test_dsetup_late_entry_throttle() {
     let initial_setups = count_d_setups(&initial_msgs);
     assert!(initial_setups > 0, "Expected initial D-SETUP after U-SETUP");
 
-    // Run a few more ticks to get through the D_SETUP_REPEATS backup window.
-    // The backup send goes through (receipt is None) and creates a tracked receipt.
-    test.run_stack(Some(8));
-    let mut backup_msgs = test.dump_sinks();
-    let backup_reporters = extract_d_setup_reporters(&mut backup_msgs);
+    // The first late-entry D-SETUP follows one multiframe (about one second)
+    // after the initial D-SETUP; there is no next-frame backup anymore.
+    test.run_stack(Some(80));
+    let mut late_entry_msgs = test.dump_sinks();
+    let late_entry_reporters = extract_d_setup_reporters(&mut late_entry_msgs);
 
-    // We should have at least one reporter from the backup send
+    // We should have at least one reporter from the first late-entry send.
     assert!(
-        !backup_reporters.is_empty(),
-        "Expected backup D-SETUP with tx_reporter in initial window"
+        !late_entry_reporters.is_empty(),
+        "Expected late-entry D-SETUP with tx_reporter after one second"
     );
-    let last_reporter = &backup_reporters[backup_reporters.len() - 1];
+    let last_reporter = &late_entry_reporters[late_entry_reporters.len() - 1];
     assert_eq!(last_reporter.get_state(), TxState::Pending);
 
-    // Run for 2 full late-entry intervals (720 ticks). With the receipt still Pending,
+    // Run for two one-second late-entry intervals. With the receipt still Pending,
     // ALL late-entry D-SETUPs should be suppressed.
-    test.run_stack(Some(720));
+    test.run_stack(Some(144));
     let throttled_msgs = test.dump_sinks();
     let throttled_count = count_d_setups(&throttled_msgs);
     assert_eq!(
@@ -236,8 +236,8 @@ fn test_dsetup_late_entry_throttle() {
     // Now mark the previous D-SETUP as transmitted (simulating UMAC sending it over the air)
     last_reporter.mark_transmitted();
 
-    // Run for 2 more late-entry intervals. Now D-SETUPs should go through.
-    test.run_stack(Some(720));
+    // Run for two more late-entry intervals. Now D-SETUPs should go through.
+    test.run_stack(Some(144));
     let mut unthrottled_msgs = test.dump_sinks();
     let unthrottled_count = count_d_setups(&unthrottled_msgs);
     assert!(

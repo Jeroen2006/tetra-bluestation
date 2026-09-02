@@ -216,16 +216,14 @@ fn neighbour_to_air(neighbour: &NeighbourCell) -> NeighbourCellInformationForCa 
 fn neighbour_security_parameters(cell: &tetra_swmi_protocol::CellConfig) -> u8 {
     let authentication_required = u8::from(cell.authentication_required);
     let sc1_supported = u8::from(cell.aie.enabled && cell.aie.sc1_allowed);
-    // This stack currently supports SC2 only. In the normative field a zero
-    // here explicitly means SC2; a one would mean SC3.
-    let sc2_or_sc3 = 0_u8;
+    let sc2_or_sc3 = u8::from(cell.aie.enabled && cell.aie.sc3.is_some());
 
     (authentication_required << 2) | (sc1_supported << 1) | sc2_or_sc3
 }
 
 #[cfg(test)]
 mod tests {
-    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm};
+    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm, Sc3AieConfig, Sc3TeaAlgorithm};
 
     use super::neighbour_security_parameters;
 
@@ -245,8 +243,22 @@ mod tests {
                     sck_vn: 23,
                     key: None,
                 }),
+                sc3: None,
             },
         }
+    }
+
+    fn sc3_cell() -> CellConfig {
+        let mut cell = sc2_cell(true, false);
+        cell.aie.sc2 = None;
+        cell.aie.sc3 = Some(Sc3AieConfig {
+            algorithm: Sc3TeaAlgorithm::Tea3,
+            cck_id: 9,
+            cck: None,
+            dck_retrieval_during_initial_cell_selection: true,
+            dck_retrieval_during_cell_reselection: true,
+        });
+        cell
     }
 
     #[test]
@@ -256,5 +268,10 @@ mod tests {
         assert_eq!(neighbour_security_parameters(&sc2_cell(true, false)), 0b0_0100);
         // With SC1 fallback available, only the SC1 bit changes.
         assert_eq!(neighbour_security_parameters(&sc2_cell(false, true)), 0b0_0010);
+    }
+
+    #[test]
+    fn ca_neighbour_security_parameters_advertise_sc3() {
+        assert_eq!(neighbour_security_parameters(&sc3_cell()), 0b0_0101);
     }
 }

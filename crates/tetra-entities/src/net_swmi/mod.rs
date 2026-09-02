@@ -18,7 +18,10 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
-use tetra_config::bluestation::{CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm, SharedConfig};
+use tetra_config::bluestation::{
+    CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm,
+    RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
+};
 use tetra_swmi_protocol::{
     CellConfig, NeighbourCellSnapshot, Sc2RolloverStatus, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
 };
@@ -36,6 +39,26 @@ fn runtime_aie_config(cell: &CellConfig) -> Result<RuntimeAieConfig, &'static st
             enabled: false,
             sc1_allowed: cell.aie.sc1_allowed,
             sc2: None,
+            sc3: None,
+            rollover: None,
+        });
+    }
+    if let Some(sc3) = cell.aie.sc3 {
+        let cck = sc3.cck.ok_or("active SwMI SC3 configuration is missing CCK material")?;
+        return Ok(RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: cell.aie.sc1_allowed,
+            sc2: None,
+            sc3: Some(RuntimeSc3Aie::new(
+                match sc3.algorithm {
+                    Sc2TeaAlgorithm::Tea1 => RuntimeSc3TeaAlgorithm::Tea1,
+                    Sc2TeaAlgorithm::Tea3 => RuntimeSc3TeaAlgorithm::Tea3,
+                },
+                sc3.cck_id,
+                cck,
+                sc3.dck_retrieval_during_initial_cell_selection,
+                sc3.dck_retrieval_during_cell_reselection,
+            )),
             rollover: None,
         });
     }
@@ -57,6 +80,7 @@ fn runtime_aie_config(cell: &CellConfig) -> Result<RuntimeAieConfig, &'static st
             sc2.sck_vn,
             key,
         )),
+        sc3: None,
         rollover: None,
     })
 }
@@ -383,6 +407,9 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             }
             tracing::info!(host = %self.config.host, "SwMI control connection established");
             self.recovery_request_id = None;
+            if let Some(sc3) = self.stack_config.state_write().aie.sc3.as_mut() {
+                sc3.retry_pending_dck_requests();
+            }
             if !self.send(SwmiMessage::Hello {
                 connection_epoch: 0,
                 software_version: tetra_core::STACK_VERSION.to_owned(),
@@ -404,7 +431,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             // service.  Do not take system-wide services down
                             // for an already-online connection.
                             let was_online = self.endpoint.online.load(Ordering::Acquire);
-                            let aie = match runtime_aie_config(&cell) {
+                            let mut aie = match runtime_aie_config(&cell) {
                                 Ok(aie) => aie,
                                 Err(error) => {
                                     tracing::warn!(
@@ -439,6 +466,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             {
                                 let mut state = self.stack_config.state_write();
                                 state.authentication_required = cell.authentication_required;
+                                aie.preserve_sc3_cache_from(&state.aie);
                                 state.aie = aie;
                                 // A changed SCKN/SCK-VN may not leave an old
                                 // per-terminal/call binding usable. The SCK
@@ -473,8 +501,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             let result = (|| {
                                 let broadcast_ready = {
                                     let state = self.stack_config.state_read();
-                                    state.network_broadcast.broadcast.time_enabled
-                                        && state.network_broadcast.broadcast.timezone.is_some()
+                                    state.network_broadcast.broadcast.time_enabled && state.network_broadcast.broadcast.timezone.is_some()
                                 };
                                 if !broadcast_ready {
                                     return Err("TETRA Network Time broadcast is not configured");
@@ -492,15 +519,12 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                     key: tetra_core::Sc2KeyIdentifier::new(active_algorithm, active.sckn, active.sck_vn)
                                         .ok_or("invalid rollover active identity")?,
                                 };
-                                self.stack_config
-                                    .state_write()
-                                    .aie
-                                    .stage_rollover(
-                                        rollover_id,
-                                        binding,
-                                        RuntimeSc2Aie::new(algorithm, future.sckn, future.sck_vn, key),
-                                        activation_network_time,
-                                    )
+                                self.stack_config.state_write().aie.stage_rollover(
+                                    rollover_id,
+                                    binding,
+                                    RuntimeSc2Aie::new(algorithm, future.sckn, future.sck_vn, key),
+                                    activation_network_time,
+                                )
                             })();
                             let (accepted, detail) = match result {
                                 Ok(()) => (true, None),
@@ -509,12 +533,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                     (false, Some(error.to_owned()))
                                 }
                             };
-                            let already_activated = accepted
-                                && self
-                                    .stack_config
-                                    .state_read()
-                                    .aie
-                                    .rollover_is_activated(rollover_id);
+                            let already_activated = accepted && self.stack_config.state_read().aie.rollover_is_activated(rollover_id);
                             let local_network_time = self
                                 .stack_config
                                 .state_read()
@@ -557,12 +576,112 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 tracing::warn!(rollover_id, "SwMI MM endpoint closed; cannot announce SC2 rollover on air");
                             }
                         }
-                        Ok(SwmiMessage::Sc2RolloverCancel { command_id, rollover_id }) => {
-                            let cancelled = self
+                        Ok(SwmiMessage::Sc3DckResponse {
+                            command_id,
+                            issi,
+                            cck_id,
+                            accepted,
+                            dck_context_id,
+                            dck,
+                            mutual,
+                            valid_until_unix,
+                        }) => {
+                            let mut state = self.stack_config.state_write();
+                            let Some(sc3) = state.aie.sc3.as_mut() else {
+                                tracing::warn!(command_id, issi, "ignoring SC3 DCK response while SC3 is disabled");
+                                continue;
+                            };
+                            if sc3.cck_id != cck_id {
+                                sc3.reject_dck(issi);
+                                tracing::warn!(
+                                    command_id,
+                                    issi,
+                                    cck_id,
+                                    active_cck_id = sc3.cck_id,
+                                    "rejecting stale SC3 DCK response"
+                                );
+                                continue;
+                            }
+                            match (accepted, dck_context_id, dck) {
+                                (true, Some(context_id), Some(dck)) => {
+                                    sc3.install_dck(issi, RuntimeSc3Dck::new(context_id, dck.into_bytes(), mutual, valid_until_unix));
+                                    tracing::info!(command_id, issi, mutual, "installed on-demand SC3 DCK context");
+                                }
+                                (false, None, None) => {
+                                    sc3.reject_dck(issi);
+                                    tracing::warn!(command_id, issi, "SwMI rejected on-demand SC3 DCK request");
+                                }
+                                _ => tracing::warn!(command_id, issi, "invalid SC3 DCK response shape ignored"),
+                            }
+                        }
+                        Ok(SwmiMessage::Sc3DckRevoke {
+                            command_id,
+                            issi,
+                            dck_context_id,
+                        }) => {
+                            let revoked = self
                                 .stack_config
                                 .state_write()
                                 .aie
-                                .cancel_staged_rollover(rollover_id);
+                                .sc3
+                                .as_mut()
+                                .is_some_and(|sc3| sc3.revoke_dck(issi, dck_context_id));
+                            let _ = self.send(SwmiMessage::Receipt {
+                                command_id,
+                                accepted: revoked,
+                                code: if revoked { 0 } else { 2 },
+                            });
+                        }
+                        Ok(SwmiMessage::Sc3GSnapshot(snapshot)) => {
+                            let command_id = snapshot.command_id;
+                            let result = self
+                                .stack_config
+                                .state_write()
+                                .aie
+                                .sc3
+                                .as_mut()
+                                .ok_or("SC3 is disabled")
+                                .and_then(|sc3| {
+                                    sc3.apply_sc3g_snapshot(
+                                        snapshot.revision,
+                                        snapshot.linked_crypto_periods,
+                                        snapshot.gck_vn,
+                                        snapshot
+                                            .keys
+                                            .into_iter()
+                                            .map(|key| RuntimeSc3Gck::new(key.gckn, key.gck_vn, key.key.into_bytes()))
+                                            .collect(),
+                                        snapshot
+                                            .associations
+                                            .into_iter()
+                                            .map(|association| (association.gssi, association.gckn))
+                                            .collect(),
+                                    )
+                                });
+                            let accepted = result.is_ok();
+                            let _ = self.send(SwmiMessage::Receipt {
+                                command_id,
+                                accepted,
+                                code: if accepted { 0 } else { 2 },
+                            });
+                            match result {
+                                Ok(changed) => tracing::info!(
+                                    command_id,
+                                    revision = snapshot.revision,
+                                    gck_vn = snapshot.gck_vn,
+                                    changed,
+                                    "applied SC3G key/association snapshot"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    command_id,
+                                    revision = snapshot.revision,
+                                    error,
+                                    "rejected SC3G key/association snapshot"
+                                ),
+                            }
+                        }
+                        Ok(SwmiMessage::Sc2RolloverCancel { command_id, rollover_id }) => {
+                            let cancelled = self.stack_config.state_write().aie.cancel_staged_rollover(rollover_id);
                             let _ = self.send(SwmiMessage::Receipt {
                                 command_id,
                                 accepted: cancelled,
@@ -662,23 +781,42 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         Err(error) => tracing::warn!(error = %error, "invalid SwMI message ignored"),
                     }
                 }
-                while let Ok(message) = self.endpoint.outgoing.try_recv() {
+                // Bound one egress round so continuous voice traffic cannot
+                // starve socket receive/Pong handling and heartbeat emission.
+                for _ in 0..256 {
+                    let Ok(message) = self.endpoint.outgoing.try_recv() else {
+                        break;
+                    };
                     if !self.send(message) {
                         break;
                     }
                 }
-                let rollover_events: Vec<RuntimeSc2RolloverEvent> = self
-                    .stack_config
-                    .state_write()
-                    .sc2_rollover_events
-                    .drain(..)
-                    .collect();
+                let sc3_requests = {
+                    let mut state = self.stack_config.state_write();
+                    state.aie.sc3.as_mut().map(|sc3| {
+                        let cck_id = sc3.cck_id;
+                        (cck_id, sc3.take_dck_requests())
+                    })
+                };
+                if let Some((cck_id, requests)) = sc3_requests {
+                    for issi in requests {
+                        let command_id = self.next_command_id();
+                        if !self.send(SwmiMessage::Sc3DckRequest { command_id, issi, cck_id }) {
+                            break;
+                        }
+                    }
+                }
+                let rollover_events: Vec<RuntimeSc2RolloverEvent> = self.stack_config.state_write().sc2_rollover_events.drain(..).collect();
                 for event in rollover_events {
                     let command_id = self.next_command_id();
                     let _ = self.send(SwmiMessage::Sc2RolloverStatus {
                         command_id,
                         rollover_id: event.rollover_id,
-                        status: if event.activated { Sc2RolloverStatus::Activated } else { Sc2RolloverStatus::Failed },
+                        status: if event.activated {
+                            Sc2RolloverStatus::Activated
+                        } else {
+                            Sc2RolloverStatus::Failed
+                        },
                         local_cutover_network_time: Some(event.local_network_time),
                         detail: None,
                     });
@@ -749,7 +887,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
 mod tests {
     use super::{LocalRadioProfile, runtime_aie_config};
     use tetra_config::bluestation::RuntimeSc2TeaAlgorithm;
-    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm};
+    use tetra_swmi_protocol::{CellAieConfig, CellConfig, Sc2AieConfig, Sc2TeaAlgorithm, Sc3AieConfig, Sc3TeaAlgorithm};
 
     #[test]
     fn runtime_aie_config_retains_the_tea_algorithm_from_swmi() {
@@ -768,11 +906,40 @@ mod tests {
                     sck_vn: 7,
                     key: Some([0x5a; 10]),
                 }),
+                sc3: None,
             },
         })
         .expect("valid AIE configuration");
 
         assert_eq!(runtime.sc2.expect("SC2 settings").algorithm, RuntimeSc2TeaAlgorithm::Tea3);
+    }
+
+    #[test]
+    fn runtime_aie_config_installs_sc3_cck_and_retrieval_policy() {
+        let runtime = runtime_aie_config(&CellConfig {
+            config_version: 1,
+            mcc: 204,
+            mnc: 2671,
+            location_area: 42,
+            authentication_required: true,
+            aie: CellAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: None,
+                sc3: Some(Sc3AieConfig {
+                    algorithm: Sc3TeaAlgorithm::Tea1,
+                    cck_id: 1,
+                    cck: Some([0xa5; 10]),
+                    dck_retrieval_during_initial_cell_selection: true,
+                    dck_retrieval_during_cell_reselection: true,
+                }),
+            },
+        })
+        .expect("SC3 runtime configuration");
+        let sc3 = runtime.sc3.expect("SC3 settings");
+        assert_eq!(sc3.cck_id, 1);
+        assert!(sc3.dck_retrieval_during_initial_cell_selection);
+        assert!(sc3.dck_retrieval_during_cell_reselection);
     }
 
     #[test]

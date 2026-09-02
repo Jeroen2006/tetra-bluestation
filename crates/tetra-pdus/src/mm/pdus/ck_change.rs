@@ -1,8 +1,8 @@
-//! SC2/TMO CK change PDUs from EN 300 392-7 annex A.4.
+//! CK change PDUs from EN 300 392-7 annex A.4.
 //!
-//! The key-change PDU family also covers CCK, GCK and DMO subset forms.  This
-//! codec deliberately accepts only the SCK/TMO form needed to enter or rotate
-//! SC2.  Unsupported forms fail closed instead of being decoded as SC2.
+//! The codec supports the SCK/TMO form used by SC2 and the linked-period
+//! `All GCKs` form used to advertise the full current GCK-VN in SC3G.
+//! Unsupported CCK, individual-GCK and DMO subset forms fail closed.
 
 use tetra_core::{BitBuffer, PduParseErr, expect_pdu_type};
 
@@ -10,6 +10,7 @@ use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use crate::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
 
 const SCK_KEY_CHANGE_TYPE: u8 = 0;
+const ALL_GCKS_KEY_CHANGE_TYPE: u8 = 4;
 const TIME_ABSOLUTE_IV: u8 = 0;
 const TIME_NETWORK: u8 = 1;
 const TIME_IMMEDIATE: u8 = 2;
@@ -45,6 +46,16 @@ pub struct DCkChangeDemand {
     /// Other values are rejected by this SC2-focused codec.
     pub change_of_security_class: u8,
     pub scks: Vec<SckChangeData>,
+    pub time: CkChangeTime,
+}
+
+/// D-CK CHANGE DEMAND advertising the version shared by all linked GCKs.
+/// TTR 001-11 requires this full 16-bit value to be broadcast periodically;
+/// SYSINFO carries only its two least-significant bits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DAllGcksChangeDemand {
+    pub acknowledgement_required: bool,
+    pub gck_version_number: u16,
     pub time: CkChangeTime,
 }
 
@@ -85,6 +96,43 @@ impl DCkChangeDemand {
         for sck in &self.scks {
             write_sck_change(sck, buffer)?;
         }
+        write_time(&self.time, buffer)
+    }
+}
+
+impl DAllGcksChangeDemand {
+    pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
+        let pdu_type = buffer.read_field(4, "pdu_type")?;
+        expect_pdu_type!(pdu_type, MmPduTypeDl::DCkChangeDemand)?;
+        let acknowledgement_required = buffer.read_field(1, "acknowledgement_flag")? != 0;
+        let change_of_security_class = buffer.read_field(2, "change_of_security_class")? as u8;
+        if change_of_security_class != 0 {
+            return Err(PduParseErr::InvalidValue {
+                field: "change_of_security_class",
+                value: u64::from(change_of_security_class),
+            });
+        }
+        let key_change_type = buffer.read_field(3, "key_change_type")? as u8;
+        if key_change_type != ALL_GCKS_KEY_CHANGE_TYPE {
+            return Err(PduParseErr::NotImplemented {
+                field: Some("key_change_type_non_all_gcks"),
+            });
+        }
+        let gck_version_number = buffer.read_field(16, "gck_version_number")? as u16;
+        let time = read_time(buffer)?;
+        Ok(Self {
+            acknowledgement_required,
+            gck_version_number,
+            time,
+        })
+    }
+
+    pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        buffer.write_bits(MmPduTypeDl::DCkChangeDemand.into_raw(), 4);
+        buffer.write_bits(self.acknowledgement_required as u64, 1);
+        buffer.write_bits(0, 2); // no change of security class
+        buffer.write_bits(u64::from(ALL_GCKS_KEY_CHANGE_TYPE), 3);
+        buffer.write_bits(u64::from(self.gck_version_number), 16);
         write_time(&self.time, buffer)
     }
 }
@@ -273,6 +321,7 @@ mod tests {
             change_of_security_class: 0,
             selected_scks: demand.scks,
         };
+        let mut buffer = BitBuffer::new_autoexpand(64);
         result.to_bitbuf(&mut buffer).expect("serialize result");
         buffer.seek(0);
         assert_eq!(UCkChangeResult::from_bitbuf(&mut buffer).expect("parse result"), result);
@@ -317,5 +366,33 @@ mod tests {
                 "0000000000001000"  // HN8
             )
         );
+    }
+
+    #[test]
+    fn all_gcks_current_demand_matches_ttr_001_11_table_1_bits() {
+        let demand = DAllGcksChangeDemand {
+            acknowledgement_required: false,
+            gck_version_number: 0x1234,
+            time: CkChangeTime::CurrentlyInUse,
+        };
+        let mut buffer = BitBuffer::new_autoexpand(32);
+        demand.to_bitbuf(&mut buffer).expect("serialize all-GCK advertisement");
+        assert_eq!(
+            buffer.to_bitstr(),
+            concat!(
+                "0010",             // D-CK CHANGE DEMAND
+                "0",                // no L3 acknowledgement
+                "00",               // no security-class change
+                "100",              // all GCKs/GCKXs
+                "0001001000110100", // full GCK-VN
+                "11"                // currently in use
+            )
+        );
+        buffer.seek(0);
+        assert_eq!(
+            DAllGcksChangeDemand::from_bitbuf(&mut buffer).expect("parse all-GCK advertisement"),
+            demand
+        );
+        assert_eq!(buffer.get_len_remaining(), 0);
     }
 }

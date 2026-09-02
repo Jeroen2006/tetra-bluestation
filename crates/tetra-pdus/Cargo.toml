@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+tetra-air-interface = { workspace = true }
 tetra-core = { workspace = true }
 tetra-saps = { workspace = true }
 tetra-config = { workspace = true }

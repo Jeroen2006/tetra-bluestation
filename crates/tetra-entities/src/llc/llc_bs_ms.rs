@@ -28,6 +28,11 @@ use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator
 // delivery path.
 const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 4;
 const ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS: u8 = 2;
+// Keep the final basic-link transaction alive for one complete TETRA frame
+// after N.252 is exhausted. An MS can only put its BL-ACK on air a few slots
+// after receiving the last fragmented MCCH retry; expiring at the retry timer
+// boundary made that valid ACK appear as an unrelated late response.
+const FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -129,7 +134,11 @@ impl Llc {
         tried_timeslots: &HashSet<u8>,
     ) -> Option<tetra_saps::tma::AssociatedChannel> {
         let mut state = config.state_write();
-        if state.subscribers.direct_response_window_active(issi, dltime) {
+        // Registration/authentication is a common-channel procedure. A stale
+        // call listener can remain in the CC routing table while the MS has
+        // already returned to MCCH for location updating, so never inherit a
+        // traffic route until D-LOCATION UPDATE ACCEPT is link-acknowledged.
+        if state.subscribers.is_registration_pending(issi) || state.subscribers.direct_response_window_active(issi, dltime) {
             return None;
         }
         state
@@ -152,12 +161,7 @@ impl Llc {
     /// LLC shall emit a combined BL-ADATA PDU. The ACK must belong to both the
     /// same SSI/protection context and the channel on which the MS is
     /// listening; an FN18 ACK must never be bundled into MCCH BL-DATA.
-    fn get_out_ack_seq_if_any(
-        &mut self,
-        addr: TetraAddress,
-        timeslot: u8,
-        aie_request: AieRequest,
-    ) -> Option<u8> {
+    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, timeslot: u8, aie_request: AieRequest) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
             if self.scheduled_out_acks[i].addr.ssi == addr.ssi
                 && self.scheduled_out_acks[i].ts == timeslot
@@ -223,7 +227,11 @@ impl Llc {
     fn process_incoming_ack(&mut self, addr: TetraAddress, nr: u8, aie_request: AieRequest) {
         // Get the expected ACK entry
         let Some(mut expected_ack) = self.take_expected_ack_for_ssi(addr.ssi) else {
-            tracing::warn!("received unexpected ACK for SSI {} N(R) {}", addr.ssi, nr);
+            // A repeated BL-ACK after the first copy completed the transaction
+            // is harmless and common when the MS heard a repeated downlink.
+            // Keep sequence mismatches against a live transaction at WARN,
+            // but do not flood operational logs for this late duplicate.
+            tracing::debug!("received late/duplicate ACK for SSI {} N(R) {}", addr.ssi, nr);
             return;
         };
 
@@ -403,6 +411,10 @@ impl Llc {
         }
     }
 
+    fn final_ack_grace_elapsed(age: i32, retry_timer: u32) -> bool {
+        age >= 0 && (age as u32) >= retry_timer.saturating_add(FINAL_ACK_GRACE_TIMESLOTS)
+    }
+
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
@@ -423,12 +435,7 @@ impl Llc {
         // table, so in-call D-CK CHANGE/OTAR first went to MCCH and sat behind
         // a missing BL-ACK for one or more multiframes.
         if prim.associated_channel.is_none() {
-            prim.associated_channel = Self::delivery_route(
-                &self.config,
-                prim.main_address.ssi,
-                self.dltime,
-                &HashSet::new(),
-            );
+            prim.associated_channel = Self::delivery_route(&self.config, prim.main_address.ssi, self.dltime, &HashSet::new());
         }
 
         // If an ack still needs to be sent, get the relevant expected sequence number
@@ -440,13 +447,8 @@ impl Llc {
                 AieScope::MacResource,
             )
         });
-        let delivery_timeslot = prim
-            .associated_channel
-            .as_ref()
-            .map(|channel| channel.timeslot)
-            .unwrap_or(1);
-        let out_ack_n =
-            self.get_out_ack_seq_if_any(prim.main_address, delivery_timeslot, outgoing_aie_request);
+        let delivery_timeslot = prim.associated_channel.as_ref().map(|channel| channel.timeslot).unwrap_or(1);
+        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, delivery_timeslot, outgoing_aie_request);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -862,7 +864,7 @@ impl Llc {
 
                     Self::submit_for_acknowledged_transmission(&self.config, queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
                     had_activity = true;
-                } else {
+                } else if Self::final_ack_grace_elapsed(age, retry_timer) {
                     // Exhausted retransmissions, flag for discard
                     removals.get_or_insert(Vec::new()).push(ack.addr.ssi);
                 }
@@ -1134,8 +1136,7 @@ mod tests {
             }],
         );
 
-        let route = Llc::delivery_route(&config, issi, TdmaTime::default(), &HashSet::new())
-            .expect("active call route");
+        let route = Llc::delivery_route(&config, issi, TdmaTime::default(), &HashSet::new()).expect("active call route");
         assert_eq!(route.call_id, 7);
         assert_eq!(route.timeslot, 2);
         assert_eq!(route.usage, 10);
@@ -1160,5 +1161,40 @@ mod tests {
         }
 
         assert!(Llc::delivery_route(&config, issi, now, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn registration_delivery_stays_on_mcch_after_direct_response_window() {
+        let config = test_config();
+        let issi = 0x12_34_56;
+        let now = TdmaTime::default();
+        {
+            let mut state = config.state_write();
+            state.subscribers.set_registration_delivery_pending(issi, true);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 7,
+                    timeslot: 2,
+                    usage: 10,
+                }],
+            );
+        }
+
+        assert!(Llc::delivery_route(&config, issi, now.add_timeslots(500), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn final_ack_gets_one_frame_of_grace_after_retry_exhaustion() {
+        let retry_timer = T251_SENDER_RETRY_TIMER;
+        assert!(!Llc::final_ack_grace_elapsed(retry_timer as i32, retry_timer));
+        assert!(!Llc::final_ack_grace_elapsed(
+            (retry_timer + FINAL_ACK_GRACE_TIMESLOTS - 1) as i32,
+            retry_timer
+        ));
+        assert!(Llc::final_ack_grace_elapsed(
+            (retry_timer + FINAL_ACK_GRACE_TIMESLOTS) as i32,
+            retry_timer
+        ));
     }
 }

@@ -9,6 +9,7 @@ use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 use crate::mm::fields::energy_saving_information::EnergySavingInformation;
 use crate::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
+use crate::mm::fields::group_identity_security_related_information::GroupIdentitySecurityRelatedInformation;
 
 /// Representation of the D-LOCATION UPDATE ACCEPT PDU (Clause 16.9.2.7).
 /// The infrastructure sends this message to the MS to indicate that updating in the network has been completed.
@@ -41,7 +42,7 @@ pub struct DLocationUpdateAccept {
     /// Type3, See ETSI EN 300 392-7 [8],
     pub authentication_downlink: Option<Type3FieldGeneric>,
     /// Type4, See ETSI EN 300 392-7 [8],
-    pub group_identity_security_related_information: Option<Type4FieldGeneric>,
+    pub group_identity_security_related_information: Option<Vec<GroupIdentitySecurityRelatedInformation>>,
     /// Type3, Cell type control
     pub cell_type_control: Option<Type3FieldGeneric>,
     /// Type3, Proprietary
@@ -104,8 +105,12 @@ impl DLocationUpdateAccept {
         let authentication_downlink = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::AuthenticationDownlink)?;
 
         // Type4
-        let group_identity_security_related_information =
-            typed::parse_type4_generic(obit, buffer, MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation)?;
+        let group_identity_security_related_information = typed::parse_type4_struct(
+            obit,
+            buffer,
+            MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation,
+            GroupIdentitySecurityRelatedInformation::from_bitbuf,
+        )?;
 
         // Type3
         let cell_type_control = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::CellTypeControl)?;
@@ -210,11 +215,12 @@ impl DLocationUpdateAccept {
         )?;
 
         // Type4
-        typed::write_type4_todo(
+        typed::write_type4_struct(
             obit,
             buffer,
             &self.group_identity_security_related_information,
             MmType34ElemIdDl::GroupIdentitySecurityRelatedInformation,
+            GroupIdentitySecurityRelatedInformation::to_bitbuf,
         )?;
 
         // Type3

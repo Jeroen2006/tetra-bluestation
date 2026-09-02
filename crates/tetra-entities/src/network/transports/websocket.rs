@@ -562,13 +562,6 @@ impl NetworkTransport for WebSocketTransport {
             self.last_ping_sent_at = Some(now);
         }
 
-        // Check heartbeat timeout
-        if now.duration_since(self.last_activity_at) >= self.config.heartbeat_timeout {
-            tracing::warn!("WebSocketTransport: heartbeat timeout, disconnecting");
-            self.ws = None;
-            return vec![];
-        }
-
         let mut messages = Vec::new();
         let source = NetworkAddress::Custom {
             scheme: if self.config.use_tls { "wss".to_string() } else { "ws".to_string() },
@@ -634,6 +627,15 @@ impl NetworkTransport for WebSocketTransport {
                     break;
                 }
             }
+        }
+
+        // Read first, then decide whether the peer timed out. If this worker
+        // was briefly delayed by media traffic, a valid Pong may already be
+        // buffered in the socket; checking before read caused a false LST
+        // transition exactly when the worker resumed after 30 seconds.
+        if self.ws.is_some() && Instant::now().duration_since(self.last_activity_at) >= self.config.heartbeat_timeout {
+            tracing::warn!("WebSocketTransport: heartbeat timeout, disconnecting");
+            self.ws = None;
         }
 
         messages

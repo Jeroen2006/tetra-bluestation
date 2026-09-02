@@ -1,14 +1,13 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use tetra_core::{Direction, TdmaTime, TimeslotAllocator, TimeslotOwner, frames, multiframes};
+use tetra_core::{Direction, TdmaTime, TimeslotAllocator, TimeslotOwner, multiframes};
 use tetra_pdus::cmce::structs::cmce_circuit::CmceCircuit;
 use tetra_saps::{
     control::enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType},
     lcmc::CallId,
 };
 
-const D_SETUP_REPEATS: i32 = 1;
-const LATE_ENTRY_INTERVAL_TIMESLOTS: i32 = multiframes!(5);
+const LATE_ENTRY_INTERVAL_TIMESLOTS: i32 = multiframes!(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitErr {
@@ -33,6 +32,11 @@ pub struct CircuitMgr {
     /// Data blocks queued to be transmitted, per timeslot
     pub tx_data: [VecDeque<Vec<u8>>; 4],
 
+    /// Next due late-entry D-SETUP per group circuit. This is deliberately
+    /// separate from `CmceCircuit::ts_created`, whose lifetime role must not
+    /// change when a new speaker takes the floor.
+    next_late_entry_d_setups: HashMap<CallId, TdmaTime>,
+
     /// 14-bit call identifier. Zero value is reserved.
     pub next_call_identifier: u16,
     /// 5-bit usage number. Values 0-3 are reserved.
@@ -46,6 +50,7 @@ impl CircuitMgr {
             dl: [None, None, None, None],
             ul_only: [None, None, None, None],
             tx_data: [VecDeque::new(), VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            next_late_entry_d_setups: HashMap::new(),
             next_call_identifier: 4,
             next_usage_number: 4,
         }
@@ -119,6 +124,14 @@ impl CircuitMgr {
             self.next_usage_number = 4; // Wrap around, skip reserved values
         }
         usage
+    }
+
+    /// Start (or restart) the one-second late-entry cadence after an on-air
+    /// D-SETUP. This is called for the initial group setup and for a successful
+    /// speaker-change D-SETUP.
+    pub fn schedule_next_late_entry_d_setup(&mut self, call_id: CallId) {
+        self.next_late_entry_d_setups
+            .insert(call_id, self.dltime.add_timeslots(LATE_ENTRY_INTERVAL_TIMESLOTS));
     }
 
     /// Finds a free timeslot for the given direction (Ul, Dl or Both)
@@ -256,6 +269,9 @@ impl CircuitMgr {
                     tracing::warn!("Closing Dl+Ul circuit on ts {} while Ul-only circuit exists", ts);
                 }
                 let circuit = self.dl[ts as usize - 1].take();
+                if let Some(circuit) = &circuit {
+                    self.next_late_entry_d_setups.remove(&circuit.call_id);
+                }
                 circuit.ok_or(CircuitErr::CircuitNotActive)
             }
             Direction::Ul => {
@@ -360,48 +376,94 @@ impl CircuitMgr {
             // First, close any expired circuits
             tasks = self.close_expired_circuits(tasks, protected_call_ids);
 
-            // Next, go through channels, see if D-SETUPs need to be sent
-            // Late entry: resend D-SETUP every 5 seconds
-            for circuit in self.dl.iter() {
-                if let Some(circuit) = circuit {
-                    // P2P setup is individually addressed by CMCE before
-                    // traffic resources are reserved.  It has no multicast
-                    // D-SETUP cache and must not use the group late-entry
-                    // scheduler.
-                    if circuit.comm_type == CommunicationType::P2p {
-                        continue;
-                    }
-                    let age = circuit.ts_created.age(dltime);
-
-                    // Send D-SETUP for the initial frame + 1 backup frame after circuit creation.
-                    // Matches ETSI Annex D Figure D.2: 1 initial + 1 back-up on MCCH.
-                    if age < frames!(D_SETUP_REPEATS) {
-                        tracing::debug!(
-                            "CircuitMgr: Sending initial D-SETUP backup for circuit {:?} (age {} frames)",
-                            circuit,
-                            age
-                        );
-                        tasks
-                            .get_or_insert_with(Vec::new)
-                            .push(CircuitMgrCmd::SendDSetup(circuit.call_id, circuit.usage, circuit.ts));
-                    }
-                    // Late entry: resend every 5 seconds.
-                    // Compare in frames (age/4) since tick_start only fires on t==1
-                    // but ts_created may have any timeslot value.
-                    else if (age / 4) % (LATE_ENTRY_INTERVAL_TIMESLOTS / 4) == 0 {
-                        tracing::debug!(
-                            "CircuitMgr: Sending late-entry D-SETUP for circuit {:?} (age {} frames)",
-                            circuit,
-                            age
-                        );
-                        tasks
-                            .get_or_insert_with(Vec::new)
-                            .push(CircuitMgrCmd::SendDSetup(circuit.call_id, circuit.usage, circuit.ts));
-                    }
+            // Next, go through channels and send due late-entry D-SETUPs.
+            let circuits: Vec<_> = self
+                .dl
+                .iter()
+                .filter_map(|circuit| circuit.as_ref())
+                // release_call removes the active call and its cached
+                // D-SETUP before the stolen D-RELEASE has drained.  The RF
+                // circuit deliberately remains alive for that short window,
+                // but it is no longer eligible for group late entry.
+                .filter(|circuit| protected_call_ids.contains(&circuit.call_id))
+                .map(|circuit| (circuit.call_id, circuit.usage, circuit.ts, circuit.ts_created, circuit.comm_type))
+                .collect();
+            for (call_id, usage, ts, ts_created, comm_type) in circuits {
+                // P2P setup is individually addressed by CMCE before traffic
+                // resources are reserved. It has no multicast D-SETUP cache
+                // and must not use the group late-entry scheduler.
+                if comm_type == CommunicationType::P2p {
+                    continue;
+                }
+                // Late entry: the first re-send is one second after the
+                // initial D-SETUP, then every second. A circuit that was
+                // created without a cached setup still gets a safe default
+                // schedule instead of an immediate backup frame.
+                let due_at = self
+                    .next_late_entry_d_setups
+                    .entry(call_id)
+                    .or_insert_with(|| ts_created.add_timeslots(LATE_ENTRY_INTERVAL_TIMESLOTS));
+                if due_at.age(dltime) >= 0 {
+                    tracing::debug!(
+                        "CircuitMgr: Sending late-entry D-SETUP for circuit {:?} (age {} frames)",
+                        call_id,
+                        ts_created.age(dltime) / 4
+                    );
+                    tasks
+                        .get_or_insert_with(Vec::new)
+                        .push(CircuitMgrCmd::SendDSetup(call_id, usage, ts));
+                    *due_at = dltime.add_timeslots(LATE_ENTRY_INTERVAL_TIMESLOTS);
                 }
             }
             return tasks;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group_circuit(call_id: CallId, created: TdmaTime) -> CmceCircuit {
+        CmceCircuit {
+            ts_created: created,
+            direction: Direction::Both,
+            ts: 2,
+            call_id,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            comm_type: CommunicationType::P2Mp,
+            simplex_duplex: false,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        }
+    }
+
+    #[test]
+    fn released_but_draining_circuit_does_not_schedule_late_entry() {
+        let created = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let due = created.add_timeslots(LATE_ENTRY_INTERVAL_TIMESLOTS);
+        let mut manager = CircuitMgr::new();
+        manager.dl[1] = Some(group_circuit(7, created));
+
+        let tasks = manager.tick_start(due, &HashSet::new());
+
+        assert!(tasks.is_none());
+        assert!(manager.dl[1].is_some(), "the D-RELEASE drain still owns the RF circuit");
+    }
+
+    #[test]
+    fn active_group_circuit_keeps_late_entry_schedule() {
+        let created = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let due = created.add_timeslots(LATE_ENTRY_INTERVAL_TIMESLOTS);
+        let mut manager = CircuitMgr::new();
+        manager.dl[1] = Some(group_circuit(7, created));
+
+        let tasks = manager
+            .tick_start(due, &HashSet::from([7]))
+            .expect("active call must receive a late-entry task");
+
+        assert!(matches!(tasks.as_slice(), [CircuitMgrCmd::SendDSetup(7, 4, 2)]));
     }
 }

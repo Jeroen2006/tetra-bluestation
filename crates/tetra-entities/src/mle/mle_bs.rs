@@ -105,6 +105,12 @@ impl MleBs {
         }
 
         match address.ssi_type {
+            SsiType::Issi if state.aie.sc3.is_some() => {
+                Some(AieRequest::sc3(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
+            }
+            SsiType::Gssi if state.aie.sc3.is_some() => {
+                Some(AieRequest::sc3(AieSubject::Group { gssi: address.ssi }, AieScope::MacResource))
+            }
             // In an SC2-only cell CMCE has no permitted clear fallback for a
             // registered ISSI.  Keep the request encrypted even while the
             // terminal binding is not ready: the provider then rejects it at
@@ -128,6 +134,12 @@ impl MleBs {
     /// clear merely because MLE crosses an asynchronous SAP boundary.
     fn mle_reply_aie(&self, address: TetraAddress, incoming_aie: Option<AieRequest>) -> Option<AieRequest> {
         let state = self.config.state_read();
+        if state.aie.enabled
+            && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(address.ssi))
+            && matches!(incoming_aie, Some(AieRequest::Sc3 { .. }))
+        {
+            return Some(AieRequest::sc3(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource));
+        }
         if state.aie.enabled && state.aie_sessions.terminal(address.ssi).is_some() && matches!(incoming_aie, Some(AieRequest::Sc2 { .. })) {
             Some(AieRequest::sc2(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
         } else {

@@ -1,6 +1,6 @@
+pub mod ck_change;
 pub mod d_attach_detach_group_identity;
 pub mod d_attach_detach_group_identity_acknowledgement;
-pub mod ck_change;
 pub mod d_authentication_demand;
 pub mod d_authentication_response;
 pub mod d_authentication_result;

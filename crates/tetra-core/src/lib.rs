@@ -33,6 +33,7 @@ pub use pdu_parse_error::PduParseErr;
 pub use phy_types::*;
 pub use sap_fields::*;
 pub use tdma_time::TdmaTime;
+pub use tetra_air_interface::{expect_failed, expect_pdu_type, expect_value, let_field};
 pub use tetra_common::*;
 pub use timeslot_alloc::*;
 pub use tx_receipt::*;

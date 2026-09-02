@@ -25,6 +25,23 @@ pub struct Sc2KeyIdentifier {
     pub sck_vn: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sc3KeyType {
+    Dck,
+    Cck,
+    /// Modified Group Cipher Key derived from the referenced GCK and the
+    /// serving LA's CCK. `context_id` encodes GCKN/GCK-VN, never key bytes.
+    Gck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sc3KeyIdentifier {
+    pub algorithm: AieAlgorithm,
+    pub cck_id: u16,
+    pub context_id: [u8; 16],
+    pub key_type: Sc3KeyType,
+}
+
 impl Sc2KeyIdentifier {
     pub const fn new(algorithm: AieAlgorithm, sckn: u8, sck_vn: u16) -> Option<Self> {
         if sckn > 31 {
@@ -83,8 +100,22 @@ impl AieCipherRegion {
 /// binds it only when the actual transmit/receive slot is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AieRequest {
-    Clear { subject: AieSubject, scope: AieScope },
-    Sc2 { subject: AieSubject, scope: AieScope },
+    Clear {
+        subject: AieSubject,
+        scope: AieScope,
+    },
+    Sc2 {
+        subject: AieSubject,
+        scope: AieScope,
+    },
+    Sc3 {
+        subject: AieSubject,
+        scope: AieScope,
+        /// Exact key identity proven by a successfully deciphered uplink.
+        /// Downlink policy requests leave this empty and resolve the current
+        /// key at the exact air time.
+        key: Option<Sc3KeyIdentifier>,
+    },
 }
 
 impl AieRequest {
@@ -95,6 +126,16 @@ impl AieRequest {
     pub const fn sc2(subject: AieSubject, scope: AieScope) -> Self {
         Self::Sc2 { subject, scope }
     }
+    pub const fn sc3(subject: AieSubject, scope: AieScope) -> Self {
+        Self::Sc3 { subject, scope, key: None }
+    }
+    pub const fn sc3_with_key(subject: AieSubject, scope: AieScope, key: Sc3KeyIdentifier) -> Self {
+        Self::Sc3 {
+            subject,
+            scope,
+            key: Some(key),
+        }
+    }
 
     /// Retain the policy/subject while selecting the concrete MAC region that
     /// is about to be sent.  UMAC uses this when a MAC-RESOURCE turns into a
@@ -103,11 +144,12 @@ impl AieRequest {
         match self {
             Self::Clear { subject, .. } => Self::clear(subject, scope),
             Self::Sc2 { subject, .. } => Self::sc2(subject, scope),
+            Self::Sc3 { subject, key, .. } => Self::Sc3 { subject, scope, key },
         }
     }
 
     pub const fn is_encrypted(self) -> bool {
-        matches!(self, Self::Sc2 { .. })
+        matches!(self, Self::Sc2 { .. } | Self::Sc3 { .. })
     }
 
     /// Returns whether two requests require the same on-air protection.  The
@@ -121,7 +163,26 @@ impl AieRequest {
             // same: neither side uses a cipher context.
             (Self::Clear { .. }, Self::Clear { .. }) => true,
             (Self::Sc2 { subject: left, .. }, Self::Sc2 { subject: right, .. }) => left == right,
+            (
+                Self::Sc3 {
+                    subject: left,
+                    key: left_key,
+                    ..
+                },
+                Self::Sc3 {
+                    subject: right,
+                    key: right_key,
+                    ..
+                },
+            ) => left == right && (left_key.is_none() || right_key.is_none() || left_key == right_key),
             _ => false,
+        }
+    }
+
+    pub const fn sc3_key(self) -> Option<Sc3KeyIdentifier> {
+        match self {
+            Self::Sc3 { key, .. } => key,
+            _ => None,
         }
     }
 }
@@ -142,6 +203,13 @@ pub enum AieContext {
         time: TdmaTime,
         scope: AieScope,
         key: Sc2KeyIdentifier,
+    },
+    Sc3 {
+        subject: AieSubject,
+        direction: AieDirection,
+        time: TdmaTime,
+        scope: AieScope,
+        key: Sc3KeyIdentifier,
     },
 }
 
@@ -167,14 +235,23 @@ impl AieContext {
             key,
         }
     }
+    pub const fn sc3(subject: AieSubject, direction: AieDirection, time: TdmaTime, scope: AieScope, key: Sc3KeyIdentifier) -> Self {
+        Self::Sc3 {
+            subject,
+            direction,
+            time,
+            scope,
+            key,
+        }
+    }
 
     pub const fn is_encrypted(self) -> bool {
-        matches!(self, Self::Sc2 { .. })
+        matches!(self, Self::Sc2 { .. } | Self::Sc3 { .. })
     }
 
     pub const fn time(self) -> TdmaTime {
         match self {
-            Self::Clear { time, .. } | Self::Sc2 { time, .. } => time,
+            Self::Clear { time, .. } | Self::Sc2 { time, .. } | Self::Sc3 { time, .. } => time,
         }
     }
 }

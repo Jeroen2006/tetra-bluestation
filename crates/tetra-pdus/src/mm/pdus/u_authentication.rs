@@ -1,6 +1,6 @@
 use crate::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
 use crate::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
-use tetra_core::{expect_pdu_type, pdu_parse_error::PduParseErr, typed_pdu_fields::typed, BitBuffer};
+use tetra_core::{BitBuffer, expect_pdu_type, pdu_parse_error::PduParseErr, typed_pdu_fields::typed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UAuthentication {

@@ -1,8 +1,8 @@
-use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, SharedConfig, StackMode};
+use tetra_config::bluestation::{BsAieKeyProvider, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
-    AieContext, AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, Sc2KeyIdentifier, TdmaTime,
-    TrainingSequence,
+    AieContext, AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, Sc2KeyIdentifier,
+    Sc3KeyIdentifier, Sc3KeyType, TdmaTime, TrainingSequence,
 };
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvCrcInd, TmvUnitdataInd};
@@ -17,6 +17,25 @@ pub struct LmacTrafficChan {
     pub is_active: bool,
     pub logical_channel: LogicalChannel,
     // TODO FIXME: extend with all required fields
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficKeyIdentity {
+    Sc2(Sc2KeyIdentifier),
+    Sc3(Sc3KeyIdentifier),
+}
+
+impl TrafficKeyIdentity {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Sc2(_) => "SCK",
+            Self::Sc3(key) => match key.key_type {
+                Sc3KeyType::Dck => "DCK",
+                Sc3KeyType::Cck => "CCK",
+                Sc3KeyType::Gck => "GCK",
+            },
+        }
+    }
 }
 
 impl Default for LmacTrafficChan {
@@ -51,9 +70,9 @@ pub struct LmacBs {
     /// per-timeslot policy when call control activates the circuit.
     downlink_traffic_aie: [Option<AieRequest>; 4],
     uplink_traffic_aie: [Option<AieRequest>; 4],
-    /// Last SC2 identity actually used for TCH/S per physical timeslot. This
+    /// Last key identity actually used for TCH/S per physical timeslot. This
     /// contains no key material and logs only a real identity transition.
-    last_downlink_traffic_key: [Option<Sc2KeyIdentifier>; 4],
+    last_downlink_traffic_key: [Option<TrafficKeyIdentity>; 4],
 
     /// Traffic channels and associated state
     // ul_circuits: [Option<LmacTrafficChan>; 4],
@@ -107,22 +126,53 @@ impl LmacBs {
     }
 
     fn observe_downlink_traffic_key(&mut self, time: TdmaTime, context: AieContext) {
-        let AieContext::Sc2 { key, .. } = context else {
-            return;
+        let identity = match context {
+            AieContext::Sc2 { key, .. } => TrafficKeyIdentity::Sc2(key),
+            AieContext::Sc3 { key, .. } => TrafficKeyIdentity::Sc3(key),
+            AieContext::Clear { .. } => return,
         };
         let selected = &mut self.last_downlink_traffic_key[time.t as usize - 1];
-        if *selected != Some(key) {
-            tracing::info!(
+        if *selected == Some(identity) {
+            return;
+        }
+        let previous_kind = selected.as_ref().copied().map(TrafficKeyIdentity::kind);
+        match identity {
+            TrafficKeyIdentity::Sc2(key) => tracing::info!(
                 dltime = %time,
                 timeslot = time.t,
+                key_type = identity.kind(),
                 sckn = key.sckn,
                 sck_vn = key.sck_vn,
                 algorithm = ?key.algorithm,
-                previous = ?*selected,
-                "downlink TCH/S SC2 identity changed at air slot"
-            );
-            *selected = Some(key);
+                ?previous_kind,
+                "downlink TCH/S key identity changed at air slot"
+            ),
+            TrafficKeyIdentity::Sc3(key) if key.key_type == Sc3KeyType::Gck => {
+                let gckn = u16::from_be_bytes([key.context_id[12], key.context_id[13]]);
+                let gck_vn = u16::from_be_bytes([key.context_id[14], key.context_id[15]]);
+                tracing::info!(
+                    dltime = %time,
+                    timeslot = time.t,
+                    key_type = identity.kind(),
+                    gckn,
+                    gck_vn,
+                    cck_id = key.cck_id,
+                    algorithm = ?key.algorithm,
+                    ?previous_kind,
+                    "downlink TCH/S key identity changed at air slot"
+                );
+            }
+            TrafficKeyIdentity::Sc3(key) => tracing::info!(
+                dltime = %time,
+                timeslot = time.t,
+                key_type = identity.kind(),
+                cck_id = key.cck_id,
+                algorithm = ?key.algorithm,
+                ?previous_kind,
+                "downlink TCH/S key identity changed at air slot"
+            ),
         }
+        *selected = Some(identity);
     }
 
     // fn determine_phy_chan_ul(&self) -> PhysicalChannel {

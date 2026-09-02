@@ -73,7 +73,14 @@ impl SsBsSubentity {
             self.deferred_until_registered.insert(job_id, deferred_message);
             return;
         }
-        let Some((ss_pdu, ss_pdu_bits)) = encode_dgna(action, gssi, name.as_deref()) else {
+        let gck_select_number = gssi.and_then(|gssi| {
+            self.config.state_read().aie.sc3.as_ref().and_then(|sc3| {
+                sc3.linked_gck_crypto_periods()
+                    .then(|| sc3.gckn_for_gssi(gssi).map(u64::from))
+                    .flatten()
+            })
+        });
+        let Some((ss_pdu, ss_pdu_bits)) = encode_dgna(action, gssi, name.as_deref(), gck_select_number) else {
             self.send_result(job_id, issi, action, false, 0, Vec::new());
             return;
         };
@@ -288,7 +295,7 @@ struct DecodedDgna {
     sequence: Option<u8>,
 }
 
-fn encode_dgna(action: u8, gssi: Option<u32>, name: Option<&str>) -> Option<(Vec<u8>, u16)> {
+fn encode_dgna(action: u8, gssi: Option<u32>, name: Option<&str>, gck_select_number: Option<u64>) -> Option<(Vec<u8>, u16)> {
     let mut buffer = BitBuffer::new_autoexpand(256);
     buffer.write_bits(SS_DGNA, 6);
     match action {
@@ -302,12 +309,13 @@ fn encode_dgna(action: u8, gssi: Option<u32>, name: Option<&str>) -> Option<(Vec
             buffer.write_bits(1, 5); // Number of groups
             buffer.write_bits(gssi as u64, 24);
             buffer.write_bits(0, 1); // no group extension
-            // DGNA-distributed groups must be valid layer-2 group addresses
-            // immediately.  ETSI TS 100 392-12-22 table 51 defines `000` as
-            // "attached permanently".  Table 45 in the same specification
-            // requires Class of usage for attachment modes `000` through
-            // `011`; Class 1 is the default/normal usage class.
-            buffer.write_bits(0b000, 3); // attached permanently
+            // Attach the newly assigned group immediately as a normal group.
+            // TTR 001-03 table 14 prescribes the exact pairing `001` + class
+            // `000` for this case.  Mode `000` is the permanently attached,
+            // always-scanned profile from table 13 and requires class `111`;
+            // combining it with class `000` makes interoperable terminals
+            // silently discard the complete ASSIGN PDU.
+            buffer.write_bits(0b001, 3); // attached; re-attach at next ITSI attach
             buffer.write_bit(1); // group-assignment O-bit: class of usage present
             buffer.write_bit(1); // class of usage present
             buffer.write_bits(0b000, 3); // class of usage 1
@@ -319,7 +327,19 @@ fn encode_dgna(action: u8, gssi: Option<u32>, name: Option<&str>) -> Option<(Vec
                     buffer.write_bits(u64::from(byte), 8);
                 }
             }
-            buffer.write_bit(0); // security information absent
+            buffer.write_bit(u8::from(gck_select_number.is_some()));
+            if let Some(gck_select_number) = gck_select_number {
+                // EN 300 392-12-22 table 59 encodes this length as N - 1:
+                // 000000 means one bit and 111111 means 64 bits. TTR 001-11
+                // tables 12/13 define a 19-bit payload here, so the on-air
+                // value must be 18. Writing 19 makes the MS consume the next
+                // Type-2 P-bit as a twentieth security bit and shifts every
+                // remaining field, causing the complete ASSIGN to be ignored.
+                buffer.write_bits(19 - 1, 6);
+                buffer.write_bit(1);
+                buffer.write_bits(gck_select_number, 17);
+                buffer.write_bit(0);
+            }
             buffer.write_bit(0); // additional group information absent
             buffer.write_bit(0); // V-GSSI absent
             buffer.write_bit(1); // acknowledgement requested
@@ -474,4 +494,96 @@ fn decode_interrogate_ack(buffer: &mut BitBuffer, bits: u16) -> Option<DecodedDg
         complete,
         sequence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sc3g_assignment_encodes_security_length_before_gck_association() {
+        let gssi = 1301;
+        let gck_select_number = 2;
+        let (raw, bits) = encode_dgna(ACTION_ASSIGN, Some(gssi), None, Some(gck_select_number)).expect("encode DGNA assignment");
+        assert_eq!(bits, 80);
+
+        let mut encoded = BitBuffer::from_vec(raw);
+        assert_eq!(encoded.read_bits(6), Some(SS_DGNA));
+        assert_eq!(encoded.read_bits(5), Some(ASSIGN));
+        assert_eq!(encoded.read_bits(5), Some(1));
+        assert_eq!(encoded.read_bits(24), Some(gssi as u64));
+        assert_eq!(encoded.read_bits(1), Some(0)); // group extension
+        assert_eq!(encoded.read_bits(3), Some(0b001)); // attached normal group
+        assert_eq!(encoded.read_bits(1), Some(1)); // optional fields follow
+        assert_eq!(encoded.read_bits(1), Some(1)); // class of usage present
+        assert_eq!(encoded.read_bits(3), Some(0));
+        assert_eq!(encoded.read_bits(1), Some(0)); // mnemonic absent
+        assert_eq!(encoded.read_bits(1), Some(1)); // security length present
+        assert_eq!(encoded.read_bits(6), Some(18)); // 19 payload bits, encoded N - 1
+        assert_eq!(encoded.read_bits(1), Some(1)); // GCK association
+        assert_eq!(encoded.read_bits(17), Some(gck_select_number));
+        assert_eq!(encoded.read_bits(1), Some(0)); // SCK association absent
+        assert_eq!(encoded.read_bits(1), Some(0)); // additional info absent
+        assert_eq!(encoded.read_bits(1), Some(0)); // V-GSSI absent
+        assert_eq!(encoded.read_bits(1), Some(1)); // ACK requested
+        assert_eq!(encoded.read_bits(1), Some(0)); // no PDU optionals
+        assert_eq!(encoded.get_pos(), usize::from(bits));
+    }
+
+    #[test]
+    fn cck_assignment_omits_unsupported_gck_association() {
+        let (raw, bits) = encode_dgna(ACTION_ASSIGN, Some(1302), None, None).expect("encode CCK DGNA assignment");
+        assert_eq!(bits, 55);
+
+        let mut encoded = BitBuffer::from_vec(raw);
+        assert_eq!(encoded.read_bits(6), Some(SS_DGNA));
+        assert_eq!(encoded.read_bits(5), Some(ASSIGN));
+        assert_eq!(encoded.read_bits(5), Some(1));
+        assert_eq!(encoded.read_bits(24), Some(1302));
+        assert_eq!(encoded.read_bits(1), Some(0)); // group extension
+        assert_eq!(encoded.read_bits(3), Some(0b001));
+        assert_eq!(encoded.read_bits(1), Some(1)); // optional fields follow
+        assert_eq!(encoded.read_bits(1), Some(1)); // class of usage present
+        assert_eq!(encoded.read_bits(3), Some(0));
+        assert_eq!(encoded.read_bits(1), Some(0)); // mnemonic absent
+        assert_eq!(encoded.read_bits(1), Some(0)); // no GCK association: use CCK
+        assert_eq!(encoded.read_bits(1), Some(0)); // additional info absent
+        assert_eq!(encoded.read_bits(1), Some(0)); // V-GSSI absent
+        assert_eq!(encoded.read_bits(1), Some(1)); // ACK requested
+        assert_eq!(encoded.read_bits(1), Some(0)); // no PDU optionals
+        assert_eq!(encoded.get_pos(), usize::from(bits));
+    }
+
+    #[test]
+    fn live_named_sc3g_assignment_keeps_all_following_fields_aligned() {
+        let (raw, bits) = encode_dgna(ACTION_ASSIGN, Some(1301), Some("Intern 1"), Some(3)).expect("encode named SC3G assignment");
+        assert_eq!(bits, 159);
+
+        let mut encoded = BitBuffer::from_vec(raw);
+        assert_eq!(encoded.read_bits(6), Some(SS_DGNA));
+        assert_eq!(encoded.read_bits(5), Some(ASSIGN));
+        assert_eq!(encoded.read_bits(5), Some(1));
+        assert_eq!(encoded.read_bits(24), Some(1301));
+        assert_eq!(encoded.read_bits(1), Some(0));
+        assert_eq!(encoded.read_bits(3), Some(0b001));
+        assert_eq!(encoded.read_bits(1), Some(1));
+        assert_eq!(encoded.read_bits(1), Some(1));
+        assert_eq!(encoded.read_bits(3), Some(0));
+        assert_eq!(encoded.read_bits(1), Some(1)); // mnemonic present
+        assert_eq!(encoded.read_bits(7), Some(1));
+        assert_eq!(encoded.read_bits(8), Some(64));
+        for byte in b"Intern 1" {
+            assert_eq!(encoded.read_bits(8), Some(u64::from(*byte)));
+        }
+        assert_eq!(encoded.read_bits(1), Some(1)); // security length present
+        assert_eq!(encoded.read_bits(6), Some(18)); // 19-bit payload
+        assert_eq!(encoded.read_bits(1), Some(1));
+        assert_eq!(encoded.read_bits(17), Some(3));
+        assert_eq!(encoded.read_bits(1), Some(0));
+        assert_eq!(encoded.read_bits(1), Some(0)); // additional info absent
+        assert_eq!(encoded.read_bits(1), Some(0)); // V-GSSI absent
+        assert_eq!(encoded.read_bits(1), Some(1)); // ACK requested
+        assert_eq!(encoded.read_bits(1), Some(0)); // no PDU optionals
+        assert_eq!(encoded.get_pos(), usize::from(bits));
+    }
 }

@@ -1,4 +1,4 @@
-use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig};
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie};
 use tetra_core::{
     AieCipherRegion, AieContext, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, PhysicalChannel,
     SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
@@ -331,6 +331,7 @@ impl BsChannelScheduler {
     /// `sc2` field itself is promoted.
     pub fn set_aie_config_for_air_time(&mut self, aie: &RuntimeAieConfig, air_time: TdmaTime) {
         let sc2 = aie.downlink_sc2_identity_at(air_time);
+        let sc3 = aie.enabled.then(|| aie.sc3.as_ref()).flatten();
         let Some(ext_services) = self.precomps.mac_sysinfo2.ext_services.as_mut() else {
             tracing::warn!("cannot update AIE policy: Extended Services is not present");
             return;
@@ -338,14 +339,25 @@ impl BsChannelScheduler {
         let previous = (
             ext_services.class1_supported,
             ext_services.class2_supported,
+            ext_services.class3_supported,
             ext_services.sck_n,
+            ext_services.dck_retrieval_during_cell_select,
+            ext_services.dck_retrieval_during_cell_reselect,
+            ext_services.linked_gck_crypto_periods,
+            ext_services.short_gck_vn,
+            ext_services.gck_supported,
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn,
             self.precomps.mle_sysinfo.bs_service_details.aie_service,
         );
         ext_services.class1_supported = aie.enabled && aie.sc1_allowed;
         ext_services.class2_supported = sc2.is_some();
-        ext_services.class3_supported = false;
+        ext_services.class3_supported = sc3.is_some();
         ext_services.sck_n = sc2.map(|key| key.sckn);
+        ext_services.dck_retrieval_during_cell_select = sc3.map(|sc3| sc3.dck_retrieval_during_initial_cell_selection);
+        ext_services.dck_retrieval_during_cell_reselect = sc3.map(|sc3| sc3.dck_retrieval_during_cell_reselection);
+        ext_services.linked_gck_crypto_periods = sc3.map(|sc3| sc3.linked_gck_crypto_periods());
+        ext_services.short_gck_vn = sc3.map(|sc3| (sc3.gck_vn() & 0x03) as u8);
+        ext_services.gck_supported = sc3.is_some_and(RuntimeSc3Aie::gck_supported);
         self.precomps.mle_sysinfo.bs_service_details.aie_service = aie.enabled;
 
         self.precomps.mac_sysinfo1.cipher_key_id_or_sck_vn = None;
@@ -354,6 +366,9 @@ impl BsChannelScheduler {
             // when SC2 is advertised; it is a CCK identifier only for SC3.
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = Some(sc2.sck_vn);
             self.precomps.mac_sysinfo2.hyperframe_number = None;
+        } else if let Some(sc3) = sc3 {
+            self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = Some(sc3.cck_id);
+            self.precomps.mac_sysinfo2.hyperframe_number = None;
         } else {
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn = None;
             self.precomps.mac_sysinfo2.hyperframe_number = Some(air_time.h);
@@ -361,7 +376,13 @@ impl BsChannelScheduler {
         let current = (
             ext_services.class1_supported,
             ext_services.class2_supported,
+            ext_services.class3_supported,
             ext_services.sck_n,
+            ext_services.dck_retrieval_during_cell_select,
+            ext_services.dck_retrieval_during_cell_reselect,
+            ext_services.linked_gck_crypto_periods,
+            ext_services.short_gck_vn,
+            ext_services.gck_supported,
             self.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn,
             self.precomps.mle_sysinfo.bs_service_details.aie_service,
         );
@@ -374,6 +395,13 @@ impl BsChannelScheduler {
                     algorithm = ?sc2.algorithm,
                     sc1_allowed = aie.sc1_allowed,
                     "BS SYSINFO AIE policy updated for air slot"
+                );
+            } else if let Some(sc3) = sc3 {
+                tracing::info!(
+                    dltime = %air_time,
+                    cck_id = sc3.cck_id,
+                    sc1_allowed = aie.sc1_allowed,
+                    "BS SYSINFO SC3 AIE policy updated for air slot"
                 );
             } else {
                 tracing::info!(dltime = %air_time, "BS SYSINFO AIE policy disabled for air slot");
@@ -402,8 +430,9 @@ impl BsChannelScheduler {
             let Some(traffic_request) = self.traffic_aie[timeslot as usize - 1] else {
                 continue;
             };
-            let AieRequest::Sc2 { subject, .. } = traffic_request else {
-                continue;
+            let subject = match traffic_request {
+                AieRequest::Sc2 { subject, .. } | AieRequest::Sc3 { subject, .. } => subject,
+                AieRequest::Clear { .. } => continue,
             };
 
             // A DUMMY is addressed to the listening MS(s), not to the call
@@ -835,7 +864,10 @@ impl BsChannelScheduler {
     pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>, aie_request: AieRequest) {
         // Get all timeslots on which a relevant MS is listening
         // let timeslots: [u8; NUM_TIMESLOTS] = self.identify_timeslots_for_ssi(pdu.addr);
-        tracing::warn!("identify_timeslots_for_ssi not implemented yet, defaulting to ts1");
+        // No explicit assigned-channel route means common-control delivery on
+        // MCCH TS1. Assigned traffic-channel signalling takes the separate
+        // associated-channel path before reaching this fallback.
+        tracing::trace!("downlink has no assigned-channel route; using MCCH TS1");
         let timeslots: [u8; NUM_TIMESLOTS] = [1, 0, 0, 0];
 
         // Queue the message for all timeslots on which we should transmit this message.
@@ -941,12 +973,12 @@ impl BsChannelScheduler {
     /// IESI for individual control and a GESI for group control.
     fn prepare_downlink_resource(&self, mut pdu: MacResource, request: AieRequest, time: TdmaTime) -> Result<MacResource, AieContextError> {
         let context = self.resolve_downlink_context(request, time)?;
-        if let AieContext::Sc2 { key, .. } = context {
+        if context.is_encrypted() {
             let Some(address) = pdu.addr.as_mut() else {
                 return Err(AieContextError::InvalidContext);
             };
             match request {
-                AieRequest::Sc2 { subject, .. } => {
+                AieRequest::Sc2 { subject, .. } | AieRequest::Sc3 { subject, .. } => {
                     let expected_type = match subject {
                         AieSubject::Individual { .. } => SsiType::Issi,
                         AieSubject::Group { .. } => SsiType::Gssi,
@@ -966,7 +998,11 @@ impl BsChannelScheduler {
                 }
                 _ => return Err(AieContextError::InvalidContext),
             }
-            pdu.encryption_mode = 0b10 | (key.sck_vn as u8 & 1);
+            pdu.encryption_mode = match context {
+                AieContext::Sc2 { key, .. } => 0b10 | (key.sck_vn as u8 & 1),
+                AieContext::Sc3 { key, .. } => 0b10 | (key.cck_id as u8 & 1),
+                AieContext::Clear { .. } => 0,
+            };
         }
         Ok(pdu)
     }
@@ -996,7 +1032,7 @@ impl BsChannelScheduler {
     fn resolve_downlink_context(&self, request: AieRequest, time: TdmaTime) -> Result<AieContext, AieContextError> {
         match request {
             AieRequest::Clear { subject, scope } => Ok(AieContext::clear(subject, AieDirection::Downlink, time, scope)),
-            AieRequest::Sc2 { .. } => {
+            AieRequest::Sc2 { .. } | AieRequest::Sc3 { .. } => {
                 self.aie_provider
                     .as_ref()
                     .ok_or(AieContextError::Sc2Disabled)?
@@ -1053,23 +1089,33 @@ impl BsChannelScheduler {
                     }
                 };
                 let mut fragger = BsFragger::new_with_aie(pdu, sdu, reporter, aie_request);
+                let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
                     tracing::warn!(dltime = %ts, ?error, "dropping associated MAC resource after AIE cipher failure");
                     return None;
                 }
                 if !complete {
-                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                    if written_before == 0 && buf.get_len_written() == 0 {
+                        tracing::warn!(dltime = %ts, "dropping associated MAC resource that cannot make progress in an empty SCH/F");
+                    } else {
+                        self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                    }
                 }
             }
             DlSchedElem::FragBuf(mut fragger) => {
+                let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
                     tracing::warn!(dltime = %ts, ?error, "dropping associated MAC fragment after AIE cipher failure");
                     return None;
                 }
                 if !complete {
-                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                    if written_before == 0 && buf.get_len_written() == 0 {
+                        tracing::warn!(dltime = %ts, "dropping associated MAC fragment that cannot make progress in an empty SCH/F");
+                    } else {
+                        self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                    }
                 }
             }
             DlSchedElem::AssociatedGrantRequest(addr, res_req) => {
@@ -1168,6 +1214,11 @@ impl BsChannelScheduler {
         if (1..=4).contains(&ts) {
             self.traffic_aie[ts as usize - 1] = request;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn traffic_aie(&self, ts: u8) -> Option<AieRequest> {
+        (1..=4).contains(&ts).then(|| self.traffic_aie[ts as usize - 1]).flatten()
     }
 
     fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
@@ -1448,15 +1499,20 @@ impl BsChannelScheduler {
                                 }
                             };
                             let mut fragger = BsFragger::new_with_aie(pdu, sdu, tx_reporter, aie_request);
+                            let written_before = buf.get_len_written();
                             let complete = fragger.get_next_chunk(&mut buf);
                             if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
                                 tracing::warn!(dltime = %ts, ?error, "dropping MAC resource after AIE cipher failure");
                                 return None;
                             }
                             if !complete {
-                                // Fragmentation was started and we have more chunks to send
-                                // Enqueue fragger with remaining data for retrieval next frame
-                                self.dl_enqueue_tma_frag_next_frame(fragger);
+                                if written_before == 0 && buf.get_len_written() == 0 {
+                                    tracing::warn!(dltime = %ts, "dropping MAC resource that cannot make progress in an empty SCH/F");
+                                } else {
+                                    // Fragmentation was started, or a partially
+                                    // occupied block caused a valid deferral.
+                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                }
                             }
                             buf_opt = Some(buf);
                         }
@@ -1464,15 +1520,18 @@ impl BsChannelScheduler {
                         DlSchedElem::FragBuf(mut fragger) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            let written_before = buf.get_len_written();
                             let complete = fragger.get_next_chunk(&mut buf);
                             if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
                                 tracing::warn!(dltime = %ts, ?error, "dropping MAC fragment after AIE cipher failure");
                                 return None;
                             }
                             if !complete {
-                                // Fragmentation was continued and we still have more chunks to send
-                                // Re-enqueue fragger with remaining data for retrieval next frame
-                                self.dl_enqueue_tma_frag_next_frame(fragger);
+                                if written_before == 0 && buf.get_len_written() == 0 {
+                                    tracing::warn!(dltime = %ts, "dropping MAC fragment that cannot make progress in an empty SCH/F");
+                                } else {
+                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                }
                             }
                             buf_opt = Some(buf);
                         }
@@ -2377,6 +2436,7 @@ mod tests {
                 7,
                 [0x5a; 10],
             )),
+            sc3: None,
             rollover: None,
         });
 
@@ -2389,6 +2449,45 @@ mod tests {
         assert!(ext.class2_supported);
         assert_eq!(ext.sck_n, Some(30));
         assert!(sched.precomps.mle_sysinfo.bs_service_details.aie_service);
+    }
+
+    #[test]
+    fn sc3_sysinfo_advertises_cck_and_retrieval_policy() {
+        let mut sched = get_testing_slotter();
+        sched.set_aie_config(&RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(tetra_config::bluestation::RuntimeSc3Aie::new(
+                tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea3,
+                23,
+                [0x6c; 10],
+                true,
+                false,
+            )),
+            rollover: None,
+        });
+
+        assert_eq!(sched.precomps.mac_sysinfo2.cipher_key_id_or_sck_vn, Some(23));
+        let ext = sched.precomps.mac_sysinfo2.ext_services.as_ref().expect("Extended Services");
+        assert!(!ext.class2_supported);
+        assert!(ext.class3_supported);
+        assert_eq!(ext.sck_n, None);
+        assert_eq!(ext.dck_retrieval_during_cell_select, Some(true));
+        assert_eq!(ext.dck_retrieval_during_cell_reselect, Some(false));
+        assert_eq!(ext.linked_gck_crypto_periods, Some(false));
+        assert_eq!(ext.short_gck_vn, Some(0));
+
+        // Exercise the actual on-air serializer; merely inspecting the
+        // precomputed structure did not catch missing mandatory SC3 bits.
+        let mut encoded = BitBuffer::new_autoexpand(128);
+        sched.precomps.mac_sysinfo2.to_bitbuf(&mut encoded);
+        encoded.seek(0);
+        let decoded = MacSysinfo::from_bitbuf(&mut encoded).expect("decode SC3 SYSINFO");
+        let decoded_ext = decoded.ext_services.expect("decoded Extended Services");
+        assert!(decoded_ext.class3_supported);
+        assert_eq!(decoded_ext.linked_gck_crypto_periods, Some(false));
+        assert_eq!(decoded_ext.short_gck_vn, Some(0));
     }
 
     #[test]
@@ -2439,6 +2538,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(old.clone()),
+                sc3: None,
                 rollover: None,
             };
         }
@@ -2448,6 +2548,7 @@ mod tests {
         sched.create_circuit(
             Direction::Dl,
             Circuit {
+                call_id: 1,
                 direction: Direction::Dl,
                 ts: 2,
                 usage: 15,
@@ -2463,6 +2564,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(old),
+            sc3: None,
             rollover: None,
         };
         sched.set_aie_config_for_air_time(&old_aie, air_time.add_timeslots(-1));
@@ -2477,6 +2579,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(target.clone()),
+                sc3: None,
                 rollover: None,
             };
         }
@@ -2484,6 +2587,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(target),
+            sc3: None,
             rollover: None,
         };
         sched.set_aie_config_for_air_time(&aie, air_time);
@@ -2636,6 +2740,7 @@ mod tests {
         sched.create_circuit(
             Direction::Ul,
             Circuit {
+                call_id: 1,
                 direction: Direction::Ul,
                 ts: 2,
                 usage: 6,
@@ -2661,10 +2766,18 @@ mod tests {
             BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
             "associated access A/B test must use zero delay"
         );
+        let target = TdmaTime { t: 2, f: 18, m: 1, h: 0 };
+        assert!(target.is_mandatory_clch());
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::SecondSubslotGranted);
         assert_eq!(
-            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 18, m: 1, h: 0 }, PhyBlockNum::Block1),
+            sched.ul_get_slot_owner(target, PhyBlockNum::Block1),
+            None,
+            "the predefined CLCH must retain the first FN18 subslot"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(target, PhyBlockNum::Block2),
             Some(1234),
-            "the corresponding FN18 must be reserved for the granted MS"
+            "the corresponding FN18 second subslot must be reserved for the granted MS"
         );
     }
 
@@ -2677,6 +2790,7 @@ mod tests {
         sched.create_circuit(
             Direction::Ul,
             Circuit {
+                call_id: 1,
                 direction: Direction::Ul,
                 ts: 2,
                 usage: 6,
@@ -2685,7 +2799,7 @@ mod tests {
                 etee_encrypted: false,
             },
         );
-        sched.cur_dltime = TdmaTime { t: 1, f: 18, m: 4, h: 0 };
+        sched.cur_dltime = TdmaTime { t: 1, f: 18, m: 5, h: 0 };
 
         let addr = TetraAddress::new(1234, SsiType::Issi);
         let grant = sched
@@ -2717,6 +2831,7 @@ mod tests {
             sched.create_circuit(
                 direction,
                 Circuit {
+                    call_id: 1,
                     direction,
                     ts: 2,
                     usage: 6,
@@ -2773,10 +2888,15 @@ mod tests {
             resource.slot_granting_element.is_some(),
             "grant must be built at actual FN18 transmission time"
         );
+        let granted_block = match resource.slot_granting_element.expect("grant checked above").capacity_allocation {
+            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
+            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
+            allocation => panic!("unexpected associated ACK allocation: {:?}", allocation),
+        };
         assert_eq!(
-            sched.ul_get_slot_owner(usable, PhyBlockNum::Both),
+            sched.ul_get_slot_owner(usable, granted_block),
             Some(1234),
-            "ACK reservation must follow the actual transmitted FN18"
+            "ACK reservation must follow the actual transmitted FN18 grant"
         );
         assert!(sched.assoc_dltx_queues[1].is_empty());
     }
@@ -2791,6 +2911,7 @@ mod tests {
             sched.create_circuit(
                 direction,
                 Circuit {
+                    call_id: 1,
                     direction,
                     ts: 2,
                     usage: 6,
@@ -2916,6 +3037,7 @@ mod tests {
         sched.create_circuit(
             Direction::Dl,
             Circuit {
+                call_id: 1,
                 direction: Direction::Dl,
                 ts: 2,
                 usage: 6,
@@ -2975,6 +3097,7 @@ mod tests {
         sched.create_circuit(
             Direction::Ul,
             Circuit {
+                call_id: 1,
                 direction: Direction::Ul,
                 ts: 2,
                 usage: 6,

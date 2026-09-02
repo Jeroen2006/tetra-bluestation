@@ -1,5 +1,5 @@
-use tetra_core::{SoftBit, TdmaTime};
 use tetra_core::TrainingSequence;
+use tetra_core::{SoftBit, TdmaTime};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum RxTxDevError {

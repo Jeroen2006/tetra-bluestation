@@ -268,16 +268,17 @@ impl MmClientMgr {
 
         if let Some(client) = self.clients.get_mut(&issi) {
             if do_attach {
-                // Send telemetry event
-                if let Some(sink) = &self.telemetry_sink {
-                    sink.send(TelemetryEvent::MsGroupAttach {
-                        issi: client.issi,
-                        gssis: vec![gssi].into_iter().collect(),
-                    });
-                }
-
                 let previous = client.groups.insert(gssi, class_of_usage);
-                Ok(previous != Some(class_of_usage))
+                let changed = previous != Some(class_of_usage);
+                if changed {
+                    if let Some(sink) = &self.telemetry_sink {
+                        sink.send(TelemetryEvent::MsGroupAttach {
+                            issi: client.issi,
+                            gssis: vec![gssi].into_iter().collect(),
+                        });
+                    }
+                }
+                Ok(changed)
             } else {
                 Ok(client.groups.remove(&gssi).is_some())
             }

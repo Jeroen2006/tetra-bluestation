@@ -1,6 +1,12 @@
 use crate::bluestation::{RuntimeNetworkBroadcast, SharedConfig};
-use std::collections::{HashMap, HashSet, VecDeque};
-use tetra_core::{AieAlgorithm, AieContext, AieDirection, AieSubject, BitBuffer, Sc2KeyIdentifier, SoftBit, TdmaTime, TimeslotAllocator};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tetra_core::{
+    AieAlgorithm, AieContext, AieDirection, AieSubject, BitBuffer, Sc2KeyIdentifier, Sc3KeyIdentifier, Sc3KeyType, SoftBit, TdmaTime,
+    TimeslotAllocator,
+};
 
 /// The TEA variant selected by the SwMI for SC2 AIE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +51,244 @@ impl std::fmt::Debug for RuntimeSc2Aie {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSc3TeaAlgorithm {
+    Tea1,
+    Tea3,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeSc3Dck {
+    pub context_id: [u8; 16],
+    pub mutual: bool,
+    pub valid_until_unix: Option<u64>,
+    key: [u8; 10],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeSc3Gck {
+    pub gckn: u16,
+    pub gck_vn: u16,
+    key: [u8; 10],
+}
+
+impl RuntimeSc3Gck {
+    pub fn new(gckn: u16, gck_vn: u16, key: [u8; 10]) -> Self {
+        Self { gckn, gck_vn, key }
+    }
+}
+
+impl std::fmt::Debug for RuntimeSc3Gck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSc3Gck")
+            .field("gckn", &self.gckn)
+            .field("gck_vn", &self.gck_vn)
+            .field("key_present", &true)
+            .finish()
+    }
+}
+
+impl RuntimeSc3Dck {
+    pub fn new(context_id: [u8; 16], key: [u8; 10], mutual: bool, valid_until_unix: Option<u64>) -> Self {
+        Self {
+            context_id,
+            mutual,
+            valid_until_unix,
+            key,
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeSc3Dck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSc3Dck")
+            .field("context_id", &self.context_id)
+            .field("mutual", &self.mutual)
+            .field("valid_until_unix", &self.valid_until_unix)
+            .field("key_present", &true)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeSc3Aie {
+    pub algorithm: RuntimeSc3TeaAlgorithm,
+    pub cck_id: u16,
+    pub dck_retrieval_during_initial_cell_selection: bool,
+    pub dck_retrieval_during_cell_reselection: bool,
+    cck: [u8; 10],
+    dcks: HashMap<u32, RuntimeSc3Dck>,
+    pending_dck_requests: HashSet<u32>,
+    dck_requests: VecDeque<u32>,
+    sc3g_revision: u64,
+    linked_gck_crypto_periods: bool,
+    gck_vn: u16,
+    gcks: HashMap<u16, RuntimeSc3Gck>,
+    group_associations: HashMap<u32, u16>,
+}
+
+impl RuntimeSc3Aie {
+    pub fn new(
+        algorithm: RuntimeSc3TeaAlgorithm,
+        cck_id: u16,
+        cck: [u8; 10],
+        dck_retrieval_during_initial_cell_selection: bool,
+        dck_retrieval_during_cell_reselection: bool,
+    ) -> Self {
+        Self {
+            algorithm,
+            cck_id,
+            dck_retrieval_during_initial_cell_selection,
+            dck_retrieval_during_cell_reselection,
+            cck,
+            dcks: HashMap::new(),
+            pending_dck_requests: HashSet::new(),
+            dck_requests: VecDeque::new(),
+            sc3g_revision: 0,
+            linked_gck_crypto_periods: false,
+            gck_vn: 0,
+            gcks: HashMap::new(),
+            group_associations: HashMap::new(),
+        }
+    }
+
+    /// Atomically replace the effective SC3G state received from the SwMI.
+    /// Older reconnect/replay revisions are ignored; equal revisions are
+    /// idempotent.  Associations are accepted only when their key is present.
+    pub fn apply_sc3g_snapshot(
+        &mut self,
+        revision: u64,
+        linked_gck_crypto_periods: bool,
+        gck_vn: u16,
+        keys: Vec<RuntimeSc3Gck>,
+        associations: Vec<(u32, u16)>,
+    ) -> Result<bool, &'static str> {
+        if revision < self.sc3g_revision {
+            return Ok(false);
+        }
+        if !linked_gck_crypto_periods && (!keys.is_empty() || !associations.is_empty()) {
+            return Err("SC3G keys require linked crypto periods");
+        }
+        let mut next_keys = HashMap::new();
+        for key in keys {
+            if key.gck_vn != gck_vn || next_keys.insert(key.gckn, key).is_some() {
+                return Err("invalid or duplicate SC3G key");
+            }
+        }
+        let mut next_associations = HashMap::new();
+        for (gssi, gckn) in associations {
+            if gssi == 0 || gssi > 0x00ff_ffff || !next_keys.contains_key(&gckn) || next_associations.insert(gssi, gckn).is_some() {
+                return Err("invalid SC3G association");
+            }
+        }
+        let changed = revision != self.sc3g_revision
+            || self.linked_gck_crypto_periods != linked_gck_crypto_periods
+            || self.gck_vn != gck_vn
+            || self.gcks != next_keys
+            || self.group_associations != next_associations;
+        self.sc3g_revision = revision;
+        self.linked_gck_crypto_periods = linked_gck_crypto_periods;
+        self.gck_vn = gck_vn;
+        self.gcks = next_keys;
+        self.group_associations = next_associations;
+        Ok(changed)
+    }
+
+    pub fn gck_supported(&self) -> bool {
+        self.linked_gck_crypto_periods && !self.gcks.is_empty()
+    }
+
+    pub fn linked_gck_crypto_periods(&self) -> bool {
+        self.linked_gck_crypto_periods
+    }
+
+    pub fn gck_vn(&self) -> u16 {
+        self.gck_vn
+    }
+
+    pub fn gckn_for_gssi(&self, gssi: u32) -> Option<u16> {
+        self.group_associations.get(&gssi).copied()
+    }
+
+    pub fn queue_dck_request(&mut self, issi: u32) -> bool {
+        if issi == 0 || issi > 0x00ff_ffff {
+            return false;
+        }
+        if self.dcks.get(&issi).is_some_and(runtime_dck_is_usable) {
+            return false;
+        }
+        self.dcks.remove(&issi);
+        if self.pending_dck_requests.insert(issi) {
+            self.dck_requests.push_back(issi);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn take_dck_requests(&mut self) -> Vec<u32> {
+        self.dck_requests.drain(..).collect()
+    }
+
+    pub fn retry_pending_dck_requests(&mut self) {
+        for issi in self.pending_dck_requests.iter().copied() {
+            if !self.dck_requests.contains(&issi) {
+                self.dck_requests.push_back(issi);
+            }
+        }
+    }
+
+    pub fn install_dck(&mut self, issi: u32, dck: RuntimeSc3Dck) {
+        self.pending_dck_requests.remove(&issi);
+        self.dcks.insert(issi, dck);
+    }
+
+    pub fn reject_dck(&mut self, issi: u32) {
+        self.pending_dck_requests.remove(&issi);
+    }
+
+    pub fn revoke_dck(&mut self, issi: u32, context_id: [u8; 16]) -> bool {
+        self.pending_dck_requests.remove(&issi);
+        self.dcks
+            .get(&issi)
+            .is_some_and(|dck| dck.context_id == context_id)
+            .then(|| self.dcks.remove(&issi))
+            .flatten()
+            .is_some()
+    }
+
+    pub fn has_dck(&self, issi: u32) -> bool {
+        self.dcks.get(&issi).is_some_and(runtime_dck_is_usable)
+    }
+}
+
+fn runtime_dck_is_usable(dck: &RuntimeSc3Dck) -> bool {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    !dck.valid_until_unix.is_some_and(|until| until <= now)
+}
+
+impl std::fmt::Debug for RuntimeSc3Aie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSc3Aie")
+            .field("algorithm", &self.algorithm)
+            .field("cck_id", &self.cck_id)
+            .field(
+                "dck_retrieval_during_initial_cell_selection",
+                &self.dck_retrieval_during_initial_cell_selection,
+            )
+            .field("dck_retrieval_during_cell_reselection", &self.dck_retrieval_during_cell_reselection)
+            .field("cck_present", &true)
+            .field("dck_count", &self.dcks.len())
+            .field("pending_dck_request_count", &self.pending_dck_requests.len())
+            .field("sc3g_revision", &self.sc3g_revision)
+            .field("linked_gck_crypto_periods", &self.linked_gck_crypto_periods)
+            .field("gck_vn", &self.gck_vn)
+            .field("gck_count", &self.gcks.len())
+            .field("group_association_count", &self.group_associations.len())
+            .finish()
+    }
+}
+
 /// AIE policy cached from the authenticated SwMI. `sc1_allowed` maps to the
 /// SC1-supported bit and a present SC2 record maps to the SC2/SCKN fields in
 /// SYSINFO. SCK-VN is advertised in the SYSINFO cipher-key field; the SCK
@@ -54,6 +298,7 @@ pub struct RuntimeAieConfig {
     pub enabled: bool,
     pub sc1_allowed: bool,
     pub sc2: Option<RuntimeSc2Aie>,
+    pub sc3: Option<RuntimeSc3Aie>,
     /// A single prepared network-wide SC2 rollover. The future/retired SCKs
     /// never leave this private runtime boundary.
     pub rollover: Option<RuntimeSc2Rollover>,
@@ -189,12 +434,24 @@ impl Default for RuntimeAieConfig {
             enabled: false,
             sc1_allowed: true,
             sc2: None,
+            sc3: None,
             rollover: None,
         }
     }
 }
 
 impl RuntimeAieConfig {
+    pub fn preserve_sc3_cache_from(&mut self, previous: &RuntimeAieConfig) {
+        let (Some(next), Some(old)) = (self.sc3.as_mut(), previous.sc3.as_ref()) else {
+            return;
+        };
+        if next.algorithm == old.algorithm && next.cck_id == old.cck_id && next.cck == old.cck {
+            next.dcks = old.dcks.clone();
+            next.pending_dck_requests = old.pending_dck_requests.clone();
+            next.dck_requests = old.dck_requests.clone();
+        }
+    }
+
     /// Return the key-free SC2 identity which must be advertised for an
     /// exact downlink air slot.  Downlink is prepared one slot ahead, so
     /// callers cannot safely use only the software-current `sc2` field at a
@@ -450,6 +707,10 @@ fn tetra_network_time_units(value: u64) -> Option<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AieContextError {
     Sc2Disabled,
+    Sc3Disabled,
+    DckNotProvisioned(u32),
+    DckExpired(u32),
+    GckNotProvisioned(u16),
     SubjectNotProvisioned,
     UnsupportedSubject,
     StaleKeyIdentity,
@@ -485,17 +746,37 @@ impl BsAieKeyProvider {
                 let binding = binding_for_subject(&state, subject, sc2)?;
                 Ok(tetra_core::AieContext::sc2(subject, direction, time, scope, binding.key))
             }
+            tetra_core::AieRequest::Sc3 {
+                subject,
+                scope,
+                key: requested_key,
+            } => {
+                let state = self.config.state_read();
+                let sc3 = active_sc3(&state.aie)?;
+                let key = sc3_identifier_for_subject(sc3, subject)?;
+                if requested_key.is_some_and(|requested| requested != key) {
+                    return Err(AieContextError::StaleKeyIdentity);
+                }
+                Ok(tetra_core::AieContext::sc3(subject, direction, time, scope, key))
+            }
         }
     }
 
     /// Transform a short identity into its encrypted form (IESI/GESI) for
     /// an SC2-protected MAC resource. The SCK never crosses this API.
     pub fn encrypted_short_identity(&self, context: AieContext, ssi: u32) -> Result<u32, AieContextError> {
-        let (_, sc2) = self.current_sc2_for_context(context, AieDirection::Downlink)?;
         if ssi > 0x00ff_ffff {
             return Err(AieContextError::InvalidContext);
         }
-        let esi = tetra_crypto::ta61(&sc2.key, &[(ssi >> 16) as u8, (ssi >> 8) as u8, ssi as u8]);
+        let key = match context {
+            AieContext::Sc2 { .. } => self.current_sc2_for_context(context, AieDirection::Downlink)?.1.key,
+            AieContext::Sc3 {
+                direction: AieDirection::Downlink,
+                ..
+            } => active_sc3(&self.config.state_read().aie)?.cck,
+            _ => return Err(AieContextError::InvalidContext),
+        };
+        let esi = tetra_crypto::ta61(&key, &[(ssi >> 16) as u8, (ssi >> 8) as u8, ssi as u8]);
         Ok(u32::from_be_bytes([0, esi[0], esi[1], esi[2]]))
     }
 
@@ -510,17 +791,42 @@ impl BsAieKeyProvider {
         }
 
         let state = self.config.state_read();
+        if let Ok(sc3) = active_sc3(&state.aie) {
+            let raw = tetra_crypto::ta61_inverse(&sc3.cck, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
+            let issi = u32::from_be_bytes([0, raw[0], raw[1], raw[2]]);
+            let key = sc3_identifier_for_subject(sc3, AieSubject::Individual { issi })?;
+            return Ok((
+                issi,
+                AieContext::sc3(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, key),
+            ));
+        }
         let sc2 = state.aie.sc2_for_air_time(AieDirection::Uplink, time)?;
         let raw = tetra_crypto::ta61_inverse(&sc2.key, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
         let issi = u32::from_be_bytes([0, raw[0], raw[1], raw[2]]);
-        if state.aie_sessions.terminal(issi).is_some() {
-            let key = RuntimeSc2Binding::from_sc2(sc2).key;
-            return Ok((
-                issi,
-                AieContext::sc2(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, key),
-            ));
-        }
-        Err(AieContextError::SubjectNotProvisioned)
+        state
+            .aie_sessions
+            .terminal(issi)
+            .map(|_| {
+                let key = RuntimeSc2Binding::from_sc2(sc2).key;
+                (
+                    issi,
+                    AieContext::sc2(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, key),
+                )
+            })
+            .ok_or(AieContextError::SubjectNotProvisioned)
+    }
+
+    pub fn request_sc3_dck(&self, issi: u32) -> bool {
+        self.config
+            .state_write()
+            .aie
+            .sc3
+            .as_mut()
+            .is_some_and(|sc3| sc3.queue_dck_request(issi))
+    }
+
+    pub fn has_sc3_dck(&self, issi: u32) -> bool {
+        self.config.state_read().aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi))
     }
 
     /// Decode an SC2 ESI and create the key-free terminal binding needed for
@@ -576,11 +882,14 @@ impl BsAieKeyProvider {
         // This compatibility verifier has no TDMA timestamp in its API. The
         // time-aware paths (`resolve_uplink_esi` and MAC/TCH decrypt) make
         // the actual on-air key decision.
-        let sc2 = active_sc2(&state.aie)?;
-        (tetra_crypto::ta61(&sc2.key, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8])
-            == [(esi >> 16) as u8, (esi >> 8) as u8, esi as u8])
-        .then_some(())
-        .ok_or(AieContextError::InvalidContext)
+        let key = if let Ok(sc3) = active_sc3(&state.aie) {
+            sc3.cck
+        } else {
+            active_sc2(&state.aie)?.key
+        };
+        (tetra_crypto::ta61(&key, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8]) == [(esi >> 16) as u8, (esi >> 8) as u8, esi as u8])
+            .then_some(())
+            .ok_or(AieContextError::InvalidContext)
     }
 
     /// A clear MAC-DATA from an already SC2-bound terminal is not a valid
@@ -588,7 +897,13 @@ impl BsAieKeyProvider {
     /// check so an unbound terminal can still perform the clear bootstrap.
     pub fn clear_uplink_allowed(&self, issi: u32) -> bool {
         let state = self.config.state_read();
-        !state.aie.enabled || state.aie.sc1_allowed || state.aie_sessions.terminal(issi).is_none()
+        !state.aie.enabled
+            || state.aie.sc1_allowed
+            || if let Some(sc3) = state.aie.sc3.as_ref() {
+                !sc3.has_dck(issi)
+            } else {
+                state.aie_sessions.terminal(issi).is_none()
+            }
     }
 
     /// Cipher exactly one phase-modulation MAC region.  `start` and `len`
@@ -689,8 +1004,26 @@ impl BsAieKeyProvider {
         if len == 0 {
             return Ok(());
         }
-        let (time, sc2) = self.current_sc2_for_context(context, direction)?;
-        self.cipher_mac_with_sc2(time, &sc2, mac_block, start, len, kss_offset, direction)
+        match context {
+            AieContext::Sc2 { .. } => {
+                let (time, sc2) = self.current_sc2_for_context(context, direction)?;
+                self.cipher_mac_with_sc2(time, &sc2, mac_block, start, len, kss_offset, direction)
+            }
+            AieContext::Sc3 { .. } => {
+                let (time, algorithm, key) = self.current_sc3_key_for_context(context, direction)?;
+                self.cipher_mac_with_key(
+                    time,
+                    algorithm == RuntimeSc3TeaAlgorithm::Tea1,
+                    &key,
+                    mac_block,
+                    start,
+                    len,
+                    kss_offset,
+                    direction,
+                )
+            }
+            AieContext::Clear { .. } => Err(AieContextError::InvalidContext),
+        }
     }
 
     fn cipher_mac_with_sc2(
@@ -706,14 +1039,32 @@ impl BsAieKeyProvider {
         if len == 0 {
             return Ok(());
         }
-        let config = self.config.config();
-        let eck = tetra_crypto::tb5(
-            config.cell.main_carrier,
-            config.cell.location_area,
-            config.cell.colour_code,
+        self.cipher_mac_with_key(
+            time,
+            sc2.algorithm == RuntimeSc2TeaAlgorithm::Tea1,
             &sc2.key,
+            mac_block,
+            start,
+            len,
+            kss_offset,
+            direction,
         )
-        .map_err(|_| AieContextError::CryptoInput)?;
+    }
+
+    fn cipher_mac_with_key(
+        &self,
+        time: TdmaTime,
+        tea1: bool,
+        key: &[u8; 10],
+        mac_block: &mut BitBuffer,
+        start: usize,
+        len: usize,
+        kss_offset: usize,
+        direction: AieDirection,
+    ) -> Result<(), AieContextError> {
+        let config = self.config.config();
+        let eck = tetra_crypto::tb5(config.cell.main_carrier, config.cell.location_area, config.cell.colour_code, key)
+            .map_err(|_| AieContextError::CryptoInput)?;
         if kss_offset % 8 != 0 {
             return Err(AieContextError::CryptoInput);
         }
@@ -726,9 +1077,10 @@ impl BsAieKeyProvider {
             uplink: direction == AieDirection::Uplink,
         }
         .iv();
-        match sc2.algorithm {
-            RuntimeSc2TeaAlgorithm::Tea1 => tetra_crypto::tea1(iv, &eck, &mut key_stream),
-            RuntimeSc2TeaAlgorithm::Tea3 => tetra_crypto::tea3(iv, &eck, &mut key_stream),
+        if tea1 {
+            tetra_crypto::tea1(iv, &eck, &mut key_stream)
+        } else {
+            tetra_crypto::tea3(iv, &eck, &mut key_stream)
         }
         let cursor = mac_block.get_pos();
         mac_block.seek(start);
@@ -764,6 +1116,49 @@ impl BsAieKeyProvider {
         }
         Err(AieContextError::StaleKeyIdentity)
     }
+
+    fn current_sc3_key_for_context(
+        &self,
+        context: AieContext,
+        expected_direction: AieDirection,
+    ) -> Result<(TdmaTime, RuntimeSc3TeaAlgorithm, [u8; 10]), AieContextError> {
+        let AieContext::Sc3 {
+            subject,
+            direction,
+            time,
+            key,
+            ..
+        } = context
+        else {
+            return Err(AieContextError::InvalidContext);
+        };
+        if direction != expected_direction {
+            return Err(AieContextError::InvalidContext);
+        }
+        let state = self.config.state_read();
+        let sc3 = active_sc3(&state.aie)?;
+        if sc3_identifier_for_subject(sc3, subject)? != key {
+            return Err(AieContextError::StaleKeyIdentity);
+        }
+        let material = match key.key_type {
+            Sc3KeyType::Cck => sc3.cck,
+            Sc3KeyType::Dck => {
+                let issi = subject_issi(subject).ok_or(AieContextError::UnsupportedSubject)?;
+                sc3.dcks.get(&issi).ok_or(AieContextError::DckNotProvisioned(issi))?.key
+            }
+            Sc3KeyType::Gck => {
+                let gssi = subject_gssi(subject).ok_or(AieContextError::UnsupportedSubject)?;
+                let gckn = sc3
+                    .group_associations
+                    .get(&gssi)
+                    .copied()
+                    .ok_or(AieContextError::StaleKeyIdentity)?;
+                let gck = sc3.gcks.get(&gckn).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+                tetra_crypto::ta71(&gck.key, &sc3.cck)
+            }
+        };
+        Ok((time, sc3.algorithm, material))
+    }
 }
 
 fn active_sc2(aie: &RuntimeAieConfig) -> Result<&RuntimeSc2Aie, AieContextError> {
@@ -771,6 +1166,73 @@ fn active_sc2(aie: &RuntimeAieConfig) -> Result<&RuntimeSc2Aie, AieContextError>
         .then_some(())
         .and_then(|()| aie.sc2.as_ref())
         .ok_or(AieContextError::Sc2Disabled)
+}
+
+fn active_sc3(aie: &RuntimeAieConfig) -> Result<&RuntimeSc3Aie, AieContextError> {
+    aie.enabled
+        .then_some(())
+        .and_then(|()| aie.sc3.as_ref())
+        .ok_or(AieContextError::Sc3Disabled)
+}
+
+fn subject_issi(subject: AieSubject) -> Option<u32> {
+    match subject {
+        AieSubject::Individual { issi } | AieSubject::Call { issi: Some(issi), .. } => Some(issi),
+        _ => None,
+    }
+}
+
+fn subject_gssi(subject: AieSubject) -> Option<u32> {
+    match subject {
+        AieSubject::Group { gssi }
+        | AieSubject::Call {
+            gssi: Some(gssi),
+            issi: None,
+            ..
+        } => Some(gssi),
+        _ => None,
+    }
+}
+
+fn sc3_identifier_for_subject(sc3: &RuntimeSc3Aie, subject: AieSubject) -> Result<Sc3KeyIdentifier, AieContextError> {
+    let algorithm = match sc3.algorithm {
+        RuntimeSc3TeaAlgorithm::Tea1 => AieAlgorithm::Tea1,
+        RuntimeSc3TeaAlgorithm::Tea3 => AieAlgorithm::Tea3,
+    };
+    if let Some(issi) = subject_issi(subject) {
+        let dck = sc3.dcks.get(&issi).ok_or(AieContextError::DckNotProvisioned(issi))?;
+        if !runtime_dck_is_usable(dck) {
+            return Err(AieContextError::DckExpired(issi));
+        }
+        return Ok(Sc3KeyIdentifier {
+            algorithm,
+            cck_id: sc3.cck_id,
+            context_id: dck.context_id,
+            key_type: Sc3KeyType::Dck,
+        });
+    }
+    if let Some(gssi) = subject_gssi(subject)
+        && let Some(gckn) = sc3.group_associations.get(&gssi).copied()
+    {
+        let gck = sc3.gcks.get(&gckn).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+        let mut context_id = [0_u8; 16];
+        context_id[12..14].copy_from_slice(&gck.gckn.to_be_bytes());
+        context_id[14..].copy_from_slice(&gck.gck_vn.to_be_bytes());
+        return Ok(Sc3KeyIdentifier {
+            algorithm,
+            cck_id: sc3.cck_id,
+            context_id,
+            key_type: Sc3KeyType::Gck,
+        });
+    }
+    let mut context_id = [0_u8; 16];
+    context_id[14..].copy_from_slice(&sc3.cck_id.to_be_bytes());
+    Ok(Sc3KeyIdentifier {
+        algorithm,
+        cck_id: sc3.cck_id,
+        context_id,
+        key_type: Sc3KeyType::Cck,
+    })
 }
 
 /// In TMO SC2 the active SCK is also the cipher context for a group-addressed
@@ -1275,11 +1737,16 @@ mod tests {
         RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea3, sckn, sck_vn, [0x5a; 10])
     }
 
+    fn test_sc3(cck_id: u16) -> RuntimeSc3Aie {
+        RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea3, cck_id, [0x6c; 10], true, true)
+    }
+
     fn rollover_aie(sckn: u8, sck_vn: u16) -> RuntimeAieConfig {
         RuntimeAieConfig {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(test_sc2(sckn, sck_vn)),
+            sc3: None,
             rollover: None,
         }
     }
@@ -1498,6 +1965,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                sc3: None,
                 rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
@@ -1544,6 +2012,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea3, 3, 7, key)),
+            sc3: None,
             rollover: None,
         };
         let provider = BsAieKeyProvider::new(config);
@@ -1586,6 +2055,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                sc3: None,
                 rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
@@ -1617,6 +2087,7 @@ mod tests {
             enabled: true,
             sc1_allowed: false,
             sc2: Some(sc2),
+            sc3: None,
             rollover: None,
         };
         let provider = BsAieKeyProvider::new(config);
@@ -1635,6 +2106,88 @@ mod tests {
     }
 
     #[test]
+    fn sc3_resolves_esi_with_cck_then_requests_only_the_missing_issi_dck() {
+        let config = test_shared_config();
+        let issi = 0x12_34_56;
+        let cck = [0x6c; 10];
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(test_sc3(23)),
+            rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config.clone());
+        let encoded = tetra_crypto::ta61(&cck, &[(issi >> 16) as u8, (issi >> 8) as u8, issi as u8]);
+        let esi = u32::from_be_bytes([0, encoded[0], encoded[1], encoded[2]]);
+
+        assert_eq!(
+            provider.resolve_uplink_esi(esi, TdmaTime::default(), AieScope::MacData),
+            Err(AieContextError::DckNotProvisioned(issi))
+        );
+        assert!(provider.request_sc3_dck(issi));
+        assert!(!provider.request_sc3_dck(issi), "a duplicate request is coalesced");
+        let mut state = config.state_write();
+        assert_eq!(state.aie.sc3.as_mut().expect("SC3").take_dck_requests(), vec![issi]);
+    }
+
+    #[test]
+    fn sc3_individual_uses_dck_group_uses_cck_and_debug_redacts_both() {
+        let config = test_shared_config();
+        let issi = 1001;
+        let context_id = [0x31; 16];
+        let mut sc3 = test_sc3(9);
+        sc3.install_dck(issi, RuntimeSc3Dck::new(context_id, [0xd3; 10], true, None));
+        let debug = format!("{sc3:?}");
+        assert!(!debug.contains("211, 211"));
+        assert!(!debug.contains("108, 108"));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config);
+        let individual = provider
+            .resolve(
+                AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacData),
+                AieDirection::Downlink,
+                TdmaTime::default(),
+            )
+            .expect("DCK context");
+        let group = provider
+            .resolve(
+                AieRequest::sc3(AieSubject::Group { gssi: 101 }, AieScope::Traffic),
+                AieDirection::Downlink,
+                TdmaTime::default(),
+            )
+            .expect("CCK context");
+        assert!(matches!(
+            individual,
+            AieContext::Sc3 {
+                key: Sc3KeyIdentifier {
+                    key_type: Sc3KeyType::Dck,
+                    context_id: found,
+                    ..
+                },
+                ..
+            } if found == context_id
+        ));
+        assert!(matches!(
+            group,
+            AieContext::Sc3 {
+                key: Sc3KeyIdentifier {
+                    key_type: Sc3KeyType::Cck,
+                    cck_id: 9,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn sc2_soft_traffic_cipher_inverts_exactly_the_ciphered_llrs() {
         let config = test_shared_config();
         let issi = 0x12_34_56;
@@ -1645,6 +2198,7 @@ mod tests {
                 enabled: true,
                 sc1_allowed: false,
                 sc2: Some(sc2.clone()),
+                sc3: None,
                 rollover: None,
             };
             state.aie_sessions.activate_terminal(issi, &sc2);
@@ -1745,6 +2299,62 @@ mod tests {
         assert!(reg.is_registered(1001));
         reg.deaffiliate(1001, 91);
         assert!(!reg.has_group_members(91));
+    }
+
+    #[test]
+    fn sc3g_associated_group_uses_mgck_while_unassociated_group_keeps_cck() {
+        let config = test_shared_config();
+        let mut sc3 = test_sc3(9);
+        assert!(
+            sc3.apply_sc3g_snapshot(2, true, 7, vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])], vec![(101, 4)],)
+                .unwrap()
+        );
+        assert!(
+            !sc3.apply_sc3g_snapshot(2, true, 7, vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])], vec![(101, 4)])
+                .unwrap()
+        );
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config);
+        let protected = provider
+            .resolve(
+                AieRequest::sc3(AieSubject::Group { gssi: 101 }, AieScope::Traffic),
+                AieDirection::Downlink,
+                TdmaTime::default(),
+            )
+            .unwrap();
+        let default = provider
+            .resolve(
+                AieRequest::sc3(AieSubject::Group { gssi: 102 }, AieScope::Traffic),
+                AieDirection::Downlink,
+                TdmaTime::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            protected,
+            AieContext::Sc3 {
+                key: Sc3KeyIdentifier {
+                    key_type: Sc3KeyType::Gck,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            default,
+            AieContext::Sc3 {
+                key: Sc3KeyIdentifier {
+                    key_type: Sc3KeyType::Cck,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 }
 

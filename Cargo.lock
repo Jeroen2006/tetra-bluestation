@@ -1458,12 +1458,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tetra-air-interface"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "tetra-config"
 version = "0.5.10"
 dependencies = [
  "chrono-tz",
  "serde",
  "tetra-core",
+ "tetra-crypto",
  "toml",
 ]
 
@@ -1476,10 +1485,15 @@ dependencies = [
  "crossbeam-channel",
  "git-version",
  "serde",
+ "tetra-air-interface",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "tetra-crypto"
+version = "0.5.10"
 
 [[package]]
 name = "tetra-entities"
@@ -1506,6 +1520,7 @@ dependencies = [
  "soapysdr",
  "tetra-config",
  "tetra-core",
+ "tetra-crypto",
  "tetra-pdus",
  "tetra-saps",
  "tetra-swmi-protocol",
@@ -1519,6 +1534,7 @@ dependencies = [
 name = "tetra-pdus"
 version = "0.5.10"
 dependencies = [
+ "tetra-air-interface",
  "tetra-config",
  "tetra-core",
  "tetra-saps",
