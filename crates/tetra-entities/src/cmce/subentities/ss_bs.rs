@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::{MessageQueue, net_swmi::SwmiCmceEndpoint};
 use tetra_config::bluestation::SharedConfig;
-use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, tetra_entities::TetraEntity};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric};
+use tetra_pdus::cmce::enums::type3_elem_id::CmceType3ElemId;
 use tetra_pdus::cmce::pdus::{d_facility::DFacility, u_facility::UFacility};
 use tetra_saps::{SapMsg, SapMsgInner, lcmc::LcmcMleUnitdataReq};
 use tetra_swmi_protocol::{DgnaObservedGroup, SwmiMessage};
@@ -21,6 +22,7 @@ pub struct SsBsSubentity {
     /// asynchronous DGNA command overtake that response: especially an EE MS
     /// can otherwise miss the FACILITY while it is still completing access.
     deferred_until_registered: HashMap<u64, SwmiMessage>,
+    next_command_id: u64,
 }
 
 struct PendingDgna {
@@ -36,14 +38,34 @@ impl SsBsSubentity {
             swmi,
             pending: HashMap::new(),
             deferred_until_registered: HashMap::new(),
+            next_command_id: 1,
         }
     }
 
     pub fn is_swmi_action(message: &SwmiMessage) -> bool {
-        matches!(message, SwmiMessage::DgnaCommand { .. })
+        matches!(message, SwmiMessage::DgnaCommand { .. }) || matches!(message, SwmiMessage::CallWaitingResponse { call_id: 0, .. })
     }
 
     pub fn handle_swmi_action(&mut self, queue: &mut MessageQueue, message: SwmiMessage) {
+        if let SwmiMessage::CallWaitingResponse {
+            itsi,
+            operation,
+            accepted,
+            active,
+            cause,
+            waiting_calls,
+            ..
+        } = message
+        {
+            let Ok(issi) = u32::try_from(itsi) else {
+                return;
+            };
+            let Some((ss_pdu, ss_pdu_bits)) = encode_call_waiting_response(operation, accepted, active, cause, waiting_calls) else {
+                return;
+            };
+            self.queue_facility(queue, issi, ss_pdu, ss_pdu_bits);
+            return;
+        }
         // Retain the complete command for the registration gate below.  The
         // individual fields are consumed while serializing the PDU.
         let deferred_message = message.clone();
@@ -169,6 +191,34 @@ impl SsBsSubentity {
             tracing::warn!(issi, "invalid U-FACILITY");
             return;
         };
+        if let Some(decoded) = decode_call_waiting(&facility.ss_pdu, facility.ss_pdu_bits) {
+            let expected_routing = match decoded.operation {
+                CW_ACTIVATE | CW_DEACTIVATE => 1, // sending MS's home SwMI
+                CW_LOCATION_CHANGE => 0,          // current/new serving SwMI
+                _ => return,
+            };
+            if facility.routing != expected_routing {
+                tracing::warn!(
+                    issi,
+                    operation = decoded.operation,
+                    routing = facility.routing,
+                    expected_routing,
+                    "SS-CW request has invalid U-FACILITY routing"
+                );
+                return;
+            }
+            let command_id = self.next_command_id;
+            self.next_command_id = self.next_command_id.wrapping_add(1).max(1);
+            if let Some(swmi) = &self.swmi {
+                let _ = swmi.submit(SwmiMessage::CallWaitingRequest {
+                    command_id,
+                    itsi: u64::from(issi),
+                    operation: decoded.operation,
+                    waiting_calls: decoded.waiting_calls,
+                });
+            }
+            return;
+        }
         let Some(decoded) = decode_dgna(&facility.ss_pdu, facility.ss_pdu_bits) else {
             tracing::warn!(
                 issi,
@@ -271,9 +321,58 @@ impl SsBsSubentity {
             Vec::new(),
         );
     }
+
+    fn queue_facility(&self, queue: &mut MessageQueue, issi: u32, ss_pdu: Vec<u8>, ss_pdu_bits: u16) {
+        let facility = DFacility { ss_pdu, ss_pdu_bits };
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        if facility.to_bitbuf(&mut sdu).is_err() {
+            return;
+        }
+        sdu.seek(0);
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: Layer2Service::Acknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                associated_channel: None,
+                main_address: TetraAddress::new(issi, SsiType::Issi),
+                aie_override: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    pub(super) fn is_call_waiting_invoke(facility: &Type3FieldGeneric) -> bool {
+        let (raw, bits) = type3_payload(facility);
+        decode_call_waiting(&raw, bits).is_some_and(|decoded| decoded.operation == CW_INVOKE)
+    }
+
+    pub(super) fn call_waiting_invocation_failure_facility(cause: u8) -> Option<Type3FieldGeneric> {
+        let (raw, bits) = encode_call_waiting_invocation_failure(cause)?;
+        Some(type3_facility(raw, bits))
+    }
 }
 
 const SS_DGNA: u64 = 0b010110;
+const SS_CALL_WAITING: u64 = 0b001011;
+const CW_ACTIVATE: u8 = 0b00101;
+const CW_ACTIVATE_ACK: u8 = 0b00110;
+const CW_DEACTIVATE: u8 = 0b00111;
+const CW_DEACTIVATE_ACK: u8 = 0b01000;
+const CW_INVOCATION_FAILURE: u8 = 0b01001;
+const CW_INVOKE: u8 = 0b01010;
+const CW_LOCATION_CHANGE: u8 = 0b01100;
+const CW_LOCATION_CHANGE_ACK: u8 = 0b01101;
 const ASSIGN: u64 = 0b00111;
 const ASSIGN_ACK: u64 = 0b01000;
 const DEASSIGN: u64 = 0b01001;
@@ -294,6 +393,98 @@ struct DecodedDgna {
     groups: Vec<DgnaObservedGroup>,
     complete: bool,
     sequence: Option<u8>,
+}
+
+struct DecodedCallWaiting {
+    operation: u8,
+    waiting_calls: u8,
+}
+
+fn decode_call_waiting(raw: &[u8], bits: u16) -> Option<DecodedCallWaiting> {
+    if raw.len() < usize::from(bits).div_ceil(8) || bits < 11 {
+        return None;
+    }
+    let mut buffer = BitBuffer::from_vec(raw.to_vec());
+    if buffer.read_bits(6)? != SS_CALL_WAITING {
+        return None;
+    }
+    let operation = buffer.read_bits(5)? as u8;
+    let waiting_calls = match operation {
+        CW_ACTIVATE | CW_DEACTIVATE | CW_INVOKE => 0,
+        CW_LOCATION_CHANGE => {
+            let count = buffer.read_bits(3)? as u8;
+            if count == 0 {
+                return None;
+            }
+            count
+        }
+        _ => return None,
+    };
+    (buffer.get_pos() == usize::from(bits)).then_some(DecodedCallWaiting { operation, waiting_calls })
+}
+
+fn encode_call_waiting_response(operation: u8, accepted: bool, active: bool, cause: u8, _waiting_calls: u8) -> Option<(Vec<u8>, u16)> {
+    let mut buffer = BitBuffer::new_autoexpand(32);
+    buffer.write_bits(SS_CALL_WAITING, 6);
+    buffer.write_bits(u64::from(operation), 5);
+    match operation {
+        CW_ACTIVATE_ACK | CW_DEACTIVATE_ACK => {
+            buffer.write_bit(u8::from(accepted));
+            buffer.write_bit(if accepted { u8::from(active) } else { u8::from(cause != 0) });
+        }
+        CW_LOCATION_CHANGE_ACK => {
+            // Intra-SwMI relocation preserves central call identifiers. The
+            // mandatory bitmap therefore reports neither changed nor lost.
+            buffer.write_bits(0, 2);
+        }
+        _ => return None,
+    }
+    bitbuffer_bytes(buffer)
+}
+
+fn encode_call_waiting_invocation_failure(cause: u8) -> Option<(Vec<u8>, u16)> {
+    if cause > 3 {
+        return None;
+    }
+    let mut buffer = BitBuffer::new_autoexpand(16);
+    buffer.write_bits(SS_CALL_WAITING, 6);
+    buffer.write_bits(u64::from(CW_INVOCATION_FAILURE), 5);
+    buffer.write_bits(u64::from(cause), 2);
+    bitbuffer_bytes(buffer)
+}
+
+fn bitbuffer_bytes(mut buffer: BitBuffer) -> Option<(Vec<u8>, u16)> {
+    let bits = buffer.get_len();
+    let mut raw = vec![0; bits.div_ceil(8)];
+    buffer.seek(0);
+    buffer.read_bits_into_slice(bits, &mut raw)?;
+    Some((raw, u16::try_from(bits).ok()?))
+}
+
+fn type3_payload(facility: &Type3FieldGeneric) -> (Vec<u8>, u16) {
+    let bits = u16::try_from(facility.len).unwrap_or(u16::MAX);
+    if !facility.raw.is_empty() {
+        return (facility.raw.clone(), bits);
+    }
+    let mut buffer = BitBuffer::new_autoexpand(facility.len.max(1));
+    buffer.write_bits(facility.data, facility.len);
+    bitbuffer_bytes(buffer).unwrap_or_default()
+}
+
+fn type3_facility(raw: Vec<u8>, bits: u16) -> Type3FieldGeneric {
+    let len = usize::from(bits);
+    let first_bits = len.min(64);
+    let data = raw
+        .iter()
+        .take(first_bits.div_ceil(8))
+        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+        >> (first_bits.div_ceil(8) * 8 - first_bits);
+    Type3FieldGeneric {
+        field_id: CmceType3ElemId::Facility.into_raw(),
+        len,
+        data,
+        raw: (len > 64).then_some(raw).unwrap_or_default(),
+    }
 }
 
 fn encode_dgna(action: u8, gssi: Option<u32>, name: Option<&str>, gck_select_number: Option<u64>) -> Option<(Vec<u8>, u16)> {
@@ -500,6 +691,59 @@ fn decode_interrogate_ack(buffer: &mut BitBuffer, bits: u16) -> Option<DecodedDg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_waiting_requests_use_exact_stage_3_type_1_lengths() {
+        for (operation, bits) in [(CW_ACTIVATE, 11), (CW_DEACTIVATE, 11), (CW_INVOKE, 11), (CW_LOCATION_CHANGE, 14)] {
+            let mut encoded = BitBuffer::new_autoexpand(bits);
+            encoded.write_bits(SS_CALL_WAITING, 6);
+            encoded.write_bits(u64::from(operation), 5);
+            if operation == CW_LOCATION_CHANGE {
+                encoded.write_bits(2, 3);
+            }
+            let (raw, encoded_bits) = bitbuffer_bytes(encoded).expect("encode SS-CW request");
+            let decoded = decode_call_waiting(&raw, encoded_bits).expect("decode SS-CW request");
+            assert_eq!(decoded.operation, operation);
+            assert_eq!(decoded.waiting_calls, u8::from(operation == CW_LOCATION_CHANGE) * 2);
+
+            let mut malformed = BitBuffer::from_vec(raw);
+            malformed.seek(usize::from(encoded_bits));
+            malformed.write_bit(0);
+            let (raw, malformed_bits) = bitbuffer_bytes(malformed).expect("encode malformed request");
+            assert!(
+                decode_call_waiting(&raw, malformed_bits).is_none(),
+                "type-1-only SS-CW PDU must reject a trailing bit"
+            );
+        }
+    }
+
+    #[test]
+    fn call_waiting_responses_match_stage_3_tables() {
+        for (operation, accepted, active, cause, expected_tail) in [
+            (CW_ACTIVATE_ACK, true, true, 0, 0b11),
+            (CW_DEACTIVATE_ACK, true, false, 0, 0b10),
+            (CW_ACTIVATE_ACK, false, false, 1, 0b01),
+            (CW_LOCATION_CHANGE_ACK, true, true, 0, 0b00),
+        ] {
+            let (raw, bits) = encode_call_waiting_response(operation, accepted, active, cause, 0).expect("encode SS-CW response");
+            assert_eq!(bits, 13);
+            let mut encoded = BitBuffer::from_vec(raw);
+            assert_eq!(encoded.read_bits(6), Some(SS_CALL_WAITING));
+            assert_eq!(encoded.read_bits(5), Some(u64::from(operation)));
+            assert_eq!(encoded.read_bits(2), Some(expected_tail));
+            assert_eq!(encoded.get_pos(), usize::from(bits));
+        }
+
+        for cause in 0..=3 {
+            let (raw, bits) = encode_call_waiting_invocation_failure(cause).expect("encode SS-CW invocation failure");
+            assert_eq!(bits, 13);
+            let mut encoded = BitBuffer::from_vec(raw);
+            assert_eq!(encoded.read_bits(6), Some(SS_CALL_WAITING));
+            assert_eq!(encoded.read_bits(5), Some(u64::from(CW_INVOCATION_FAILURE)));
+            assert_eq!(encoded.read_bits(2), Some(u64::from(cause)));
+            assert_eq!(encoded.get_pos(), usize::from(bits));
+        }
+    }
 
     #[test]
     fn sc3g_assignment_encodes_security_length_before_gck_association() {

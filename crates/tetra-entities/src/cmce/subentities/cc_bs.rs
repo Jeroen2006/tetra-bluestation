@@ -50,6 +50,7 @@ use tetra_swmi_protocol::{HandoverChannelAllocation, SwmiMessage, TalkingPartyPr
 // broadcast); 1 is INFORM2 (LE acknowledgement).
 const NOTIFICATION_LE_BROADCAST: u64 = 0;
 const NOTIFICATION_LE_ACKNOWLEDGEMENT: u64 = 1;
+const NOTIFICATION_CALL_WAITING: u64 = 10;
 /// A D-TX-INTERRUPT must reach the current speaker before the replacement
 /// holder receives D-TX-GRANTED.  The UMAC scheduler emits FACCH a few slots
 /// ahead of CMCE, so six complete TDMA frames leaves a deterministic receive
@@ -232,6 +233,8 @@ struct PrivateCallLocal {
     duplex: bool,
     request_to_transmit: bool,
     priority: u8,
+    waiting_required: bool,
+    waiting_invoked: bool,
     /// Current central simplex floor holder; zero means private-call
     /// hangtime. It lets a restored endpoint receive the right D-CALL
     /// RESTORE grant without inventing a new floor decision.
@@ -2578,6 +2581,8 @@ impl CcBsSubentity {
                         duplex,
                         request_to_transmit,
                         priority,
+                        waiting_required: false,
+                        waiting_invoked: false,
                         floor_itsi: 0,
                         connected: false,
                         local_mask: 0x01,
@@ -2603,6 +2608,8 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    waiting_required: false,
+                    waiting_invoked: false,
                     floor_itsi: 0,
                     connected: false,
                     local_mask: 0x02,
@@ -2614,6 +2621,50 @@ impl CcBsSubentity {
                     .or_insert_with(|| call.clone());
                 self.send_private_d_setup(queue, call_id, &call);
                 tracing::info!(call_id, caller_itsi, callee_itsi, "private D-SETUP sent to called terminal");
+            }
+            SwmiMessage::PrivateCallWaitingOffer {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+                invoked,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else {
+                    return;
+                };
+                let call = PrivateCallLocal {
+                    caller_itsi: caller_itsi as u32,
+                    callee_itsi: callee_itsi as u32,
+                    hook,
+                    duplex,
+                    request_to_transmit,
+                    priority,
+                    waiting_required: true,
+                    waiting_invoked: invoked,
+                    floor_itsi: 0,
+                    connected: false,
+                    local_mask: 0x02,
+                    talking_party: None,
+                };
+                self.private_calls
+                    .entry(call_id)
+                    .and_modify(|existing| {
+                        existing.local_mask |= 0x02;
+                        existing.waiting_required = true;
+                        existing.waiting_invoked |= invoked;
+                    })
+                    .or_insert_with(|| call.clone());
+                self.send_private_d_setup(queue, call_id, &call);
+                tracing::info!(
+                    call_id,
+                    caller_itsi,
+                    callee_itsi,
+                    invoked,
+                    "SS-CW D-SETUP sent on called terminal's current channel"
+                );
             }
             SwmiMessage::PrivateCallAlert { call_id, callee_itsi: _ } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
@@ -2631,6 +2682,37 @@ impl CcBsSubentity {
                 };
                 let mut sdu = BitBuffer::new_autoexpand(32);
                 pdu.to_bitbuf(&mut sdu).expect("serialize private D-ALERT");
+                sdu.seek(0);
+                queue.push_back(Self::build_sapmsg(
+                    sdu,
+                    None,
+                    TetraAddress::new(call.caller_itsi, SsiType::Issi),
+                    Layer2Service::Acknowledged,
+                    None,
+                ));
+            }
+            SwmiMessage::PrivateCallWaitingAlert { call_id, callee_itsi: _ } => {
+                let Ok(call_id) = u16::try_from(call_id) else {
+                    return;
+                };
+                let Some(call) = self.private_calls.get_mut(&call_id) else {
+                    return;
+                };
+                call.waiting_required = true;
+                call.waiting_invoked = true;
+                let pdu = DAlert {
+                    call_identifier: call_id,
+                    call_time_out_set_up_phase: PRIVATE_CALL_SETUP_TIMEOUT.into_raw() as u8,
+                    reserved: true,
+                    simplex_duplex_selection: call.duplex,
+                    call_queued: false,
+                    basic_service_information: None,
+                    notification_indicator: Some(NOTIFICATION_CALL_WAITING),
+                    facility: None,
+                    proprietary: None,
+                };
+                let mut sdu = BitBuffer::new_autoexpand(32);
+                pdu.to_bitbuf(&mut sdu).expect("serialize SS-CW private D-ALERT");
                 sdu.seek(0);
                 queue.push_back(Self::build_sapmsg(
                     sdu,
@@ -2791,6 +2873,8 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    waiting_required: false,
+                    waiting_invoked: false,
                     floor_itsi: initial_floor_itsi as u32,
                     connected: true,
                     local_mask: endpoint_mask,
@@ -2892,6 +2976,54 @@ impl CcBsSubentity {
                 // resource result to the SwMI) or PrivateCallConnected (which
                 // would emit a spurious D-CONNECT before U-RESTORE).
                 tracing::info!(call_id, endpoint_mask, "recreated private call endpoint for roaming restore");
+            }
+            SwmiMessage::PrivateCallWaitingSync {
+                call_id,
+                caller_itsi,
+                callee_itsi,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+                endpoint_mask,
+                waiting_required,
+                invoked,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else {
+                    return;
+                };
+                let call = PrivateCallLocal {
+                    caller_itsi: caller_itsi as u32,
+                    callee_itsi: callee_itsi as u32,
+                    hook,
+                    duplex,
+                    request_to_transmit,
+                    priority,
+                    waiting_required,
+                    waiting_invoked: invoked,
+                    floor_itsi: 0,
+                    connected: false,
+                    local_mask: endpoint_mask,
+                    talking_party: None,
+                };
+                self.private_calls
+                    .entry(call_id)
+                    .and_modify(|existing| {
+                        existing.local_mask |= endpoint_mask;
+                        existing.waiting_required = waiting_required;
+                        existing.waiting_invoked |= invoked;
+                    })
+                    .or_insert_with(|| call.clone());
+                if endpoint_mask & 0x02 != 0 && !invoked {
+                    self.send_private_d_setup(queue, call_id, &call);
+                }
+                tracing::info!(
+                    call_id,
+                    endpoint_mask,
+                    waiting_required,
+                    invoked,
+                    "re-anchored private call offer after roaming"
+                );
             }
             SwmiMessage::PrivateCallEndpointMoved { call_id, itsi } => {
                 if let (Ok(call_id), Ok(itsi)) = (u16::try_from(call_id), u32::try_from(itsi)) {
@@ -3091,6 +3223,23 @@ impl CcBsSubentity {
                     } else {
                         tracing::warn!(call_id, itsi, cause, "central floor request rejected after local call disappeared");
                     }
+                }
+            }
+            SwmiMessage::CallWaitingResponse {
+                itsi,
+                call_id,
+                operation: 9,
+                cause,
+                ..
+            } => {
+                if let Ok(call_id) = u16::try_from(call_id) {
+                    self.release_private_endpoint_with_facility(
+                        queue,
+                        call_id,
+                        itsi as u32,
+                        DisconnectCause::CalledPartyBusy,
+                        SsBsSubentity::call_waiting_invocation_failure_facility(cause),
+                    );
                 }
             }
             _ => {}
@@ -3808,16 +3957,28 @@ impl CcBsSubentity {
         };
         let itsi = prim.received_tetra_address.ssi;
         let Ok(pdu) = UAlert::from_bitbuf(&mut prim.sdu) else { return };
-        if self
-            .private_calls
-            .get(&pdu.call_identifier)
-            .is_some_and(|call| call.callee_itsi == itsi)
+        let invokes_call_waiting = pdu.facility.as_ref().is_some_and(SsBsSubentity::is_call_waiting_invoke);
+        if let Some(call) = self.private_calls.get_mut(&pdu.call_identifier)
+            && call.callee_itsi == itsi
+            && (!call.waiting_required || invokes_call_waiting)
         {
+            if invokes_call_waiting {
+                call.waiting_required = true;
+                call.waiting_invoked = true;
+            }
             if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
-                let _ = swmi.submit(SwmiMessage::PrivateCallAlert {
-                    call_id: pdu.call_identifier as u64,
-                    callee_itsi: itsi as u64,
-                });
+                let message = if invokes_call_waiting {
+                    SwmiMessage::PrivateCallWaitingAlert {
+                        call_id: pdu.call_identifier as u64,
+                        callee_itsi: itsi as u64,
+                    }
+                } else {
+                    SwmiMessage::PrivateCallAlert {
+                        call_id: pdu.call_identifier as u64,
+                        callee_itsi: itsi as u64,
+                    }
+                };
+                let _ = swmi.submit(message);
             }
         }
     }
@@ -3993,6 +4154,58 @@ impl CcBsSubentity {
                     None,
                 ));
             }
+        }
+    }
+
+    fn release_private_endpoint_with_facility(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        itsi: u32,
+        cause: DisconnectCause,
+        facility: Option<Type3FieldGeneric>,
+    ) {
+        let Some(call) = self.private_calls.get(&call_id).cloned() else {
+            return;
+        };
+        if itsi != call.callee_itsi || call.local_mask & 0x02 == 0 {
+            return;
+        }
+        self.pending_private_floor_requests.remove(&(call_id, itsi));
+        self.pending_private_keepalives
+            .retain(|(pending_call_id, pending_itsi, _), _| *pending_call_id != call_id || *pending_itsi != itsi);
+        if let Some(local) = self.private_calls.get_mut(&call_id) {
+            local.local_mask &= !0x02;
+        }
+        if self.private_calls.get(&call_id).is_some_and(|local| local.local_mask == 0) {
+            self.private_calls.remove(&call_id);
+        }
+        let pdu = DRelease {
+            call_identifier: call_id,
+            disconnect_cause: cause,
+            notification_indicator: None,
+            facility,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("serialize SS-CW invocation-failure D-RELEASE");
+        sdu.seek(0);
+        if let Some(circuit) = self.private_circuits.remove(&(call_id, itsi)) {
+            queue.push_back(Self::build_sapmsg_stealing(sdu, TetraAddress::new(itsi, SsiType::Issi), circuit.ts));
+            self.releasing_private_circuits.push(ReleasingPrivateCircuit {
+                call_id,
+                itsi,
+                circuit,
+                sent_at: self.dltime,
+            });
+        } else {
+            queue.push_back(Self::build_sapmsg(
+                sdu,
+                None,
+                TetraAddress::new(itsi, SsiType::Issi),
+                Layer2Service::Acknowledged,
+                None,
+            ));
         }
     }
 
@@ -5445,6 +5658,8 @@ mod tests {
             duplex: false,
             request_to_transmit: true,
             priority: 0,
+            waiting_required: false,
+            waiting_invoked: false,
             floor_itsi: 430_905,
             connected: true,
             local_mask: 0x03,
@@ -5495,6 +5710,126 @@ mod tests {
                 "SC3 private connect for {itsi} needs {on_air_bits} bits but SCH/F has {SCH_F_CAP}"
             );
         }
+    }
+
+    fn waiting_test_call() -> PrivateCallLocal {
+        PrivateCallLocal {
+            caller_itsi: 430_892,
+            callee_itsi: 430_905,
+            hook: true,
+            duplex: false,
+            request_to_transmit: false,
+            priority: 0,
+            waiting_required: true,
+            waiting_invoked: false,
+            floor_itsi: 0,
+            connected: false,
+            local_mask: 0x03,
+            talking_party: None,
+        }
+    }
+
+    #[test]
+    fn successful_call_waiting_invoke_notifies_the_caller() {
+        let call_id = 27;
+        let mut cc = test_cc_with_group(204);
+        cc.private_calls.insert(call_id, waiting_test_call());
+        let mut queue = MessageQueue::new();
+
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::PrivateCallWaitingAlert {
+                call_id: u64::from(call_id),
+                callee_itsi: 430_905,
+            },
+        );
+
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = queue.pop_front().expect("D-ALERT queued").msg else {
+            panic!("SS-CW D-ALERT must be routed to MLE")
+        };
+        assert_eq!(prim.main_address.ssi, 430_892);
+        let alert = DAlert::from_bitbuf(&mut prim.sdu).expect("parse SS-CW D-ALERT");
+        assert_eq!(alert.call_identifier, call_id);
+        assert_eq!(alert.notification_indicator, Some(NOTIFICATION_CALL_WAITING));
+        assert!(cc.private_calls[&call_id].waiting_invoked);
+    }
+
+    #[test]
+    fn invocation_failure_releases_each_same_cell_endpoint_once() {
+        let call_id = 28;
+        let mut cc = test_cc_with_group(204);
+        cc.private_calls.insert(call_id, waiting_test_call());
+        let mut queue = MessageQueue::new();
+
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::CallWaitingResponse {
+                command_id: 0,
+                itsi: 430_905,
+                call_id: u64::from(call_id),
+                operation: 9,
+                accepted: false,
+                active: false,
+                cause: 2,
+                waiting_calls: 0,
+            },
+        );
+
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = queue.pop_front().expect("served-user D-RELEASE queued").msg else {
+            panic!("served-user D-RELEASE must be routed to MLE")
+        };
+        assert_eq!(prim.main_address.ssi, 430_905);
+        let release = DRelease::from_bitbuf(&mut prim.sdu).expect("parse served-user D-RELEASE");
+        assert_eq!(release.call_identifier, call_id);
+        assert_eq!(release.disconnect_cause, DisconnectCause::CalledPartyBusy);
+        let facility = release.facility.expect("INVOCATION FAILURE facility");
+        assert_eq!(facility.len, 13);
+        assert_eq!(cc.private_calls[&call_id].local_mask, 0x01);
+
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::PrivateCallRelease {
+                call_id: u64::from(call_id),
+                itsi: 0,
+                cause: DisconnectCause::CalledPartyBusy as u8,
+            },
+        );
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = queue.pop_front().expect("affected-user D-RELEASE queued").msg else {
+            panic!("affected-user D-RELEASE must be routed to MLE")
+        };
+        assert_eq!(prim.main_address.ssi, 430_892);
+        let release = DRelease::from_bitbuf(&mut prim.sdu).expect("parse affected-user D-RELEASE");
+        assert!(release.facility.is_none());
+        assert!(!cc.private_calls.contains_key(&call_id));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn invoked_waiting_call_roaming_sync_does_not_repeat_d_setup() {
+        let call_id = 29;
+        let mut cc = test_cc_with_group(204);
+        let mut queue = MessageQueue::new();
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::PrivateCallWaitingSync {
+                call_id: u64::from(call_id),
+                caller_itsi: 430_892,
+                callee_itsi: 430_905,
+                hook: true,
+                duplex: false,
+                request_to_transmit: false,
+                priority: 0,
+                endpoint_mask: 0x02,
+                waiting_required: true,
+                invoked: true,
+            },
+        );
+
+        assert!(queue.pop_front().is_none());
+        let call = &cc.private_calls[&call_id];
+        assert!(call.waiting_required);
+        assert!(call.waiting_invoked);
+        assert_eq!(call.local_mask, 0x02);
     }
 
     #[test]
@@ -5709,6 +6044,8 @@ mod tests {
                 duplex: true,
                 request_to_transmit: false,
                 priority: 0,
+                waiting_required: false,
+                waiting_invoked: false,
                 floor_itsi: 0,
                 connected: false,
                 local_mask: 0x03,

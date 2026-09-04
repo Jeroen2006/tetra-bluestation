@@ -778,6 +778,9 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::PrivateCallProceeding { .. }
                             | SwmiMessage::PrivateCallOffer { .. }
                             | SwmiMessage::PrivateCallAlert { .. }
+                            | SwmiMessage::PrivateCallWaitingOffer { .. }
+                            | SwmiMessage::PrivateCallWaitingAlert { .. }
+                            | SwmiMessage::PrivateCallWaitingSync { .. }
                             | SwmiMessage::PrivateCallReserve { .. }
                             | SwmiMessage::PrivateCallConnected { .. }
                             | SwmiMessage::PrivateCallRestore { .. }
@@ -790,7 +793,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::SdsDeliver { .. }
                             | SwmiMessage::SdsFailure { .. }
                             | SwmiMessage::StatusDeliver { .. }
-                            | SwmiMessage::DgnaCommand { .. }),
+                            | SwmiMessage::DgnaCommand { .. }
+                            | SwmiMessage::CallWaitingResponse { .. }),
                         ) => {
                             if self.endpoint.cmce_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI CMCE endpoint closed; dropping central call action");

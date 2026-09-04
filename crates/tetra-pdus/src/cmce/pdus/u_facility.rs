@@ -11,6 +11,9 @@ use tetra_core::{BitBuffer, expect_pdu_type, pdu_parse_error::PduParseErr};
 // note 1: Contents of this PDU shall be defined by SS protocols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UFacility {
+    /// ETSI EN 300 392-9 routeing value. Zero addresses the current SwMI and
+    /// one addresses the sending MS's home SwMI.
+    pub routing: u8,
     pub ss_pdu: Vec<u8>,
     pub ss_pdu_bits: u16,
 }
@@ -21,9 +24,10 @@ impl UFacility {
         let pdu_type = buffer.read_field(5, "pdu_type")?;
         expect_pdu_type!(pdu_type, CmcePduTypeUl::UFacility)?;
 
-        if buffer.read_field(2, "routing")? != 0 {
+        let routing = buffer.read_field(2, "routing")? as u8;
+        if routing > 1 {
             return Err(PduParseErr::NotImplemented {
-                field: Some("non-current SwMI routing"),
+                field: Some("unsupported U-FACILITY routing"),
             });
         }
         let count = buffer.read_field(4, "number_ss_pdus")?;
@@ -47,6 +51,7 @@ impl UFacility {
             return Err(PduParseErr::InvalidTrailingMbitValue);
         }
         Ok(Self {
+            routing,
             ss_pdu,
             ss_pdu_bits: bits as u16,
         })
@@ -61,7 +66,13 @@ impl UFacility {
             });
         }
         buffer.write_bits(CmcePduTypeUl::UFacility.into_raw(), 5);
-        buffer.write_bits(0, 2); // routing: current SwMI
+        if self.routing > 1 {
+            return Err(PduParseErr::InvalidValue {
+                field: "routing",
+                value: u64::from(self.routing),
+            });
+        }
+        buffer.write_bits(u64::from(self.routing), 2);
         buffer.write_bits(1, 4);
         buffer.write_bits(self.ss_pdu_bits as u64, 11);
         let mut source = BitBuffer::from_vec(self.ss_pdu.clone());
@@ -73,6 +84,35 @@ impl UFacility {
 
 impl fmt::Display for UFacility {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "UFacility {{ ss_pdu_bits: {} }}", self.ss_pdu_bits)
+        write!(f, "UFacility {{ routing: {}, ss_pdu_bits: {} }}", self.routing, self.ss_pdu_bits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_swmi_routing_roundtrips() {
+        let facility = UFacility {
+            routing: 1,
+            ss_pdu: vec![0xab, 0xc0],
+            ss_pdu_bits: 12,
+        };
+        let mut buffer = BitBuffer::new_autoexpand(64);
+        facility.to_bitbuf(&mut buffer).expect("serialize U-FACILITY");
+        buffer.seek(0);
+
+        assert_eq!(UFacility::from_bitbuf(&mut buffer).expect("parse U-FACILITY"), facility);
+    }
+
+    #[test]
+    fn unsupported_routing_is_rejected() {
+        let facility = UFacility {
+            routing: 2,
+            ss_pdu: vec![0x80],
+            ss_pdu_bits: 1,
+        };
+        assert!(facility.to_bitbuf(&mut BitBuffer::new_autoexpand(32)).is_err());
     }
 }
