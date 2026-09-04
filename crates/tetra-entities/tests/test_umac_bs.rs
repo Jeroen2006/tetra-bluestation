@@ -26,6 +26,7 @@ fn test_in_fragmented_sch_hu_and_sch_f() {
         ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
+        rf_observation: None,
     };
     let test_sapmsg1 = SapMsg {
         sap: Sap::TmvSap,
@@ -40,6 +41,7 @@ fn test_in_fragmented_sch_hu_and_sch_f() {
         ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
+        rf_observation: None,
     };
     let test_sapmsg2 = SapMsg {
         sap: Sap::TmvSap,
@@ -86,6 +88,7 @@ fn test_in_fragmented_sch_hu_and_sch_hu() {
         ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
+        rf_observation: None,
     };
     let test_sapmsg1 = SapMsg {
         sap: Sap::TmvSap,
@@ -100,6 +103,7 @@ fn test_in_fragmented_sch_hu_and_sch_hu() {
         ul_time: dltime_vec1.add_timeslots(-2),
         crc_pass: true,
         scrambling_code: 864282631,
+        rf_observation: None,
     };
     let test_sapmsg2 = SapMsg {
         sap: Sap::TmvSap,

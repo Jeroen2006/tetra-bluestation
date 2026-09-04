@@ -2,7 +2,7 @@ use num;
 use num::complex::ComplexFloat;
 
 use tetra_core::TrainingSequence;
-use tetra_core::{SoftBit, TdmaTime};
+use tetra_core::{SoftBit, TdmaTime, UplinkRfObservation};
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 
@@ -246,11 +246,13 @@ impl Demodulator {
 
         let bits = &mut burst_finder.bits;
         let soft_bits = &mut burst_finder.soft_bits;
+        let symbols = &mut burst_finder.symbols;
         let mut previous_symbol: Option<ComplexSample> = None;
         for i in (first_symbol_index..first_symbol_index + SPS * n_symbols).step_by(SPS) {
             // Use fractional part of timing estimate to interpolate between samples.
             // Linear interpolation is not the best choice here but maybe good enough.
             let symbol = (1.0 - timing_fract) * self.past_samples.delayed(d - i) + timing_fract * self.past_samples.delayed(d - (i + 1));
+            symbols.push(symbol);
 
             if let Some(previous_symbol) = previous_symbol {
                 // Differential phase demodulation
@@ -339,6 +341,9 @@ impl Demodulator {
             }
             Mode::Ul => {
                 training_sequence_found = burst_finder.check_slot(if subslot_number == 0 { SlotType::UlFull } else { SlotType::UlSub });
+                if training_sequence_found {
+                    burst_finder.measure_rf(symbol_timing, subslot_number);
+                }
 
                 // Uplink slot numbering is offset from downlink by 2.
                 // This could also be done by using a different reference_time for UL
@@ -462,6 +467,8 @@ struct SlotBurstFinder {
     bits: Vec<u8>,
     /// Signed bit reliabilities aligned one-to-one with `bits`.
     soft_bits: Vec<SoftBit>,
+    /// Interpolated symbol samples used to derive per-burst RF metrics.
+    symbols: Vec<ComplexSample>,
     /// Training sequence found
     train_type: TrainingSequence,
     /// Number of bit errors in training sequence
@@ -470,6 +477,7 @@ struct SlotBurstFinder {
     burst_pos: usize,
     /// Length of burst
     burst_len: usize,
+    rf_observation: Option<UplinkRfObservation>,
 }
 
 impl SlotBurstFinder {
@@ -489,20 +497,24 @@ impl SlotBurstFinder {
         Self {
             bits: Vec::with_capacity(510),
             soft_bits: Vec::with_capacity(510),
+            symbols: Vec::with_capacity(256),
             train_type: TrainingSequence::NotFound,
             train_errs: Self::ERRS_NO_BURST,
             burst_pos: 0,
             burst_len: 0,
+            rf_observation: None,
         }
     }
 
     fn clear(&mut self) {
         self.bits.clear();
         self.soft_bits.clear();
+        self.symbols.clear();
         self.train_type = TrainingSequence::NotFound;
         self.train_errs = Self::ERRS_NO_BURST;
         self.burst_pos = 0;
         self.burst_len = 0;
+        self.rf_observation = None;
     }
 
     fn check_sequence(
@@ -607,6 +619,183 @@ impl SlotBurstFinder {
             bits: &self.bits[self.burst_pos..self.burst_pos + self.burst_len],
             soft_bits: (self.soft_bits.len() >= self.burst_pos + self.burst_len)
                 .then(|| &self.soft_bits[self.burst_pos..self.burst_pos + self.burst_len]),
+            rf_observation: self.rf_observation,
         }
+    }
+
+    fn measure_rf(&mut self, symbol_timing: RealSample, burst_index: u8) {
+        let (training_offset, training_bits): (usize, &[u8]) = match self.train_type {
+            TrainingSequence::NormalTrainSeq1 => (4 + 216, &train_consts::SEQ_NORM1_AS_ARR),
+            TrainingSequence::NormalTrainSeq2 => (4 + 216, &train_consts::SEQ_NORM2_AS_ARR),
+            TrainingSequence::ExtendedTrainSeq => (4 + 84, &train_consts::SEQ_EXT_AS_ARR),
+            _ => return,
+        };
+        const TAIL_BITS: usize = 4;
+        let useful_symbol_start = (self.burst_pos + TAIL_BITS) / 2;
+        let useful_symbol_count = (self.burst_len - 2 * TAIL_BITS) / 2;
+        let Some(power_symbols) = self
+            .symbols
+            .get(useful_symbol_start + 1..=useful_symbol_start + useful_symbol_count)
+        else {
+            return;
+        };
+        let received_power_linear =
+            power_symbols.iter().map(|symbol| symbol.norm_sqr()).sum::<RealSample>() / power_symbols.len() as RealSample;
+
+        let training_symbol_start = (self.burst_pos + training_offset) / 2;
+        let mut residuals = Vec::with_capacity(training_bits.len() / 2);
+        for (index, pair) in training_bits.chunks_exact(2).enumerate() {
+            let Some((&previous, &current)) = self
+                .symbols
+                .get(training_symbol_start + index..=training_symbol_start + index + 1)
+                .and_then(|values| {
+                    values
+                        .split_first()
+                        .and_then(|(first, rest)| rest.first().map(|second| (first, second)))
+                })
+            else {
+                return;
+            };
+            let differential = current * previous.conj();
+            let magnitude = differential.abs();
+            if magnitude <= RealSample::EPSILON {
+                continue;
+            }
+            let ideal_phase = match (pair[0], pair[1]) {
+                (0, 0) => sample_consts::FRAC_PI_4,
+                (0, 1) => 3.0 * sample_consts::FRAC_PI_4,
+                (1, 0) => -sample_consts::FRAC_PI_4,
+                (1, 1) => -3.0 * sample_consts::FRAC_PI_4,
+                _ => return,
+            };
+            let ideal = ComplexSample::new(ideal_phase.cos(), ideal_phase.sin());
+            residuals.push((differential / magnitude) * ideal.conj());
+        }
+        if residuals.is_empty() || !received_power_linear.is_finite() || received_power_linear <= 0.0 {
+            return;
+        }
+        let circular_sum = residuals.iter().copied().sum::<ComplexSample>();
+        let mean_phase = circular_sum.im.atan2(circular_sum.re);
+        let frequency_offset_hz = mean_phase * (18_000.0 / (2.0 * sample_consts::PI));
+        let correction = ComplexSample::new((-mean_phase).cos(), (-mean_phase).sin());
+        let training_evm_percent = (residuals
+            .iter()
+            .map(|residual| (*residual * correction - ComplexSample::new(1.0, 0.0)).norm_sqr())
+            .sum::<RealSample>()
+            / residuals.len() as RealSample)
+            .sqrt()
+            * 100.0;
+        let nominal_burst_pos = (self.bits.len().saturating_sub(self.burst_len)) as RealSample / 2.0;
+        let relative_arrival_symbols =
+            (self.burst_pos as RealSample - nominal_burst_pos) / 2.0 + (symbol_timing - SPS as RealSample / 2.0) / SPS as RealSample;
+        if [frequency_offset_hz, training_evm_percent, relative_arrival_symbols]
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return;
+        }
+        self.rf_observation = Some(UplinkRfObservation {
+            burst_index,
+            received_power_linear,
+            frequency_offset_hz,
+            training_error_bits: self.train_errs.min(u16::MAX as usize) as u16,
+            training_bit_count: training_bits.len() as u16,
+            training_evm_percent,
+            relative_arrival_symbols,
+        });
+    }
+}
+
+#[cfg(test)]
+mod rf_tests {
+    use super::*;
+
+    fn finder_with_training(train_type: TrainingSequence, frequency_offset_hz: RealSample, amplitude: RealSample) -> SlotBurstFinder {
+        let (burst_len, training_offset, training): (usize, usize, &[u8]) = match train_type {
+            TrainingSequence::NormalTrainSeq1 => (4 + 216 + 22 + 216 + 4, 4 + 216, &train_consts::SEQ_NORM1_AS_ARR),
+            TrainingSequence::NormalTrainSeq2 => (4 + 216 + 22 + 216 + 4, 4 + 216, &train_consts::SEQ_NORM2_AS_ARR),
+            TrainingSequence::ExtendedTrainSeq => (4 + 84 + 30 + 84 + 4, 4 + 84, &train_consts::SEQ_EXT_AS_ARR),
+            _ => unreachable!(),
+        };
+        let total_bits = burst_len + 48;
+        let burst_pos = 24;
+        let mut bits = vec![0; total_bits];
+        bits[burst_pos + training_offset..burst_pos + training_offset + training.len()].copy_from_slice(training);
+
+        let offset_phase = 2.0 * sample_consts::PI * frequency_offset_hz / 18_000.0;
+        let mut symbols = Vec::with_capacity(total_bits / 2 + 1);
+        let mut symbol = ComplexSample::new(amplitude, 0.0);
+        symbols.push(symbol);
+        for pair in bits.chunks_exact(2) {
+            let ideal_phase = match (pair[0], pair[1]) {
+                (0, 0) => sample_consts::FRAC_PI_4,
+                (0, 1) => 3.0 * sample_consts::FRAC_PI_4,
+                (1, 0) => -sample_consts::FRAC_PI_4,
+                (1, 1) => -3.0 * sample_consts::FRAC_PI_4,
+                _ => unreachable!(),
+            };
+            let rotation = ComplexSample::new((ideal_phase + offset_phase).cos(), (ideal_phase + offset_phase).sin());
+            symbol *= rotation;
+            symbols.push(symbol);
+        }
+
+        let mut finder = SlotBurstFinder::new();
+        finder.bits = bits;
+        finder.symbols = symbols;
+        finder.train_type = train_type;
+        finder.train_errs = 0;
+        finder.burst_pos = burst_pos;
+        finder.burst_len = burst_len;
+        finder
+    }
+
+    #[test]
+    fn measures_normal_uplink_power_frequency_and_timing() {
+        let mut finder = finder_with_training(TrainingSequence::NormalTrainSeq1, 75.0, 0.1);
+        finder.measure_rf(2.0, 0);
+        let observation = finder.rf_observation.expect("RF observation");
+        assert!((10.0 * observation.received_power_linear.log10() + 20.0).abs() < 0.01);
+        assert!((observation.frequency_offset_hz - 75.0).abs() < 0.1);
+        assert!(observation.training_evm_percent < 0.01);
+        assert!(observation.relative_arrival_symbols.abs() < 0.01);
+        assert_eq!(observation.training_bit_count, 22);
+    }
+
+    #[test]
+    fn measures_control_uplink_negative_frequency_offset() {
+        let mut finder = finder_with_training(TrainingSequence::ExtendedTrainSeq, -55.0, 0.25);
+        finder.measure_rf(2.0, 2);
+        let observation = finder.rf_observation.expect("RF observation");
+        assert!((observation.frequency_offset_hz + 55.0).abs() < 0.1);
+        assert_eq!(observation.training_bit_count, 30);
+        assert_eq!(observation.burst_index, 2);
+    }
+
+    #[test]
+    fn reports_training_errors_timing_and_noisy_evm() {
+        let mut finder = finder_with_training(TrainingSequence::NormalTrainSeq2, 20.0, 0.2);
+        finder.train_errs = 1;
+        let training_symbol_start = (finder.burst_pos + 4 + 216) / 2;
+        for (index, symbol) in finder.symbols[training_symbol_start..training_symbol_start + 12]
+            .iter_mut()
+            .enumerate()
+        {
+            let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+            *symbol += ComplexSample::new(0.002 * sign, -0.001 * sign);
+        }
+        finder.measure_rf(3.0, 0);
+        let observation = finder.rf_observation.expect("RF observation");
+        assert_eq!(observation.training_error_bits, 1);
+        assert!((observation.relative_arrival_symbols - 0.25).abs() < 0.01);
+        assert!(observation.training_evm_percent.is_finite());
+        assert!(observation.training_evm_percent > 0.0);
+    }
+
+    #[test]
+    fn rejects_non_finite_symbol_power() {
+        let mut finder = finder_with_training(TrainingSequence::NormalTrainSeq1, 0.0, 0.2);
+        finder.symbols[((finder.burst_pos + 4) / 2) + 1].re = RealSample::NAN;
+        finder.measure_rf(2.0, 0);
+        assert!(finder.rf_observation.is_none());
     }
 }

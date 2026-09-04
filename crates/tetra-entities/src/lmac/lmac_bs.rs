@@ -1,8 +1,8 @@
 use tetra_config::bluestation::{BsAieKeyProvider, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
-    AieContext, AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, Sc2KeyIdentifier,
-    Sc3KeyIdentifier, Sc3KeyType, TdmaTime, TrainingSequence,
+    AieContext, AieDirection, AieRequest, AieScope, BurstType, PhyBlockNum, PhysicalChannel, Sap, Sc2KeyIdentifier, Sc3KeyIdentifier,
+    Sc3KeyType, TdmaTime, TrainingSequence,
 };
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvCrcInd, TmvUnitdataInd};
@@ -273,6 +273,27 @@ impl LmacBs {
         }
     }
 
+    fn enqueue_traffic_ind(
+        queue: &mut MessageQueue,
+        ul_time: TdmaTime,
+        data: Vec<u8>,
+        block_ok: bool,
+        rf_observation: Option<tetra_core::UplinkRfObservation>,
+    ) {
+        queue.push_back(SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                ts: ul_time.t,
+                ul_time,
+                data,
+                block_ok,
+                rf_observation,
+            }),
+        });
+    }
+
     fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel, ul_time: TdmaTime) {
         // Only full-slot TCH/S supported for now
         if lchan != LogicalChannel::TchS || blk.block_num != PhyBlockNum::Both {
@@ -284,9 +305,13 @@ impl LmacBs {
             return;
         }
 
+        let rf_observation = blk.rf_observation;
         let (decoded, crc_ok) = errorcontrol::decode_tp_with_soft(lchan, blk.block, blk.soft_bits.as_deref(), self.scrambling_code);
         let Some(mut acelp_bits) = decoded else {
             tracing::warn!("rx_blk_traffic: decode_tp returned None");
+            if rf_observation.is_some() {
+                Self::enqueue_traffic_ind(queue, ul_time, Vec::new(), false, rf_observation);
+            }
             return;
         };
 
@@ -307,12 +332,14 @@ impl LmacBs {
                 Ok(context) => context,
                 Err(error) => {
                     tracing::warn!(?error, ul_time = %ul_time, "dropping uplink traffic without a valid SC2 context");
+                    Self::enqueue_traffic_ind(queue, ul_time, Vec::new(), crc_ok, rf_observation);
                     return;
                 }
             };
             let len = acelp_bits.get_len();
             if let Err(error) = self.aie_provider.cipher_uplink_traffic(context, &mut acelp_bits, 0, len) {
                 tracing::warn!(?error, ul_time = %ul_time, "dropping uplink traffic after SC2 decrypt failure");
+                Self::enqueue_traffic_ind(queue, ul_time, Vec::new(), crc_ok, rf_observation);
                 return;
             }
         }
@@ -323,13 +350,7 @@ impl LmacBs {
         bb.seek(0);
         bb.to_bitarr(&mut data);
 
-        let msg = SapMsg {
-            sap: Sap::TmdSap,
-            src: TetraEntity::Lmac,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: ul_time.t, data }),
-        };
-        queue.push_back(msg);
+        Self::enqueue_traffic_ind(queue, ul_time, data, crc_ok, rf_observation);
     }
 
     fn rx_blk_control(
@@ -347,6 +368,7 @@ impl LmacBs {
         );
 
         let block_num = blk.block_num;
+        let rf_observation = blk.rf_observation;
         let (type1bits, crc_pass) = errorcontrol::decode_cp(lchan, blk, Some(self.scrambling_code));
 
         if ul_time.f == 18 && lchan == LogicalChannel::SchF {
@@ -365,19 +387,21 @@ impl LmacBs {
         // );
         tracing::debug!("rx_blk_cp {:?} CRC: {}", lchan, if crc_pass { "ok" } else { "WRONG" });
 
-        if !crc_pass && common_control && lchan == LogicalChannel::SchHu {
-            let key = (ul_time, block_num);
-            if self.recent_common_crc_failures.contains(&key) {
-                tracing::debug!(
-                    "rx_blk_control: suppressing duplicate common SCH/HU CRC failure at {} block={:?}",
-                    ul_time,
-                    block_num
-                );
-                return;
-            }
-            self.recent_common_crc_failures.push_back(key);
-            if self.recent_common_crc_failures.len() > 32 {
-                self.recent_common_crc_failures.pop_front();
+        if !crc_pass {
+            if common_control && lchan == LogicalChannel::SchHu {
+                let key = (ul_time, block_num);
+                if self.recent_common_crc_failures.contains(&key) {
+                    tracing::debug!(
+                        "rx_blk_control: suppressing duplicate common SCH/HU CRC failure at {} block={:?}",
+                        ul_time,
+                        block_num
+                    );
+                    return;
+                }
+                self.recent_common_crc_failures.push_back(key);
+                if self.recent_common_crc_failures.len() > 32 {
+                    self.recent_common_crc_failures.pop_front();
+                }
             }
             queue.push_prio(
                 SapMsg {
@@ -385,9 +409,11 @@ impl LmacBs {
                     src: TetraEntity::Lmac,
                     dest: TetraEntity::Umac,
                     msg: SapMsgInner::TmvCrcInd(TmvCrcInd {
+                        ul_time,
                         logical_channel: lchan,
                         block_num,
                         common_control,
+                        rf_observation,
                     }),
                 },
                 MessagePrio::Immediate,
@@ -415,6 +441,7 @@ impl LmacBs {
                 block_num,
                 crc_pass,
                 scrambling_code: self.scrambling_code,
+                rf_observation,
             }),
         };
 
@@ -807,6 +834,7 @@ mod tests {
             block_type: PhyBlockType::NUB,
             block_num: PhyBlockNum::Both,
             soft_bits: None,
+            rf_observation: None,
             block: BitBuffer::new(0),
         }
     }

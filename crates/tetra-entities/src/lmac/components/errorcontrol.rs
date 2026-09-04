@@ -606,6 +606,7 @@ mod tests {
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
             soft_bits: None,
+            rf_observation: None,
             block: type5,
         };
 
@@ -639,6 +640,7 @@ mod tests {
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
             soft_bits: None,
+            rf_observation: None,
             block: type5,
         };
 
@@ -795,6 +797,7 @@ mod tests {
             block_type: PhyBlockType::NDB,
             block_num: PhyBlockNum::Both,
             soft_bits: None,
+            rf_observation: None,
             block: type5,
         };
 

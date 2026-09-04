@@ -116,6 +116,7 @@ fn build_bs_stack(
     swmi_cmce: Option<net_swmi::SwmiCmceEndpoint>,
     swmi_mle: Option<net_swmi::SwmiMleEndpoint>,
     swmi_media: Option<net_swmi::SwmiMediaEndpoint>,
+    swmi_rf: Option<net_swmi::SwmiRfEndpoint>,
 ) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
     let mut router = MessageRouter::new(cfg.clone());
 
@@ -148,7 +149,7 @@ fn build_bs_stack(
 
     // Add remaining components
     let lmac = LmacBs::new(cfg.clone());
-    let umac = UmacBs::new(cfg.clone());
+    let umac = UmacBs::new_with_swmi(cfg.clone(), swmi_rf);
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone(), swmi_mle, c_e.remove(&TetraEntity::Mle));
     let mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm), swmi_mm);
@@ -207,13 +208,13 @@ fn main() {
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
-    let (swmi_worker, swmi_mm, _swmi_cmce, swmi_mle, swmi_media) = if cfg.config().swmi.is_some() {
-        let (worker, mm, cmce, mle, media) = net_swmi::channel();
-        (Some(worker), Some(mm), Some(cmce), Some(mle), Some(media))
+    let (swmi_worker, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf) = if cfg.config().swmi.is_some() {
+        let (worker, mm, cmce, mle, media, rf) = net_swmi::channel();
+        (Some(worker), Some(mm), Some(cmce), Some(mle), Some(media), Some(rf))
     } else {
-        (None, None, None, None, None)
+        (None, None, None, None, None, None)
     };
-    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, swmi_mm, _swmi_cmce, swmi_mle, swmi_media);
+    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf);
 
     // Start Telemetry and Control threads, if enabled
     if let Some(telemetry_source) = tsource {

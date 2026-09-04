@@ -108,7 +108,7 @@ pub struct CcBsSubentity {
     /// Floor grants held briefly after an on-air D-TX-INTERRUPT.  Without this
     /// barrier UMAC leaves hangtime immediately and a still-transmitting MS
     /// can overlap the emergency speaker before it receives the interrupt.
-    pending_preemptive_floor_grants: HashMap<u16, (u32, TdmaTime)>,
+    pending_preemptive_floor_grants: HashMap<u16, PendingPreemptiveFloorGrant>,
     /// Private U-TX DEMANDs awaiting the central floor decision. The value is
     /// when a D-TX-GRANTED(RequestQueued) is due if no decision arrives.
     pending_private_floor_requests: HashMap<(u16, u32), TdmaTime>,
@@ -184,6 +184,17 @@ struct PendingRemoteSwmiCall {
     acknowledged: bool,
 }
 
+/// A new floor holder is deliberately held until the old holder has received
+/// D-TX-INTERRUPT.  Network/Brew callers additionally need their radio
+/// resources only after that guard, otherwise downlink speech can overlap the
+/// interrupted local speaker.
+#[derive(Clone, Copy)]
+struct PendingPreemptiveFloorGrant {
+    itsi: u32,
+    ready_at: TdmaTime,
+    brew_uuid: Option<uuid::Uuid>,
+}
+
 struct PendingPrivateReservation {
     caller_itsi: u64,
     callee_itsi: u64,
@@ -247,6 +258,13 @@ struct ListeningCandidate {
 }
 
 impl CcBsSubentity {
+    fn circuit_lifetime_protected_call_ids(&self) -> HashSet<u16> {
+        let mut protected: HashSet<u16> = self.active_calls.keys().chain(self.private_calls.keys()).copied().collect();
+        protected.extend(self.releasing_calls.iter().map(|call| call.call_id));
+        protected.extend(self.releasing_private_circuits.iter().map(|circuit| circuit.call_id));
+        protected
+    }
+
     /// Build the SS-TPI INFORM carried in CMCE's Facility type-3 element.
     /// Text is ISO-8859-1 (encoding 1), bounded by ETSI's 15-character
     /// limit.  We include an explicit local SSI where the basic call PDU has
@@ -1978,8 +1996,14 @@ impl CcBsSubentity {
         // particular, a central call can remain valid beyond the local
         // circuit's six-minute safety age and must only be released by its
         // central lifecycle decision.
-        let protected_call_ids: HashSet<u16> = self.active_calls.keys().chain(self.private_calls.keys()).copied().collect();
-        if let Some(tasks) = self.circuits.tick_start(dltime, &protected_call_ids) {
+        let late_entry_call_ids = self.active_calls.keys().copied().collect::<HashSet<_>>();
+        let protected_call_ids = self.circuit_lifetime_protected_call_ids();
+        // A released call remains the owner of its RF circuit while its stolen
+        // D-RELEASE drains for one multiframe. Without this protection, the
+        // six-minute orphan watchdog can close an old circuit immediately,
+        // let a waiting call reuse the slot, and then have the delayed release
+        // close that new call by timeslot number.
+        if let Some(tasks) = self.circuits.tick_start(dltime, &protected_call_ids, &late_entry_call_ids) {
             for task in tasks {
                 match task {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
@@ -2439,7 +2463,14 @@ impl CcBsSubentity {
                 }
                 if self.apply_floor_preemption(queue, call_id, previous_itsi as u32, next_itsi as u32) {
                     let ready_at = self.dltime.add_timeslots(PREEMPTION_GUARD_TIMESLOTS);
-                    self.pending_preemptive_floor_grants.insert(call_id, (next_itsi as u32, ready_at));
+                    self.pending_preemptive_floor_grants.insert(
+                        call_id,
+                        PendingPreemptiveFloorGrant {
+                            itsi: next_itsi as u32,
+                            ready_at,
+                            brew_uuid: None,
+                        },
+                    );
                     tracing::info!(
                         call_id,
                         previous_itsi,
@@ -2465,7 +2496,7 @@ impl CcBsSubentity {
                 if self
                     .pending_preemptive_floor_grants
                     .get(&call_id)
-                    .is_some_and(|(expected_itsi, _)| *expected_itsi == itsi as u32)
+                    .is_some_and(|pending| pending.itsi == itsi as u32)
                 {
                     return;
                 }
@@ -3049,12 +3080,7 @@ impl CcBsSubentity {
                             "central floor request rejected; sent D-TX GRANTED(NotGranted)"
                         );
                     } else {
-                        tracing::warn!(
-                            call_id,
-                            itsi,
-                            cause,
-                            "central floor request rejected after local call disappeared"
-                        );
+                        tracing::warn!(call_id, itsi, cause, "central floor request rejected after local call disappeared");
                     }
                 }
             }
@@ -3066,12 +3092,35 @@ impl CcBsSubentity {
         let ready: Vec<_> = self
             .pending_preemptive_floor_grants
             .iter()
-            .filter_map(|(&call_id, &(itsi, ready_at))| (ready_at.age(self.dltime) >= 0).then_some((call_id, itsi)))
+            .filter_map(|(&call_id, pending)| {
+                (pending.ready_at.age(self.dltime) >= 0).then_some((call_id, pending.itsi, pending.brew_uuid))
+            })
             .collect();
-        for (call_id, itsi) in ready {
+        for (call_id, itsi, brew_uuid) in ready {
             self.pending_preemptive_floor_grants.remove(&call_id);
             tracing::info!(call_id, itsi, "D-TX-INTERRUPT guard elapsed; granting central floor");
+            if let Some(brew_uuid) = brew_uuid {
+                if let Some(call) = self.active_calls.get_mut(&call_id) {
+                    call.brew_uuid = Some(brew_uuid);
+                    call.origin = CallOrigin::Network { brew_uuid };
+                }
+            }
             self.apply_central_floor_grant(queue, call_id, itsi);
+            if let Some(brew_uuid) = brew_uuid {
+                if let Some(call) = self.active_calls.get(&call_id) {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Brew,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                            brew_uuid,
+                            call_id,
+                            ts: call.ts,
+                            usage: call.usage,
+                        }),
+                    });
+                }
+            }
         }
     }
 
@@ -3513,9 +3562,28 @@ impl CcBsSubentity {
                 // The circuit may have been removed already by a stale
                 // CircuitMgr timeout task; the saved circuit still carries
                 // the exact UMAC/timeslot teardown information we need.
-                let _ = self.circuits.close_circuit(Direction::Both, rc.circuit.ts);
-                Self::signal_umac_circuit_close(queue, rc.circuit.clone());
-                self.release_timeslot(rc.circuit.ts);
+                let current_call_id = self.circuits.call_id_at(rc.circuit.ts, Direction::Both);
+                match current_call_id {
+                    Some(current) if current == rc.call_id => {
+                        let _ = self.circuits.close_circuit(Direction::Both, rc.circuit.ts);
+                        Self::signal_umac_circuit_close(queue, rc.circuit.clone());
+                        self.release_timeslot(rc.circuit.ts);
+                    }
+                    None => {
+                        // No RF circuit can own this allocation anymore. This
+                        // is safe to free and prevents a leak after an earlier
+                        // defensive cleanup.
+                        self.release_timeslot(rc.circuit.ts);
+                    }
+                    Some(current) => {
+                        tracing::warn!(
+                            call_id = rc.call_id,
+                            ts = rc.circuit.ts,
+                            current_call_id = current,
+                            "not closing recycled traffic slot for stale private release"
+                        );
+                    }
+                }
                 queue.push_back(SapMsg {
                     sap: Sap::Control,
                     src: TetraEntity::Cmce,
@@ -3573,8 +3641,27 @@ impl CcBsSubentity {
         is_local: bool,
         brew_uuid: Option<uuid::Uuid>,
     ) {
-        if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
-            Self::signal_umac_circuit_close(queue, circuit);
+        let current_call_id = self.circuits.call_id_at(ts, Direction::Both);
+        match current_call_id {
+            Some(current) if current == call_id => {
+                if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
+                    Self::signal_umac_circuit_close(queue, circuit);
+                }
+                self.release_timeslot(ts);
+            }
+            None => {
+                // The channel is already gone, so only its allocator claim can
+                // remain. Freeing that claim cannot affect a replacement call.
+                self.release_timeslot(ts);
+            }
+            Some(current) => {
+                tracing::warn!(
+                    call_id,
+                    ts,
+                    current_call_id = current,
+                    "not closing recycled traffic slot for stale group release"
+                );
+            }
         }
 
         // Ensure UMAC clears hangtime even if the CMCE circuit was already closed above.
@@ -3596,8 +3683,6 @@ impl CcBsSubentity {
                 msg: SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }),
             });
         }
-
-        self.release_timeslot(ts);
 
         // Tell Brew the call is gone. Local-origin calls get CallEnded so Brew clears
         // ul_forwarded[ts] from any earlier UL forwarding. If a network speaker was
@@ -4475,8 +4560,19 @@ impl CcBsSubentity {
     }
 
     /// Handle network-initiated group call start
-    fn rx_network_call_start(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, source_issi: u32, dest_gssi: u32, _priority: u8) {
+    fn rx_network_call_start(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, source_issi: u32, dest_gssi: u32, priority: u8) {
         assert!(net_brew::is_brew_gssi_routable(&self.config, dest_gssi));
+
+        if priority > 15 {
+            tracing::warn!(brew_uuid = %brew_uuid, source_issi, dest_gssi, priority, "rejecting network call with invalid TETRA call priority");
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
+            });
+            return;
+        }
 
         if !self.has_listener(dest_gssi) {
             tracing::info!(
@@ -4496,21 +4592,62 @@ impl CcBsSubentity {
             return;
         }
 
-        // Check if there is an active call for this GSSI (speaker change scenario)
-        if let Some((call_id, call)) = self.active_calls.iter_mut().find(|(_, c)| c.dest_gssi == dest_gssi) {
-            // Reject speaker change if a local MS is already transmitting
-            if call.tx_active {
-                tracing::warn!(
-                    "CMCE: network speaker change rejected, ISSI {} already transmitting on gssi={}",
-                    call.source_issi,
-                    dest_gssi
-                );
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
-                });
+        // Check if there is an active call for this GSSI (speaker change scenario).
+        // A pre-emptive call, including emergency priority 15, must interrupt
+        // a lower-priority active speaker rather than being rejected merely
+        // because the group is busy.
+        if let Some((call_id, current)) = self
+            .active_calls
+            .iter()
+            .find(|(_, call)| call.dest_gssi == dest_gssi)
+            .map(|(&call_id, call)| (call_id, call.clone()))
+        {
+            if current.tx_active {
+                let preempts_current_floor = (12..=15).contains(&priority) && priority > current.priority;
+                if !preempts_current_floor {
+                    tracing::warn!(
+                        call_id,
+                        active_issi = current.source_issi,
+                        active_priority = current.priority,
+                        source_issi,
+                        priority,
+                        dest_gssi,
+                        "rejecting network speaker change while a higher or equal priority floor is active"
+                    );
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Brew,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
+                    });
+                    return;
+                }
+
+                if let Some(call) = self.active_calls.get_mut(&call_id) {
+                    call.priority = priority;
+                }
+                if let Some((setup, _, _)) = self.cached_setups.get_mut(&call_id) {
+                    setup.call_priority = priority;
+                }
+                if self.apply_floor_preemption(queue, call_id, current.source_issi, source_issi) {
+                    let ready_at = self.dltime.add_timeslots(PREEMPTION_GUARD_TIMESLOTS);
+                    self.pending_preemptive_floor_grants.insert(
+                        call_id,
+                        PendingPreemptiveFloorGrant {
+                            itsi: source_issi,
+                            ready_at,
+                            brew_uuid: Some(brew_uuid),
+                        },
+                    );
+                    tracing::info!(
+                        call_id,
+                        previous_itsi = current.source_issi,
+                        next_itsi = source_issi,
+                        priority,
+                        ready_at = %ready_at,
+                        "network pre-emption queued; waiting for D-TX-INTERRUPT guard"
+                    );
+                }
                 return;
             }
 
@@ -4519,10 +4656,12 @@ impl CcBsSubentity {
                 "CMCE: network call speaker change gssi={} new_speaker={} (was {})",
                 dest_gssi,
                 source_issi,
-                call.source_issi
+                current.source_issi
             );
 
+            let call = self.active_calls.get_mut(&call_id).expect("active call found immediately above");
             call.source_issi = source_issi;
+            call.priority = priority;
             call.tx_active = true;
             call.hangtime_start = None;
             call.brew_uuid = Some(brew_uuid);
@@ -4536,12 +4675,16 @@ impl CcBsSubentity {
             }
 
             // Extract values before mutable borrow ends
-            let call_id_val = *call_id;
+            let call_id_val = call_id;
             let ts = call.ts;
             let usage = call.usage;
 
             // End the mutable borrow
             let _ = call;
+
+            if let Some((setup, _, _)) = self.cached_setups.get_mut(&call_id_val) {
+                setup.call_priority = priority;
+            }
 
             self.send_d_tx_granted_facch(queue, call_id_val, source_issi, dest_gssi, ts);
             self.send_d_tx_granted_individual_facch(queue, call_id_val, source_issi, ts);
@@ -4633,7 +4776,7 @@ impl CcBsSubentity {
             },
             transmission_grant: TransmissionGrant::GrantedToOtherUser,
             transmission_request_permission: false,
-            call_priority: 0,
+            call_priority: priority,
             notification_indicator: Some(NOTIFICATION_LE_BROADCAST),
             temporary_address: None,
             calling_party_address_ssi: Some(source_issi),
@@ -4674,7 +4817,7 @@ impl CcBsSubentity {
             transmission_grant: TransmissionGrant::GrantedToOtherUser,
             transmission_request_permission: false,
             call_ownership: false,
-            call_priority: None,
+            call_priority: Some(priority as u64),
             basic_service_information: None,
             temporary_address: None,
             notification_indicator: None,
@@ -4717,7 +4860,7 @@ impl CcBsSubentity {
                 source_issi,
                 ts,
                 usage,
-                priority: 0,
+                priority,
                 acknowledged: false,
                 talking_party: None,
                 tx_active: true,
@@ -4810,7 +4953,10 @@ impl CcBsSubentity {
             self.send_d_tx_interrupt_individual_facch(queue, call_id, previous_itsi, next_itsi, ts);
         }
         self.send_d_tx_interrupt_group_facch(queue, call_id, next_itsi, dest_gssi, ts);
-        for dest in [TetraEntity::Umac, TetraEntity::Swmi] {
+        // UMAC stops accepting the old uplink immediately; Brew must also
+        // stop exporting the old local speaker while the on-air interrupt is
+        // travelling to that MS.
+        for dest in [TetraEntity::Umac, TetraEntity::Swmi, TetraEntity::Brew] {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
@@ -5209,6 +5355,29 @@ mod tests {
         cc
     }
 
+    fn test_cc_with_brew_group(gssi: u32) -> CcBsSubentity {
+        let mut config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        config.brew = Some(tetra_config::bluestation::CfgBrew {
+            host: "test.local".to_owned(),
+            port: 443,
+            tls: false,
+            username: None,
+            password: None,
+            reconnect_delay: std::time::Duration::from_secs(1),
+            jitter_initial_latency_frames: 0,
+            feature_sds_enabled: true,
+            whitelisted_ssis: Some(vec![gssi]),
+        });
+        let mut cc = CcBsSubentity::new(SharedConfig::from_parts(config, None), None);
+        cc.subscriber_groups.insert(430_892, HashSet::from([gssi]));
+        cc.group_listeners.insert(gssi, 1);
+        cc
+    }
+
     #[test]
     fn ss_tpi_inform_ends_with_its_required_o_bit() {
         let profile = TalkingPartyProfile {
@@ -5318,17 +5487,7 @@ mod tests {
         let call_id = 7;
         let mut cc = test_cc_with_group(gssi);
         let mut queue = MessageQueue::new();
-        cc.start_remote_swmi_call(
-            &mut queue,
-            call_id,
-            77492,
-            gssi,
-            0,
-            77492,
-            None,
-            false,
-            true,
-        );
+        cc.start_remote_swmi_call(&mut queue, call_id, 77492, gssi, 0, 77492, None, false, true);
         while queue.pop_front().is_some() {}
 
         cc.handle_swmi_action(
@@ -5341,9 +5500,7 @@ mod tests {
             },
         );
 
-        let response_message = queue
-            .pop_front()
-            .expect("floor rejection must produce an air-interface response");
+        let response_message = queue.pop_front().expect("floor rejection must produce an air-interface response");
         let SapMsgInner::LcmcMleUnitdataReq(prim) = response_message.msg else {
             panic!("floor rejection must be routed to MLE")
         };
@@ -5352,10 +5509,7 @@ mod tests {
         assert_eq!(address.ssi, itsi);
         assert!(matches!(address.ssi_type, SsiType::Issi));
         assert_eq!(response.call_identifier, call_id);
-        assert_eq!(
-            response.transmission_grant,
-            TransmissionGrant::NotGranted.into_raw() as u8
-        );
+        assert_eq!(response.transmission_grant, TransmissionGrant::NotGranted.into_raw() as u8);
         assert!(response.transmission_request_permission);
     }
 
@@ -5379,6 +5533,143 @@ mod tests {
 
         assert!(!cc.pending_remote_swmi_calls.contains_key(&4));
         assert!(cc.active_calls.contains_key(&4));
+    }
+
+    #[test]
+    fn releasing_group_circuit_is_not_reaped_before_d_release_drains() {
+        let gssi = 204;
+        let call_id = 40;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, call_id, 2_403_032, gssi, 1, 2_403_032, None, false, true);
+        let ts = cc.active_calls[&call_id].ts;
+
+        // Reproduce the log condition: the central call has legitimately
+        // existed longer than the six-minute orphan safety age when release
+        // begins. It must still own the RF slot for the D-RELEASE drain.
+        cc.dltime = cc.dltime.add_timeslots(6 * 60 * 18 * 4 + 4);
+        cc.release_call(&mut queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+        assert!(cc.releasing_calls.iter().any(|release| release.call_id == call_id));
+
+        let protected = cc.circuit_lifetime_protected_call_ids();
+        let tasks = cc.circuits.tick_start(cc.dltime, &protected, &HashSet::new());
+
+        assert!(
+            tasks.is_none(),
+            "release-draining circuit must not be classified as an expired orphan"
+        );
+        assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), Some(call_id));
+    }
+
+    #[test]
+    fn stale_group_finalize_cannot_close_or_free_a_recycled_timeslot() {
+        let gssi = 204;
+        let old_call_id = 40;
+        let new_call_id = 41;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, old_call_id, 2_403_032, gssi, 1, 2_403_032, None, false, true);
+        let ts = cc.active_calls[&old_call_id].ts;
+        cc.release_call(&mut queue, old_call_id, DisconnectCause::SwmiRequestedDisconnection);
+
+        // Model an earlier cleanup which made TS2 available and allowed the
+        // next central call to use it before the delayed old finalizer ran.
+        let old_circuit = cc
+            .circuits
+            .close_circuit(Direction::Both, ts)
+            .expect("old call owns the initial circuit");
+        assert_eq!(old_circuit.call_id, old_call_id);
+        cc.release_timeslot(ts);
+        cc.start_remote_swmi_call(&mut queue, new_call_id, 2_043_227, gssi, 1, 2_043_227, None, false, true);
+        assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), Some(new_call_id));
+        while queue.pop_front().is_some() {}
+
+        cc.finalize_release(&mut queue, old_call_id, ts, gssi, false, None);
+
+        assert_eq!(
+            cc.circuits.call_id_at(ts, Direction::Both),
+            Some(new_call_id),
+            "old delayed release must not close the replacement circuit"
+        );
+        assert_eq!(cc.config.state_read().timeslot_alloc.owner(ts), Some(TimeslotOwner::Cmce));
+        assert!(!queue.iter_mut().any(|message| {
+            matches!(
+                message.msg,
+                SapMsgInner::CmceCallControl(CallControl::Close {
+                    call_id,
+                    ts: close_ts,
+                    ..
+                }) if call_id == new_call_id && close_ts == ts
+            )
+        }));
+    }
+
+    #[test]
+    fn emergency_network_call_interrupts_active_floor_before_media_is_ready() {
+        let gssi = 204;
+        let call_id = 7;
+        let old_itsi = 430_892;
+        let emergency_itsi = 430_905;
+        let brew_uuid = uuid::Uuid::new_v4();
+        let mut cc = test_cc_with_brew_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, call_id, old_itsi, gssi, 0, old_itsi, None, false, true);
+        while queue.pop_front().is_some() {}
+
+        cc.rx_network_call_start(&mut queue, brew_uuid, emergency_itsi, gssi, 15);
+
+        let active = cc
+            .active_calls
+            .get(&call_id)
+            .expect("existing group call remains active during guard");
+        assert!(!active.tx_active, "old floor must be stopped before the emergency grant");
+        assert_eq!(active.source_issi, old_itsi);
+        assert_eq!(active.priority, 15);
+        assert!(cc.pending_preemptive_floor_grants.contains_key(&call_id));
+
+        let mut individual_interrupt = false;
+        let mut group_interrupt = false;
+        while let Some(message) = queue.pop_front() {
+            let SapMsgInner::LcmcMleUnitdataReq(mut prim) = message.msg else {
+                continue;
+            };
+            let address = prim.main_address;
+            if let Ok(interrupt) = DTxInterrupt::from_bitbuf(&mut prim.sdu) {
+                assert_eq!(interrupt.call_identifier, call_id);
+                assert_eq!(interrupt.transmitting_party_address_ssi, Some(emergency_itsi as u64));
+                match address.ssi_type {
+                    SsiType::Issi => individual_interrupt = address.ssi == old_itsi,
+                    SsiType::Gssi => group_interrupt = address.ssi == gssi,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            individual_interrupt,
+            "the old local speaker must receive an individual D-TX-INTERRUPT"
+        );
+        assert!(group_interrupt, "the group must receive D-TX-INTERRUPT before the new grant");
+
+        cc.dltime = cc.dltime.add_timeslots(PREEMPTION_GUARD_TIMESLOTS);
+        cc.process_pending_preemptive_floor_grants(&mut queue);
+
+        let active = cc.active_calls.get(&call_id).expect("call remains after emergency pre-emption");
+        assert!(active.tx_active);
+        assert_eq!(active.source_issi, emergency_itsi);
+        assert_eq!(active.brew_uuid, Some(brew_uuid));
+
+        let mut media_ready = false;
+        while let Some(message) = queue.pop_front() {
+            if let SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                brew_uuid: ready_uuid,
+                call_id: ready_call_id,
+                ..
+            }) = message.msg
+            {
+                media_ready = ready_uuid == brew_uuid && ready_call_id == call_id;
+            }
+        }
+        assert!(media_ready, "Brew media may start only after the interrupt guard");
     }
 
     #[test]

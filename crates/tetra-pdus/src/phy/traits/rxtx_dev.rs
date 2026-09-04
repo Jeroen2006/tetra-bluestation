@@ -1,5 +1,5 @@
 use tetra_core::TrainingSequence;
-use tetra_core::{SoftBit, TdmaTime};
+use tetra_core::{SoftBit, TdmaTime, UplinkRfObservation};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum RxTxDevError {
@@ -13,6 +13,7 @@ pub struct RxBurstBits<'a> {
     pub bits: &'a [u8],
     /// Signed reliabilities aligned one-to-one with `bits`.
     pub soft_bits: Option<&'a [SoftBit]>,
+    pub rf_observation: Option<UplinkRfObservation>,
 }
 
 #[derive(Debug, Default)]

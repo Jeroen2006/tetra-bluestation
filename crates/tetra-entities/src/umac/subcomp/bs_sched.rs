@@ -2618,6 +2618,7 @@ mod tests {
                 block_type: tetra_core::PhyBlockType::NDB,
                 block_num: PhyBlockNum::Block1,
                 soft_bits: None,
+                rf_observation: None,
                 block: encoded,
             },
             Some(stch.scrambling_code),

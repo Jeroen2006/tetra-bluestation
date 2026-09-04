@@ -7,6 +7,20 @@
 /// an erasure.  The magnitude is consumed by soft-decision Viterbi decoding.
 pub type SoftBit = i8;
 
+/// Raw RF measurements attached to one physical uplink burst. Floating-point
+/// values stay inside the BS process; the SwMI wire format uses fixed point.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UplinkRfObservation {
+    /// Distinguishes a full-slot burst (0) from control subslots (1 and 2).
+    pub burst_index: u8,
+    pub received_power_linear: f32,
+    pub frequency_offset_hz: f32,
+    pub training_error_bits: u16,
+    pub training_bit_count: u16,
+    pub training_evm_percent: f32,
+    pub relative_arrival_symbols: f32,
+}
+
 /// Identifies which block(s) within a timeslot
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PhyBlockNum {

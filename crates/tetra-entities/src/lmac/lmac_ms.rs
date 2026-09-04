@@ -95,6 +95,7 @@ impl LmacMs {
                 ul_time: self.ts.unwrap_or_default(),
                 crc_pass: true,
                 scrambling_code,
+                rf_observation: None,
             }),
         };
 
@@ -195,6 +196,7 @@ impl LmacMs {
                     ul_time: self.ts.unwrap_or_default(),
                     crc_pass,
                     scrambling_code: scramb_code,
+                    rf_observation: None,
                 }),
             };
             queue.push_back(m);

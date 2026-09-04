@@ -108,6 +108,26 @@ impl CircuitMgr {
         (dl_usage, ul_usage)
     }
 
+    /// Return the call generation currently owning a circuit direction on a
+    /// traffic slot. CMCE release work is delayed by at least one multiframe,
+    /// so a timeslot number alone is not a safe teardown identity after the
+    /// slot has been recycled.
+    pub fn call_id_at(&self, ts: u8, dir: Direction) -> Option<CallId> {
+        if !(1..=4).contains(&ts) {
+            return None;
+        }
+        match dir {
+            Direction::Dl | Direction::Both => self.dl[ts as usize - 1].as_ref().map(|circuit| circuit.call_id),
+            Direction::Ul => self.ul_only[ts as usize - 1].as_ref().map(|circuit| circuit.call_id).or_else(|| {
+                self.dl[ts as usize - 1]
+                    .as_ref()
+                    .filter(|circuit| circuit.direction == Direction::Both)
+                    .map(|circuit| circuit.call_id)
+            }),
+            Direction::None => None,
+        }
+    }
+
     pub fn get_next_call_id(&mut self) -> CallId {
         let call_id = self.next_call_identifier;
         self.next_call_identifier += 1;
@@ -368,13 +388,18 @@ impl CircuitMgr {
         tasks
     }
 
-    pub fn tick_start(&mut self, dltime: TdmaTime, protected_call_ids: &HashSet<CallId>) -> Option<Vec<CircuitMgrCmd>> {
+    pub fn tick_start(
+        &mut self,
+        dltime: TdmaTime,
+        lifetime_protected_call_ids: &HashSet<CallId>,
+        late_entry_call_ids: &HashSet<CallId>,
+    ) -> Option<Vec<CircuitMgrCmd>> {
         self.dltime = dltime;
         let mut tasks = None;
 
         if dltime.t == 1 {
             // First, close any expired circuits
-            tasks = self.close_expired_circuits(tasks, protected_call_ids);
+            tasks = self.close_expired_circuits(tasks, lifetime_protected_call_ids);
 
             // Next, go through channels and send due late-entry D-SETUPs.
             let circuits: Vec<_> = self
@@ -385,7 +410,7 @@ impl CircuitMgr {
                 // D-SETUP before the stolen D-RELEASE has drained.  The RF
                 // circuit deliberately remains alive for that short window,
                 // but it is no longer eligible for group late entry.
-                .filter(|circuit| protected_call_ids.contains(&circuit.call_id))
+                .filter(|circuit| late_entry_call_ids.contains(&circuit.call_id))
                 .map(|circuit| (circuit.call_id, circuit.usage, circuit.ts, circuit.ts_created, circuit.comm_type))
                 .collect();
             for (call_id, usage, ts, ts_created, comm_type) in circuits {
@@ -447,7 +472,7 @@ mod tests {
         let mut manager = CircuitMgr::new();
         manager.dl[1] = Some(group_circuit(7, created));
 
-        let tasks = manager.tick_start(due, &HashSet::new());
+        let tasks = manager.tick_start(due, &HashSet::new(), &HashSet::new());
 
         assert!(tasks.is_none());
         assert!(manager.dl[1].is_some(), "the D-RELEASE drain still owns the RF circuit");
@@ -461,7 +486,7 @@ mod tests {
         manager.dl[1] = Some(group_circuit(7, created));
 
         let tasks = manager
-            .tick_start(due, &HashSet::from([7]))
+            .tick_start(due, &HashSet::from([7]), &HashSet::from([7]))
             .expect("active call must receive a late-entry task");
 
         assert!(matches!(tasks.as_slice(), [CircuitMgrCmd::SendDSetup(7, 4, 2)]));

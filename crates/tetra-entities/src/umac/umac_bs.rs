@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     panic,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie, SharedConfig};
@@ -37,8 +38,10 @@ use tetra_saps::tma::{AssociatedChannel, TmaReport, TmaReportInd, TmaUnitdataInd
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
+use tetra_swmi_protocol::{SwmiMessage, UplinkRfStats};
 
 use crate::lmac::components::scrambler;
+use crate::net_swmi::SwmiRfEndpoint;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, MACSCHED_TX_AHEAD, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::random_access::RandomAccessController;
@@ -103,6 +106,102 @@ pub struct UmacBs {
     /// They retain their original UL air time and are replayed only after the
     /// authenticated SwMI response has populated the bounded runtime cache.
     pending_sc3_access: VecDeque<PendingSc3Access>,
+    swmi_rf: Option<SwmiRfEndpoint>,
+    rf_windows: HashMap<u32, RfWindow>,
+    pending_rf_reports: HashMap<u32, UplinkRfStats>,
+}
+
+struct RfWindow {
+    started_at: Instant,
+    measured_at_unix_ms: u64,
+    seen_bursts: HashSet<(i32, u8)>,
+    burst_count: u32,
+    power_sum: f64,
+    frequency_weighted_sum: f64,
+    training_symbol_count: u32,
+    training_error_bits: u32,
+    training_bit_count: u32,
+    block_error_count: u32,
+    block_count: u32,
+    evm_squared_weighted_sum: f64,
+    arrival_sum: f64,
+}
+
+impl RfWindow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            measured_at_unix_ms: 0,
+            seen_bursts: HashSet::new(),
+            burst_count: 0,
+            power_sum: 0.0,
+            frequency_weighted_sum: 0.0,
+            training_symbol_count: 0,
+            training_error_bits: 0,
+            training_bit_count: 0,
+            block_error_count: 0,
+            block_count: 0,
+            evm_squared_weighted_sum: 0.0,
+            arrival_sum: 0.0,
+        }
+    }
+
+    fn observe(&mut self, ul_time: TdmaTime, observation: tetra_core::UplinkRfObservation, block_ok: bool) {
+        self.measured_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.block_count = self.block_count.saturating_add(1);
+        self.block_error_count = self.block_error_count.saturating_add(u32::from(!block_ok));
+        if !self.seen_bursts.insert((ul_time.to_int(), observation.burst_index)) {
+            return;
+        }
+        self.burst_count = self.burst_count.saturating_add(1);
+        self.power_sum += f64::from(observation.received_power_linear);
+        let training_symbols = u32::from(observation.training_bit_count / 2);
+        self.frequency_weighted_sum += f64::from(observation.frequency_offset_hz) * f64::from(training_symbols);
+        self.training_symbol_count = self.training_symbol_count.saturating_add(training_symbols);
+        self.training_error_bits = self.training_error_bits.saturating_add(u32::from(observation.training_error_bits));
+        self.training_bit_count = self.training_bit_count.saturating_add(u32::from(observation.training_bit_count));
+        self.evm_squared_weighted_sum += f64::from(observation.training_evm_percent).powi(2) * f64::from(training_symbols);
+        self.arrival_sum += f64::from(observation.relative_arrival_symbols);
+    }
+
+    fn finish(self, issi: u32) -> Option<UplinkRfStats> {
+        if self.burst_count == 0 || self.block_count == 0 || self.training_bit_count == 0 || self.training_symbol_count == 0 {
+            return None;
+        }
+        let power_dbfs = 10.0 * (self.power_sum / f64::from(self.burst_count)).log10();
+        let frequency_offset = self.frequency_weighted_sum / f64::from(self.training_symbol_count);
+        let evm = (self.evm_squared_weighted_sum / f64::from(self.training_symbol_count)).sqrt();
+        let arrival = self.arrival_sum / f64::from(self.burst_count);
+        if [power_dbfs, frequency_offset, evm, arrival].iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        Some(UplinkRfStats {
+            issi,
+            measured_at_unix_ms: self.measured_at_unix_ms,
+            window_ms: 1_000,
+            burst_count: self.burst_count.min(u32::from(u16::MAX)) as u16,
+            received_power_dbfs_x100: scaled_i16(power_dbfs, 100.0),
+            frequency_offset_hz_x100: scaled_i32(frequency_offset, 100.0),
+            training_error_bits: self.training_error_bits.min(u32::from(u16::MAX)) as u16,
+            training_bit_count: self.training_bit_count.min(u32::from(u16::MAX)) as u16,
+            block_error_count: self.block_error_count.min(u32::from(u16::MAX)) as u16,
+            block_count: self.block_count.min(u32::from(u16::MAX)) as u16,
+            training_evm_percent_x100: (evm * 100.0).round().clamp(0.0, f64::from(u16::MAX)) as u16,
+            relative_arrival_symbols_x1000: scaled_i32(arrival, 1_000.0),
+        })
+    }
+}
+
+fn scaled_i16(value: f64, scale: f64) -> i16 {
+    (value * scale).round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
+fn scaled_i32(value: f64, scale: f64) -> i32 {
+    (value * scale).round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
 struct PendingStch {
@@ -129,6 +228,10 @@ struct PendingSc3Access {
 
 impl UmacBs {
     pub fn new(config: SharedConfig) -> Self {
+        Self::new_with_swmi(config, None)
+    }
+
+    pub fn new_with_swmi(config: SharedConfig, swmi_rf: Option<SwmiRfEndpoint>) -> Self {
         let c = config.config();
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
@@ -159,6 +262,71 @@ impl UmacBs {
             duplex_private_media_timeslots: HashSet::new(),
             deferred_mcch: VecDeque::new(),
             pending_sc3_access: VecDeque::new(),
+            swmi_rf,
+            rf_windows: HashMap::new(),
+            pending_rf_reports: HashMap::new(),
+        }
+    }
+
+    fn observe_terminal_rf(&mut self, issi: u32, ul_time: TdmaTime, observation: Option<tetra_core::UplinkRfObservation>, block_ok: bool) {
+        let Some(observation) = observation.filter(|observation| {
+            observation.received_power_linear.is_finite()
+                && observation.received_power_linear > 0.0
+                && observation.frequency_offset_hz.is_finite()
+                && observation.training_evm_percent.is_finite()
+                && observation.relative_arrival_symbols.is_finite()
+                && observation.training_bit_count > 0
+                && observation.training_error_bits <= observation.training_bit_count
+        }) else {
+            return;
+        };
+        self.rf_windows
+            .entry(issi)
+            .or_insert_with(RfWindow::new)
+            .observe(ul_time, observation, block_ok);
+    }
+
+    fn observe_control_rf(
+        &mut self,
+        decoded_issi: Option<u32>,
+        ul_time: TdmaTime,
+        block_num: PhyBlockNum,
+        observation: Option<tetra_core::UplinkRfObservation>,
+        block_ok: bool,
+    ) {
+        let scheduled_issi = self.channel_scheduler.ul_get_slot_owner(ul_time, block_num);
+        let issi = match (scheduled_issi, decoded_issi) {
+            (Some(scheduled), Some(decoded)) if scheduled != decoded => {
+                tracing::warn!(scheduled, decoded, %ul_time, ?block_num, "ignoring uplink RF observation with conflicting identities");
+                return;
+            }
+            (Some(scheduled), _) => scheduled,
+            (None, Some(decoded)) => decoded,
+            (None, None) => return,
+        };
+        self.observe_terminal_rf(issi, ul_time, observation, block_ok);
+    }
+
+    fn flush_rf_windows(&mut self) {
+        let expired = self
+            .rf_windows
+            .iter()
+            .filter_map(|(issi, window)| (window.started_at.elapsed() >= Duration::from_secs(1)).then_some(*issi))
+            .collect::<Vec<_>>();
+        for issi in expired {
+            if let Some(report) = self.rf_windows.remove(&issi).and_then(|window| window.finish(issi)) {
+                self.pending_rf_reports.insert(issi, report);
+            }
+        }
+
+        let Some(endpoint) = self.swmi_rf.as_ref().filter(|endpoint| endpoint.is_online()) else {
+            return;
+        };
+        let pending = std::mem::take(&mut self.pending_rf_reports);
+        for (issi, report) in pending {
+            if let Err(SwmiMessage::UplinkRfStats(report)) = endpoint.submit(SwmiMessage::UplinkRfStats(report)) {
+                self.pending_rf_reports.insert(issi, report);
+            }
         }
     }
 
@@ -546,6 +714,7 @@ impl UmacBs {
                 self.rx_tmv_unitdata_ind(queue, message);
             }
             SapMsgInner::TmvCrcInd(ind) => {
+                self.observe_control_rf(None, ind.ul_time, ind.block_num, ind.rf_observation, false);
                 if ind.common_control && ind.logical_channel == LogicalChannel::SchHu {
                     self.random_access.observe_crc_failure();
                     tracing::debug!("UmacBs: common random-access CRC failure block={:?}", ind.block_num);
@@ -622,7 +791,7 @@ impl UmacBs {
             };
             let Some(bits) = prim.pdu.peek_bits(3) else {
                 tracing::warn!("insufficient bits: {}", prim.pdu.dump_bin());
-                return;
+                break;
             };
             let orig_start = prim.pdu.get_raw_start();
             let lchan = prim.logical_channel;
@@ -633,7 +802,7 @@ impl UmacBs {
                     // First two bits are MAC PDU type
                     let Ok(pdu_type) = MacPduType::try_from(bits >> 1) else {
                         tracing::warn!("invalid pdu type: {}", bits >> 1);
-                        return;
+                        break;
                     };
 
                     match pdu_type {
@@ -698,6 +867,17 @@ impl UmacBs {
                 }
             }
         }
+
+        let remaining_rf = match &mut message.msg {
+            SapMsgInner::TmvUnitdataInd(prim) => prim
+                .rf_observation
+                .take()
+                .map(|observation| (prim.ul_time, prim.block_num, prim.crc_pass, observation)),
+            _ => None,
+        };
+        if let Some((ul_time, block_num, block_ok, observation)) = remaining_rf {
+            self.observe_control_rf(None, ul_time, block_num, Some(observation), block_ok);
+        }
     }
 
     fn rx_mac_data(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
@@ -706,7 +886,6 @@ impl UmacBs {
             panic!()
         };
         assert!(prim.pdu.get_pos() == 0); // We should be at the start of the MAC PDU
-
         let pdu = match MacData::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
@@ -786,6 +965,9 @@ impl UmacBs {
         );
 
         if is_null_pdu {
+            let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+            let rf_observation = prim.rf_observation.take();
+            self.observe_control_rf(decoded_issi, prim.ul_time, prim.block_num, rf_observation, true);
             // TODO not sure if there is scenarios in which we want to pass a null pdu to the LLC
             // tracing::warn!("rx_mac_data: Null PDU not passed to LLC");
             return;
@@ -832,6 +1014,9 @@ impl UmacBs {
             // MLE/MM reject all other clear post-SC2 control traffic.
             AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData)
         };
+        let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+        let rf_observation = prim.rf_observation.take();
+        self.observe_control_rf(decoded_issi, msg_dltime, prim.block_num, rf_observation, true);
         if let Some(res_req) = &pdu.reservation_req {
             // During a call, queue only the request. The associated FN18 may
             // be deferred by mandatory BSCH/BNCH; building the grant now
@@ -906,7 +1091,6 @@ impl UmacBs {
             panic!()
         };
         assert!(prim.pdu.get_pos() == 0); // We should be at the start of the MAC PDU
-
         let pdu = match MacAccess::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
@@ -975,6 +1159,9 @@ impl UmacBs {
         );
 
         if pdu.is_null_pdu() {
+            let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+            let rf_observation = prim.rf_observation.take();
+            self.observe_control_rf(decoded_issi, prim.ul_time, prim.block_num, rf_observation, true);
             // tracing::warn!("rx_mac_access: Null PDU not passed to LLC");
             return;
         }
@@ -1059,6 +1246,8 @@ impl UmacBs {
         };
 
         let issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+        let rf_observation = prim.rf_observation.take();
+        self.observe_control_rf(issi, msg_dltime, prim.block_num, rf_observation, true);
         let (active, registration_pending) = issi
             .map(|issi| {
                 let state = self.config.state_read();
@@ -2094,6 +2283,14 @@ impl UmacBs {
             SapMsgInner::TmdCircuitDataInd(prim) => {
                 let ts = prim.ts;
                 let data = prim.data;
+                if (1..=4).contains(&ts)
+                    && let Some(issi) = self.traffic_floor_holder[ts as usize - 1]
+                {
+                    self.observe_terminal_rf(issi, prim.ul_time, prim.rf_observation, prim.block_ok);
+                }
+                if data.is_empty() {
+                    return;
+                }
 
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {
@@ -2109,7 +2306,13 @@ impl UmacBs {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Brew,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                ts,
+                                ul_time: prim.ul_time,
+                                data: data.clone(),
+                                block_ok: true,
+                                rf_observation: None,
+                            }),
                         };
                         queue.push_back(msg);
                     } else {
@@ -2123,7 +2326,13 @@ impl UmacBs {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Swmi,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                ts,
+                                ul_time: prim.ul_time,
+                                data: data.clone(),
+                                block_ok: true,
+                                rf_observation: None,
+                            }),
                         });
                     }
                 }
@@ -2425,7 +2634,12 @@ impl UmacBs {
                 ts,
             } => {
                 if !self.owns_traffic_slot(call_id, ts) {
-                    tracing::warn!(call_id, ts, dest_gssi, "ignoring stale floor grant after traffic-timeslot recycling");
+                    tracing::warn!(
+                        call_id,
+                        ts,
+                        dest_gssi,
+                        "ignoring stale floor grant after traffic-timeslot recycling"
+                    );
                     return;
                 }
                 if (1..=4).contains(&ts) {
@@ -2648,6 +2862,7 @@ impl TetraEntityTrait for UmacBs {
         self.refresh_authentication_required();
         self.refresh_aie_config();
         self.refresh_random_access_control(ts);
+        self.flush_rf_windows();
 
         if self.channel_scheduler.cur_dltime != ts && self.channel_scheduler.cur_dltime == (TdmaTime { t: 0, f: 0, m: 0, h: 0 }) {
             // Upon start of the system, we need to set the dl time for the channel scheduler
@@ -2737,6 +2952,35 @@ fn pack_ul_acelp_bits(bits: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+    fn rf_observation(burst_index: u8, power: f32, offset: f32) -> tetra_core::UplinkRfObservation {
+        tetra_core::UplinkRfObservation {
+            burst_index,
+            received_power_linear: power,
+            frequency_offset_hz: offset,
+            training_error_bits: 1,
+            training_bit_count: 22,
+            training_evm_percent: 5.0,
+            relative_arrival_symbols: 0.25,
+        }
+    }
+
+    #[test]
+    fn rf_window_deduplicates_physical_bursts_but_counts_blocks() {
+        let time = TdmaTime::default();
+        let mut window = RfWindow::new();
+        window.observe(time, rf_observation(0, 0.01, 10.0), true);
+        window.observe(time, rf_observation(0, 0.01, 10.0), false);
+        window.observe(time.add_timeslots(1), rf_observation(0, 0.1, -10.0), true);
+        let stats = window.finish(1001).expect("RF stats");
+        assert_eq!(stats.burst_count, 2);
+        assert_eq!(stats.block_count, 3);
+        assert_eq!(stats.block_error_count, 1);
+        assert_eq!(stats.training_bit_count, 44);
+        assert_eq!(stats.training_error_bits, 2);
+        assert_eq!(stats.frequency_offset_hz_x100, 0);
+        assert_eq!(stats.received_power_dbfs_x100, -1_260);
+    }
 
     fn test_circuit(call_id: u16, ts: u8) -> Circuit {
         Circuit {

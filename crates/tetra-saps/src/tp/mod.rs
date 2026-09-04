@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, SoftBit, TdmaTime, TrainingSequence};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, SoftBit, TdmaTime, TrainingSequence, UplinkRfObservation};
 
 #[derive(Debug, Clone)]
 pub struct TpUnitdataInd {
@@ -12,6 +12,8 @@ pub struct TpUnitdataInd {
     pub block_num: PhyBlockNum,
     /// Optional signed reliability for every bit in `block`.
     pub soft_bits: Option<Vec<SoftBit>>,
+    /// Shared by both decoded halves of the same physical burst.
+    pub rf_observation: Option<UplinkRfObservation>,
     pub block: BitBuffer,
 }
 

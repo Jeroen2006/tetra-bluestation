@@ -60,6 +60,19 @@ use tetra_pdus::mm::pdus::u_mm_status::UMmStatusGatewayPayload;
 
 /// ETSI T351 = 10 seconds. TETRA has 18 TDMA frames of four slots per second.
 const T351_TIMESLOTS: i32 = 10 * 18 * 4;
+/// Use the standardized attach/detach response interval as the upper bound for
+/// the layer-3 acknowledgement to an infrastructure-initiated Figure-20
+/// amendment.  A basic-link ACK is delivery evidence only.
+const GROUP_SECURITY_ACK_TIMEOUT_TIMESLOTS: i32 = 10 * 18 * 4;
+/// A terminal may still be completing MM registration after it has generated
+/// the BL-ACK for D-LOCATION UPDATE ACCEPT.  Registration overrides a colliding
+/// group attachment procedure (TS 100 392-2 clause 16.8.6), so leave one
+/// multiframe before sending an association that arrived too late for the
+/// location-update response itself.
+const GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS: i32 = 18 * 4;
+/// Initial transmission plus two bounded application-layer retries. LLC keeps
+/// ownership of the independent basic-link retransmissions for each attempt.
+const MAX_GROUP_SECURITY_RETRIES: u8 = 2;
 
 /// TTR 001-11 Table 6.2 on-air KSG numbers. These are protocol values, not
 /// the ordinal positions of the local TEA enum.
@@ -222,6 +235,33 @@ struct PendingRegistrationDelivery {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupSecurityAssociationPhase {
+    LinkDelivery,
+    AwaitingMmAcknowledgement,
+}
+
+/// One Figure-20 transaction. There is no transaction identifier in the air
+/// PDU, therefore at most one instance may exist for a terminal at a time.
+/// The structure contains only public GSSI/GCKN selection metadata; key bytes
+/// remain inside the runtime AIE provider.
+#[derive(Debug)]
+struct PendingGroupSecurityAssociation {
+    air_handle: u32,
+    groups: Vec<u32>,
+    tx_reporter: TxReporter,
+    phase: GroupSecurityAssociationPhase,
+    acknowledgement_deadline: Option<TdmaTime>,
+    retries: u8,
+}
+
+#[derive(Debug, Default)]
+struct QueuedGroupSecurityAssociation {
+    air_handle: u32,
+    groups: HashSet<u32>,
+    retries: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GskoBootstrapStatus {
     Requested,
     Providing {
@@ -302,6 +342,14 @@ pub struct MmBs {
     /// A registration is not active merely because its accept was queued.
     /// Keep the newest delivery per ISSI pending until LLC observes BL-ACK.
     pending_registration_deliveries: HashMap<u32, PendingRegistrationDelivery>,
+    /// SwMI-initiated GSSI -> GCKN amendments awaiting their normative MM ACK.
+    pending_group_security_associations: HashMap<u32, PendingGroupSecurityAssociation>,
+    /// Coalesced desired associations which cannot start while registration or
+    /// another Figure-20 transaction owns the terminal's MM exchange.
+    queued_group_security_associations: HashMap<u32, QueuedGroupSecurityAssociation>,
+    /// Earliest safe start after a registration BL-ACK, preventing the new
+    /// attachment exchange from colliding with terminal-side registration MM.
+    group_security_not_before: HashMap<u32, TdmaTime>,
     /// Empty acknowledged BL-DATA presence probes requested by the SwMI.
     /// These deliberately live outside MM registration state: a reachability
     /// check must not mutate affiliations, security associations or roaming.
@@ -370,7 +418,38 @@ struct PendingLocationAttachment {
 }
 
 impl MmBs {
+    fn normalized_group_security_gssis(&self, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let state = self.config.state_read();
+        let Some(sc3) = state.aie.sc3.as_ref().filter(|sc3| sc3.linked_gck_crypto_periods()) else {
+            return Vec::new();
+        };
+        let mut groups = gssis
+            .into_iter()
+            .filter(|gssi| sc3.gckn_for_gssi(*gssi).is_some())
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups.dedup();
+        groups.truncate(30);
+        groups
+    }
+
+    /// Registration may carry associations for GSSIs other than the selected
+    /// group (TTR 001-11 clause 6.2.8.2). Merge the complete authoritative
+    /// local scan/attachment state into D-LOCATION UPDATE ACCEPT so roaming
+    /// does not unnecessarily depend on a second Figure-20 transaction.
+    fn registration_group_security_gssis(&mut self, issi: u32, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let mut groups = gssis.into_iter().collect::<Vec<_>>();
+        groups.extend(
+            self.client_mgr
+                .get_client_by_issi(issi)
+                .into_iter()
+                .flat_map(|client| client.groups.keys().copied()),
+        );
+        self.normalized_group_security_gssis(groups)
+    }
+
     fn group_security_information(&self, gssis: impl IntoIterator<Item = u32>) -> Option<Vec<GroupIdentitySecurityRelatedInformation>> {
+        let gssis = self.normalized_group_security_gssis(gssis);
         let state = self.config.state_read();
         let sc3 = state.aie.sc3.as_ref()?;
         if !sc3.linked_gck_crypto_periods() {
@@ -390,7 +469,6 @@ impl MmBs {
                     selection: GckSelectNumber::Selected(gckn),
                 })
             })
-            .take(30)
             .collect::<Vec<_>>();
         (!associations.is_empty()).then_some(vec![GroupIdentitySecurityRelatedInformation { associations }])
     }
@@ -627,32 +705,38 @@ impl MmBs {
             let state = pending.tx_reporter.get_state();
             if delivered {
                 self.config.state_write().subscribers.mark_active(issi);
+                self.group_security_not_before
+                    .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
                 // SubscriberStateSync can restore the terminal's roaming
                 // scan/attachment list while D-LOCATION UPDATE ACCEPT is
                 // still awaiting its BL-ACK.  Those groups were not present
                 // in the original location-update transaction, but they do
                 // need the same post-registration GSSI -> GCKN amendment
                 // before a restored or late-entry group call is usable.
-                let mut security_groups = pending.security_groups;
-                security_groups.extend(
+                let included_security_groups = pending.security_groups.iter().copied().collect::<HashSet<_>>();
+                let mut current_security_groups = pending.security_groups;
+                current_security_groups.extend(
                     self.client_mgr
                         .get_client_by_issi(issi)
                         .into_iter()
                         .flat_map(|client| client.groups.keys().copied()),
                 );
-                security_groups.sort_unstable();
-                security_groups.dedup();
-                let association_count = self
-                    .group_security_information(security_groups.iter().copied())
-                    .map(|information| information.into_iter().map(|item| item.associations.len()).sum::<usize>())
-                    .unwrap_or_default();
-                self.send_group_security_association_amendments(queue, issi, 0, security_groups);
+                let current_security_groups = self.normalized_group_security_gssis(current_security_groups);
+                let post_registration_groups = current_security_groups
+                    .iter()
+                    .filter(|gssi| !included_security_groups.contains(gssi))
+                    .copied()
+                    .collect::<Vec<_>>();
+                let association_count = current_security_groups.len();
+                let late_association_count = post_registration_groups.len();
+                self.send_group_security_association_amendments(queue, issi, 0, post_registration_groups);
                 self.send_current_gck_version_to_terminal(queue, issi, 0);
                 tracing::info!(
                     command_id = ?pending.command_id,
                     issi = pending.issi,
                     authentication_downlink = pending.authentication_downlink,
                     association_count,
+                    late_association_count,
                     "location update accepted and link-acknowledged on air interface"
                 );
             } else {
@@ -856,6 +940,9 @@ impl MmBs {
             pending_otar_deliveries: HashMap::new(),
             recent_otar_deliveries: VecDeque::new(),
             pending_registration_deliveries: HashMap::new(),
+            pending_group_security_associations: HashMap::new(),
+            queued_group_security_associations: HashMap::new(),
+            group_security_not_before: HashMap::new(),
             pending_liveliness_probes: HashMap::new(),
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
@@ -1524,6 +1611,10 @@ impl MmBs {
         // registration decision; they must never make the registration itself
         // silently fall back to LST.
         let issi = prim.received_address.ssi;
+        // TS 100 392-2 clause 16.8.6: registration overrides a colliding
+        // attachment transaction. Its current desired associations are folded
+        // into the ensuing D-LOCATION UPDATE ACCEPT instead.
+        self.cancel_group_security_association_for_registration(issi);
         // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
         // startpoint. Current policy accepts the requested mode and selects
         // the next MCCH phase from the local TDMA clock. For periodic/demand
@@ -1719,6 +1810,8 @@ impl MmBs {
         }
         let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
 
+        let registration_security_groups = self.registration_group_security_gssis(issi, Vec::new());
+
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
             location_update_accept_type: pdu.location_update_type,
@@ -1732,7 +1825,7 @@ impl MmBs {
             group_identity_location_accept: gila,
             default_group_attachment_lifetime: None,
             authentication_downlink: None,
-            group_identity_security_related_information: None,
+            group_identity_security_related_information: self.group_security_information(registration_security_groups.iter().copied()),
             cell_type_control: None,
             proprietary: None,
         };
@@ -1765,7 +1858,7 @@ impl MmBs {
             }),
         };
         queue.push_back(msg);
-        self.track_registration_delivery(None, issi, false, Vec::new(), tx_reporter);
+        self.track_registration_delivery(None, issi, false, registration_security_groups, tx_reporter);
 
         // If this is an unknown returning radio (not ITSI attach) that didn't
         // include groups in the registration, force a full group report via
@@ -2179,7 +2272,7 @@ impl MmBs {
         queue.push_back(msg);
     }
 
-    fn rx_u_attach_detach_group_identity_acknowledgement(&mut self, mut message: SapMsg) {
+    fn rx_u_attach_detach_group_identity_acknowledgement(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
@@ -2194,12 +2287,7 @@ impl MmBs {
                 return;
             }
         };
-        tracing::info!(
-            issi = prim.received_address.ssi,
-            accepted = !pdu.group_identity_acknowledgement_type,
-            returned_groups = pdu.group_identity_uplink.as_ref().map_or(0, Vec::len),
-            "group-security attachment amendment acknowledged by terminal"
-        );
+        self.complete_group_security_association_ack(queue, prim.received_address.ssi, pdu);
     }
 
     fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -2264,7 +2352,9 @@ impl MmBs {
             MmPduTypeUl::UOtar => self.rx_u_otar(queue, message),
             MmPduTypeUl::UInformationProvide => unimplemented_log!("UInformationProvide"),
             MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
-            MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => self.rx_u_attach_detach_group_identity_acknowledgement(message),
+            MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => {
+                self.rx_u_attach_detach_group_identity_acknowledgement(queue, message)
+            }
             MmPduTypeUl::UTeiProvide => unimplemented_log!("UTeiProvide"),
             MmPduTypeUl::UDisableStatus => unimplemented_log!("UDisableStatus"),
             MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
@@ -2972,6 +3062,7 @@ impl MmBs {
             let local_results = Self::local_attachment_results(&attachment);
             let (had_rejection, response_groups, security_groups) =
                 self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
+            let security_groups = self.registration_group_security_gssis(pending.itsi, security_groups);
             let receipt = self.send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
@@ -3002,6 +3093,7 @@ impl MmBs {
             }
             return;
         }
+        let security_groups = self.registration_group_security_gssis(pending.itsi, Vec::new());
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
@@ -3015,7 +3107,7 @@ impl MmBs {
                 group_identity_accept_reject: 0,
                 group_identity_downlink: None,
             }),
-            Vec::new(),
+            security_groups.clone(),
             None,
             rua_requested,
         );
@@ -3023,7 +3115,7 @@ impl MmBs {
             Some(command_id),
             pending.itsi,
             pending.authentication_successful,
-            Vec::new(),
+            security_groups,
             receipt.clone(),
         );
         let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
@@ -3404,6 +3496,7 @@ impl MmBs {
         let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
+        let security_groups = self.registration_group_security_gssis(registration.itsi, security_groups);
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
@@ -3442,7 +3535,7 @@ impl MmBs {
     }
 
     fn send_d_attachment_acknowledgement(
-        &self,
+        &mut self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
@@ -3484,6 +3577,12 @@ impl MmBs {
                 seamless_handover: None,
             }),
         });
+        // Do not start a queued SwMI-initiated amendment in the same instant
+        // as this response to an MS-initiated attachment. The PDU types have
+        // no transaction identifiers and the terminal MM must first complete
+        // the exchange it initiated.
+        self.group_security_not_before
+            .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
     }
 
     /// Re-advertise the currently attached GSSI associations whose GCK was
@@ -3518,21 +3617,49 @@ impl MmBs {
         );
     }
 
-    /// Queue one transactional association amendment for all supplied SC3G
-    /// groups. TTR 001-11 table 14 permits up to thirty associations in one
-    /// security element, which covers the supported twenty-group scan list.
-    /// The LLC/MAC layers may fragment the PDU, but the MS then applies and
-    /// acknowledges the complete association set as one figure-20 operation.
-    fn send_group_security_association_amendments(
-        &self,
+    fn group_security_exchange_blocked(&self, issi: u32) -> bool {
+        self.config.state_read().subscribers.is_registration_pending(issi)
+            || self.pending_group_security_associations.contains_key(&issi)
+            || self.pending_attachments.values().any(|pending| pending.itsi == issi)
+            || self
+                .pending_location_attachments
+                .values()
+                .any(|pending| pending.registration.itsi == issi)
+    }
+
+    fn enqueue_group_security_associations(&mut self, issi: u32, handle: u32, groups: Vec<u32>, retries: u8) {
+        if groups.is_empty() {
+            return;
+        }
+        let pending = self.queued_group_security_associations.entry(issi).or_default();
+        if handle != 0 || pending.air_handle == 0 {
+            pending.air_handle = handle;
+        }
+        pending.groups.extend(groups);
+        pending.retries = pending.retries.max(retries);
+    }
+
+    fn group_security_guard_active(&self, issi: u32) -> bool {
+        self.group_security_not_before
+            .get(&issi)
+            .is_some_and(|not_before| not_before.age(self.current_time) < 0)
+    }
+
+    /// Begin exactly one Figure-20 transaction. TTR 001-11 table 14 permits
+    /// up to thirty associations in one security element, which covers the
+    /// supported twenty-group scan list. LLC/MAC may fragment this one PDU;
+    /// its BL-ACK and the terminal's MM acknowledgement remain distinct.
+    fn start_group_security_association_transaction(
+        &mut self,
         queue: &mut MessageQueue,
         issi: u32,
         handle: u32,
-        groups: impl IntoIterator<Item = u32>,
+        groups: Vec<u32>,
+        retries: u8,
     ) {
-        let mut seen = HashSet::new();
-        let requested_groups = groups.into_iter().filter(|gssi| seen.insert(*gssi)).take(30).collect::<Vec<_>>();
-        let Some(security) = self.group_security_information(requested_groups) else {
+        debug_assert!(!self.pending_group_security_associations.contains_key(&issi));
+        let groups = self.normalized_group_security_gssis(groups);
+        let Some(security) = self.group_security_information(groups.iter().copied()) else {
             return;
         };
         let group_identity_downlink = security
@@ -3564,6 +3691,7 @@ impl MmBs {
         let mut sdu = BitBuffer::new_autoexpand(64);
         pdu.to_bitbuf(&mut sdu).expect("serialize GCK association refresh");
         sdu.seek(0);
+        let tx_reporter = TxReporter::new();
         queue.push_back(SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -3578,10 +3706,262 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
-                tx_reporter: None,
+                tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover: None,
             }),
         });
+        let association_count = groups.len();
+        self.pending_group_security_associations.insert(
+            issi,
+            PendingGroupSecurityAssociation {
+                air_handle: handle,
+                groups,
+                tx_reporter,
+                phase: GroupSecurityAssociationPhase::LinkDelivery,
+                acknowledgement_deadline: None,
+                retries,
+            },
+        );
+        tracing::info!(
+            issi,
+            association_count,
+            attempt = retries + 1,
+            "queued transactional group-security association amendment"
+        );
+    }
+
+    fn send_group_security_association_amendments(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        groups: impl IntoIterator<Item = u32>,
+    ) {
+        let groups = self.normalized_group_security_gssis(groups);
+        if groups.is_empty() {
+            return;
+        }
+        if self.group_security_exchange_blocked(issi) || self.group_security_guard_active(issi) {
+            self.enqueue_group_security_associations(issi, handle, groups, 0);
+            return;
+        }
+        // Do not retain an expired wrapped TDMA deadline indefinitely. Apart
+        // from keeping the map bounded, removal prevents an ancient guard
+        // from looking future again after half of the hyperframe counter
+        // range has elapsed.
+        self.group_security_not_before.remove(&issi);
+        self.start_group_security_association_transaction(queue, issi, handle, groups, 0);
+    }
+
+    fn flush_queued_group_security_associations(&mut self, queue: &mut MessageQueue) {
+        let ready = self
+            .queued_group_security_associations
+            .keys()
+            .copied()
+            .filter(|issi| !self.group_security_exchange_blocked(*issi) && !self.group_security_guard_active(*issi))
+            .collect::<Vec<_>>();
+        for issi in ready {
+            self.group_security_not_before.remove(&issi);
+            let Some(queued) = self.queued_group_security_associations.remove(&issi) else {
+                continue;
+            };
+            self.start_group_security_association_transaction(
+                queue,
+                issi,
+                queued.air_handle,
+                queued.groups.into_iter().collect(),
+                queued.retries,
+            );
+        }
+    }
+
+    fn retry_group_security_association(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        pending: PendingGroupSecurityAssociation,
+        groups: Vec<u32>,
+        reason: &'static str,
+    ) {
+        let retries = pending.retries.saturating_add(1);
+        if pending.retries >= MAX_GROUP_SECURITY_RETRIES {
+            tracing::warn!(
+                issi,
+                association_count = groups.len(),
+                attempts = pending.retries + 1,
+                reason,
+                "group-security association transaction exhausted bounded retries"
+            );
+            return;
+        }
+        tracing::warn!(
+            issi,
+            association_count = groups.len(),
+            attempt = retries + 1,
+            reason,
+            "retrying group-security association transaction"
+        );
+        if self.group_security_exchange_blocked(issi) || self.group_security_guard_active(issi) {
+            self.enqueue_group_security_associations(issi, pending.air_handle, groups, retries);
+        } else {
+            self.start_group_security_association_transaction(queue, issi, pending.air_handle, groups, retries);
+        }
+    }
+
+    fn update_group_security_association_statuses(&mut self, queue: &mut MessageQueue) {
+        enum Failed {
+            Link(TxState),
+            MmTimeout,
+        }
+
+        let issis = self.pending_group_security_associations.keys().copied().collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for issi in issis {
+            let Some(pending) = self.pending_group_security_associations.get_mut(&issi) else {
+                continue;
+            };
+            match pending.phase {
+                GroupSecurityAssociationPhase::LinkDelivery => match pending.tx_reporter.get_state() {
+                    TxState::Pending | TxState::Transmitted => {}
+                    TxState::Discarded | TxState::Lost => failures.push((issi, Failed::Link(pending.tx_reporter.get_state()))),
+                    TxState::Acknowledged => {
+                        pending.phase = GroupSecurityAssociationPhase::AwaitingMmAcknowledgement;
+                        pending.acknowledgement_deadline = Some(self.current_time.add_timeslots(GROUP_SECURITY_ACK_TIMEOUT_TIMESLOTS));
+                        tracing::debug!(
+                            issi,
+                            association_count = pending.groups.len(),
+                            "group-security association link-acknowledged; awaiting terminal MM acknowledgement"
+                        );
+                    }
+                },
+                GroupSecurityAssociationPhase::AwaitingMmAcknowledgement => {
+                    if pending
+                        .acknowledgement_deadline
+                        .is_some_and(|deadline| deadline.age(self.current_time) >= 0)
+                    {
+                        failures.push((issi, Failed::MmTimeout));
+                    }
+                }
+            }
+        }
+
+        for (issi, failure) in failures {
+            let Some(pending) = self.pending_group_security_associations.remove(&issi) else {
+                continue;
+            };
+            let groups = pending.groups.clone();
+            match failure {
+                Failed::Link(state) => {
+                    tracing::warn!(issi, ?state, "group-security association basic-link delivery failed");
+                    self.retry_group_security_association(queue, issi, pending, groups, "basic-link-failure");
+                }
+                Failed::MmTimeout => {
+                    self.retry_group_security_association(queue, issi, pending, groups, "terminal-mm-ack-timeout");
+                }
+            }
+        }
+        self.flush_queued_group_security_associations(queue);
+    }
+
+    fn complete_group_security_association_ack(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        pdu: UAttachDetachGroupIdentityAcknowledgement,
+    ) {
+        let Some(pending) = self.pending_group_security_associations.remove(&issi) else {
+            tracing::warn!(
+                issi,
+                accepted = !pdu.group_identity_acknowledgement_type,
+                returned_groups = pdu.group_identity_uplink.as_ref().map_or(0, Vec::len),
+                "ignoring group-security attachment acknowledgement without a pending Figure-20 transaction"
+            );
+            return;
+        };
+
+        let offered = pending.groups.iter().copied().collect::<HashSet<_>>();
+        let mut rejected = Vec::new();
+        let mut malformed = false;
+        let mut class_updates = Vec::new();
+        for returned in pdu.group_identity_uplink.as_deref().unwrap_or_default() {
+            let Some(gssi) = returned.gssi else {
+                malformed = true;
+                continue;
+            };
+            if !offered.contains(&gssi) {
+                tracing::warn!(issi, gssi, "terminal returned a group outside the pending Figure-20 request");
+                malformed = true;
+                continue;
+            }
+            if returned.group_identity_detachment_uplink.is_some() {
+                rejected.push(gssi);
+                continue;
+            }
+            if let Some(class_of_usage) = returned.class_of_usage
+                && self
+                    .client_mgr
+                    .client_group_attach_with_class_of_usage(issi, gssi, true, class_of_usage)
+                    .unwrap_or(false)
+            {
+                class_updates.push((gssi, class_of_usage));
+            }
+        }
+        rejected.sort_unstable();
+        rejected.dedup();
+
+        // Annex F: type 0 accepts the complete request; type 1 requires every
+        // rejected attachment to be returned explicitly. Contradictory or
+        // empty rejection data cannot safely identify what the MS retained.
+        if !pdu.group_identity_acknowledgement_type && !rejected.is_empty() {
+            malformed = true;
+        }
+        if pdu.group_identity_acknowledgement_type && rejected.is_empty() {
+            malformed = true;
+        }
+
+        if !class_updates.is_empty() {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                    issi,
+                    groups: class_updates.iter().map(|(gssi, _)| *gssi).collect(),
+                    action: BrewSubscriberAction::Affiliate,
+                    class_of_usage: class_updates.iter().map(|(_, cou)| *cou).collect(),
+                    scanning_enabled: None,
+                }),
+            });
+        }
+
+        tracing::info!(
+            issi,
+            accepted = !pdu.group_identity_acknowledgement_type && !malformed,
+            returned_groups = pdu.group_identity_uplink.as_ref().map_or(0, Vec::len),
+            rejected_groups = rejected.len(),
+            malformed,
+            "group-security attachment amendment acknowledged by terminal"
+        );
+
+        if malformed {
+            let groups = pending.groups.clone();
+            self.retry_group_security_association(queue, issi, pending, groups, "ambiguous-terminal-mm-ack");
+        } else if !rejected.is_empty() {
+            self.retry_group_security_association(queue, issi, pending, rejected, "terminal-rejected-association");
+        }
+        self.flush_queued_group_security_associations(queue);
+    }
+
+    fn cancel_group_security_association_for_registration(&mut self, issi: u32) {
+        let pending = self.pending_group_security_associations.remove(&issi);
+        let queued = self.queued_group_security_associations.remove(&issi);
+        self.group_security_not_before.remove(&issi);
+        if pending.is_some() || queued.is_some() {
+            tracing::info!(
+                issi,
+                "abandoned colliding Figure-20 association transaction in favour of registration"
+            );
+        }
     }
 
     fn send_d_location_update_accept(
@@ -4101,6 +4481,7 @@ impl TetraEntityTrait for MmBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
         self.update_registration_delivery_statuses(queue);
+        self.update_group_security_association_statuses(queue);
         self.update_liveliness_probe_statuses();
         self.update_sc2_activations(queue);
         self.update_otar_delivery_statuses();
@@ -4788,13 +5169,16 @@ mod tests {
     use tetra_core::{
         AieRequest, AieScope, AieSubject, Sap, SsiType, TxReporter, tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric,
     };
+    use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
     use tetra_pdus::mm::fields::group_identity_security_related_information::GckSelectNumber;
     use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
     use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DAllGcksChangeDemand};
     use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
     use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+    use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+    use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
     use tetra_saps::SapMsgInner;
-    use tetra_swmi_protocol::{AttachmentOperation, EnergyEconomyAssignment};
+    use tetra_swmi_protocol::{AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment};
 
     fn test_config() -> SharedConfig {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -4803,6 +5187,34 @@ mod tests {
         )))
         .expect("example configuration must remain valid");
         SharedConfig::from_parts(config, None)
+    }
+
+    fn test_sc3g_mm(issi: u32, groups: &[u32]) -> MmBs {
+        let config = test_config();
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
+        sc3.apply_sc3g_snapshot(
+            1,
+            true,
+            1,
+            vec![RuntimeSc3Gck::new(1, 1, [0x31; 10])],
+            groups.iter().map(|gssi| (*gssi, 1)).collect(),
+        )
+        .expect("valid linked SC3G snapshot");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        for gssi in groups {
+            mm.client_mgr
+                .client_group_attach_with_class_of_usage(issi, *gssi, true, 3)
+                .expect("test group must attach");
+        }
+        mm
     }
 
     #[test]
@@ -4952,7 +5364,7 @@ mod tests {
             sc3: Some(sc3),
             rollover: None,
         };
-        let mm = MmBs::new(config, None, None, None);
+        let mut mm = MmBs::new(config, None, None, None);
         let mut queue = MessageQueue::new();
 
         mm.send_d_attachment_acknowledgement(&mut queue, 430_893, 0, false, Vec::new(), &[1201]);
@@ -5019,11 +5431,18 @@ mod tests {
     }
 
     #[test]
-    fn multi_group_security_amendments_use_one_transactional_pdu() {
+    fn twenty_scanned_group_security_amendments_use_one_transactional_pdu() {
         let config = test_config();
+        let expected_groups = (1200..1220).collect::<Vec<_>>();
         let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
-        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2), (1203, 2)])
-            .expect("valid multi-group SC3G snapshot");
+        sc3.apply_sc3g_snapshot(
+            1,
+            true,
+            1,
+            vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])],
+            expected_groups.iter().map(|gssi| (*gssi, 2)).collect(),
+        )
+        .expect("valid twenty-group SC3G snapshot");
         config.state_write().aie = RuntimeAieConfig {
             enabled: true,
             sc1_allowed: false,
@@ -5034,14 +5453,14 @@ mod tests {
         let issi = 77_492;
         let mut mm = MmBs::new(config, None, None, None);
         mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
-        for gssi in [1202, 1203] {
+        for gssi in &expected_groups {
             mm.client_mgr
-                .client_group_attach_with_class_of_usage(issi, gssi, true, 4)
+                .client_group_attach_with_class_of_usage(issi, *gssi, true, 3)
                 .expect("test group must attach");
         }
         let mut queue = MessageQueue::new();
 
-        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202, 1203]);
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, expected_groups.iter().copied());
 
         let message = queue.pop_front().expect("one combined amendment must be queued");
         let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
@@ -5049,7 +5468,7 @@ mod tests {
         };
         let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid combined association amendment");
         let groups = pdu.group_identity_downlink.expect("group amendment");
-        assert_eq!(groups.iter().filter_map(|group| group.gssi).collect::<Vec<_>>(), vec![1202, 1203]);
+        assert_eq!(groups.iter().filter_map(|group| group.gssi).collect::<Vec<_>>(), expected_groups);
         let security = pdu.group_identity_security_related_information.expect("security associations");
         assert_eq!(
             security[0]
@@ -5057,9 +5476,260 @@ mod tests {
                 .iter()
                 .map(|association| association.gssi)
                 .collect::<Vec<_>>(),
-            vec![1202, 1203]
+            expected_groups
         );
         assert!(queue.pop_front().is_none(), "the complete association set must use one PDU");
+    }
+
+    #[test]
+    fn figure20_link_ack_waits_for_distinct_terminal_mm_ack() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202]);
+        let mut queue = MessageQueue::new();
+
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+        queue.pop_front().expect("initial Figure-20 PDU");
+        let reporter = mm
+            .pending_group_security_associations
+            .get(&issi)
+            .expect("transaction must be pending")
+            .tx_reporter
+            .clone();
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        mm.update_group_security_association_statuses(&mut queue);
+
+        let pending = mm
+            .pending_group_security_associations
+            .get(&issi)
+            .expect("BL-ACK must not complete the MM transaction");
+        assert_eq!(pending.phase, super::GroupSecurityAssociationPhase::AwaitingMmAcknowledgement);
+        assert!(pending.acknowledgement_deadline.is_some());
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn figure20_empty_accept_ack_completes_the_full_offered_set() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202, 1203]);
+        queue.pop_front().expect("initial Figure-20 PDU");
+
+        mm.complete_group_security_association_ack(
+            &mut queue,
+            issi,
+            UAttachDetachGroupIdentityAcknowledgement {
+                group_identity_acknowledgement_type: false,
+                group_identity_uplink: None,
+                proprietary: None,
+            },
+        );
+
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn figure20_timeout_retries_the_same_transaction_boundedly() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+        queue.pop_front().expect("initial Figure-20 PDU");
+        let reporter = mm.pending_group_security_associations[&issi].tx_reporter.clone();
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        mm.update_group_security_association_statuses(&mut queue);
+
+        mm.current_time = mm.current_time.add_timeslots(super::GROUP_SECURITY_ACK_TIMEOUT_TIMESLOTS);
+        mm.update_group_security_association_statuses(&mut queue);
+
+        let retry = queue.pop_front().expect("MM timeout must queue one retry");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = retry.msg else {
+            panic!("retry must be an LMM downlink")
+        };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid retried Figure-20 PDU");
+        assert_eq!(
+            pdu.group_identity_downlink
+                .expect("retried group")
+                .iter()
+                .filter_map(|group| group.gssi)
+                .collect::<Vec<_>>(),
+            vec![1202]
+        );
+        assert_eq!(mm.pending_group_security_associations[&issi].retries, 1);
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn figure20_reject_ack_retries_only_explicitly_rejected_groups() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202, 1203]);
+        queue.pop_front().expect("initial Figure-20 PDU");
+
+        mm.complete_group_security_association_ack(
+            &mut queue,
+            issi,
+            UAttachDetachGroupIdentityAcknowledgement {
+                group_identity_acknowledgement_type: true,
+                group_identity_uplink: Some(vec![GroupIdentityUplink {
+                    class_of_usage: None,
+                    group_identity_detachment_uplink: Some(0),
+                    gssi: Some(1203),
+                    address_extension: None,
+                    vgssi: None,
+                }]),
+                proprietary: None,
+            },
+        );
+
+        let retry = queue.pop_front().expect("rejected association must be retried");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = retry.msg else {
+            panic!("retry must be an LMM downlink")
+        };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid rejected-group retry");
+        assert_eq!(
+            pdu.group_identity_downlink
+                .expect("retried group")
+                .iter()
+                .filter_map(|group| group.gssi)
+                .collect::<Vec<_>>(),
+            vec![1203]
+        );
+    }
+
+    #[test]
+    fn figure20_coalesces_new_groups_without_overlapping_transactions() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1203]);
+        assert_eq!(queue.iter_mut().count(), 1, "only the first transaction may be on air");
+        queue.pop_front().expect("first Figure-20 PDU");
+
+        mm.complete_group_security_association_ack(
+            &mut queue,
+            issi,
+            UAttachDetachGroupIdentityAcknowledgement {
+                group_identity_acknowledgement_type: false,
+                group_identity_uplink: None,
+                proprietary: None,
+            },
+        );
+
+        assert_eq!(queue.iter_mut().count(), 1, "the coalesced successor starts only after the MM ACK");
+        assert_eq!(mm.pending_group_security_associations[&issi].groups, vec![1203]);
+    }
+
+    #[test]
+    fn figure20_exhausts_after_two_application_retries() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+
+        for retry in 0..=super::MAX_GROUP_SECURITY_RETRIES {
+            queue.pop_front().expect("current Figure-20 attempt");
+            let reporter = mm.pending_group_security_associations[&issi].tx_reporter.clone();
+            reporter.mark_transmitted();
+            reporter.mark_acknowledged();
+            mm.update_group_security_association_statuses(&mut queue);
+            mm.current_time = mm.current_time.add_timeslots(super::GROUP_SECURITY_ACK_TIMEOUT_TIMESLOTS);
+            mm.update_group_security_association_statuses(&mut queue);
+
+            if retry < super::MAX_GROUP_SECURITY_RETRIES {
+                assert_eq!(mm.pending_group_security_associations[&issi].retries, retry + 1);
+                assert_eq!(queue.iter_mut().count(), 1, "exactly one bounded retry must be queued");
+            }
+        }
+
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
+        assert!(!mm.queued_group_security_associations.contains_key(&issi));
+        assert!(queue.pop_front().is_none(), "retry exhaustion must not loop forever");
+    }
+
+    #[test]
+    fn registration_accept_embeds_all_known_sc3g_scan_associations() {
+        let issi = 77_492;
+        let expected_groups = vec![1202, 1203, 1204];
+        let mut mm = test_sc3g_mm(issi, &expected_groups);
+        let security_groups = mm.registration_group_security_gssis(issi, Vec::new());
+        let mut queue = MessageQueue::new();
+
+        mm.send_d_location_update_accept_with_handover(
+            &mut queue,
+            issi,
+            0,
+            LocationUpdateType::ItsiAttach,
+            None,
+            true,
+            &AieLocationUpdateDecision::default(),
+            AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            None,
+            security_groups,
+            None,
+            false,
+        );
+
+        let message = queue.pop_front().expect("registration accept");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("registration accept must be an LMM downlink")
+        };
+        let pdu = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid D-LOCATION UPDATE ACCEPT");
+        let associations = pdu
+            .group_identity_security_related_information
+            .expect("registration must embed the restored scan associations")[0]
+            .associations
+            .iter()
+            .map(|association| association.gssi)
+            .collect::<Vec<_>>();
+        assert_eq!(associations, expected_groups);
+        assert!(
+            queue.pop_front().is_none(),
+            "the associations belong to the single registration PDU"
+        );
+    }
+
+    #[test]
+    fn registration_cancels_a_colliding_figure20_transaction() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1203]);
+        assert!(mm.pending_group_security_associations.contains_key(&issi));
+        assert!(mm.queued_group_security_associations.contains_key(&issi));
+
+        mm.cancel_group_security_association_for_registration(issi);
+
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
+        assert!(!mm.queued_group_security_associations.contains_key(&issi));
+        assert!(!mm.group_security_not_before.contains_key(&issi));
+    }
+
+    #[test]
+    fn liveliness_probe_does_not_change_a_pending_figure20_transaction() {
+        let issi = 77_492;
+        let mut mm = test_sc3g_mm(issi, &[1202]);
+        let mut queue = MessageQueue::new();
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
+        let figure20_reporter = mm.pending_group_security_associations[&issi].tx_reporter.clone();
+        let groups_before = mm.pending_group_security_associations[&issi].groups.clone();
+
+        mm.send_liveliness_probe(&mut queue, issi);
+        let liveliness_reporter = mm.pending_liveliness_probes[&issi].clone();
+        liveliness_reporter.mark_transmitted();
+        liveliness_reporter.mark_acknowledged();
+        mm.update_liveliness_probe_statuses();
+
+        let pending = &mm.pending_group_security_associations[&issi];
+        assert_eq!(pending.groups, groups_before);
+        assert_eq!(pending.tx_reporter.get_state(), figure20_reporter.get_state());
+        assert!(!mm.pending_liveliness_probes.contains_key(&issi));
     }
 
     #[test]
@@ -5337,7 +6007,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_link_ack_includes_security_for_a_roaming_restored_group() {
+    fn registration_link_ack_defers_late_roaming_association_past_collision_guard() {
         let issi = 77_468;
         let gssi = 91;
         let config = test_config();
@@ -5373,7 +6043,20 @@ mod tests {
         reporter.mark_acknowledged();
         mm.update_registration_delivery_statuses(&mut queue);
 
-        let message = queue.pop_front().expect("figure-20 association amendment must be queued first");
+        let version_message = queue.pop_front().expect("full current GCK-VN follows registration");
+        let SapMsgInner::LmmMleUnitdataReq(mut version_request) = version_message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        DAllGcksChangeDemand::from_bitbuf(&mut version_request.sdu).expect("valid full current GCK-VN advertisement");
+        assert!(
+            queue.pop_front().is_none(),
+            "Figure-20 must not collide with terminal-side registration MM"
+        );
+
+        mm.current_time = mm.current_time.add_timeslots(super::GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS);
+        mm.update_group_security_association_statuses(&mut queue);
+
+        let message = queue.pop_front().expect("late Figure-20 association amendment after guard");
         let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
             panic!("expected an LMM downlink request")
         };
@@ -5389,11 +6072,6 @@ mod tests {
         assert_eq!(security[0].associations[0].gssi, gssi);
         assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(1));
 
-        let version_message = queue.pop_front().expect("full current GCK-VN must follow the association");
-        let SapMsgInner::LmmMleUnitdataReq(mut version_request) = version_message.msg else {
-            panic!("expected an LMM downlink request")
-        };
-        DAllGcksChangeDemand::from_bitbuf(&mut version_request.sdu).expect("valid full current GCK-VN advertisement");
         assert!(queue.pop_front().is_none());
     }
 

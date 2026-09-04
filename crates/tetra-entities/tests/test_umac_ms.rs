@@ -30,6 +30,7 @@ fn test_umac_ms() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
 
@@ -69,6 +70,7 @@ fn test_umac_frag() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
     test.submit_message(m);
@@ -87,6 +89,7 @@ fn test_umac_frag() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
 
@@ -126,6 +129,7 @@ fn test_sysinfo() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
     test.submit_message(m);
@@ -161,6 +165,7 @@ fn test_sync() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
     test.submit_message(m);
@@ -194,6 +199,7 @@ fn test_resource() {
             ul_time: TdmaTime::default(),
             crc_pass: true,
             scrambling_code: 0,
+            rf_observation: None,
         }),
     };
     test.submit_message(m);

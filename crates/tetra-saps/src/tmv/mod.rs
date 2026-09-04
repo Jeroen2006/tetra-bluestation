@@ -1,6 +1,6 @@
 pub mod enums;
 
-use tetra_core::{AieCipherRegion, AieRequest, BitBuffer, PhyBlockNum, PhysicalChannel, TdmaTime, Todo};
+use tetra_core::{AieCipherRegion, AieRequest, BitBuffer, PhyBlockNum, PhysicalChannel, TdmaTime, Todo, UplinkRfObservation};
 
 use crate::tmv::enums::logical_chans::LogicalChannel;
 
@@ -54,15 +54,18 @@ pub struct TmvUnitdataInd {
     /// If no CRC is present on this message type (for example, for AACH), crc_pass is set to True
     pub crc_pass: bool,
     pub scrambling_code: u32,
+    pub rf_observation: Option<UplinkRfObservation>,
 }
 
 /// Indicates a CRC-failed uplink control block that LMAC discarded.
 /// UMAC uses common-channel SCH/HU failures for random-access load estimation.
 #[derive(Debug, Clone, Copy)]
 pub struct TmvCrcInd {
+    pub ul_time: TdmaTime,
     pub logical_channel: LogicalChannel,
     pub block_num: PhyBlockNum,
     pub common_control: bool,
+    pub rf_observation: Option<UplinkRfObservation>,
 }
 
 /// Clause 23.2.1

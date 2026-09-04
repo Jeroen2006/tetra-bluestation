@@ -83,6 +83,7 @@ impl<D: RxTxDev> PhyBs<D> {
         block_num: PhyBlockNum,
         bits: BitBuffer,
         soft_bits: Option<Vec<SoftBit>>,
+        rf_observation: Option<tetra_core::UplinkRfObservation>,
     ) {
         // Uplink timeslot is two after downlink. Thus was transmitted at dltime - 2
         let sapmsg = SapMsg {
@@ -96,6 +97,7 @@ impl<D: RxTxDev> PhyBs<D> {
                 block_type,
                 block_num,
                 soft_bits,
+                rf_observation,
                 block: bits,
             }),
         };
@@ -140,6 +142,7 @@ impl<D: RxTxDev> PhyBs<D> {
                             NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS,
                         ],
                     ),
+                    burst.rf_observation,
                 );
             }
 
@@ -158,6 +161,7 @@ impl<D: RxTxDev> PhyBs<D> {
                     PhyBlockNum::Block1,
                     blk1,
                     Self::collect_soft_bits(burst, &[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS]),
+                    burst.rf_observation,
                 );
                 Self::send_rxblock_to_lmac(
                     queue,
@@ -168,6 +172,7 @@ impl<D: RxTxDev> PhyBs<D> {
                     PhyBlockNum::Block2,
                     blk2,
                     Self::collect_soft_bits(burst, &[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS]),
+                    burst.rf_observation,
                 );
             }
             TrainingSequence::ExtendedTrainSeq => {
@@ -198,6 +203,7 @@ impl<D: RxTxDev> PhyBs<D> {
                             CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS,
                         ],
                     ),
+                    burst.rf_observation,
                 );
             }
 

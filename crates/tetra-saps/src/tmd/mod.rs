@@ -11,5 +11,8 @@ pub struct TmdCircuitDataReq {
 pub struct TmdCircuitDataInd {
     // call_id: CallId,
     pub ts: u8,
+    pub ul_time: tetra_core::TdmaTime,
     pub data: Vec<u8>,
+    pub block_ok: bool,
+    pub rf_observation: Option<tetra_core::UplinkRfObservation>,
 }

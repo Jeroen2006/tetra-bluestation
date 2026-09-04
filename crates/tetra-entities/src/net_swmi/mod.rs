@@ -175,6 +175,25 @@ pub struct SwmiMediaEndpoint {
     online: Arc<AtomicBool>,
 }
 
+/// Write-only RF statistics endpoint. UMAC owns correlation and aggregation;
+/// the transport worker remains the only WebSocket owner.
+pub struct SwmiRfEndpoint {
+    outgoing: Sender<SwmiMessage>,
+    online: Arc<AtomicBool>,
+}
+
+impl SwmiRfEndpoint {
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::Acquire)
+    }
+
+    pub fn submit(&self, message: SwmiMessage) -> Result<(), SwmiMessage> {
+        self.outgoing.try_send(message).map_err(|error| match error {
+            TrySendError::Full(message) | TrySendError::Disconnected(message) => message,
+        })
+    }
+}
+
 impl SwmiMediaEndpoint {
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::Acquire)
@@ -229,6 +248,7 @@ pub fn channel() -> (
     SwmiCmceEndpoint,
     SwmiMleEndpoint,
     SwmiMediaEndpoint,
+    SwmiRfEndpoint,
 ) {
     let (outgoing_tx, outgoing_rx) = crossbeam_channel::unbounded();
     let (mm_incoming_tx, mm_incoming_rx) = crossbeam_channel::unbounded();
@@ -257,8 +277,12 @@ pub fn channel() -> (
         },
         SwmiMleEndpoint { incoming: mle_incoming_rx },
         SwmiMediaEndpoint {
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.clone(),
             incoming: media_incoming_rx,
+            online: online.clone(),
+        },
+        SwmiRfEndpoint {
+            outgoing: outgoing_tx,
             online,
         },
     )
