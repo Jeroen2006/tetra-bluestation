@@ -13,6 +13,8 @@ pub struct SecurityDownlink {
 impl SecurityDownlink {
     pub fn terminal_information_request() -> Self {
         Self {
+            // Table A.39: one also means no authentication is in progress.
+            authentication_result: true,
             tei_requested: true,
             model_requested: true,
             hardware_software_requested: true,
@@ -56,7 +58,7 @@ mod tests {
     fn terminal_information_request_is_exactly_six_bits() {
         let mut encoded = BitBuffer::new_autoexpand(6);
         SecurityDownlink::terminal_information_request().to_bitbuf(&mut encoded).unwrap();
-        assert_eq!(encoded.to_bitstr(), "011100");
+        assert_eq!(encoded.to_bitstr(), "111100");
         encoded.seek(0);
         assert_eq!(
             SecurityDownlink::from_bitbuf(&mut encoded).unwrap(),

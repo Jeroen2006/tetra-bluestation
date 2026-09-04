@@ -78,6 +78,8 @@ const GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS: i32 = 18 * 4;
 /// ownership of the independent basic-link retransmissions for each attempt.
 const MAX_GROUP_SECURITY_RETRIES: u8 = 2;
 const TERMINAL_CONTROL_TIMEOUT_TIMESLOTS: i32 = 10 * 18 * 4;
+const TERMINAL_CONTROL_CAUSE_RADIO_LINK_FAILED: u8 = 240;
+const TERMINAL_CONTROL_CAUSE_RESPONSE_TIMEOUT: u8 = 241;
 
 // EN 300 392-7 table A.46, in on-air order: KSG(4), SC(1), TM-SCK,
 // SDMO/DM-SCK, GCK, security-information protocol, reserved.
@@ -281,7 +283,9 @@ struct PendingTerminalControl {
     action: TerminalControlAction,
     operations: Vec<AttachmentOperation>,
     tx_reporter: Option<TxReporter>,
-    deadline: TdmaTime,
+    /// Starts immediately for location-update controls and only after LLC
+    /// delivery for group controls that have their own MM acknowledgement.
+    response_deadline: Option<TdmaTime>,
     information: TerminalInformation,
 }
 
@@ -380,6 +384,9 @@ pub struct MmBs {
     pending_liveliness_probes: HashMap<u32, TxReporter>,
     pending_terminal_controls: HashMap<u32, PendingTerminalControl>,
     security_information_protocol_supported: HashSet<u32>,
+    /// SwMI command id of the newest accepted local registration. Roaming
+    /// cleanup is safe only while this still matches the superseded session.
+    registration_generations: HashMap<u32, u64>,
     /// Per-terminal GSKO bootstrap state. A GSKO itself is never stored at
     /// the BS; only its version and CMG association are tracked.
     gsko_bootstraps: HashMap<u32, GskoBootstrapStatus>,
@@ -835,20 +842,29 @@ impl MmBs {
     }
 
     fn update_terminal_control_statuses(&mut self) {
-        let failed = self
-            .pending_terminal_controls
-            .iter()
-            .filter_map(|(&issi, pending)| {
-                let link_failed = pending
-                    .tx_reporter
-                    .as_ref()
-                    .is_some_and(|reporter| matches!(reporter.get_state(), TxState::Discarded | TxState::Lost));
-                let timed_out = pending.deadline.age(self.current_time) >= 0;
-                (link_failed || timed_out).then_some(issi)
-            })
-            .collect::<Vec<_>>();
-        for issi in failed {
-            self.finish_terminal_control(issi, false, 4, Vec::new(), None);
+        let mut failed = Vec::new();
+        for (&issi, pending) in &mut self.pending_terminal_controls {
+            if let Some(reporter) = pending.tx_reporter.as_ref() {
+                match reporter.get_state() {
+                    TxState::Discarded | TxState::Lost => {
+                        failed.push((issi, TERMINAL_CONTROL_CAUSE_RADIO_LINK_FAILED));
+                        continue;
+                    }
+                    TxState::Acknowledged if pending.response_deadline.is_none() => {
+                        pending.response_deadline = Some(self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS));
+                    }
+                    TxState::Pending | TxState::Transmitted | TxState::Acknowledged => {}
+                }
+            }
+            if pending
+                .response_deadline
+                .is_some_and(|deadline| deadline.age(self.current_time) >= 0)
+            {
+                failed.push((issi, TERMINAL_CONTROL_CAUSE_RESPONSE_TIMEOUT));
+            }
+        }
+        for (issi, cause) in failed {
+            self.finish_terminal_control(issi, false, cause, Vec::new(), None);
         }
     }
 
@@ -1013,6 +1029,7 @@ impl MmBs {
             pending_liveliness_probes: HashMap::new(),
             pending_terminal_controls: HashMap::new(),
             security_information_protocol_supported: HashSet::new(),
+            registration_generations: HashMap::new(),
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
             pending_security_activations: HashMap::new(),
@@ -1548,6 +1565,7 @@ impl MmBs {
     fn remove_local_subscriber(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
         let client = self.client_mgr.remove_client(issi);
         self.security_information_protocol_supported.remove(&issi);
+        self.registration_generations.remove(&issi);
         let had_local_state = {
             let mut state = self.config.state_write();
             let existed = state.subscribers.is_registered(issi) || state.aie_sessions.terminal(issi).is_some();
@@ -1571,6 +1589,22 @@ impl MmBs {
             tracing::debug!(issi, "removed stale subscriber/AIE state without an MM client");
         }
         client.is_some() || had_local_state || was_gateway
+    }
+
+    fn apply_old_serving_cleanup(&mut self, queue: &mut MessageQueue, issi: u32, expected_generation: u64) {
+        match self.registration_generations.get(&issi).copied() {
+            Some(current_generation) if current_generation == expected_generation => {
+                if self.remove_local_subscriber(queue, issi) {
+                    tracing::info!(issi, expected_generation, "discarded superseded old-serving-cell subscriber state");
+                }
+            }
+            current_generation => tracing::info!(
+                issi,
+                expected_generation,
+                ?current_generation,
+                "ignored stale old-serving-cell cleanup after a newer registration"
+            ),
+        }
     }
 
     fn submit_terminal_control_result(
@@ -1628,9 +1662,14 @@ impl MmBs {
             if self.pending_terminal_controls.contains_key(&issi) {
                 self.finish_terminal_control(issi, false, 6, Vec::new(), None);
             }
-            let removed = self.remove_local_subscriber(queue, issi);
-            self.submit_terminal_control_result(command_id, issi, action, removed, u8::from(!removed), Vec::new(), None);
-            return;
+            if !self.config.state_read().subscribers.is_registered(issi) {
+                self.submit_terminal_control_result(command_id, issi, action, false, 2, Vec::new(), None);
+                return;
+            }
+            // TS 100 392-2 clause 16.4.3 supplies the only non-disable
+            // infrastructure-initiated MM path that makes the MS register.
+            // The blocked SwMI will reject that demand over the air; retaining
+            // local state until then is required to deliver the rejection.
         }
         if !self.config.state_read().subscribers.is_registered(issi) {
             self.submit_terminal_control_result(command_id, issi, action, false, 2, Vec::new(), None);
@@ -1654,7 +1693,7 @@ impl MmBs {
                 action,
                 operations,
                 tx_reporter: None,
-                deadline: self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS),
+                response_deadline: Some(self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS)),
                 information: TerminalInformation::default(),
             },
         );
@@ -1806,8 +1845,14 @@ impl MmBs {
                 return;
             }
         };
-        if pdu.ciphering_parameters.is_some_and(supports_security_information_protocol) {
-            self.security_information_protocol_supported.insert(prim.received_address.ssi);
+        // EN 300 392-7 clause 4.4a defines this capability indication only
+        // for an ITSI attach. A later attach also replaces a cached claim.
+        if pdu.location_update_type == LocationUpdateType::ItsiAttach {
+            if pdu.ciphering_parameters.is_some_and(supports_security_information_protocol) {
+                self.security_information_protocol_supported.insert(prim.received_address.ssi);
+            } else {
+                self.security_information_protocol_supported.remove(&prim.received_address.ssi);
+            }
         }
 
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
@@ -3217,7 +3262,14 @@ impl MmBs {
                     cause as u8,
                 );
             }
-            if self.pending_terminal_controls.contains_key(&pending.itsi) {
+            if self
+                .pending_terminal_controls
+                .get(&pending.itsi)
+                .is_some_and(|control| control.action == TerminalControlAction::Disconnect)
+            {
+                self.remove_local_subscriber(queue, pending.itsi);
+                self.finish_terminal_control(pending.itsi, true, 0, Vec::new(), None);
+            } else if self.pending_terminal_controls.contains_key(&pending.itsi) {
                 self.finish_terminal_control(pending.itsi, false, cause as u8, Vec::new(), None);
             }
             return;
@@ -3300,6 +3352,7 @@ impl MmBs {
             );
             return;
         }
+        self.registration_generations.insert(pending.itsi, command_id);
         self.config
             .state_write()
             .subscribers
@@ -4058,7 +4111,7 @@ impl MmBs {
                 action,
                 operations,
                 tx_reporter: Some(tx_reporter),
-                deadline: self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS),
+                response_deadline: None,
                 information: TerminalInformation::default(),
             },
         );
@@ -4488,6 +4541,12 @@ impl MmBs {
         rua_requested: bool,
     ) -> TxReporter {
         let security = self.group_security_information(group_security_gssis);
+        let information_requested = self
+            .pending_terminal_controls
+            .get(&issi)
+            .is_some_and(|pending| pending.action == TerminalControlAction::RequestInformation);
+        let information_via_security = information_requested && self.security_information_protocol_supported.contains(&issi);
+        let information_via_authentication = information_requested && !information_via_security;
         let pdu = DLocationUpdateAccept {
             location_update_accept_type: location_update_type,
             ssi: Some(issi as u64),
@@ -4496,27 +4555,24 @@ impl MmBs {
             energy_saving_information,
             scch_information_and_distribution_on_18th_frame: None,
             new_registered_area: None,
-            security_downlink: self
-                .pending_terminal_controls
-                .get(&issi)
-                .is_some_and(|pending| pending.action == TerminalControlAction::RequestInformation)
-                .then(|| {
-                    self.security_information_protocol_supported
-                        .contains(&issi)
-                        .then(SecurityDownlink::terminal_information_request)
-                })
-                .flatten(),
+            security_downlink: information_via_security.then(SecurityDownlink::terminal_information_request),
             group_identity_location_accept,
             default_group_attachment_lifetime: None,
             authentication_downlink: aie
                 .authentication_downlink_bit_len
                 .map(|len| {
-                    let first = aie
+                    let mut first = aie
                         .authentication_downlink
                         .get(..8)
                         .and_then(|bytes| bytes.try_into().ok())
                         .map(u64::from_be_bytes)
                         .unwrap_or_default();
+                    if information_via_authentication {
+                        // Table A.34: TEI request is the second transmitted
+                        // bit. These SwMI payloads are longer than 64 bits, so
+                        // it is bit 62 in the writer's first u64 chunk.
+                        first |= 1_u64 << 62;
+                    }
                     Type3FieldGeneric {
                         field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
                         len: usize::from(len),
@@ -4532,27 +4588,19 @@ impl MmBs {
                         // Accept the authentication without requesting a TEI or
                         // provisioning a cipher key.
                         len: 3,
-                        data: 0b100
-                            | u64::from(self.pending_terminal_controls.get(&issi).is_some_and(|pending| {
-                                pending.action == TerminalControlAction::RequestInformation
-                                    && !self.security_information_protocol_supported.contains(&issi)
-                            })) << 1,
+                        data: 0b100 | u64::from(information_via_authentication) << 1,
                         raw: Vec::new(),
                     })
                 })
                 .or_else(|| {
-                    self.pending_terminal_controls
-                        .get(&issi)
-                        .is_some_and(|pending| {
-                            pending.action == TerminalControlAction::RequestInformation
-                                && !self.security_information_protocol_supported.contains(&issi)
-                        })
-                        .then(|| Type3FieldGeneric {
-                            field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
-                            len: 3,
-                            data: 0b010,
-                            raw: Vec::new(),
-                        })
+                    information_via_authentication.then(|| Type3FieldGeneric {
+                        field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                        len: 3,
+                        // Authentication result 1 means successful or no
+                        // authentication currently in progress (A.8.5).
+                        data: 0b110,
+                        raw: Vec::new(),
+                    })
                 }),
             group_identity_security_related_information: security,
             cell_type_control: None,
@@ -4565,12 +4613,13 @@ impl MmBs {
                 raw: Vec::new(),
             }),
         };
+        let authentication_downlink_present = pdu.authentication_downlink.is_some();
         let mut sdu = BitBuffer::new_autoexpand(32);
         pdu.to_bitbuf(&mut sdu).expect("serialize SwMI D-LOCATION UPDATE ACCEPT");
         sdu.seek(0);
         tracing::debug!(
             issi,
-            authentication_downlink = aie.authentication_downlink_bit_len.is_some() || authentication_successful,
+            authentication_downlink = authentication_downlink_present,
             downlink_encrypted = aie_request.is_encrypted(),
             "sending D-LOCATION UPDATE ACCEPT"
         );
@@ -5498,21 +5547,15 @@ impl TetraEntityTrait for MmBs {
                         "applied canonical LST recovery result from SwMI"
                     );
                 }
-                // Command id zero is reserved for the SwMI-to-old-serving-BS
-                // direction. It is deliberately not a normal U-ITSI DETACH:
-                // the SwMI has already moved the authoritative registration
-                // anchor, so only local MM/CMCE state must be discarded.
-                SwmiMessage::DeregistrationNotice { command_id: 0, itsi } => {
+                // In this direction command_id identifies the exact local
+                // registration superseded by a roam. A delayed A->B cleanup
+                // must not remove a newer A->B->A registration.
+                SwmiMessage::DeregistrationNotice { command_id, itsi } => {
                     let Ok(issi) = u32::try_from(itsi) else {
                         tracing::warn!(itsi, "discarding old-serving-cell cleanup with invalid ISSI");
                         continue;
                     };
-                    if self.remove_local_subscriber(queue, issi) {
-                        tracing::info!(issi, "discarded stale old-serving-cell subscriber state after roam");
-                    }
-                }
-                SwmiMessage::DeregistrationNotice { command_id, itsi } => {
-                    tracing::warn!(command_id, itsi, "unexpected nonzero deregistration notice from SwMI");
+                    self.apply_old_serving_cleanup(queue, issi, command_id);
                 }
                 SwmiMessage::EnergyEconomyDecision {
                     command_id,
@@ -5690,7 +5733,10 @@ impl TetraEntityTrait for MmBs {
 
 #[cfg(test)]
 mod tests {
-    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, sc2_ksg_number, supports_security_information_protocol};
+    use super::{
+        MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
+        sc2_ksg_number, supports_security_information_protocol,
+    };
     use crate::MessageQueue;
     use std::collections::HashSet;
     use tetra_config::bluestation::{
@@ -5709,7 +5755,8 @@ mod tests {
     use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
     use tetra_saps::SapMsgInner;
     use tetra_swmi_protocol::{
-        AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalControlAction, TerminalSecurityClass,
+        AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalControlAction, TerminalInformation,
+        TerminalSecurityClass,
     };
 
     fn test_config() -> SharedConfig {
@@ -5760,6 +5807,85 @@ mod tests {
         assert!(supports_security_information_protocol(0b10_0010));
         assert!(!supports_security_information_protocol(0b10_0000));
         assert!(!supports_security_information_protocol(0b00_0010));
+        assert!(!supports_security_information_protocol(60));
+    }
+
+    #[test]
+    fn information_request_without_security_protocol_sets_successful_tei_query() {
+        let issi = 77_468;
+        let mut mm = MmBs::new(test_config(), None, None, None);
+        mm.pending_terminal_controls.insert(
+            issi,
+            PendingTerminalControl {
+                command_id: 1,
+                action: TerminalControlAction::RequestInformation,
+                operations: Vec::new(),
+                tx_reporter: None,
+                response_deadline: Some(mm.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS)),
+                information: TerminalInformation::default(),
+            },
+        );
+        let mut queue = MessageQueue::new();
+
+        mm.send_d_location_update_accept(&mut queue, issi, 0, LocationUpdateType::DemandLocationUpdating, None, false, None);
+
+        let message = queue.pop_front().expect("location-update accept must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let accept = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid location-update accept");
+        assert_eq!(accept.authentication_downlink.expect("TEI query").data, 0b110);
+        assert!(accept.security_downlink.is_none());
+    }
+
+    #[test]
+    fn delayed_old_cell_cleanup_cannot_remove_new_registration() {
+        let issi = 77_468;
+        let config = test_config();
+        config.state_write().subscribers.register(issi);
+        let mut mm = MmBs::new(config, None, None, None);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.registration_generations.insert(issi, 12);
+        let mut queue = MessageQueue::new();
+
+        mm.apply_old_serving_cleanup(&mut queue, issi, 11);
+        assert!(mm.client_mgr.client_is_known(issi));
+        assert_eq!(mm.registration_generations.get(&issi), Some(&12));
+
+        mm.apply_old_serving_cleanup(&mut queue, issi, 12);
+        assert!(!mm.client_mgr.client_is_known(issi));
+        assert!(!mm.registration_generations.contains_key(&issi));
+    }
+
+    #[test]
+    fn group_control_response_timer_waits_for_basic_link_ack() {
+        let mut mm = test_sc3g_mm(77_468, &[91]);
+        let mut queue = MessageQueue::new();
+        mm.start_terminal_group_control(
+            &mut queue,
+            1,
+            77_468,
+            TerminalControlAction::AmendTalkgroups,
+            vec![AttachmentOperation {
+                gssi: 91,
+                detach: true,
+                class_of_usage: 0,
+            }],
+        );
+        let reporter = mm.pending_terminal_controls[&77_468]
+            .tx_reporter
+            .as_ref()
+            .expect("group command must track LLC delivery")
+            .clone();
+
+        mm.current_time = mm.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS + 1);
+        mm.update_terminal_control_statuses();
+        assert!(mm.pending_terminal_controls.contains_key(&77_468));
+
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        mm.update_terminal_control_statuses();
+        assert!(mm.pending_terminal_controls[&77_468].response_deadline.is_some());
     }
 
     #[test]
