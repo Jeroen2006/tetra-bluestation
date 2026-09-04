@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, TetraAddress, Todo, TxReporter};
+use tetra_core::{AieRequest, BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, TetraAddress, Todo, TxReporter};
 
 use crate::{control::enums::circuit_mode_type::CircuitModeType, lcmc::fields::chan_alloc_req::CmceChanAllocReq, tma::AssociatedChannel};
 
@@ -189,6 +189,10 @@ pub struct LcmcMleUnitdataReq {
     pub main_address: TetraAddress,
     pub chan_alloc: Option<CmceChanAllocReq>,
     pub associated_channel: Option<AssociatedChannel>,
+    /// Optional per-message AIE policy. `None` lets MLE resolve the current
+    /// terminal/group policy; `Some(Clear)` is used for a clear group SDS
+    /// without mutating the protection of an active call.
+    pub aie_override: Option<AieRequest>,
     // Transmit 4 times (if capacity allows)
     // pub redundant_transmission: u8,
     pub tx_reporter: Option<TxReporter>,

@@ -13,8 +13,9 @@ use tetra_core::{
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, fields::chan_alloc_req::CmceChanAllocReq};
 use tetra_saps::lmm::{LmmMleSeamlessHandover, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataIndBl, TlaTlUnitdataReqBl};
+use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
+use tetra_swmi_protocol::{GroupProtection, TerminalSecurityClass};
 
 use tetra_pdus::mle::enums::mle_pdu_type_ul::MlePduTypeUl;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
@@ -105,7 +106,17 @@ impl MleBs {
         }
 
         match address.ssi_type {
-            SsiType::Issi if state.aie.sc3.is_some() => {
+            SsiType::Issi if state.aie_sessions.terminal_allows_clear(address.ssi) => None,
+            SsiType::Gssi
+                if state.aie_sessions.group_protection(address.ssi) == GroupProtection::Clear
+                    && !state.aie.sc3.as_ref().is_some_and(|sc3| sc3.gckn_for_gssi(address.ssi).is_some()) =>
+            {
+                None
+            }
+            SsiType::Issi
+                if state.aie_sessions.terminal_class(address.ssi) == TerminalSecurityClass::Sc3
+                    || (state.aie_sessions.terminal_class(address.ssi) == TerminalSecurityClass::Unknown && state.aie.sc3.is_some()) =>
+            {
                 Some(AieRequest::sc3(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
             }
             SsiType::Gssi if state.aie.sc3.is_some() => {
@@ -116,10 +127,7 @@ impl MleBs {
             // terminal binding is not ready: the provider then rejects it at
             // TX time rather than silently emitting (for example) D-STATUS
             // in clear.  MM bootstrap traffic does not use this path.
-            SsiType::Issi
-                if state.aie_sessions.terminal(address.ssi).is_some()
-                    || (!state.aie.sc1_allowed && state.subscribers.is_registered(address.ssi)) =>
-            {
+            SsiType::Issi if state.aie_sessions.terminal(address.ssi).is_some() || state.subscribers.is_registered(address.ssi) => {
                 Some(AieRequest::sc2(AieSubject::Individual { issi: address.ssi }, AieScope::MacResource))
             }
             SsiType::Gssi => Some(AieRequest::sc2(AieSubject::Group { gssi: address.ssi }, AieScope::MacResource)),
@@ -425,7 +433,9 @@ impl MleBs {
 
         let is_clear_from_bound_sc2_terminal = matches!(air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
-            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(main_address.ssi).is_some()
+            state.aie.enabled
+                && state.subscribers.is_registered(main_address.ssi)
+                && !state.aie_sessions.terminal_allows_clear(main_address.ssi)
         };
         if is_clear_from_bound_sc2_terminal && pdu_type != MleProtocolDiscriminator::Mm {
             tracing::warn!(
@@ -525,7 +535,9 @@ impl MleBs {
         // BL-ACK before it reaches MLE.
         let is_clear_from_bound_sc2_terminal = matches!(air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
-            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(main_address.ssi).is_some()
+            state.aie.enabled
+                && state.subscribers.is_registered(main_address.ssi)
+                && !state.aie_sessions.terminal_allows_clear(main_address.ssi)
         };
         if is_clear_from_bound_sc2_terminal && pdu_type != MleProtocolDiscriminator::Mm {
             tracing::warn!(
@@ -774,7 +786,7 @@ impl MleBs {
         // Resolve once before moving the address into the outgoing primitive.
         // LLC/UMAC retain this request across fragmentation and bind the key at
         // the exact transmission time.
-        let air_interface_encryption = self.cmce_downlink_aie(prim.main_address);
+        let air_interface_encryption = prim.aie_override.take().or_else(|| self.cmce_downlink_aie(prim.main_address));
 
         let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
             // Unacknowledged service, send a TlUnitdataReqBl

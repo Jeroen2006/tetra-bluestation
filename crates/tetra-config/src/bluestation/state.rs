@@ -7,6 +7,7 @@ use tetra_core::{
     AieAlgorithm, AieContext, AieDirection, AieSubject, BitBuffer, Sc2KeyIdentifier, Sc3KeyIdentifier, Sc3KeyType, SoftBit, TdmaTime,
     TimeslotAllocator,
 };
+use tetra_swmi_protocol::{GroupProtection, TerminalSecurityClass};
 
 /// The TEA variant selected by the SwMI for SC2 AIE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +362,13 @@ impl RuntimeSc2Binding {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeAieSessions {
     terminals: HashMap<u32, RuntimeSc2Binding>,
+    /// Authoritative per-terminal class selected by the SwMI. Keeping this
+    /// separate from SCK/DCK material prevents `sc1_allowed` from becoming a
+    /// cell-wide clear-traffic bypass.
+    terminal_classes: HashMap<u32, TerminalSecurityClass>,
+    /// Current centrally selected protection for group-addressed resources.
+    /// Active call decisions are frozen by the SwMI until call release.
+    group_protections: HashMap<u32, GroupProtection>,
     /// A call can legitimately have several individually protected legs
     /// (e.g. each party of a private call, or successive floor holders).
     /// Keep every subject separately instead of letting the last update
@@ -371,10 +379,28 @@ pub struct RuntimeAieSessions {
 impl RuntimeAieSessions {
     pub fn activate_terminal(&mut self, issi: u32, sc2: &RuntimeSc2Aie) {
         self.terminals.insert(issi, RuntimeSc2Binding::from_sc2(sc2));
+        self.terminal_classes.insert(issi, TerminalSecurityClass::Sc2);
+    }
+
+    pub fn set_terminal_class(&mut self, issi: u32, security_class: TerminalSecurityClass, sc2: Option<&RuntimeSc2Aie>) {
+        match security_class {
+            TerminalSecurityClass::Sc2 => {
+                if let Some(sc2) = sc2 {
+                    self.terminals.insert(issi, RuntimeSc2Binding::from_sc2(sc2));
+                } else {
+                    self.terminals.remove(&issi);
+                }
+            }
+            TerminalSecurityClass::Sc1 | TerminalSecurityClass::Sc3 | TerminalSecurityClass::Unknown => {
+                self.terminals.remove(&issi);
+            }
+        }
+        self.terminal_classes.insert(issi, security_class);
     }
 
     pub fn deactivate_terminal(&mut self, issi: u32) {
         self.terminals.remove(&issi);
+        self.terminal_classes.remove(&issi);
         self.calls.retain(|_, bindings| {
             bindings.retain(|subject, _| !matches!(subject, AieSubject::Call { issi: Some(value), .. } if *value == issi));
             !bindings.is_empty()
@@ -383,6 +409,26 @@ impl RuntimeAieSessions {
 
     pub fn terminal(&self, issi: u32) -> Option<RuntimeSc2Binding> {
         self.terminals.get(&issi).copied()
+    }
+
+    pub fn terminal_class(&self, issi: u32) -> TerminalSecurityClass {
+        self.terminal_classes.get(&issi).copied().unwrap_or_default()
+    }
+
+    pub fn terminal_allows_clear(&self, issi: u32) -> bool {
+        self.terminal_class(issi) == TerminalSecurityClass::Sc1
+    }
+
+    pub fn set_group_protection(&mut self, gssi: u32, protection: GroupProtection) {
+        self.group_protections.insert(gssi, protection);
+    }
+
+    pub fn clear_group_protection(&mut self, gssi: u32) {
+        self.group_protections.remove(&gssi);
+    }
+
+    pub fn group_protection(&self, gssi: u32) -> GroupProtection {
+        self.group_protections.get(&gssi).copied().unwrap_or_default()
     }
 
     pub fn bind_call(&mut self, call_id: u32, subject: AieSubject, sc2: &RuntimeSc2Aie) {
@@ -406,6 +452,7 @@ impl RuntimeAieSessions {
     pub fn retain_current_key(&mut self, sc2: Option<&RuntimeSc2Aie>) {
         let Some(sc2) = sc2 else {
             self.terminals.clear();
+            self.terminal_classes.retain(|_, class| *class != TerminalSecurityClass::Sc2);
             self.calls.clear();
             return;
         };
@@ -898,12 +945,8 @@ impl BsAieKeyProvider {
     pub fn clear_uplink_allowed(&self, issi: u32) -> bool {
         let state = self.config.state_read();
         !state.aie.enabled
-            || state.aie.sc1_allowed
-            || if let Some(sc3) = state.aie.sc3.as_ref() {
-                !sc3.has_dck(issi)
-            } else {
-                state.aie_sessions.terminal(issi).is_none()
-            }
+            || (!state.subscribers.is_registered(issi) && state.aie_sessions.terminal_class(issi) == TerminalSecurityClass::Unknown)
+            || state.aie_sessions.terminal_allows_clear(issi)
     }
 
     /// Cipher exactly one phase-modulation MAC region.  `start` and `len`
@@ -1933,6 +1976,32 @@ mod tests {
 
         assert_eq!(sessions.call(17, alice), Some(RuntimeSc2Binding::from_sc2(&sc2)));
         assert_eq!(sessions.call(17, bob), Some(RuntimeSc2Binding::from_sc2(&sc2)));
+    }
+
+    #[test]
+    fn terminal_security_class_controls_clear_permission_without_downgrading_encrypted_peers() {
+        let sc2 = test_sc2(3, 42);
+        let mut sessions = RuntimeAieSessions::default();
+
+        sessions.set_terminal_class(1001, TerminalSecurityClass::Sc1, Some(&sc2));
+        sessions.set_terminal_class(1002, TerminalSecurityClass::Sc2, Some(&sc2));
+        sessions.set_terminal_class(1003, TerminalSecurityClass::Sc3, Some(&sc2));
+
+        assert!(sessions.terminal_allows_clear(1001));
+        assert!(!sessions.terminal_allows_clear(1002));
+        assert!(!sessions.terminal_allows_clear(1003));
+        assert!(sessions.terminal(1002).is_some());
+        assert!(sessions.terminal(1003).is_none());
+    }
+
+    #[test]
+    fn group_protection_is_explicit_and_fail_closed_by_default() {
+        let mut sessions = RuntimeAieSessions::default();
+        assert_eq!(sessions.group_protection(1201), GroupProtection::NetworkEncrypted);
+        sessions.set_group_protection(1201, GroupProtection::Clear);
+        assert_eq!(sessions.group_protection(1201), GroupProtection::Clear);
+        sessions.clear_group_protection(1201);
+        assert_eq!(sessions.group_protection(1201), GroupProtection::NetworkEncrypted);
     }
 
     #[test]

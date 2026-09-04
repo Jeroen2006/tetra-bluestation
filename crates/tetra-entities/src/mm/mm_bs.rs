@@ -18,7 +18,8 @@ use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{
     AieLocationUpdateDecision, AieObservationEvent, AieObservationState, AttachmentOperation, AttachmentResult, DmGatewayAddress,
-    DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation, Sc3RetrievalEvidence, SwmiMessage, TerminalAieObservation,
+    DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation, Sc3RetrievalEvidence, SwmiMessage, TerminalAieCapabilities,
+    TerminalAieObservation, TerminalSecurityClass,
 };
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
@@ -365,7 +366,7 @@ pub struct MmBs {
     /// the terminal into an SC2 peer. Do not enable the BS-side binding at
     /// queue admission: its clear BL-ACK must still be accepted. The receipt
     /// reaches `Transmitted` only after the complete air PDU was sent.
-    pending_sc2_activations: HashMap<u32, TxReporter>,
+    pending_security_activations: HashMap<u32, (TerminalSecurityClass, TxReporter)>,
     /// Last all-MS rollover announcement. This is metadata only; the SCK
     /// remains inside runtime AIE state.
     last_rollover_broadcast: Option<(u64, TdmaTime)>,
@@ -480,11 +481,23 @@ impl MmBs {
     /// protected normal OTAR.
     fn downlink_aie_request(&self, issi: u32) -> AieRequest {
         let state = self.config.state_read();
-        if state.aie.enabled && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+        if !state.aie.enabled || state.aie_sessions.terminal_allows_clear(issi) {
+            return AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource);
+        }
+        if state.aie_sessions.terminal_class(issi) == TerminalSecurityClass::Sc3
+            && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi))
+        {
             return AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource);
         }
-        if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
+        if state.aie_sessions.terminal_class(issi) == TerminalSecurityClass::Sc2 && state.aie_sessions.terminal(issi).is_some() {
             AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
+        } else if state.subscribers.is_registered(issi) {
+            // Unknown/partially restored registered state is fail-closed.
+            if state.aie.sc3.is_some() {
+                AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource)
+            } else {
+                AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource)
+            }
         } else {
             AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)
         }
@@ -496,6 +509,10 @@ impl MmBs {
     /// CCK instead of being sent in clear (EN 300 392-7 clause 6.5).
     fn group_downlink_aie_request(&self, gssi: u32) -> AieRequest {
         let state = self.config.state_read();
+        let sc3g = state.aie.sc3.as_ref().is_some_and(|sc3| sc3.gckn_for_gssi(gssi).is_some());
+        if !sc3g && state.aie_sessions.group_protection(gssi) == tetra_swmi_protocol::GroupProtection::Clear {
+            return AieRequest::clear(AieSubject::Group { gssi }, AieScope::MacResource);
+        }
         if state.aie.enabled && state.aie.sc3.is_some() {
             return AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
         }
@@ -520,8 +537,7 @@ impl MmBs {
         if state.aie_sessions.terminal(issi).is_some() {
             return Ok(AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource));
         }
-        if state.aie.sc1_allowed {
-            // This is compatibility policy, not an SC2 bootstrap exception.
+        if state.aie_sessions.terminal_allows_clear(issi) && kind.is_clear_gsko_bootstrap() {
             return Ok(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
         }
         Err("SC2-only OTAR downlink has no active terminal cipher context")
@@ -946,7 +962,7 @@ impl MmBs {
             pending_liveliness_probes: HashMap::new(),
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
-            pending_sc2_activations: HashMap::new(),
+            pending_security_activations: HashMap::new(),
             last_rollover_broadcast: None,
             last_gck_version_broadcast: None,
             rollover_late_broadcast_mask: None,
@@ -1052,15 +1068,13 @@ impl MmBs {
 
     /// The SCK itself remains in the shared AIE key-provider state. MM only
     /// records the key-free identity after a successful SC2 registration.
-    fn activate_sc2_terminal(&self, issi: u32) {
+    fn activate_terminal_security_class(&self, issi: u32, security_class: TerminalSecurityClass) {
         let mut state = self.config.state_write();
         if !state.aie.enabled {
             return;
         }
-        let Some(sc2) = state.aie.sc2.clone() else {
-            return;
-        };
-        state.aie_sessions.activate_terminal(issi, &sc2);
+        let sc2 = state.aie.sc2.clone();
+        state.aie_sessions.set_terminal_class(issi, security_class, sc2.as_ref());
     }
 
     /// Keep an already encrypted location-update exchange encrypted. In
@@ -1069,7 +1083,13 @@ impl MmBs {
     /// no binding yet and therefore remains clear until its accept is sent.
     fn aie_request_for_terminal(&self, issi: u32) -> AieRequest {
         let state = self.config.state_read();
-        if state.aie.enabled && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi)) {
+        if !state.aie.enabled || state.aie_sessions.terminal_allows_clear(issi) {
+            return AieRequest::clear(AieSubject::System, AieScope::MacResource);
+        }
+        if state.aie.enabled
+            && state.aie_sessions.terminal_class(issi) == TerminalSecurityClass::Sc3
+            && state.aie.sc3.as_ref().is_some_and(|sc3| sc3.has_dck(issi))
+        {
             return AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource);
         }
         if state.aie.enabled && state.aie_sessions.terminal(issi).is_some() {
@@ -1100,7 +1120,7 @@ impl MmBs {
         self.aie_request_for_registration(issi, encrypted)
     }
 
-    fn defer_sc2_activation(&mut self, issi: u32, aie: &AieLocationUpdateDecision, receipt: TxReporter) -> bool {
+    fn defer_security_activation(&mut self, issi: u32, aie: &AieLocationUpdateDecision, receipt: TxReporter) -> bool {
         // Cipher Control announces the cell's selected SC2 parameters, but
         // it does not itself give a previously clear MS an SCK.  Activating
         // the BS binding in that case makes the cell reject the MS's next
@@ -1109,9 +1129,9 @@ impl MmBs {
         // 369 bits when it also carries the future SCK) can transition a
         // clear terminal into SC2 here.  An already ciphered registration
         // already has its binding before this function is reached.
-        let deferred = matches!(aie.authentication_downlink_bit_len, Some(228 | 369));
+        let deferred = aie.selected_class != TerminalSecurityClass::Unknown;
         if deferred {
-            self.pending_sc2_activations.insert(issi, receipt);
+            self.pending_security_activations.insert(issi, (aie.selected_class, receipt));
         }
         deferred
     }
@@ -1279,34 +1299,47 @@ impl MmBs {
     /// or on its clear BL-ACK, whichever comes first. `Transmitted` is the
     /// former event in this stack. A dropped/lost clear accept must never
     /// leave an SC2 binding active.
-    fn update_sc2_activations(&mut self, queue: &mut MessageQueue) {
+    fn update_security_activations(&mut self, queue: &mut MessageQueue) {
         let outcomes = self
-            .pending_sc2_activations
+            .pending_security_activations
             .iter()
-            .filter_map(|(&issi, receipt)| match receipt.get_state() {
-                TxState::Transmitted | TxState::Acknowledged => Some((issi, true, receipt.get_state())),
-                TxState::Discarded | TxState::Lost => Some((issi, false, receipt.get_state())),
+            .filter_map(|(&issi, (security_class, receipt))| match receipt.get_state() {
+                TxState::Transmitted | TxState::Acknowledged => Some((issi, *security_class, true, receipt.get_state())),
+                TxState::Discarded | TxState::Lost => Some((issi, *security_class, false, receipt.get_state())),
                 TxState::Pending => None,
             })
             .collect::<Vec<_>>();
-        for (issi, activate, state) in outcomes {
-            self.pending_sc2_activations.remove(&issi);
+        for (issi, security_class, activate, state) in outcomes {
+            self.pending_security_activations.remove(&issi);
             if activate {
-                self.activate_sc2_terminal(issi);
+                self.activate_terminal_security_class(issi, security_class);
                 self.report_aie_observation(
                     issi,
                     0,
                     AieObservationEvent::TerminalActivation,
-                    AieObservationState::Sc2,
-                    Some(true),
+                    match security_class {
+                        TerminalSecurityClass::Sc1 => AieObservationState::Sc1,
+                        TerminalSecurityClass::Sc2 => AieObservationState::Sc2,
+                        TerminalSecurityClass::Sc3 => AieObservationState::Sc3,
+                        TerminalSecurityClass::Unknown => AieObservationState::Unknown,
+                    },
+                    Some(security_class.is_encrypted()),
                     None,
                     None,
                     None,
                     Some(true),
                     None,
-                    Some("SC2 terminal binding activated after delivered bootstrap".to_owned()),
+                    Some(format!(
+                        "{:?} terminal class activated after delivered registration",
+                        security_class
+                    )),
                 );
-                tracing::debug!(issi, ?state, "activated SC2 after clear location-update accept transmission");
+                tracing::debug!(
+                    issi,
+                    ?state,
+                    ?security_class,
+                    "activated terminal security class after location-update response transmission"
+                );
                 // A future SCK may have been provisioned in the same
                 // Authentication-downlink element (Table A.94). Announce its
                 // pending Absolute IV only after this activation, now as an
@@ -1316,7 +1349,8 @@ impl MmBs {
                 tracing::warn!(
                     issi,
                     ?state,
-                    "clear location-update accept was not delivered; SC2 activation cancelled"
+                    ?security_class,
+                    "location-update response was not delivered; security-class activation cancelled"
                 );
             }
         }
@@ -1578,7 +1612,12 @@ impl MmBs {
             tracing::error!("Unsupported critical features in ULocationUpdateDemand");
             return;
         }
-        if let Err((cause, parameters)) = self.validate_aie_location_update(&pdu) {
+        // The connected SwMI owns SC1 fallback and cipher negotiation policy.
+        // Local validation remains the LST/offline guard only; otherwise the
+        // SwMI must see Class-of-MS capabilities and whether K-based OTAR is
+        // possible before choosing clear or proposing encrypted parameters.
+        let swmi_owns_aie_decision = self.swmi.as_ref().is_some_and(SwmiMmEndpoint::is_online);
+        if !swmi_owns_aie_decision && let Err((cause, parameters)) = self.validate_aie_location_update(&pdu) {
             let air_interface_encrypted = prim.air_interface_encryption.is_some_and(AieRequest::is_encrypted);
             self.report_aie_observation(
                 prim.received_address.ssi,
@@ -1683,6 +1722,11 @@ impl MmBs {
                     cipher_control: pdu.cipher_control,
                     ciphering_parameters,
                     ck_requested,
+                    capabilities: pdu.class_of_ms.as_ref().map(|class| TerminalAieCapabilities {
+                        sck_encryption: class.sck_encryption,
+                        dck_encryption: class.dck_encryption,
+                        authentication: class.authentication,
+                    }),
                 },
                 sc3_retrieval,
             };
@@ -2315,7 +2359,9 @@ impl MmBs {
         // SC1 fallback is disabled.
         let is_clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
-            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.received_address.ssi).is_some()
+            state.aie.enabled
+                && state.subscribers.is_registered(prim.received_address.ssi)
+                && !state.aie_sessions.terminal_allows_clear(prim.received_address.ssi)
         };
         if is_clear_from_bound_sc2_terminal
             && !matches!(
@@ -2404,7 +2450,9 @@ impl MmBs {
         };
         let is_clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
-            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.received_address.ssi).is_some()
+            state.aie.enabled
+                && state.subscribers.is_registered(prim.received_address.ssi)
+                && !state.aie_sessions.terminal_allows_clear(prim.received_address.ssi)
         };
         if is_clear_from_bound_sc2_terminal
             && !matches!(
@@ -3087,7 +3135,7 @@ impl MmBs {
                 security_groups,
                 receipt.clone(),
             );
-            let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+            let deferred = self.defer_security_activation(pending.itsi, &pending.aie, receipt);
             if !deferred {
                 let _ = self.send_rollover_broadcast_round(queue);
             }
@@ -3118,7 +3166,7 @@ impl MmBs {
             security_groups,
             receipt.clone(),
         );
-        let deferred = self.defer_sc2_activation(pending.itsi, &pending.aie, receipt);
+        let deferred = self.defer_security_activation(pending.itsi, &pending.aie, receipt);
         if !deferred {
             let _ = self.send_rollover_broadcast_round(queue);
         }
@@ -3192,6 +3240,7 @@ impl MmBs {
         groups: Vec<AttachmentOperation>,
         scanning_enabled: bool,
         energy_economy: EnergyEconomyAssignment,
+        security_class: TerminalSecurityClass,
     ) {
         let Ok(issi) = u32::try_from(itsi) else {
             tracing::warn!(itsi, "discarding roaming state with invalid ISSI");
@@ -3205,6 +3254,7 @@ impl MmBs {
             self.config.state_write().subscribers.register(issi);
             self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
         }
+        self.activate_terminal_security_class(issi, security_class);
         // This arrives before call replay during roaming, so UMAC has the
         // target-cell monitoring phase before it queues any MCCH setup.
         // Reconciliation must be idempotent: tearing down unchanged groups
@@ -3521,7 +3571,7 @@ impl MmBs {
             security_groups,
             receipt.clone(),
         );
-        let deferred = self.defer_sc2_activation(registration.itsi, &registration.aie, receipt);
+        let deferred = self.defer_security_activation(registration.itsi, &registration.aie, receipt);
         if !deferred {
             let _ = self.send_rollover_broadcast_round(queue);
         }
@@ -4483,7 +4533,7 @@ impl TetraEntityTrait for MmBs {
         self.update_registration_delivery_statuses(queue);
         self.update_group_security_association_statuses(queue);
         self.update_liveliness_probe_statuses();
-        self.update_sc2_activations(queue);
+        self.update_security_activations(queue);
         self.update_otar_delivery_statuses();
         let active_gck_vn = {
             let state = self.config.state_read();
@@ -4893,14 +4943,19 @@ impl TetraEntityTrait for MmBs {
                     groups,
                     scanning_enabled,
                     energy_economy,
-                } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled, energy_economy),
+                    security_class,
+                } => self.apply_swmi_subscriber_state_sync(queue, itsi, groups, scanning_enabled, energy_economy, security_class),
                 SwmiMessage::LstRecoveryRequest { command_id } => {
                     if !self.pending_lst_recoveries.insert(command_id) {
                         tracing::warn!(command_id, "duplicate LST recovery request ignored");
                         continue;
                     }
                     let rua_state = self.config.state_read().subscribers.clone();
-                    let subscribers = self.client_mgr.lst_recovery_snapshot(|issi| rua_state.rua_assignment_state(issi));
+                    let mut subscribers = self.client_mgr.lst_recovery_snapshot(|issi| rua_state.rua_assignment_state(issi));
+                    let state = self.config.state_read();
+                    for subscriber in &mut subscribers {
+                        subscriber.security_class = state.aie_sessions.terminal_class(subscriber.itsi as u32);
+                    }
                     let subscriber_count = subscribers.len();
                     let Some(endpoint) = self.swmi.as_ref() else {
                         self.pending_lst_recoveries.remove(&command_id);
@@ -4936,6 +4991,7 @@ impl TetraEntityTrait for MmBs {
                             subscriber.groups,
                             subscriber.scanning_enabled,
                             subscriber.energy_economy,
+                            subscriber.security_class,
                         );
                         if requested_rua_reassignment {
                             let issi = subscriber.itsi as u32;
@@ -5178,7 +5234,7 @@ mod tests {
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
     use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
     use tetra_saps::SapMsgInner;
-    use tetra_swmi_protocol::{AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment};
+    use tetra_swmi_protocol::{AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalSecurityClass};
 
     fn test_config() -> SharedConfig {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -5830,6 +5886,10 @@ mod tests {
             sc3: Some(sc3),
             rollover: None,
         };
+        config
+            .state_write()
+            .aie_sessions
+            .set_terminal_class(issi, TerminalSecurityClass::Sc3, None);
         let mm = MmBs::new(config, None, None, None);
         let mut queue = MessageQueue::new();
 
@@ -5862,6 +5922,10 @@ mod tests {
             sc3: Some(sc3),
             rollover: None,
         };
+        config
+            .state_write()
+            .aie_sessions
+            .set_terminal_class(issi, TerminalSecurityClass::Sc3, None);
         let mut mm = MmBs::new(config, None, None, None);
         let mut queue = MessageQueue::new();
 
@@ -5919,7 +5983,14 @@ mod tests {
         };
         let mut queue = MessageQueue::new();
 
-        mm.apply_swmi_subscriber_state_sync(&mut queue, u64::from(issi), groups, true, energy_economy);
+        mm.apply_swmi_subscriber_state_sync(
+            &mut queue,
+            u64::from(issi),
+            groups,
+            true,
+            energy_economy,
+            TerminalSecurityClass::Unknown,
+        );
 
         assert!(
             queue.pop_front().is_none(),
@@ -5966,6 +6037,7 @@ mod tests {
                 frame_number: None,
                 multiframe_number: None,
             },
+            TerminalSecurityClass::Sc3,
         );
 
         let association = queue

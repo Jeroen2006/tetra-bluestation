@@ -204,7 +204,7 @@ impl Llc {
     /// window.
     fn clear_transition_ack_expected(&self, addr: TetraAddress, nr: u8) -> bool {
         let state = self.config.state_read();
-        if !state.aie.enabled || state.aie.sc1_allowed || state.aie_sessions.terminal(addr.ssi).is_none() {
+        if !state.aie.enabled || !state.subscribers.is_registered(addr.ssi) || state.aie_sessions.terminal_allows_clear(addr.ssi) {
             return false;
         }
         self.outbound_messages.iter().any(|expected| {
@@ -695,7 +695,9 @@ impl Llc {
 
         let clear_from_bound_sc2_terminal = matches!(prim.air_interface_encryption, Some(AieRequest::Clear { .. }) | None) && {
             let state = self.config.state_read();
-            state.aie.enabled && !state.aie.sc1_allowed && state.aie_sessions.terminal(prim.main_address.ssi).is_some()
+            state.aie.enabled
+                && state.subscribers.is_registered(prim.main_address.ssi)
+                && !state.aie_sessions.terminal_allows_clear(prim.main_address.ssi)
         };
         if clear_from_bound_sc2_terminal {
             let bare_ack_bits = if has_fcs { 36 } else { 4 };

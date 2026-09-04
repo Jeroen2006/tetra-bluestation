@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
-use tetra_swmi_protocol::{AttachmentOperation, EnergyEconomyAssignment, SubscriberRecoveryState};
+use tetra_swmi_protocol::{AttachmentOperation, EnergyEconomyAssignment, SubscriberRecoveryState, TerminalSecurityClass};
 
 #[derive(Debug)]
 pub enum ClientMgrErr {
@@ -176,6 +176,7 @@ impl MmClientMgr {
                         multiframe_number: client.energy_saving_multiframe_number,
                     },
                     rua_assigned: rua_assignment_state(client.issi),
+                    security_class: TerminalSecurityClass::Unknown,
                 }
             })
             .collect::<Vec<_>>();

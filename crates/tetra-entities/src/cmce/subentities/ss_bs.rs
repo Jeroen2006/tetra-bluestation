@@ -124,6 +124,7 @@ impl SsBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: TetraAddress::new(issi, SsiType::Issi),
+                aie_override: None,
                 tx_reporter: None,
             }),
         });

@@ -428,6 +428,7 @@ impl CcBsSubentity {
                 chan_alloc,
                 associated_channel: None,
                 main_address: address,
+                aie_override: None,
                 tx_reporter: reporter,
             }),
         }
@@ -479,6 +480,7 @@ impl CcBsSubentity {
                 chan_alloc: Some(chan_alloc),
                 associated_channel: None,
                 main_address: address,
+                aie_override: None,
                 tx_reporter: None,
             }),
         }
@@ -1090,6 +1092,7 @@ impl CcBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: prim.received_tetra_address,
+                aie_override: None,
                 tx_reporter: None,
             }),
         };
@@ -1175,6 +1178,7 @@ impl CcBsSubentity {
                 }),
                 associated_channel: None,
                 main_address: calling_party,
+                aie_override: None,
                 tx_reporter: None,
             }),
         });
@@ -1219,6 +1223,7 @@ impl CcBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: prim.received_tetra_address,
+                aie_override: None,
                 tx_reporter: None,
             }),
         });
@@ -1263,6 +1268,7 @@ impl CcBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: prim.received_tetra_address,
+                aie_override: None,
                 tx_reporter: None,
             }),
         });
@@ -2349,7 +2355,9 @@ impl CcBsSubentity {
                 priority,
                 floor_itsi,
                 acknowledged,
+                protection,
             } => {
+                self.config.state_write().aie_sessions.set_group_protection(gssi, protection);
                 let allocation = self.reserve_seamless_handover_group_call(
                     queue,
                     itsi as u32,
@@ -2376,8 +2384,9 @@ impl CcBsSubentity {
                 floor_itsi,
                 talking_party,
                 acknowledged,
-                ..
+                protection,
             } => {
+                self.config.state_write().aie_sessions.set_group_protection(gssi, protection);
                 let Ok(call_id) = u16::try_from(call_id) else {
                     tracing::warn!(call_id, "SwMI supplied call id outside TETRA range");
                     return;
@@ -3707,6 +3716,12 @@ impl CcBsSubentity {
                 });
             }
         }
+        if !self.active_calls.values().any(|call| call.dest_gssi == dest_gssi)
+            && !self.pending_remote_swmi_calls.values().any(|call| call.gssi == dest_gssi)
+            && !self.releasing_calls.iter().any(|call| call.dest_gssi == dest_gssi)
+        {
+            self.config.state_write().aie_sessions.clear_group_protection(dest_gssi);
+        }
     }
 
     fn rx_private_u_setup(&mut self, queue: &mut MessageQueue, original: SapMsg, caller: TetraAddress, pdu: USetup) {
@@ -4495,6 +4510,7 @@ impl CcBsSubentity {
                     chan_alloc: None,
                     associated_channel: None,
                     main_address: sender_addr,
+                    aie_override: None,
                     tx_reporter: None,
                 }),
             };
@@ -4846,6 +4862,7 @@ impl CcBsSubentity {
                 chan_alloc: None, // Already sent in D-SETUP
                 associated_channel: None,
                 main_address: dest_addr,
+                aie_override: None,
                 tx_reporter: None,
             }),
         };

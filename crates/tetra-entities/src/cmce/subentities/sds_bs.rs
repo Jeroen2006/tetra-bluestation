@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use tetra_config::bluestation::{DmMsRouteAddress, SharedConfig};
 use tetra_core::{
-    BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, TxReporter, TxState, tetra_entities::TetraEntity,
-    typed_pdu_fields::Type3FieldGeneric, unimplemented_log,
+    AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, TxReporter, TxState,
+    tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric, unimplemented_log,
 };
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
@@ -146,6 +146,7 @@ impl SdsBsSubentity {
                 data_type,
                 length_bits,
                 data,
+                protection,
             } => {
                 tracing::info!(transaction_id, source_issi, destination_ssi, "SwMI SDS delivery received by BS");
                 if !destination_is_group {
@@ -160,6 +161,8 @@ impl SdsBsSubentity {
                     data_type,
                     length_bits,
                     data,
+                    (destination_is_group && protection == tetra_swmi_protocol::GroupProtection::Clear)
+                        .then(|| AieRequest::clear(AieSubject::Group { gssi: destination_ssi }, AieScope::MacResource)),
                 );
             }
             SwmiMessage::SdsFailure {
@@ -447,6 +450,7 @@ impl SdsBsSubentity {
         data_type: u8,
         length_bits: u16,
         data: Vec<u8>,
+        aie_override: Option<AieRequest>,
     ) {
         let destination_type = if destination_is_group { SsiType::Gssi } else { SsiType::Issi };
         let gateway_route = (!destination_is_group)
@@ -469,7 +473,16 @@ impl SdsBsSubentity {
         let delivered = if let Some((gateway_issi, address)) = gateway_route {
             self.send_d_sds_data_to_gateway(queue, source_issi, gateway_issi, address, user_data, reporter.clone())
         } else {
-            self.send_d_sds_data(queue, source_issi, destination_ssi, destination_type, user_data, reporter.clone())
+            self.send_d_sds_data_to(
+                queue,
+                source_issi,
+                destination_ssi,
+                destination_type,
+                None,
+                user_data,
+                reporter.clone(),
+                aie_override,
+            )
         };
         if !delivered {
             self.report_delivery(transaction_id, destination_ssi, false, SDS_FAILURE_DELIVERY_FAILED);
@@ -599,6 +612,7 @@ impl SdsBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: TetraAddress::new(destination_ssi, destination_type),
+                aie_override: None,
                 tx_reporter: None,
             }),
         });
@@ -642,6 +656,7 @@ impl SdsBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: TetraAddress::new(gateway_issi, SsiType::Issi),
+                aie_override: None,
                 tx_reporter: None,
             }),
         });
@@ -664,6 +679,7 @@ impl SdsBsSubentity {
             None,
             user_defined_data,
             tx_reporter,
+            None,
         )
     }
 
@@ -684,6 +700,7 @@ impl SdsBsSubentity {
             Some(dm_ms_address),
             user_defined_data,
             tx_reporter,
+            None,
         )
     }
 
@@ -696,6 +713,7 @@ impl SdsBsSubentity {
         dm_ms_address: Option<DmMsRouteAddress>,
         user_defined_data: SdsUserData,
         tx_reporter: Option<TxReporter>,
+        aie_override: Option<AieRequest>,
     ) -> bool {
         let pdu = DSdsData {
             calling_party_type_identifier: PartyTypeIdentifier::Ssi,
@@ -732,6 +750,7 @@ impl SdsBsSubentity {
                 chan_alloc: None,
                 associated_channel: None,
                 main_address: TetraAddress::new(destination_ssi, destination_type),
+                aie_override,
                 tx_reporter,
             }),
         });

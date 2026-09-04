@@ -38,7 +38,7 @@ use tetra_saps::tma::{AssociatedChannel, TmaReport, TmaReportInd, TmaUnitdataInd
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
-use tetra_swmi_protocol::{SwmiMessage, UplinkRfStats};
+use tetra_swmi_protocol::{GroupProtection, SwmiMessage, TerminalSecurityClass, UplinkRfStats};
 
 use crate::lmac::components::scrambler;
 use crate::net_swmi::SwmiRfEndpoint;
@@ -580,12 +580,40 @@ impl UmacBs {
     }
 
     fn active_aie_request(&self, subject: AieSubject, scope: AieScope) -> Option<AieRequest> {
-        self.aie.enabled.then(|| {
-            if self.aie.sc3.is_some() {
-                AieRequest::sc3(subject, scope)
-            } else {
-                AieRequest::sc2(subject, scope)
+        if !self.aie.enabled {
+            return None;
+        }
+        let state = self.config.state_read();
+        let group = match subject {
+            AieSubject::Group { gssi } | AieSubject::Call { gssi: Some(gssi), .. } => Some(gssi),
+            _ => None,
+        };
+        if let Some(gssi) = group {
+            let sc3g = self.aie.sc3.as_ref().is_some_and(|sc3| sc3.gckn_for_gssi(gssi).is_some());
+            if !sc3g && state.aie_sessions.group_protection(gssi) == GroupProtection::Clear {
+                return None;
             }
+        }
+        let terminal = match subject {
+            AieSubject::Individual { issi } | AieSubject::Call { issi: Some(issi), .. } => Some(issi),
+            _ => None,
+        };
+        if let Some(issi) = terminal {
+            return match state.aie_sessions.terminal_class(issi) {
+                TerminalSecurityClass::Sc1 => None,
+                TerminalSecurityClass::Sc2 => Some(AieRequest::sc2(subject, scope)),
+                TerminalSecurityClass::Sc3 => Some(AieRequest::sc3(subject, scope)),
+                TerminalSecurityClass::Unknown => Some(if self.aie.sc3.is_some() {
+                    AieRequest::sc3(subject, scope)
+                } else {
+                    AieRequest::sc2(subject, scope)
+                }),
+            };
+        }
+        Some(if self.aie.sc3.is_some() {
+            AieRequest::sc3(subject, scope)
+        } else {
+            AieRequest::sc2(subject, scope)
         })
     }
 
