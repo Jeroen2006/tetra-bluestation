@@ -734,6 +734,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::AuthenticationResponseDemand { .. }
                             | SwmiMessage::AuthenticationResult { .. }
                             | SwmiMessage::OtarDownlink { .. }
+                            | SwmiMessage::TerminalControl { .. }
                             | SwmiMessage::LivelinessCheck { .. }),
                         ) => {
                             if let SwmiMessage::LstRecoveryRequest { command_id } = &message {

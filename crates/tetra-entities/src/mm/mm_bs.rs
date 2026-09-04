@@ -19,7 +19,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{
     AieLocationUpdateDecision, AieObservationEvent, AieObservationState, AttachmentOperation, AttachmentResult, DmGatewayAddress,
     DmGatewayCarrier, EnergyEconomyAssignment, HandoverChannelAllocation, Sc3RetrievalEvidence, SwmiMessage, TerminalAieCapabilities,
-    TerminalAieObservation, TerminalSecurityClass,
+    TerminalAieObservation, TerminalControlAction, TerminalInformation, TerminalSecurityClass,
 };
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
@@ -39,6 +39,7 @@ use tetra_pdus::mm::fields::group_identity_security_related_information::{
     GckSelectNumber, GroupGckAssociation, GroupIdentitySecurityRelatedInformation,
 };
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+use tetra_pdus::mm::fields::security_downlink::SecurityDownlink;
 use tetra_pdus::mm::pdus::ck_change::{CkChangeTime, DAllGcksChangeDemand, DCkChangeDemand, SckChangeData, UCkChangeResult};
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
@@ -54,10 +55,12 @@ use tetra_pdus::mm::pdus::otar::{DOtar, UOtar};
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
+use tetra_pdus::mm::pdus::u_information_provide::UInformationProvide;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatusGatewayPayload;
+use tetra_pdus::mm::pdus::u_tei_provide::UTeiProvide;
 
 /// ETSI T351 = 10 seconds. TETRA has 18 TDMA frames of four slots per second.
 const T351_TIMESLOTS: i32 = 10 * 18 * 4;
@@ -74,6 +77,16 @@ const GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS: i32 = 18 * 4;
 /// Initial transmission plus two bounded application-layer retries. LLC keeps
 /// ownership of the independent basic-link retransmissions for each attempt.
 const MAX_GROUP_SECURITY_RETRIES: u8 = 2;
+const TERMINAL_CONTROL_TIMEOUT_TIMESLOTS: i32 = 10 * 18 * 4;
+
+// EN 300 392-7 table A.46, in on-air order: KSG(4), SC(1), TM-SCK,
+// SDMO/DM-SCK, GCK, security-information protocol, reserved.
+const CIPHERING_PARAMETERS_SC3: u64 = 1 << 5;
+const CIPHERING_PARAMETERS_SECURITY_INFORMATION: u64 = 1 << 1;
+
+fn supports_security_information_protocol(parameters: u64) -> bool {
+    parameters & CIPHERING_PARAMETERS_SC3 != 0 && parameters & CIPHERING_PARAMETERS_SECURITY_INFORMATION != 0
+}
 
 /// TTR 001-11 Table 6.2 on-air KSG numbers. These are protocol values, not
 /// the ordinal positions of the local TEA enum.
@@ -262,6 +275,16 @@ struct QueuedGroupSecurityAssociation {
     retries: u8,
 }
 
+#[derive(Debug)]
+struct PendingTerminalControl {
+    command_id: u64,
+    action: TerminalControlAction,
+    operations: Vec<AttachmentOperation>,
+    tx_reporter: Option<TxReporter>,
+    deadline: TdmaTime,
+    information: TerminalInformation,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GskoBootstrapStatus {
     Requested,
@@ -355,6 +378,8 @@ pub struct MmBs {
     /// These deliberately live outside MM registration state: a reachability
     /// check must not mutate affiliations, security associations or roaming.
     pending_liveliness_probes: HashMap<u32, TxReporter>,
+    pending_terminal_controls: HashMap<u32, PendingTerminalControl>,
+    security_information_protocol_supported: HashSet<u32>,
     /// Per-terminal GSKO bootstrap state. A GSKO itself is never stored at
     /// the BS; only its version and CMG association are tracked.
     gsko_bootstraps: HashMap<u32, GskoBootstrapStatus>,
@@ -766,6 +791,14 @@ impl MmBs {
                     "D-LOCATION UPDATE ACCEPT was not link-acknowledged; registration remains inactive"
                 );
             }
+            if self.pending_terminal_controls.get(&issi).is_some_and(|control| {
+                matches!(
+                    control.action,
+                    TerminalControlAction::Reregister | TerminalControlAction::Reauthenticate
+                )
+            }) {
+                self.finish_terminal_control(issi, delivered, u8::from(!delivered), Vec::new(), None);
+            }
         }
     }
 
@@ -798,6 +831,24 @@ impl MmBs {
             } else {
                 tracing::warn!(issi, ?state, "terminal did not acknowledge empty BL-DATA presence probe");
             }
+        }
+    }
+
+    fn update_terminal_control_statuses(&mut self) {
+        let failed = self
+            .pending_terminal_controls
+            .iter()
+            .filter_map(|(&issi, pending)| {
+                let link_failed = pending
+                    .tx_reporter
+                    .as_ref()
+                    .is_some_and(|reporter| matches!(reporter.get_state(), TxState::Discarded | TxState::Lost));
+                let timed_out = pending.deadline.age(self.current_time) >= 0;
+                (link_failed || timed_out).then_some(issi)
+            })
+            .collect::<Vec<_>>();
+        for issi in failed {
+            self.finish_terminal_control(issi, false, 4, Vec::new(), None);
         }
     }
 
@@ -960,6 +1011,8 @@ impl MmBs {
             queued_group_security_associations: HashMap::new(),
             group_security_not_before: HashMap::new(),
             pending_liveliness_probes: HashMap::new(),
+            pending_terminal_controls: HashMap::new(),
+            security_information_protocol_supported: HashSet::new(),
             gsko_bootstraps: HashMap::new(),
             ck_change_results: HashMap::new(),
             pending_security_activations: HashMap::new(),
@@ -1494,6 +1547,7 @@ impl MmBs {
     /// not be allowed to deregister the new serving cell.
     fn remove_local_subscriber(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
         let client = self.client_mgr.remove_client(issi);
+        self.security_information_protocol_supported.remove(&issi);
         let had_local_state = {
             let mut state = self.config.state_write();
             let existed = state.subscribers.is_registered(issi) || state.aie_sessions.terminal(issi).is_some();
@@ -1517,6 +1571,173 @@ impl MmBs {
             tracing::debug!(issi, "removed stale subscriber/AIE state without an MM client");
         }
         client.is_some() || had_local_state || was_gateway
+    }
+
+    fn submit_terminal_control_result(
+        &self,
+        command_id: u64,
+        issi: u32,
+        action: TerminalControlAction,
+        success: bool,
+        cause: u8,
+        results: Vec<AttachmentResult>,
+        information: Option<TerminalInformation>,
+    ) {
+        let Some(swmi) = self.swmi.as_ref() else {
+            return;
+        };
+        if let Err(error) = swmi.submit(SwmiMessage::TerminalControlResult {
+            command_id,
+            itsi: u64::from(issi),
+            action,
+            success,
+            cause,
+            results,
+            information,
+        }) {
+            tracing::warn!(command_id, issi, ?action, ?error, "failed to report terminal-control result");
+        }
+    }
+
+    fn finish_terminal_control(
+        &mut self,
+        issi: u32,
+        success: bool,
+        cause: u8,
+        results: Vec<AttachmentResult>,
+        information: Option<TerminalInformation>,
+    ) {
+        let Some(pending) = self.pending_terminal_controls.remove(&issi) else {
+            return;
+        };
+        self.submit_terminal_control_result(pending.command_id, issi, pending.action, success, cause, results, information);
+    }
+
+    fn handle_terminal_control(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        itsi: u64,
+        action: TerminalControlAction,
+        operations: Vec<AttachmentOperation>,
+    ) {
+        let Ok(issi) = u32::try_from(itsi) else {
+            return;
+        };
+        if action == TerminalControlAction::Disconnect {
+            if self.pending_terminal_controls.contains_key(&issi) {
+                self.finish_terminal_control(issi, false, 6, Vec::new(), None);
+            }
+            let removed = self.remove_local_subscriber(queue, issi);
+            self.submit_terminal_control_result(command_id, issi, action, removed, u8::from(!removed), Vec::new(), None);
+            return;
+        }
+        if !self.config.state_read().subscribers.is_registered(issi) {
+            self.submit_terminal_control_result(command_id, issi, action, false, 2, Vec::new(), None);
+            return;
+        }
+        if self.pending_terminal_controls.contains_key(&issi) {
+            self.submit_terminal_control_result(command_id, issi, action, false, 5, Vec::new(), None);
+            return;
+        }
+        if matches!(
+            action,
+            TerminalControlAction::AmendTalkgroups | TerminalControlAction::ReplaceTalkgroups
+        ) {
+            self.start_terminal_group_control(queue, command_id, issi, action, operations);
+            return;
+        }
+        self.pending_terminal_controls.insert(
+            issi,
+            PendingTerminalControl {
+                command_id,
+                action,
+                operations,
+                tx_reporter: None,
+                deadline: self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS),
+                information: TerminalInformation::default(),
+            },
+        );
+        // Core clauses 8.7.4 and 8.7.5 both permit SwMI-initiated
+        // registration. These operator commands do not require a group
+        // report; talkgroup reconciliation is a separate explicit action.
+        self.send_d_location_update_command(queue, issi, 0, false);
+    }
+
+    fn rx_u_tei_provide(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let pdu = match UTeiProvide::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(issi = prim.received_address.ssi, ?error, "invalid U-TEI PROVIDE");
+                return;
+            }
+        };
+        let issi = prim.received_address.ssi;
+        if pdu.ssi != issi {
+            tracing::warn!(issi, pdu_ssi = pdu.ssi, "discarding U-TEI PROVIDE with mismatched SSI");
+            return;
+        }
+        if self
+            .pending_terminal_controls
+            .get(&issi)
+            .is_some_and(|pending| pending.action == TerminalControlAction::RequestInformation)
+        {
+            self.finish_terminal_control(
+                issi,
+                true,
+                0,
+                Vec::new(),
+                Some(TerminalInformation {
+                    tei: Some(pdu.tei),
+                    ..TerminalInformation::default()
+                }),
+            );
+        }
+    }
+
+    fn rx_u_information_provide(&mut self, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+        let pdu = match UInformationProvide::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(issi = prim.received_address.ssi, ?error, "invalid U-INFORMATION PROVIDE");
+                return;
+            }
+        };
+        let issi = prim.received_address.ssi;
+        if pdu.ssi != issi {
+            tracing::warn!(issi, pdu_ssi = pdu.ssi, "discarding U-INFORMATION PROVIDE with mismatched SSI");
+            return;
+        }
+        if let Some(pending) = self
+            .pending_terminal_controls
+            .get_mut(&issi)
+            .filter(|pending| pending.action == TerminalControlAction::RequestInformation)
+        {
+            if pdu.tei.is_some() {
+                pending.information.tei = pdu.tei;
+            }
+            if pdu.model.is_some() {
+                pending.information.model = pdu.model;
+            }
+            if pdu.hardware_version.is_some() {
+                pending.information.hardware_version = pdu.hardware_version;
+            }
+            if pdu.software_version.is_some() {
+                pending.information.software_version = pdu.software_version;
+            }
+            if pdu.further_information_follows {
+                tracing::debug!(issi, "awaiting next U-INFORMATION PROVIDE part");
+                return;
+            }
+            let information = pending.information.clone();
+            self.finish_terminal_control(issi, true, 0, Vec::new(), Some(information));
+        }
     }
 
     fn rx_u_itsi_detach(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1585,6 +1806,9 @@ impl MmBs {
                 return;
             }
         };
+        if pdu.ciphering_parameters.is_some_and(supports_security_information_protocol) {
+            self.security_information_protocol_supported.insert(prim.received_address.ssi);
+        }
 
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
         // D-LOCATION-UPDATE-PROCEEDING which we don't implement. Reject with cause
@@ -2331,7 +2555,20 @@ impl MmBs {
                 return;
             }
         };
-        self.complete_group_security_association_ack(queue, prim.received_address.ssi, pdu);
+        if self
+            .pending_terminal_controls
+            .get(&prim.received_address.ssi)
+            .is_some_and(|pending| {
+                matches!(
+                    pending.action,
+                    TerminalControlAction::AmendTalkgroups | TerminalControlAction::ReplaceTalkgroups
+                )
+            })
+        {
+            self.complete_terminal_group_control(queue, prim.received_address.ssi, pdu);
+        } else {
+            self.complete_group_security_association_ack(queue, prim.received_address.ssi, pdu);
+        }
     }
 
     fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -2396,12 +2633,12 @@ impl MmBs {
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
             MmPduTypeUl::UCkChangeResult => self.rx_u_ck_change_result(message),
             MmPduTypeUl::UOtar => self.rx_u_otar(queue, message),
-            MmPduTypeUl::UInformationProvide => unimplemented_log!("UInformationProvide"),
+            MmPduTypeUl::UInformationProvide => self.rx_u_information_provide(message),
             MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
             MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => {
                 self.rx_u_attach_detach_group_identity_acknowledgement(queue, message)
             }
-            MmPduTypeUl::UTeiProvide => unimplemented_log!("UTeiProvide"),
+            MmPduTypeUl::UTeiProvide => self.rx_u_tei_provide(message),
             MmPduTypeUl::UDisableStatus => unimplemented_log!("UDisableStatus"),
             MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
         };
@@ -2795,6 +3032,14 @@ impl MmBs {
                     .to_owned(),
                 ),
             );
+            if !authentication_result
+                && self
+                    .pending_terminal_controls
+                    .get(&prim.received_address.ssi)
+                    .is_some_and(|pending| pending.action == TerminalControlAction::Reauthenticate)
+            {
+                self.finish_terminal_control(prim.received_address.ssi, false, 1, Vec::new(), None);
+            }
         } else {
             tracing::info!(
                 command_id,
@@ -2971,6 +3216,9 @@ impl MmBs {
                     pending.address_extension,
                     cause as u8,
                 );
+            }
+            if self.pending_terminal_controls.contains_key(&pending.itsi) {
+                self.finish_terminal_control(pending.itsi, false, cause as u8, Vec::new(), None);
             }
             return;
         }
@@ -3695,6 +3943,190 @@ impl MmBs {
             .is_some_and(|not_before| not_before.age(self.current_time) < 0)
     }
 
+    fn terminal_group_diff(
+        &mut self,
+        issi: u32,
+        action: TerminalControlAction,
+        requested: Vec<AttachmentOperation>,
+    ) -> Vec<AttachmentOperation> {
+        if action == TerminalControlAction::AmendTalkgroups {
+            return requested;
+        }
+        let current = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.clone())
+            .unwrap_or_default();
+        let desired = requested
+            .into_iter()
+            .filter(|operation| !operation.detach)
+            .map(|operation| (operation.gssi, operation.class_of_usage))
+            .collect::<HashMap<_, _>>();
+        let mut operations = current
+            .keys()
+            .filter(|gssi| !desired.contains_key(gssi))
+            .map(|gssi| AttachmentOperation {
+                gssi: *gssi,
+                detach: true,
+                class_of_usage: 0,
+            })
+            .collect::<Vec<_>>();
+        operations.extend(desired.into_iter().filter_map(|(gssi, class_of_usage)| {
+            (current.get(&gssi).copied() != Some(class_of_usage)).then_some(AttachmentOperation {
+                gssi,
+                detach: false,
+                class_of_usage,
+            })
+        }));
+        operations.sort_unstable_by_key(|operation| (operation.detach, operation.gssi));
+        operations
+    }
+
+    fn start_terminal_group_control(
+        &mut self,
+        queue: &mut MessageQueue,
+        command_id: u64,
+        issi: u32,
+        action: TerminalControlAction,
+        requested: Vec<AttachmentOperation>,
+    ) {
+        let operations = self.terminal_group_diff(issi, action, requested);
+        if operations.is_empty() {
+            self.submit_terminal_control_result(command_id, issi, action, true, 0, Vec::new(), None);
+            return;
+        }
+        let group_identity_downlink = operations
+            .iter()
+            .map(|operation| GroupIdentityDownlink {
+                group_identity_attachment: (!operation.detach).then_some(GroupIdentityAttachment {
+                    group_identity_attachment_lifetime: 1,
+                    class_of_usage: operation.class_of_usage,
+                }),
+                // Temporary-1 detachment is a reversible network policy
+                // change; it is intentionally not a permanent disable.
+                group_identity_detachment_uplink: operation.detach.then_some(1),
+                gssi: Some(operation.gssi),
+                address_extension: None,
+                vgssi: None,
+            })
+            .collect();
+        let pdu = DAttachDetachGroupIdentity {
+            group_identity_report: false,
+            group_identity_acknowledgement_request: true,
+            // TTR 001-01 §8.7.2 requires amendment mode for SwMI-initiated changes.
+            group_identity_attach_detach_mode: false,
+            proprietary: None,
+            group_report_response: None,
+            group_identity_downlink: Some(group_identity_downlink),
+            group_identity_security_related_information: self.group_security_information(
+                operations
+                    .iter()
+                    .filter(|operation| !operation.detach)
+                    .map(|operation| operation.gssi),
+            ),
+        };
+        let mut sdu = BitBuffer::new_autoexpand(128);
+        if let Err(error) = pdu.to_bitbuf(&mut sdu) {
+            tracing::warn!(command_id, issi, ?error, "cannot serialize terminal talkgroup amendment");
+            self.submit_terminal_control_result(command_id, issi, action, false, 3, Vec::new(), None);
+            return;
+        }
+        sdu.seek(0);
+        let tx_reporter = TxReporter::new();
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                aie_request: self.downlink_aie_request(issi),
+                is_null_pdu: false,
+                tx_reporter: Some(tx_reporter.clone()),
+                seamless_handover: None,
+            }),
+        });
+        self.pending_terminal_controls.insert(
+            issi,
+            PendingTerminalControl {
+                command_id,
+                action,
+                operations,
+                tx_reporter: Some(tx_reporter),
+                deadline: self.current_time.add_timeslots(TERMINAL_CONTROL_TIMEOUT_TIMESLOTS),
+                information: TerminalInformation::default(),
+            },
+        );
+    }
+
+    fn complete_terminal_group_control(&mut self, queue: &mut MessageQueue, issi: u32, pdu: UAttachDetachGroupIdentityAcknowledgement) {
+        let Some(pending) = self.pending_terminal_controls.remove(&issi) else {
+            return;
+        };
+        let returned = pdu.group_identity_uplink.as_deref().unwrap_or_default();
+        let rejected = if pdu.group_identity_acknowledgement_type {
+            returned
+                .iter()
+                .filter_map(|group| Some((group.gssi?, group.group_identity_detachment_uplink?)))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let returned_classes = returned
+            .iter()
+            .filter_map(|group| Some((group.gssi?, group.class_of_usage?)))
+            .collect::<HashMap<_, _>>();
+        let mut attached = Vec::new();
+        let mut detached = Vec::new();
+        let mut results = Vec::with_capacity(pending.operations.len());
+        for mut operation in pending.operations {
+            let mut accepted = !rejected.contains_key(&operation.gssi);
+            let mut cause = rejected.get(&operation.gssi).copied().unwrap_or(0);
+            if accepted
+                && !operation.detach
+                && let Some(class_of_usage) = returned_classes.get(&operation.gssi).copied()
+            {
+                operation.class_of_usage = class_of_usage;
+            }
+            if accepted {
+                if self
+                    .client_mgr
+                    .client_group_attach_with_class_of_usage(issi, operation.gssi, !operation.detach, operation.class_of_usage)
+                    .is_ok()
+                {
+                    if operation.detach {
+                        self.config.state_write().subscribers.deaffiliate(issi, operation.gssi);
+                        detached.push(operation.gssi);
+                    } else {
+                        self.config.state_write().subscribers.affiliate(issi, operation.gssi);
+                        attached.push(operation.gssi);
+                    }
+                } else {
+                    accepted = false;
+                    cause = 3;
+                }
+            }
+            results.push(AttachmentResult {
+                operation,
+                accepted,
+                cause,
+            });
+        }
+        if !attached.is_empty() {
+            self.emit_subscriber_update(queue, issi, attached, BrewSubscriberAction::Affiliate);
+        }
+        if !detached.is_empty() {
+            self.emit_subscriber_update(queue, issi, detached, BrewSubscriberAction::Deaffiliate);
+        }
+        let success = results.iter().all(|result| result.accepted);
+        self.submit_terminal_control_result(pending.command_id, issi, pending.action, success, u8::from(!success), results, None);
+    }
+
     /// Begin exactly one Figure-20 transaction. TTR 001-11 table 14 permits
     /// up to thirty associations in one security element, which covers the
     /// supported twenty-group scan list. LLC/MAC may fragment this one PDU;
@@ -4064,7 +4496,16 @@ impl MmBs {
             energy_saving_information,
             scch_information_and_distribution_on_18th_frame: None,
             new_registered_area: None,
-            security_downlink: None,
+            security_downlink: self
+                .pending_terminal_controls
+                .get(&issi)
+                .is_some_and(|pending| pending.action == TerminalControlAction::RequestInformation)
+                .then(|| {
+                    self.security_information_protocol_supported
+                        .contains(&issi)
+                        .then(SecurityDownlink::terminal_information_request)
+                })
+                .flatten(),
             group_identity_location_accept,
             default_group_attachment_lifetime: None,
             authentication_downlink: aie
@@ -4091,9 +4532,27 @@ impl MmBs {
                         // Accept the authentication without requesting a TEI or
                         // provisioning a cipher key.
                         len: 3,
-                        data: 0b100,
+                        data: 0b100
+                            | u64::from(self.pending_terminal_controls.get(&issi).is_some_and(|pending| {
+                                pending.action == TerminalControlAction::RequestInformation
+                                    && !self.security_information_protocol_supported.contains(&issi)
+                            })) << 1,
                         raw: Vec::new(),
                     })
+                })
+                .or_else(|| {
+                    self.pending_terminal_controls
+                        .get(&issi)
+                        .is_some_and(|pending| {
+                            pending.action == TerminalControlAction::RequestInformation
+                                && !self.security_information_protocol_supported.contains(&issi)
+                        })
+                        .then(|| Type3FieldGeneric {
+                            field_id: MmType34ElemIdDl::AuthenticationDownlink.into(),
+                            len: 3,
+                            data: 0b010,
+                            raw: Vec::new(),
+                        })
                 }),
             group_identity_security_related_information: security,
             cell_type_control: None,
@@ -4533,6 +4992,7 @@ impl TetraEntityTrait for MmBs {
         self.update_registration_delivery_statuses(queue);
         self.update_group_security_association_statuses(queue);
         self.update_liveliness_probe_statuses();
+        self.update_terminal_control_statuses();
         self.update_security_activations(queue);
         self.update_otar_delivery_statuses();
         let active_gck_vn = {
@@ -4613,6 +5073,12 @@ impl TetraEntityTrait for MmBs {
         }
         while let Some(message) = self.swmi.as_ref().and_then(SwmiMmEndpoint::try_recv) {
             match message {
+                SwmiMessage::TerminalControl {
+                    command_id,
+                    itsi,
+                    action,
+                    operations,
+                } => self.handle_terminal_control(queue, command_id, itsi, action, operations),
                 SwmiMessage::LivelinessCheck { itsi } => {
                     let Ok(issi) = u32::try_from(itsi) else {
                         tracing::warn!(itsi, "discarding liveliness check with invalid ISSI");
@@ -4735,6 +5201,14 @@ impl TetraEntityTrait for MmBs {
                             None,
                             RejectCause::AuthenticationFailure as u8,
                         );
+                    }
+                    if !success
+                        && self
+                            .pending_terminal_controls
+                            .get(&(itsi as u32))
+                            .is_some_and(|pending| pending.action == TerminalControlAction::Reauthenticate)
+                    {
+                        self.finish_terminal_control(itsi as u32, false, 1, Vec::new(), None);
                     }
                     tracing::debug!(command_id, itsi, response_2 = ?response_2, "received D-AUTHENTICATION RESULT");
                 }
@@ -5216,7 +5690,7 @@ impl TetraEntityTrait for MmBs {
 
 #[cfg(test)]
 mod tests {
-    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, sc2_ksg_number};
+    use super::{MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, sc2_ksg_number, supports_security_information_protocol};
     use crate::MessageQueue;
     use std::collections::HashSet;
     use tetra_config::bluestation::{
@@ -5234,7 +5708,9 @@ mod tests {
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
     use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
     use tetra_saps::SapMsgInner;
-    use tetra_swmi_protocol::{AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalSecurityClass};
+    use tetra_swmi_protocol::{
+        AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalControlAction, TerminalSecurityClass,
+    };
 
     fn test_config() -> SharedConfig {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -5277,6 +5753,94 @@ mod tests {
     fn sc2_ksg_numbers_match_the_on_air_table() {
         assert_eq!(sc2_ksg_number(RuntimeSc2TeaAlgorithm::Tea1), 0b0000);
         assert_eq!(sc2_ksg_number(RuntimeSc2TeaAlgorithm::Tea3), 0b0010);
+    }
+
+    #[test]
+    fn security_information_support_requires_sc3_and_table_a46_support_bit() {
+        assert!(supports_security_information_protocol(0b10_0010));
+        assert!(!supports_security_information_protocol(0b10_0000));
+        assert!(!supports_security_information_protocol(0b00_0010));
+    }
+
+    #[test]
+    fn terminal_talkgroup_replacement_uses_amendment_and_supports_empty_list() {
+        let config = test_config();
+        let mut mm = MmBs::new(config, None, None, None);
+        let issi = 77_493;
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, 91, true, 3)
+            .expect("existing group must attach");
+        let mut queue = MessageQueue::new();
+
+        mm.start_terminal_group_control(&mut queue, 1, issi, TerminalControlAction::ReplaceTalkgroups, Vec::new());
+
+        let message = queue.pop_front().expect("replacement must queue an amendment");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("queued amendment must parse");
+        assert!(!pdu.group_identity_attach_detach_mode);
+        let groups = pdu.group_identity_downlink.expect("detachment must be present");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].gssi, Some(91));
+        assert!(groups[0].group_identity_detachment_uplink.is_some());
+    }
+
+    #[test]
+    fn terminal_talkgroup_ack_applies_partial_acceptance_and_ms_cou_change() {
+        let config = test_config();
+        let mut mm = MmBs::new(config, None, None, None);
+        let issi = 77_494;
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        let mut queue = MessageQueue::new();
+        mm.start_terminal_group_control(
+            &mut queue,
+            2,
+            issi,
+            TerminalControlAction::AmendTalkgroups,
+            vec![
+                AttachmentOperation {
+                    gssi: 91,
+                    detach: false,
+                    class_of_usage: 3,
+                },
+                AttachmentOperation {
+                    gssi: 92,
+                    detach: false,
+                    class_of_usage: 2,
+                },
+            ],
+        );
+        while queue.pop_front().is_some() {}
+
+        mm.complete_terminal_group_control(
+            &mut queue,
+            issi,
+            UAttachDetachGroupIdentityAcknowledgement {
+                group_identity_acknowledgement_type: true,
+                group_identity_uplink: Some(vec![
+                    GroupIdentityUplink {
+                        class_of_usage: None,
+                        group_identity_detachment_uplink: Some(2),
+                        gssi: Some(91),
+                        address_extension: None,
+                        vgssi: None,
+                    },
+                    GroupIdentityUplink {
+                        class_of_usage: Some(5),
+                        group_identity_detachment_uplink: None,
+                        gssi: Some(92),
+                        address_extension: None,
+                        vgssi: None,
+                    },
+                ]),
+                proprietary: None,
+            },
+        );
+
+        assert_eq!(mm.client_mgr.client_group_class_of_usage(issi, 91), None);
+        assert_eq!(mm.client_mgr.client_group_class_of_usage(issi, 92), Some(5));
     }
 
     #[test]

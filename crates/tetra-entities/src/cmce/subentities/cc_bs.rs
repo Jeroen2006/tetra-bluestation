@@ -976,6 +976,22 @@ impl CcBsSubentity {
                 tracing::info!("CMCE: subscriber register issi={} known={}", issi, known);
             }
             BrewSubscriberAction::Deregister => {
+                let private_call_ids = self
+                    .private_calls
+                    .iter()
+                    .filter_map(|(&call_id, call)| (call.caller_itsi == issi || call.callee_itsi == issi).then_some(call_id))
+                    .collect::<Vec<_>>();
+                for call_id in private_call_ids {
+                    let cause = DisconnectCause::SwmiRequestedDisconnection;
+                    if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
+                        let _ = swmi.submit(SwmiMessage::PrivateCallRelease {
+                            call_id: u64::from(call_id),
+                            itsi: u64::from(issi),
+                            cause: cause as u8,
+                        });
+                    }
+                    self.release_private_call_local(queue, call_id, cause);
+                }
                 if let Some(existing) = self.subscriber_groups.remove(&issi) {
                     for gssi in existing {
                         self.dec_group_listener(gssi);

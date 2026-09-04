@@ -8,3 +8,4 @@ pub mod group_identity_location_accept;
 pub mod group_identity_location_demand;
 pub mod group_identity_security_related_information;
 pub mod group_identity_uplink;
+pub mod security_downlink;

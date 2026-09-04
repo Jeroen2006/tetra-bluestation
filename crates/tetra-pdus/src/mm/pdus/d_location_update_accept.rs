@@ -10,6 +10,7 @@ use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 use crate::mm::fields::energy_saving_information::EnergySavingInformation;
 use crate::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use crate::mm::fields::group_identity_security_related_information::GroupIdentitySecurityRelatedInformation;
+use crate::mm::fields::security_downlink::SecurityDownlink;
 
 /// Representation of the D-LOCATION UPDATE ACCEPT PDU (Clause 16.9.2.7).
 /// The infrastructure sends this message to the MS to indicate that updating in the network has been completed.
@@ -34,7 +35,7 @@ pub struct DLocationUpdateAccept {
     /// Type4, See note,
     pub new_registered_area: Option<Type4FieldGeneric>,
     /// Type3, See ETSI EN 300 392-7 [8],
-    pub security_downlink: Option<Type3FieldGeneric>,
+    pub security_downlink: Option<SecurityDownlink>,
     /// Type3, See note,
     pub group_identity_location_accept: Option<GroupIdentityLocationAccept>,
     /// Type3, See note,
@@ -88,7 +89,7 @@ impl DLocationUpdateAccept {
         let new_registered_area = typed::parse_type4_generic(obit, buffer, MmType34ElemIdDl::NewRegisteredArea)?;
 
         // Type3
-        let security_downlink = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::SecurityDownlink)?;
+        let security_downlink = typed::parse_type3_struct(obit, buffer, MmType34ElemIdDl::SecurityDownlink, SecurityDownlink::from_bitbuf)?;
 
         // Type3
         let group_identity_location_accept = typed::parse_type3_struct(
@@ -187,7 +188,13 @@ impl DLocationUpdateAccept {
         typed::write_type4_todo(obit, buffer, &self.new_registered_area, MmType34ElemIdDl::NewRegisteredArea)?;
 
         // Type3
-        typed::write_type3_generic(obit, buffer, &self.security_downlink, MmType34ElemIdDl::SecurityDownlink)?;
+        typed::write_type3_struct(
+            obit,
+            buffer,
+            &self.security_downlink,
+            MmType34ElemIdDl::SecurityDownlink,
+            SecurityDownlink::to_bitbuf,
+        )?;
 
         // Type3
         typed::write_type3_struct(
