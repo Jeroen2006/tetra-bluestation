@@ -15,13 +15,14 @@ fn read_tei(buffer: &mut BitBuffer) -> Result<String, PduParseErr> {
     let mut value = String::with_capacity(15);
     for _ in 0..15 {
         let digit = buffer.read_field(4, "tei_digit")? as u8;
-        if digit > 9 {
-            return Err(PduParseErr::InvalidValue {
-                field: "tei_digit",
-                value: u64::from(digit),
-            });
-        }
-        value.push(char::from(b'0' + digit));
+        // EN 300 392-7, table A.109 defines every four-bit TEI digit as
+        // "Any", not as BCD.  Preserve values A..F instead of rejecting a
+        // terminal response that legitimately uses the complete nibble.
+        value.push(
+            char::from_digit(u32::from(digit), 16)
+                .expect("four-bit TEI digit")
+                .to_ascii_uppercase(),
+        );
     }
     Ok(value)
 }
@@ -64,6 +65,21 @@ mod tests {
         let pdu = UTeiProvide::from_bitbuf(&mut buffer).unwrap();
         assert_eq!(pdu.tei, "000123456789012");
         assert_eq!(pdu.ssi, 77_492);
+    }
+
+    #[test]
+    fn preserves_non_decimal_tei_nibbles() {
+        let mut bits = String::from("1001");
+        for digit in [0xA, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xB, 0xC, 0xD, 0xF] {
+            bits.push_str(&format!("{digit:04b}"));
+        }
+        bits.push_str(&format!("{:024b}0", 77_468));
+        let mut buffer = BitBuffer::from_bitstr(&bits);
+
+        let pdu = UTeiProvide::from_bitbuf(&mut buffer).unwrap();
+
+        assert_eq!(pdu.tei, "A0123456789BCDF");
+        assert_eq!(pdu.ssi, 77_468);
     }
 
     #[test]

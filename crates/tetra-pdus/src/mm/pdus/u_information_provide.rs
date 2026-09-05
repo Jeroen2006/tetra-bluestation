@@ -35,13 +35,13 @@ fn read_tei(buffer: &mut BitBuffer) -> Result<String, PduParseErr> {
     let mut tei = String::with_capacity(15);
     for _ in 0..15 {
         let digit = buffer.read_field(4, "tei_digit")? as u8;
-        if digit > 9 {
-            return Err(PduParseErr::InvalidValue {
-                field: "tei_digit",
-                value: u64::from(digit),
-            });
-        }
-        tei.push(char::from(b'0' + digit));
+        // EN 300 392-7, table A.109 permits any value in each four-bit
+        // digit.  Hex keeps the complete over-the-air value losslessly.
+        tei.push(
+            char::from_digit(u32::from(digit), 16)
+                .expect("four-bit TEI digit")
+                .to_ascii_uppercase(),
+        );
     }
     Ok(tei)
 }
@@ -148,5 +148,16 @@ mod tests {
         assert_eq!(pdu.model.as_deref(), Some("MTP850"));
         assert_eq!(pdu.hardware_version.as_deref(), Some("R2"));
         assert_eq!(pdu.software_version.as_deref(), Some("MR2025.1"));
+    }
+
+    #[test]
+    fn preserves_non_decimal_tei_nibbles() {
+        let mut buffer = BitBuffer::new_autoexpand(60);
+        for digit in [0xA, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xB, 0xC, 0xD, 0xF] {
+            buffer.write_bits(digit, 4);
+        }
+        buffer.seek(0);
+
+        assert_eq!(read_tei(&mut buffer).unwrap(), "A0123456789BCDF");
     }
 }
