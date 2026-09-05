@@ -466,19 +466,14 @@ impl MmBs {
         groups
     }
 
-    /// Registration may carry associations for GSSIs other than the selected
-    /// group (TTR 001-11 clause 6.2.8.2). Merge the complete authoritative
-    /// local scan/attachment state into D-LOCATION UPDATE ACCEPT so roaming
-    /// does not unnecessarily depend on a second Figure-20 transaction.
-    fn registration_group_security_gssis(&mut self, issi: u32, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
-        let mut groups = gssis.into_iter().collect::<Vec<_>>();
-        groups.extend(
-            self.client_mgr
-                .get_client_by_issi(issi)
-                .into_iter()
-                .flat_map(|client| client.groups.keys().copied()),
-        );
-        self.normalized_group_security_gssis(groups)
+    /// Figure 18 places GCK associations for the group attachment being
+    /// answered in D-LOCATION UPDATE ACCEPT. Although clause 6.2.8.2 permits
+    /// unrelated GSSIs too, keep restored scan-list associations out of this
+    /// registration-critical PDU. They follow as bounded Figure-20 exchanges
+    /// after the registration BL-ACK, avoiding a large fragmented accept that
+    /// interoperates poorly with terminals.
+    fn registration_group_security_gssis(&self, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        self.normalized_group_security_gssis(gssis)
     }
 
     fn group_security_information(&self, gssis: impl IntoIterator<Item = u32>) -> Option<Vec<GroupIdentitySecurityRelatedInformation>> {
@@ -2123,7 +2118,7 @@ impl MmBs {
         }
         let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
 
-        let registration_security_groups = self.registration_group_security_gssis(issi, Vec::new());
+        let registration_security_groups = self.registration_group_security_gssis(Vec::new());
 
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
@@ -3411,7 +3406,7 @@ impl MmBs {
             let local_results = Self::local_attachment_results(&attachment);
             let (had_rejection, response_groups, security_groups) =
                 self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
-            let security_groups = self.registration_group_security_gssis(pending.itsi, security_groups);
+            let security_groups = self.registration_group_security_gssis(security_groups);
             let receipt = self.send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
@@ -3442,7 +3437,7 @@ impl MmBs {
             }
             return;
         }
-        let security_groups = self.registration_group_security_gssis(pending.itsi, Vec::new());
+        let security_groups = self.registration_group_security_gssis(Vec::new());
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
@@ -3847,7 +3842,7 @@ impl MmBs {
         let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
-        let security_groups = self.registration_group_security_gssis(registration.itsi, security_groups);
+        let security_groups = self.registration_group_security_gssis(security_groups);
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
@@ -4071,12 +4066,11 @@ impl MmBs {
             proprietary: None,
             group_report_response: None,
             group_identity_downlink: Some(group_identity_downlink),
-            group_identity_security_related_information: self.group_security_information(
-                operations
-                    .iter()
-                    .filter(|operation| !operation.detach)
-                    .map(|operation| operation.gssi),
-            ),
+            // First complete the requested scan-list change. GCK associations
+            // follow, one at a time, as Figure-20 amendments after the MS ACK.
+            // This keeps the control transaction small and independently
+            // correlatable on terminals that reject bundled associations.
+            group_identity_security_related_information: None,
         };
         let mut sdu = BitBuffer::new_autoexpand(128);
         if let Err(error) = pdu.to_bitbuf(&mut sdu) {
@@ -4135,6 +4129,7 @@ impl MmBs {
             .filter_map(|group| Some((group.gssi?, group.class_of_usage?)))
             .collect::<HashMap<_, _>>();
         let mut attached = Vec::new();
+        let mut security_groups = Vec::new();
         let mut detached = Vec::new();
         let mut results = Vec::with_capacity(pending.operations.len());
         for mut operation in pending.operations {
@@ -4158,6 +4153,7 @@ impl MmBs {
                     } else {
                         self.config.state_write().subscribers.affiliate(issi, operation.gssi);
                         attached.push(operation.gssi);
+                        security_groups.push(operation.gssi);
                     }
                 } else {
                     accepted = false;
@@ -4178,12 +4174,21 @@ impl MmBs {
         }
         let success = results.iter().all(|result| result.accepted);
         self.submit_terminal_control_result(pending.command_id, issi, pending.action, success, u8::from(!success), results, None);
+        if !security_groups.is_empty() {
+            // The acknowledgement has completed the terminal-control MM
+            // exchange. Leave one multiframe before the first Figure-20 PDU so
+            // the two identifier-less procedures cannot collide in terminal MM.
+            self.group_security_not_before
+                .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
+            self.send_group_security_association_amendments(queue, issi, 0, security_groups);
+        }
     }
 
-    /// Begin exactly one Figure-20 transaction. TTR 001-11 table 14 permits
-    /// up to thirty associations in one security element, which covers the
-    /// supported twenty-group scan list. LLC/MAC may fragment this one PDU;
-    /// its BL-ACK and the terminal's MM acknowledgement remain distinct.
+    /// Begin exactly one single-GSSI Figure-20 transaction. Table 14 permits
+    /// multiple associations, but deployed terminals have been observed to
+    /// link-acknowledge a bundled PDU without completing its MM procedure.
+    /// Serializing the associations also keeps every PDU unfragmented and its
+    /// identifier-less MM acknowledgement unambiguous.
     fn start_group_security_association_transaction(
         &mut self,
         queue: &mut MessageQueue,
@@ -4193,7 +4198,11 @@ impl MmBs {
         retries: u8,
     ) {
         debug_assert!(!self.pending_group_security_associations.contains_key(&issi));
-        let groups = self.normalized_group_security_gssis(groups);
+        let mut groups = self.normalized_group_security_gssis(groups);
+        if groups.len() > 1 {
+            let remaining = groups.split_off(1);
+            self.enqueue_group_security_associations(issi, handle, remaining, 0);
+        }
         let Some(security) = self.group_security_information(groups.iter().copied()) else {
             return;
         };
@@ -5734,8 +5743,8 @@ impl TetraEntityTrait for MmBs {
 #[cfg(test)]
 mod tests {
     use super::{
-        MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
-        sc2_ksg_number, supports_security_information_protocol,
+        GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS, MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment,
+        PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS, sc2_ksg_number, supports_security_information_protocol,
     };
     use crate::MessageQueue;
     use std::collections::HashSet;
@@ -5911,6 +5920,65 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].gssi, Some(91));
         assert!(groups[0].group_identity_detachment_uplink.is_some());
+    }
+
+    #[test]
+    fn terminal_talkgroup_control_defers_gck_association_until_after_ack() {
+        let issi = 77_493;
+        let gssi = 91;
+        let mut mm = test_sc3g_mm(issi, &[gssi]);
+        mm.client_mgr
+            .client_group_attach_with_class_of_usage(issi, gssi, false, 0)
+            .expect("test group must start detached");
+        let mut queue = MessageQueue::new();
+
+        mm.start_terminal_group_control(
+            &mut queue,
+            1,
+            issi,
+            TerminalControlAction::AmendTalkgroups,
+            vec![AttachmentOperation {
+                gssi,
+                detach: false,
+                class_of_usage: 4,
+            }],
+        );
+
+        let message = queue.pop_front().expect("group control must be queued");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let control = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid group control");
+        assert!(control.group_identity_security_related_information.is_none());
+
+        mm.complete_terminal_group_control(
+            &mut queue,
+            issi,
+            UAttachDetachGroupIdentityAcknowledgement {
+                group_identity_acknowledgement_type: false,
+                group_identity_uplink: None,
+                proprietary: None,
+            },
+        );
+        assert_eq!(mm.queued_group_security_associations[&issi].groups, HashSet::from([gssi]));
+        while let Some(message) = queue.pop_front() {
+            assert!(
+                !matches!(message.msg, SapMsgInner::LmmMleUnitdataReq(_)),
+                "association must respect the post-control guard"
+            );
+        }
+
+        mm.current_time = mm.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS);
+        mm.update_group_security_association_statuses(&mut queue);
+        let message = queue.pop_front().expect("Figure-20 association follows the guard");
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+            panic!("expected an LMM downlink request")
+        };
+        let association = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid Figure-20 PDU");
+        assert_eq!(
+            association.group_identity_security_related_information.expect("GCK association")[0].associations[0].gssi,
+            gssi
+        );
     }
 
     #[test]
@@ -6177,7 +6245,7 @@ mod tests {
     }
 
     #[test]
-    fn twenty_scanned_group_security_amendments_use_one_transactional_pdu() {
+    fn twenty_scanned_group_security_amendments_are_serialized_per_gssi() {
         let config = test_config();
         let expected_groups = (1200..1220).collect::<Vec<_>>();
         let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
@@ -6208,13 +6276,13 @@ mod tests {
 
         mm.send_group_security_association_amendments(&mut queue, issi, 0, expected_groups.iter().copied());
 
-        let message = queue.pop_front().expect("one combined amendment must be queued");
+        let message = queue.pop_front().expect("first association amendment must be queued");
         let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
             panic!("expected an LMM downlink request")
         };
-        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid combined association amendment");
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).expect("valid single association amendment");
         let groups = pdu.group_identity_downlink.expect("group amendment");
-        assert_eq!(groups.iter().filter_map(|group| group.gssi).collect::<Vec<_>>(), expected_groups);
+        assert_eq!(groups.iter().filter_map(|group| group.gssi).collect::<Vec<_>>(), vec![1200]);
         let security = pdu.group_identity_security_related_information.expect("security associations");
         assert_eq!(
             security[0]
@@ -6222,9 +6290,14 @@ mod tests {
                 .iter()
                 .map(|association| association.gssi)
                 .collect::<Vec<_>>(),
-            expected_groups
+            vec![1200]
         );
-        assert!(queue.pop_front().is_none(), "the complete association set must use one PDU");
+        assert_eq!(
+            mm.queued_group_security_associations[&issi].groups.len(),
+            expected_groups.len() - 1,
+            "the remaining associations must wait for the preceding MM ACK"
+        );
+        assert!(queue.pop_front().is_none(), "only one Figure-20 transaction may be on air");
     }
 
     #[test]
@@ -6255,7 +6328,7 @@ mod tests {
     }
 
     #[test]
-    fn figure20_empty_accept_ack_completes_the_full_offered_set() {
+    fn figure20_empty_accept_ack_advances_to_the_next_serialized_group() {
         let issi = 77_492;
         let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
         let mut queue = MessageQueue::new();
@@ -6272,8 +6345,8 @@ mod tests {
             },
         );
 
-        assert!(!mm.pending_group_security_associations.contains_key(&issi));
-        assert!(queue.pop_front().is_none());
+        assert_eq!(mm.pending_group_security_associations[&issi].groups, vec![1203]);
+        assert!(queue.pop_front().is_some(), "the next association starts after the MM ACK");
     }
 
     #[test]
@@ -6311,9 +6384,9 @@ mod tests {
     #[test]
     fn figure20_reject_ack_retries_only_explicitly_rejected_groups() {
         let issi = 77_492;
-        let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
+        let mut mm = test_sc3g_mm(issi, &[1202]);
         let mut queue = MessageQueue::new();
-        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202, 1203]);
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [1202]);
         queue.pop_front().expect("initial Figure-20 PDU");
 
         mm.complete_group_security_association_ack(
@@ -6324,7 +6397,7 @@ mod tests {
                 group_identity_uplink: Some(vec![GroupIdentityUplink {
                     class_of_usage: None,
                     group_identity_detachment_uplink: Some(0),
-                    gssi: Some(1203),
+                    gssi: Some(1202),
                     address_extension: None,
                     vgssi: None,
                 }]),
@@ -6343,7 +6416,7 @@ mod tests {
                 .iter()
                 .filter_map(|group| group.gssi)
                 .collect::<Vec<_>>(),
-            vec![1203]
+            vec![1202]
         );
     }
 
@@ -6399,11 +6472,11 @@ mod tests {
     }
 
     #[test]
-    fn registration_accept_embeds_all_known_sc3g_scan_associations() {
+    fn registration_accept_embeds_only_the_attachment_being_answered() {
         let issi = 77_492;
         let expected_groups = vec![1202, 1203, 1204];
-        let mut mm = test_sc3g_mm(issi, &expected_groups);
-        let security_groups = mm.registration_group_security_gssis(issi, Vec::new());
+        let mm = test_sc3g_mm(issi, &expected_groups);
+        let security_groups = mm.registration_group_security_gssis([1202]);
         let mut queue = MessageQueue::new();
 
         mm.send_d_location_update_accept_with_handover(
@@ -6428,12 +6501,12 @@ mod tests {
         let pdu = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid D-LOCATION UPDATE ACCEPT");
         let associations = pdu
             .group_identity_security_related_information
-            .expect("registration must embed the restored scan associations")[0]
+            .expect("registration must embed the current attachment association")[0]
             .associations
             .iter()
             .map(|association| association.gssi)
             .collect::<Vec<_>>();
-        assert_eq!(associations, expected_groups);
+        assert_eq!(associations, vec![1202]);
         assert!(
             queue.pop_front().is_none(),
             "the associations belong to the single registration PDU"
