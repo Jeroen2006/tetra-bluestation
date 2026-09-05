@@ -789,6 +789,68 @@ impl CcBsSubentity {
         }
     }
 
+    /// Re-evaluate the active group channels an MS can be listening to after
+    /// its attachment or scanning state changes.  Calls may already be in
+    /// progress when MM applies the update, so call-start tracking alone is
+    /// insufficient for routing unrelated individual signalling over SACCH.
+    fn reconcile_subscriber_group_listeners(&mut self, issi: u32) {
+        let eligible_calls: Vec<(u16, u8, u8, u32)> = self
+            .active_calls
+            .iter()
+            .filter_map(|(&call_id, call)| {
+                self.subscriber_groups
+                    .get(&issi)
+                    .is_some_and(|groups| groups.contains(&call.dest_gssi) && self.group_is_receivable(issi, call.dest_gssi))
+                    .then_some((call_id, call.ts, call.usage, call.dest_gssi))
+            })
+            .collect();
+        let eligible_keys: HashSet<(u16, u8)> = eligible_calls
+            .iter()
+            .map(|(call_id, timeslot, _, _)| (*call_id, *timeslot))
+            .collect();
+
+        let remove_empty_entry = if let Some(candidates) = self.listening_candidates.get_mut(&issi) {
+            candidates.retain(|candidate| {
+                !matches!(candidate.service, ListeningService::Group { .. })
+                    || eligible_keys.contains(&(candidate.call_id, candidate.timeslot))
+            });
+            candidates.is_empty()
+        } else {
+            false
+        };
+        if remove_empty_entry {
+            self.listening_candidates.remove(&issi);
+        }
+
+        // A connected private circuit is authoritative until it ends.  Keep
+        // any still-valid historical group hints, but do not infer that the
+        // MS moved to a newly affiliated group while it is in that call.
+        if self.private_call_is_connected_for(issi) {
+            return;
+        }
+
+        for (call_id, timeslot, usage, gssi) in eligible_calls {
+            let already_tracked = self.listening_candidates.get(&issi).is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.call_id == call_id && candidate.timeslot == timeslot)
+            });
+            if !already_tracked {
+                self.record_listening_candidate(
+                    issi,
+                    ListeningCandidate {
+                        call_id,
+                        timeslot,
+                        usage,
+                        service: ListeningService::Group { gssi },
+                        last_seen: self.dltime,
+                        confirmed: false,
+                    },
+                );
+            }
+        }
+    }
+
     /// Unique source channels on which a terminal is likely still listening
     /// to a lower-priority group call.  The terminal remains authoritative:
     /// this merely gets the new GSSI D-SETUP to the place where it can make
@@ -1019,6 +1081,7 @@ impl CcBsSubentity {
                     self.inc_group_listener(*gssi);
                 }
                 self.activate_pending_remote_swmi_calls(queue, &new_groups);
+                self.reconcile_subscriber_group_listeners(issi);
 
                 if new_groups.is_empty() {
                     tracing::debug!("CMCE: affiliate ignored (no new groups) issi={}", issi);
@@ -1054,14 +1117,17 @@ impl CcBsSubentity {
                         self.drop_group_calls_if_unlistened(queue, *gssi);
                     }
                 }
+                self.reconcile_subscriber_group_listeners(issi);
             }
             BrewSubscriberAction::ScanningState => {
                 if let Some(enabled) = scanning_enabled {
                     self.subscriber_scanning_enabled.insert(issi, enabled);
+                    self.reconcile_subscriber_group_listeners(issi);
                     tracing::info!(issi, scanning_enabled = enabled, "CMCE updated MS group-scanning reception set");
                 }
             }
         }
+        self.refresh_delivery_routes();
     }
 
     fn send_d_call_proceeding(&mut self, queue: &mut MessageQueue, message: &SapMsg, pdu_request: &USetup, call_id: u16) {
@@ -5622,6 +5688,101 @@ mod tests {
         cc.subscriber_groups.insert(430_892, HashSet::from([gssi]));
         cc.group_listeners.insert(gssi, 1);
         cc
+    }
+
+    #[test]
+    fn affiliation_during_active_call_installs_and_removes_individual_route() {
+        let gssi = 91;
+        let issi = 77_468;
+        let call_id = 4;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, call_id, 430_892, gssi, 1, 430_892, None, false, true);
+        let call = cc.active_calls.get(&call_id).expect("group call must be active").clone();
+        assert!(cc.preferred_listener_channel(issi).is_none());
+
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![gssi],
+                action: BrewSubscriberAction::Affiliate,
+                class_of_usage: vec![4],
+                scanning_enabled: None,
+            },
+        );
+
+        let route = cc.preferred_listener_channel(issi).expect("late affiliate must use active call");
+        assert_eq!(route.call_id, call_id);
+        assert_eq!(route.timeslot, call.ts);
+        assert_eq!(route.usage, call.usage);
+        {
+            let state = cc.config.state_read();
+            let cached_routes = &state.subscriber_delivery_routes[&issi];
+            assert_eq!(cached_routes.len(), 1);
+            assert_eq!(cached_routes[0].call_id, call_id);
+            assert_eq!(cached_routes[0].timeslot, call.ts);
+            assert_eq!(cached_routes[0].usage, call.usage);
+        }
+
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![gssi],
+                action: BrewSubscriberAction::Deaffiliate,
+                class_of_usage: vec![],
+                scanning_enabled: None,
+            },
+        );
+
+        assert!(cc.preferred_listener_channel(issi).is_none());
+        assert!(cc.config.state_read().subscriber_delivery_routes.get(&issi).is_none());
+    }
+
+    #[test]
+    fn scanning_change_reconciles_active_call_route() {
+        let gssi = 91;
+        let issi = 77_468;
+        let call_id = 4;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, call_id, 430_892, gssi, 1, 430_892, None, false, true);
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![gssi],
+                action: BrewSubscriberAction::Affiliate,
+                class_of_usage: vec![3],
+                scanning_enabled: None,
+            },
+        );
+        assert!(cc.preferred_listener_channel(issi).is_some());
+
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![],
+                action: BrewSubscriberAction::ScanningState,
+                class_of_usage: vec![],
+                scanning_enabled: Some(false),
+            },
+        );
+        assert!(cc.preferred_listener_channel(issi).is_none());
+
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![],
+                action: BrewSubscriberAction::ScanningState,
+                class_of_usage: vec![],
+                scanning_enabled: Some(true),
+            },
+        );
+        assert!(cc.preferred_listener_channel(issi).is_some());
     }
 
     #[test]
