@@ -28,11 +28,16 @@ use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator
 // delivery path.
 const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 4;
 const ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS: u8 = 2;
-// Keep the final basic-link transaction alive for one complete TETRA frame
-// after N.252 is exhausted. An MS can only put its BL-ACK on air a few slots
-// after receiving the last fragmented MCCH retry; expiring at the retry timer
-// boundary made that valid ACK appear as an unrelated late response.
-const FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
+// Keep a common-channel basic-link transaction alive for one complete TETRA
+// frame after N.252 is exhausted. An MS can only put its BL-ACK on air a few
+// slots after receiving the last fragmented retry.
+const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
+// An assigned-channel retry can reach an MS immediately before it returns to
+// MCCH. The MS may then send the BL-ACK through MCCH random access. ETSI
+// TS 100 392-2 annex B permits T.205 to be as short as five multiframes, so
+// retain the outstanding LLC transaction for that minimum random-access
+// window instead of classifying the valid ACK as a late duplicate.
+const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -448,8 +453,13 @@ impl Llc {
         }
     }
 
-    fn final_ack_grace_elapsed(age: i32, retry_timer: u32) -> bool {
-        age >= 0 && (age as u32) >= retry_timer.saturating_add(FINAL_ACK_GRACE_TIMESLOTS)
+    fn final_ack_grace_elapsed(age: i32, retry_timer: u32, assigned_channel: bool) -> bool {
+        let grace = if assigned_channel {
+            ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS
+        } else {
+            COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS
+        };
+        age >= 0 && (age as u32) >= retry_timer.saturating_add(grace)
     }
 
     fn mark_reporter_lost(reporter: &TxReporter) {
@@ -917,7 +927,7 @@ impl Llc {
 
                     Self::submit_for_acknowledged_transmission(&self.config, queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
                     had_activity = true;
-                } else if Self::final_ack_grace_elapsed(age, retry_timer) {
+                } else if Self::final_ack_grace_elapsed(age, retry_timer, Self::has_assigned_channel_context(ack)) {
                     // Exhausted retransmissions, flag for discard
                     removals.get_or_insert(Vec::new()).push(ack.addr.ssi);
                 }
@@ -1509,16 +1519,33 @@ mod tests {
     }
 
     #[test]
-    fn final_ack_gets_one_frame_of_grace_after_retry_exhaustion() {
+    fn final_common_channel_ack_gets_one_frame_of_grace_after_retry_exhaustion() {
         let retry_timer = T251_SENDER_RETRY_TIMER;
-        assert!(!Llc::final_ack_grace_elapsed(retry_timer as i32, retry_timer));
+        assert!(!Llc::final_ack_grace_elapsed(retry_timer as i32, retry_timer, false));
         assert!(!Llc::final_ack_grace_elapsed(
-            (retry_timer + FINAL_ACK_GRACE_TIMESLOTS - 1) as i32,
-            retry_timer
+            (retry_timer + COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS - 1) as i32,
+            retry_timer,
+            false,
         ));
         assert!(Llc::final_ack_grace_elapsed(
-            (retry_timer + FINAL_ACK_GRACE_TIMESLOTS) as i32,
-            retry_timer
+            (retry_timer + COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS) as i32,
+            retry_timer,
+            false,
+        ));
+    }
+
+    #[test]
+    fn final_assigned_channel_ack_survives_mcch_random_access_window() {
+        let retry_timer = T251_SENDER_RETRY_TIMER * ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER;
+        let observed_late_ack_age = retry_timer + 3 * 18 * 4;
+        assert!(
+            !Llc::final_ack_grace_elapsed(observed_late_ack_age as i32, retry_timer, true),
+            "a BL-ACK returning through MCCH after a call edge must remain associated with its delivery"
+        );
+        assert!(Llc::final_ack_grace_elapsed(
+            (retry_timer + ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS) as i32,
+            retry_timer,
+            true,
         ));
     }
 
