@@ -435,6 +435,18 @@ impl Llc {
         age >= 0 && (age as u32) >= retry_timer.saturating_add(FINAL_ACK_GRACE_TIMESLOTS)
     }
 
+    fn mark_reporter_lost(reporter: &TxReporter) {
+        // The last retry can be discarded or still queued after an earlier
+        // attempt reached the air.  TxReporter requires Transmitted -> Lost,
+        // so normalize the per-attempt state before completing the overall
+        // basic-link transaction.
+        if !reporter.is_transmitted() {
+            reporter.reset();
+            reporter.mark_transmitted();
+        }
+        reporter.mark_lost();
+    }
+
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
@@ -904,7 +916,7 @@ impl Llc {
                     ack.addr.ssi,
                     ack.ns
                 );
-                ack.tx_reporter.mark_lost();
+                Self::mark_reporter_lost(&ack.tx_reporter);
             }
             // The ack expires here
         }
@@ -1416,5 +1428,15 @@ mod tests {
             (retry_timer + FINAL_ACK_GRACE_TIMESLOTS) as i32,
             retry_timer
         ));
+    }
+
+    #[test]
+    fn discarded_final_attempt_reports_lost_without_panicking() {
+        let reporter = TxReporter::new();
+        reporter.mark_discarded();
+
+        Llc::mark_reporter_lost(&reporter);
+
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Lost);
     }
 }
