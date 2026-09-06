@@ -106,6 +106,10 @@ pub struct UmacBs {
     /// They retain their original UL air time and are replayed only after the
     /// authenticated SwMI response has populated the bounded runtime cache.
     pending_sc3_access: VecDeque<PendingSc3Access>,
+    /// Individually encrypted downlinks waiting for the same on-demand DCK
+    /// path. This is required after state recovery: the SwMI can restore a
+    /// subscriber before this BS has repopulated its ephemeral DCK cache.
+    pending_sc3_downlink: VecDeque<PendingSc3Downlink>,
     swmi_rf: Option<SwmiRfEndpoint>,
     rf_windows: HashMap<u32, RfWindow>,
     pending_rf_reports: HashMap<u32, UplinkRfStats>,
@@ -226,6 +230,12 @@ struct PendingSc3Access {
     message: SapMsg,
 }
 
+struct PendingSc3Downlink {
+    issi: u32,
+    expires_at: TdmaTime,
+    message: SapMsg,
+}
+
 impl UmacBs {
     pub fn new(config: SharedConfig) -> Self {
         Self::new_with_swmi(config, None)
@@ -262,6 +272,7 @@ impl UmacBs {
             duplex_private_media_timeslots: HashSet::new(),
             deferred_mcch: VecDeque::new(),
             pending_sc3_access: VecDeque::new(),
+            pending_sc3_downlink: VecDeque::new(),
             swmi_rf,
             rf_windows: HashMap::new(),
             pending_rf_reports: HashMap::new(),
@@ -1871,6 +1882,33 @@ impl UmacBs {
     fn rx_ul_tma_unitdata_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_ul_tma_unitdata_req");
 
+        let missing_downlink_dck = match &message.msg {
+            SapMsgInner::TmaUnitdataReq(prim) => match prim.air_interface_encryption {
+                Some(AieRequest::Sc3 {
+                    subject: AieSubject::Individual { issi },
+                    key: None,
+                    ..
+                }) if !self.aie_provider.has_sc3_dck(issi) => Some(issi),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(issi) = missing_downlink_dck {
+            self.aie_provider.request_sc3_dck(issi);
+            if self.pending_sc3_downlink.len() >= 64
+                && let Some(expired) = self.pending_sc3_downlink.pop_front()
+            {
+                Self::discard_pending_downlink(expired.message);
+            }
+            self.pending_sc3_downlink.push_back(PendingSc3Downlink {
+                issi,
+                expires_at: self.dltime.add_timeslots(4 * 18),
+                message,
+            });
+            tracing::info!(issi, "deferred encrypted SC3 downlink pending on-demand DCK");
+            return;
+        }
+
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
         let all_ms_traffic_broadcast = prim.stealing_permission
@@ -2273,6 +2311,15 @@ impl UmacBs {
 
         // let enqueue_ts = 1;
         // self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
+    }
+
+    fn discard_pending_downlink(message: SapMsg) {
+        if let SapMsgInner::TmaUnitdataReq(prim) = message.msg
+            && let Some(reporter) = prim.tx_reporter
+            && reporter.get_state() == tetra_core::TxState::Pending
+        {
+            reporter.mark_discarded();
+        }
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -2946,6 +2993,23 @@ impl TetraEntityTrait for UmacBs {
             self.rx_tmv_prim(queue, message);
         }
 
+        let mut waiting = VecDeque::new();
+        let mut ready = Vec::new();
+        while let Some(pending) = self.pending_sc3_downlink.pop_front() {
+            if self.aie_provider.has_sc3_dck(pending.issi) {
+                ready.push(pending.message);
+            } else if pending.expires_at.age(ts) < 0 {
+                waiting.push_back(pending);
+            } else {
+                tracing::warn!(issi = pending.issi, "expired deferred SC3 downlink without a DCK response");
+                Self::discard_pending_downlink(pending.message);
+            }
+        }
+        self.pending_sc3_downlink = waiting;
+        for message in ready {
+            self.rx_tma_prim(queue, message);
+        }
+
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
 
@@ -3167,6 +3231,77 @@ mod tests {
         umac.tick_start(&mut MessageQueue::new(), tick);
 
         assert!(umac.deferred_mcch.is_empty());
+    }
+
+    #[test]
+    fn missing_sc3_dck_defers_downlink_until_key_arrives() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let config = SharedConfig::from_parts(config, None);
+        let issi = 430_904;
+        config.state_write().aie.sc3 = Some(tetra_config::bluestation::RuntimeSc3Aie::new(
+            tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea1,
+            1,
+            [0x11; 10],
+            true,
+            true,
+        ));
+        let mut umac = UmacBs::new(config.clone());
+        let reporter = TxReporter::new();
+        let mut queue = MessageQueue::new();
+        umac.rx_tma_prim(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("00010010"),
+                    main_address: TetraAddress::issi(issi),
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: Some(AieRequest::sc3(
+                        AieSubject::Individual { issi },
+                        AieScope::MacResource,
+                    )),
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: Some(reporter.clone()),
+                }),
+            ),
+        );
+
+        assert_eq!(umac.pending_sc3_downlink.len(), 1);
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert!(!umac.aie_provider.request_sc3_dck(issi), "DCK request must be coalesced");
+
+        config
+            .state_write()
+            .aie
+            .sc3
+            .as_mut()
+            .expect("SC3 configured")
+            .install_dck(
+                issi,
+                tetra_config::bluestation::RuntimeSc3Dck::new([0x22; 16], [0x33; 10], true, None),
+            );
+        let tick = TdmaTime::default().add_timeslots(1);
+        umac.tick_start(&mut queue, tick);
+
+        assert!(umac.pending_sc3_downlink.is_empty());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert!(
+            umac.channel_scheduler
+                .dl_take_prioritized_sched_item(TdmaTime { t: 1, f: 2, m: 1, h: 0 })
+                .is_some()
+        );
     }
 
     #[test]
