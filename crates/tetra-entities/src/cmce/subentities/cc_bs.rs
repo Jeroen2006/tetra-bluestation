@@ -853,6 +853,18 @@ impl CcBsSubentity {
         }
     }
 
+    /// Rebuild listener candidates after a call disappears. Candidate history
+    /// is intentionally bounded, so short-lived calls can otherwise evict a
+    /// still-active lower-priority bearer and leave an MS on TCH with only an
+    /// MCCH SDS route.
+    fn reconcile_all_subscriber_group_listeners(&mut self) {
+        let subscribers: Vec<u32> = self.subscriber_groups.keys().copied().collect();
+        for issi in subscribers {
+            self.reconcile_subscriber_group_listeners(issi);
+        }
+        self.refresh_delivery_routes();
+    }
+
     /// Unique source channels on which a terminal is likely still listening
     /// to a lower-priority group call.  The terminal remains authoritative:
     /// this merely gets the new GSSI D-SETUP to the place where it can make
@@ -2168,6 +2180,7 @@ impl CcBsSubentity {
                         self.pending_restore_floor_indications
                             .retain(|(pending_call_id, _), _| *pending_call_id != call_id);
                         self.active_calls.remove(&call_id);
+                        self.reconcile_all_subscriber_group_listeners();
 
                         // Signal UMAC to release the circuit
                         Self::signal_umac_circuit_close(queue, circuit);
@@ -3780,6 +3793,7 @@ impl CcBsSubentity {
         let Some(call) = self.active_calls.remove(&call_id) else {
             return;
         };
+        self.reconcile_all_subscriber_group_listeners();
         let ts = call.ts;
         let dest_gssi = call.dest_gssi;
         let source_issi = call.source_issi;
@@ -5779,6 +5793,38 @@ mod tests {
 
         assert!(cc.preferred_listener_channel(issi).is_none());
         assert!(cc.config.state_read().subscriber_delivery_routes.get(&issi).is_none());
+    }
+
+    #[test]
+    fn ending_preferred_call_restores_remaining_listener_route() {
+        let issi = 77_468;
+        let mut cc = test_cc_with_group(91);
+        let mut queue = MessageQueue::new();
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi,
+                groups: vec![91, 92],
+                action: BrewSubscriberAction::Affiliate,
+                class_of_usage: vec![4, 5],
+                scanning_enabled: None,
+            },
+        );
+        cc.start_remote_swmi_call(&mut queue, 7, 430_892, 91, 1, 430_892, None, false, true);
+        cc.start_remote_swmi_call(&mut queue, 8, 430_893, 92, 2, 430_893, None, false, true);
+
+        assert_eq!(cc.preferred_listener_channel(issi).map(|route| route.call_id), Some(8));
+        cc.release_call(&mut queue, 8, DisconnectCause::SwmiRequestedDisconnection);
+
+        let route = cc
+            .preferred_listener_channel(issi)
+            .expect("remaining active scanned call must become the SDS route");
+        assert_eq!(route.call_id, 7);
+        assert_eq!(
+            cc.config.state_read().subscriber_delivery_routes[&issi][0].call_id,
+            7,
+            "LLC route cache must be refreshed immediately when the preferred call ends"
+        );
     }
 
     #[test]

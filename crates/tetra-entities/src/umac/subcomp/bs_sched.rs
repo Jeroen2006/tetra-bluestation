@@ -1928,10 +1928,14 @@ impl BsChannelScheduler {
         // If any signalling could not be sent this slot, it should be in the next slot queue
         // Swap next slot queue into current slot queue, to schedule it for next frame
         if !self.dltx_next_slot_queue.is_empty() {
-            let a = &mut self.dltx_queues[ts.t as usize - 1];
-            let b = &mut self.dltx_next_slot_queue;
-            assert!(a.is_empty(), "queue should be empty");
-            std::mem::swap(a, b);
+            let queue = &mut self.dltx_queues[ts.t as usize - 1];
+            // A missing acknowledgement grant stops this block early. Keep
+            // both the element that requested the unavailable grant and every
+            // lower-priority element which has not been visited yet. A full
+            // uplink schedule is transient and must not turn queued SDS into
+            // either a scheduler panic or a dropped TxReporter.
+            self.dltx_next_slot_queue.append(queue);
+            std::mem::swap(queue, &mut self.dltx_next_slot_queue);
         }
 
         if let Some(buf) = buf_opt.as_mut() {
@@ -3575,6 +3579,67 @@ mod tests {
                 .is_some()
         );
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+    }
+
+    #[test]
+    fn full_hangtime_uplink_schedule_defers_all_pending_signalling() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 3;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 45,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(timeslot, true);
+
+        // Force every ordinary uplink grant opportunity to be occupied. The
+        // reliable resource cannot be sent until a BL-ACK slot is available.
+        for slot in &mut sched.ulsched[timeslot as usize - 1] {
+            slot.ul1 = Some(90_001);
+            slot.ul2 = Some(90_001);
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("10101010"),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::issi(77_479), None, false),
+            BitBuffer::from_bitstr("01010101"),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: 77_479 }, AieScope::MacResource),
+        );
+
+        let facch_time = TdmaTime {
+            t: timeslot,
+            f: 5,
+            m: 4,
+            h: 0,
+        };
+        sched.cur_dltime = facch_time.add_timeslots(-1);
+        let _ = sched.finalize_ts_for_tick();
+
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert_eq!(sched.dltx_queues[timeslot as usize - 1].len(), 2);
+        assert!(sched.dltx_next_slot_queue.is_empty());
     }
 
     #[test]
