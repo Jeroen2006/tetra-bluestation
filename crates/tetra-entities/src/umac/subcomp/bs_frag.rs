@@ -2,6 +2,7 @@ use std::cmp::min;
 
 use crate::umac::subcomp::fillbits;
 use tetra_core::{AieRequest, AieScope, BitBuffer, TxReporter};
+use tetra_pdus::umac::fields::basic_slotgrant::BasicSlotgrant;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START;
 use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource};
@@ -10,6 +11,12 @@ use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_r
 pub struct BsFragger {
     resource: MacResource,
     chan_alloc: Option<ChanAllocElement>,
+    /// A slot grant selected at the actual transmission time of the final
+    /// fragment.  For acknowledged fragmented downlinks the MS can only form
+    /// its BL-ACK after MAC-END, so granting capacity in MAC-RESOURCE would be
+    /// too early.
+    final_slot_grant: Option<BasicSlotgrant>,
+    final_slot_grant_required: bool,
     mac_hdr_is_written: bool,
     is_fully_transmitted: bool,
     sdu: BitBuffer,
@@ -52,6 +59,8 @@ impl BsFragger {
         BsFragger {
             resource,
             chan_alloc: None,
+            final_slot_grant: None,
+            final_slot_grant_required: false,
             mac_hdr_is_written: false,
             is_fully_transmitted: false,
             sdu,
@@ -63,6 +72,52 @@ impl BsFragger {
 
     pub fn take_cipher_region(&mut self) -> Option<MacCipherRegion> {
         self.last_cipher_region.take()
+    }
+
+    /// Return whether the pending fragment chain can finish in one MAC-END
+    /// carrying an eight-bit basic slot grant.
+    pub fn can_finish_with_slot_grant(&self, slot_cap_bits: usize) -> bool {
+        if !self.mac_hdr_is_written || self.is_fully_transmitted {
+            return false;
+        }
+        let macend_len_bits = MacEndDl::compute_hdr_len(None, self.chan_alloc.clone()) + 8 + self.sdu.get_len_remaining();
+        macend_len_bits.div_ceil(8) * 8 <= slot_cap_bits
+    }
+
+    pub fn set_final_slot_grant(&mut self, grant: BasicSlotgrant) {
+        assert!(self.mac_hdr_is_written, "a final-fragment grant requires an active fragment chain");
+        assert!(
+            !self.is_fully_transmitted,
+            "cannot grant capacity for an already completed fragment chain"
+        );
+        self.final_slot_grant = Some(grant);
+    }
+
+    pub fn require_final_slot_grant(&mut self) {
+        assert!(self.mac_hdr_is_written, "a final-fragment grant requires an active fragment chain");
+        self.final_slot_grant_required = true;
+    }
+
+    pub fn expects_ack(&self) -> bool {
+        self.tx_reporter.as_ref().is_some_and(TxReporter::expects_ack)
+    }
+
+    pub fn individual_issi(&self) -> Option<u32> {
+        match self.aie_request {
+            AieRequest::Clear {
+                subject: tetra_core::AieSubject::Individual { issi },
+                ..
+            }
+            | AieRequest::Sc2 {
+                subject: tetra_core::AieSubject::Individual { issi },
+                ..
+            }
+            | AieRequest::Sc3 {
+                subject: tetra_core::AieSubject::Individual { issi },
+                ..
+            } => Some(issi),
+            _ => None,
+        }
     }
 
     /// Writes MAC-RESOURCE to dest_buf, starting fragmentation if needed.
@@ -201,20 +256,26 @@ impl BsFragger {
         let chunk_start = mac_block.get_pos();
         // Check if we can fit all in a MAC-END message
         let sdu_bits = self.sdu.get_len_remaining();
-        let macend_len_bits = MacEndDl::compute_hdr_len(None, self.chan_alloc.clone()) + sdu_bits;
+        let reserved_slot_grant_bits = usize::from(self.final_slot_grant_required && self.final_slot_grant.is_none()) * 8;
+        let macend_len_bits =
+            MacEndDl::compute_hdr_len(self.final_slot_grant.clone(), self.chan_alloc.clone()) + reserved_slot_grant_bits + sdu_bits;
         let macend_len_bytes = (macend_len_bits + 7) / 8;
         let slot_cap_bits = mac_block.get_len_remaining();
 
         // tracing::trace!("MAC-END would have length: {} bits, {} bytes, slot capacity: {} bits",
         //     macend_len_bits, macend_len_bytes, slot_cap);
         if macend_len_bytes * 8 <= slot_cap_bits {
+            if self.final_slot_grant_required && self.final_slot_grant.is_none() {
+                tracing::debug!("-> final MAC-END awaits an actual-time slot grant");
+                return false;
+            }
             // Fits in single MAC-END
             let num_fill_bits = fillbits::addition::compute_required(macend_len_bits, slot_cap_bits);
             let mut pdu = MacEndDl {
                 fill_bits: num_fill_bits > 0,
                 pos_of_grant: 0,
                 length_ind: macend_len_bytes as u8,
-                slot_granting_element: None,
+                slot_granting_element: self.final_slot_grant.take(),
                 chan_alloc_element: None,
             };
 
@@ -240,7 +301,7 @@ impl BsFragger {
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
             let clear_header = MacEndDl::compute_hdr_len(None, None);
-            let full_header = MacEndDl::compute_hdr_len(None, pdu.chan_alloc_element.clone());
+            let full_header = MacEndDl::compute_hdr_len(pdu.slot_granting_element.clone(), pdu.chan_alloc_element.clone());
             self.last_cipher_region = Some(MacCipherRegion {
                 request: self.aie_request.with_scope(AieScope::MacFragment),
                 start: chunk_start + clear_header,

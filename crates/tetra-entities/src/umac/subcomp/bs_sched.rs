@@ -1055,24 +1055,33 @@ impl BsChannelScheduler {
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
             DlSchedElem::Resource(mut pdu, sdu, reporter, aie_request) => {
-                // Build the BL-ACK grant from the FN18 that is actually being
-                // transmitted. The queue can survive mandatory BSCH/BNCH
-                // frames, so an enqueue-time reservation may point one
-                // multiframe too early.
-                if pdu.slot_granting_element.is_none()
-                    && reporter.as_ref().is_some_and(|tx| tx.expects_ack())
-                    && let Some(addr) = pdu.addr
+                let acknowledged_addr = reporter.as_ref().is_some_and(TxReporter::expects_ack).then_some(pdu.addr).flatten();
+                // TTR 001-01 14.1.14 permits a current-channel grant in either
+                // MAC-RESOURCE or MAC-END.  Grant in MAC-RESOURCE only when
+                // the complete BL-DATA fits there.  A fragmented SDS cannot
+                // be acknowledged until MAC-END, so its grant is added at the
+                // actual transmission time of that final fragment below.
+                let resource_len_with_grant = pdu.compute_header_len()
+                    + usize::from(pdu.slot_granting_element.is_none() && acknowledged_addr.is_some()) * 8
+                    + sdu.get_len();
+                let resource_fill = fillbits::addition::compute_required(resource_len_with_grant, SCH_F_CAP);
+                let completes_in_resource = resource_len_with_grant + resource_fill <= SCH_F_CAP;
+                if completes_in_resource
+                    && pdu.slot_granting_element.is_none()
+                    && let Some(addr) = acknowledged_addr
                 {
-                    pdu.slot_granting_element = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr);
-                    if pdu.slot_granting_element.is_some() {
-                        pdu.update_len_and_fill_ind(sdu.get_len());
-                        tracing::info!(
-                            dltime = %ts,
-                            address = ?addr,
-                            grant = ?pdu.slot_granting_element,
-                            "prepared FN18 basic-link acknowledgement grant at actual transmission time"
-                        );
-                    }
+                    let Some(grant) = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr) else {
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::Resource(pdu, sdu, reporter, aie_request));
+                        return None;
+                    };
+                    tracing::info!(
+                        dltime = %ts,
+                        address = ?addr,
+                        grant = ?grant,
+                        "prepared FN18 basic-link acknowledgement grant in complete MAC-RESOURCE"
+                    );
+                    pdu.slot_granting_element = Some(grant);
+                    pdu.update_len_and_fill_ind(sdu.get_len());
                 }
                 tracing::debug!(
                     dltime = %ts,
@@ -1099,11 +1108,33 @@ impl BsChannelScheduler {
                     if written_before == 0 && buf.get_len_written() == 0 {
                         tracing::warn!(dltime = %ts, "dropping associated MAC resource that cannot make progress in an empty SCH/F");
                     } else {
+                        if acknowledged_addr.is_some() {
+                            fragger.require_final_slot_grant();
+                        }
                         self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
                     }
                 }
             }
             DlSchedElem::FragBuf(mut fragger) => {
+                if fragger.expects_ack() && fragger.can_finish_with_slot_grant(buf.get_len_remaining()) {
+                    let Some(issi) = fragger.individual_issi() else {
+                        tracing::warn!(dltime = %ts, "associated acknowledged fragment has no individual address for its MAC-END grant");
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        return None;
+                    };
+                    let addr = TetraAddress::issi(issi);
+                    let Some(grant) = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr) else {
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        return None;
+                    };
+                    tracing::info!(
+                        dltime = %ts,
+                        address = ?addr,
+                        grant = ?grant,
+                        "prepared FN18 basic-link acknowledgement grant in final MAC-END"
+                    );
+                    fragger.set_final_slot_grant(grant);
+                }
                 let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
@@ -1258,7 +1289,24 @@ impl BsChannelScheduler {
         if (1..=4).contains(&ts) {
             self.hangtime[ts as usize - 1] = false;
         }
-        self.circuits.close_circuit(dir, ts)
+        let closed = self.circuits.close_circuit(dir, ts);
+
+        // An associated basic link exists only while its physical resource
+        // allocation exists (ETSI TS 100 392-2 clause 22.3.2.1).  A resource
+        // can be queued for the next usable FN18 when both directions of the
+        // circuit are closed.  Report that queued transmission as discarded;
+        // otherwise LLC never receives a MAC completion, never starts its
+        // retry handling, and every later acknowledged PDU for the SSI remains
+        // blocked behind the orphaned item indefinitely.
+        if closed.is_some()
+            && (1..=4).contains(&ts)
+            && !self.circuits.is_active(Direction::Dl, ts)
+            && !self.circuits.is_active(Direction::Ul, ts)
+        {
+            self.dl_drop_associated_control(ts);
+        }
+
+        closed
     }
 
     pub fn create_circuit(&mut self, dir: Direction, circuit: Circuit) {
@@ -1403,6 +1451,33 @@ impl BsChannelScheduler {
         }
 
         item_was_discarded
+    }
+
+    /// Discard control waiting on an associated basic link whose circuit has
+    /// been removed.  Resource reporters wake LLC so the same TL-SDU can be
+    /// retried on a currently available link (normally MCCH).  Dropping a
+    /// partial fragger performs the same notification in `BsFragger::drop`.
+    fn dl_drop_associated_control(&mut self, timeslot: u8) -> bool {
+        let queued = std::mem::take(&mut self.assoc_dltx_queues[timeslot as usize - 1]);
+        let had_items = !queued.is_empty();
+
+        for elem in queued {
+            tracing::warn!(
+                dltime = %self.cur_dltime,
+                ts = timeslot,
+                element = ?elem,
+                "discarding associated control after circuit removal"
+            );
+
+            if let DlSchedElem::Resource(_, _, Some(tx_reporter), _) = &elem
+                && tx_reporter.get_state() == tetra_core::TxState::Pending
+            {
+                tx_reporter.mark_discarded();
+            }
+            // `FragBuf` marks a still-pending reporter discarded on drop.
+        }
+
+        had_items
     }
 
     pub fn dl_integrate_sched_elems_for_timeslot(&mut self, ts: TdmaTime) {
@@ -2302,7 +2377,7 @@ mod tests {
             fields::{
                 sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA, sysinfo_ext_services::SysinfoExtendedServices,
             },
-            pdus::{mac_sync::MacSync, mac_sysinfo::MacSysinfo},
+            pdus::{mac_end_dl::MacEndDl, mac_sync::MacSync, mac_sysinfo::MacSysinfo},
         },
     };
 
@@ -2900,6 +2975,118 @@ mod tests {
             "ACK reservation must follow the actual transmitted FN18 grant"
         );
         assert!(sched.assoc_dltx_queues[1].is_empty());
+    }
+
+    #[test]
+    fn fragmented_associated_downlink_grants_ack_in_final_mac_end() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 37,
+                    direction,
+                    ts: 3,
+                    usage: 40,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"10".repeat(115)[..229]),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let first_time = TdmaTime { t: 3, f: 18, m: 3, h: 0 };
+        assert!(!first_time.is_mandatory_bsch() && !first_time.is_mandatory_bnch());
+        let mut first = sched
+            .dl_build_associated_control_block(first_time)
+            .expect("first associated fragment");
+        first.seek(0);
+        let resource = MacResource::from_bitbuf(&mut first).expect("fragmented MAC-RESOURCE");
+        assert_eq!(
+            resource.length_ind,
+            tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START
+        );
+        assert!(resource.slot_granting_element.is_none(), "the MS cannot acknowledge before MAC-END");
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert_eq!(sched.ul_get_slot_owner(first_time, PhyBlockNum::Block1), None);
+        assert_eq!(sched.ul_get_slot_owner(first_time, PhyBlockNum::Block2), None);
+
+        let mut final_time = first_time.add_timeslots(18 * 4);
+        while final_time.is_mandatory_bsch() || final_time.is_mandatory_bnch() {
+            final_time = final_time.add_timeslots(18 * 4);
+        }
+        let mut final_block = sched
+            .dl_build_associated_control_block(final_time)
+            .expect("final associated fragment");
+        final_block.seek(0);
+        let end = MacEndDl::from_bitbuf(&mut final_block).expect("MAC-END with acknowledgement grant");
+        let grant = end.slot_granting_element.expect("final MAC-END must grant the BL-ACK response");
+        let granted_block = match grant.capacity_allocation {
+            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
+            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
+            allocation => panic!("unexpected associated ACK allocation: {:?}", allocation),
+        };
+        assert_eq!(sched.ul_get_slot_owner(final_time, granted_block), Some(addr.ssi));
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+        assert!(sched.assoc_dltx_queues[2].is_empty());
+    }
+
+    #[test]
+    fn closing_assigned_link_discards_queued_associated_control() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 2;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 7,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::new(0),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        // The associated link still exists while one circuit direction is
+        // active, so closing only DL must not discard its queued control.
+        assert!(sched.close_circuit(Direction::Dl, timeslot).is_some());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert_eq!(sched.assoc_dltx_queues[timeslot as usize - 1].len(), 1);
+
+        // Closing the last direction removes the associated basic link.  The
+        // queued PDU must be reported to LLC instead of becoming immortal.
+        assert!(sched.close_circuit(Direction::Ul, timeslot).is_some());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+        assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
     }
 
     #[test]

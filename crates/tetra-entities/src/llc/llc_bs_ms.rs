@@ -353,7 +353,12 @@ impl Llc {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
         let mut sapmsg = ack.retransmission_buf.clone();
         if ack.retransmit_count > 0 {
-            let route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
+            let untried_route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
+            // Try every other live listener route first.  Once those have all
+            // been attempted, retain a still-active associated basic link;
+            // an MS on TCH is not expected to hear an MCCH retry.
+            let reusing_active_route = untried_route.is_none();
+            let route = untried_route.or_else(|| Self::delivery_route(config, ack.addr.ssi, dltime, &HashSet::new()));
             if let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg {
                 req.associated_channel = route;
                 if let Some(route) = route {
@@ -362,7 +367,8 @@ impl Llc {
                     tracing::info!(
                         issi = ack.addr.ssi,
                         timeslot = route.timeslot,
-                        "retrying acknowledged downlink on refreshed listener timeslot"
+                        reused = reusing_active_route,
+                        "retrying acknowledged downlink on active listener timeslot"
                     );
                 } else {
                     // No other valid traffic listener remains.  UMAC will use
@@ -1142,6 +1148,140 @@ mod tests {
         assert_eq!(route.call_id, 7);
         assert_eq!(route.timeslot, 2);
         assert_eq!(route.usage, 10);
+    }
+
+    #[test]
+    fn discarded_associated_downlink_retries_over_mcch() {
+        let config = test_config();
+        let issi = 77_468;
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        config.state_write().subscriber_delivery_routes.insert(
+            issi,
+            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 7,
+                timeslot: 2,
+                usage: 10,
+            }],
+        );
+
+        let mut llc = Llc::new(config.clone());
+        llc.dltime = start;
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(issi),
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: BitBuffer::from_bitstr("1010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        let first = queue.pop_front().expect("associated attempt queued");
+        let SapMsgInner::TmaUnitdataReq(first) = first.msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(2));
+
+        // UMAC removes the assigned basic link before its queued FN18 and
+        // reports the item as discarded.  Once that route disappears, LLC's
+        // retry must use the surviving common-control basic link.
+        llc.outbound_messages[0].tx_reporter.mark_discarded();
+        config.state_write().subscriber_delivery_routes.remove(&issi);
+        llc.dltime = start.add_timeslots(1);
+        assert!(!llc.submit_retransmissions_to_umac(&mut queue));
+        let retry_timer = Llc::basic_link_retry_timer(&llc.outbound_messages[0]);
+        llc.dltime = llc.dltime.add_timeslots(retry_timer as i32);
+        assert!(llc.submit_retransmissions_to_umac(&mut queue));
+
+        let retry = queue.pop_front().expect("MCCH retry queued");
+        let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
+            panic!("expected TMA retry")
+        };
+        assert!(retry.associated_channel.is_none());
+        assert_eq!(llc.outbound_messages[0].retransmit_count, 1);
+    }
+
+    #[test]
+    fn unacknowledged_associated_downlink_reuses_live_listener_route() {
+        let config = test_config();
+        let issi = 77_479;
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        config.state_write().subscriber_delivery_routes.insert(
+            issi,
+            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 8,
+                timeslot: 3,
+                usage: 11,
+            }],
+        );
+
+        let mut llc = Llc::new(config);
+        llc.dltime = start;
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(issi),
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: BitBuffer::from_bitstr("1010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        let first = queue.pop_front().expect("associated attempt queued");
+        let SapMsgInner::TmaUnitdataReq(first) = first.msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(3));
+
+        llc.outbound_messages[0].tx_reporter.mark_transmitted();
+        llc.dltime = start.add_timeslots(1);
+        assert!(!llc.submit_retransmissions_to_umac(&mut queue));
+        let retry_timer = Llc::basic_link_retry_timer(&llc.outbound_messages[0]);
+        llc.dltime = llc.dltime.add_timeslots(retry_timer as i32);
+        assert!(llc.submit_retransmissions_to_umac(&mut queue));
+
+        let retry = queue.pop_front().expect("associated retry queued");
+        let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
+            panic!("expected TMA retry")
+        };
+        let route = retry.associated_channel.expect("live listener route must be retained");
+        assert_eq!(route.call_id, 8);
+        assert_eq!(route.timeslot, 3);
+        assert_eq!(route.usage, 11);
     }
 
     #[test]
