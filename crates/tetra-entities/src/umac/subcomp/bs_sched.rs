@@ -1227,6 +1227,11 @@ impl BsChannelScheduler {
                     Ok(pdu) => pdu,
                     Err(error) => {
                         tracing::warn!(dltime = %ts, ?error, "dropping associated MAC resource without a valid AIE context");
+                        if let Some(reporter) = reporter.as_ref()
+                            && reporter.get_state() == tetra_core::TxState::Pending
+                        {
+                            reporter.mark_discarded();
+                        }
                         return None;
                     }
                 };
@@ -1834,6 +1839,11 @@ impl BsChannelScheduler {
                                 Ok(pdu) => pdu,
                                 Err(error) => {
                                     tracing::warn!(dltime = %ts, ?error, "dropping MAC resource without a valid AIE context");
+                                    if let Some(reporter) = tx_reporter.as_ref()
+                                        && reporter.get_state() == tetra_core::TxState::Pending
+                                    {
+                                        reporter.mark_discarded();
+                                    }
                                     buf_opt = Some(buf);
                                     continue;
                                 }
@@ -2818,6 +2828,76 @@ mod tests {
         let mut sched = BsChannelScheduler::new(1, precomps);
         sched.set_dl_time(TdmaTime::default().add_timeslots(2));
         sched
+    }
+
+    fn enable_test_sc3(sched: &mut BsChannelScheduler) {
+        sched.set_aie_config(&RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(tetra_config::bluestation::RuntimeSc3Aie::new(
+                tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea3,
+                23,
+                [0x6c; 10],
+                true,
+                false,
+            )),
+            rollover: None,
+        });
+    }
+
+    #[test]
+    fn missing_dck_discards_mcch_reporter() {
+        let mut sched = get_testing_slotter();
+        enable_test_sc3(&mut sched);
+        let addr = TetraAddress::issi(77_468);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_tma(
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("1010"),
+            Some(reporter.clone()),
+            AieRequest::sc3(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let _ = sched.dl_build_block_from_signalling_schedule(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+    }
+
+    #[test]
+    fn missing_dck_discards_associated_reporter() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        enable_test_sc3(&mut sched);
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 1,
+                    direction,
+                    ts: 2,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        let addr = TetraAddress::issi(77_468);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("1010"),
+            Some(reporter.clone()),
+            AieRequest::sc3(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let _ = sched.dl_build_associated_control_block(TdmaTime { t: 2, f: 18, m: 2, h: 0 });
+
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
     }
 
     #[test]
