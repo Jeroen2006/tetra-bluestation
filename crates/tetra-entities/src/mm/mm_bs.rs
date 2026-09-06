@@ -3501,6 +3501,15 @@ impl MmBs {
             );
             return;
         }
+        // Cause 2 is the SwMI's explicit "unknown terminal" result. This can
+        // happen after the BS and SwMI have both restarted while the MS still
+        // considers its registration valid. Reject the stale attachment as
+        // requested, then use the infrastructure-initiated MM recovery from
+        // TS 100 392-2 clause 16.4.3 to make the MS register and report its
+        // groups again.
+        let registration_recovery_required = results
+            .iter()
+            .any(|result| !result.accepted && result.cause == 2);
 
         let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending, results);
@@ -3520,6 +3529,14 @@ impl MmBs {
         );
         if !inline_security {
             self.send_group_security_association_amendments(queue, pending.itsi, pending.air_handle, security_groups);
+        }
+        if registration_recovery_required {
+            self.send_d_location_update_command(queue, pending.itsi, pending.air_handle, true);
+            tracing::warn!(
+                command_id,
+                issi = pending.itsi,
+                "SwMI does not know attaching MS; requested fresh location update and group report"
+            );
         }
         tracing::info!(
             command_id,
@@ -5752,11 +5769,12 @@ mod tests {
     use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
     use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+    use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
     use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
     use tetra_saps::SapMsgInner;
     use tetra_swmi_protocol::{
-        AieLocationUpdateDecision, AttachmentOperation, EnergyEconomyAssignment, TerminalControlAction, TerminalInformation,
-        TerminalSecurityClass,
+        AieLocationUpdateDecision, AttachmentOperation, AttachmentResult, EnergyEconomyAssignment, TerminalControlAction,
+        TerminalInformation, TerminalSecurityClass,
     };
 
     fn test_config() -> SharedConfig {
@@ -6687,6 +6705,58 @@ mod tests {
             "an identical snapshot must not deaffiliate, reaffiliate or amend GCK state"
         );
         assert_eq!(mm.client_mgr.client_group_class_of_usage(issi, 1202), Some(4));
+    }
+
+    #[test]
+    fn unknown_terminal_attachment_requests_fresh_location_update() {
+        let issi = 77_468;
+        let command_id = 41;
+        let operation = AttachmentOperation {
+            gssi: 204,
+            detach: false,
+            class_of_usage: 4,
+        };
+        let mut mm = MmBs::new(test_config(), None, None, None);
+        mm.pending_attachments.insert(
+            command_id,
+            PendingAttachment {
+                itsi: issi,
+                air_handle: 7,
+                replace_all: false,
+                operations: vec![GroupIdentityUplink {
+                    class_of_usage: Some(4),
+                    group_identity_detachment_uplink: None,
+                    gssi: Some(204),
+                    address_extension: None,
+                    vgssi: None,
+                }],
+            },
+        );
+        let mut queue = MessageQueue::new();
+
+        mm.apply_swmi_attachment_decision(
+            &mut queue,
+            command_id,
+            u64::from(issi),
+            7,
+            true,
+            vec![AttachmentResult {
+                operation,
+                accepted: false,
+                cause: 2,
+            }],
+        );
+
+        let location_update = queue.iter_mut().find_map(|message| {
+            let SapMsgInner::LmmMleUnitdataReq(request) = &mut message.msg else {
+                return None;
+            };
+            DLocationUpdateCommand::from_bitbuf(&mut request.sdu).ok()
+        });
+        assert!(
+            location_update.is_some_and(|command| command.group_identity_report),
+            "unknown terminal rejection must trigger a complete registration and group report"
+        );
     }
 
     #[test]
