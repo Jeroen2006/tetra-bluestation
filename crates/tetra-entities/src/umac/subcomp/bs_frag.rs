@@ -74,23 +74,41 @@ impl BsFragger {
         self.last_cipher_region.take()
     }
 
-    /// Return whether the pending fragment chain can finish in one MAC-END
-    /// carrying an eight-bit basic slot grant.
+    /// Return whether the pending delivery can finish in one MAC-RESOURCE or
+    /// MAC-END carrying an eight-bit basic slot grant.
     pub fn can_finish_with_slot_grant(&self, slot_cap_bits: usize) -> bool {
-        if !self.mac_hdr_is_written || self.is_fully_transmitted {
+        if self.is_fully_transmitted {
             return false;
+        }
+        if !self.mac_hdr_is_written {
+            let resource_len_bits = self.resource.compute_header_len()
+                + usize::from(self.resource.slot_granting_element.is_none()) * 8
+                + self.sdu.get_len_remaining();
+            let fill_bits = fillbits::addition::compute_required(resource_len_bits, slot_cap_bits);
+            return resource_len_bits + fill_bits <= slot_cap_bits;
         }
         let macend_len_bits = MacEndDl::compute_hdr_len(None, self.chan_alloc.clone()) + 8 + self.sdu.get_len_remaining();
         macend_len_bits.div_ceil(8) * 8 <= slot_cap_bits
     }
 
-    pub fn set_final_slot_grant(&mut self, grant: BasicSlotgrant) {
-        assert!(self.mac_hdr_is_written, "a final-fragment grant requires an active fragment chain");
+    pub fn set_completion_slot_grant(&mut self, grant: BasicSlotgrant) {
         assert!(
             !self.is_fully_transmitted,
             "cannot grant capacity for an already completed fragment chain"
         );
-        self.final_slot_grant = Some(grant);
+        if self.mac_hdr_is_written {
+            self.final_slot_grant = Some(grant);
+        } else {
+            assert!(
+                self.resource.slot_granting_element.is_none(),
+                "cannot replace a slot grant on an unstarted MAC-RESOURCE"
+            );
+            self.resource.slot_granting_element = Some(grant);
+        }
+    }
+
+    pub fn has_started(&self) -> bool {
+        self.mac_hdr_is_written
     }
 
     pub fn require_final_slot_grant(&mut self) {

@@ -1246,7 +1246,7 @@ impl BsChannelScheduler {
                     if written_before == 0 && buf.get_len_written() == 0 {
                         tracing::warn!(dltime = %ts, "dropping associated MAC resource that cannot make progress in an empty SCH/F");
                     } else {
-                        if acknowledged_addr.is_some() {
+                        if acknowledged_addr.is_some() && fragger.has_started() {
                             fragger.require_final_slot_grant();
                         }
                         self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
@@ -1271,7 +1271,7 @@ impl BsChannelScheduler {
                         grant = ?grant,
                         "prepared FN18 basic-link acknowledgement grant in final MAC-END"
                     );
-                    fragger.set_final_slot_grant(grant);
+                    fragger.set_completion_slot_grant(grant);
                 }
                 let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
@@ -1861,7 +1861,7 @@ impl BsChannelScheduler {
                                 } else {
                                     // Fragmentation was started, or a partially
                                     // occupied block caused a valid deferral.
-                                    if facch_ack_addr.is_some() {
+                                    if facch_ack_addr.is_some() && fragger.has_started() {
                                         fragger.require_final_slot_grant();
                                     }
                                     self.dl_enqueue_tma_frag_next_frame(fragger);
@@ -1896,7 +1896,7 @@ impl BsChannelScheduler {
                                     grant = ?grant,
                                     "prepared FACCH basic-link acknowledgement grant in final MAC-END"
                                 );
-                                fragger.set_final_slot_grant(grant);
+                                fragger.set_completion_slot_grant(grant);
                             }
                             let written_before = buf.get_len_written();
                             let complete = fragger.get_next_chunk(&mut buf);
@@ -3720,6 +3720,71 @@ mod tests {
         assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
         assert_eq!(sched.dltx_queues[timeslot as usize - 1].len(), 2);
         assert!(sched.dltx_next_slot_queue.is_empty());
+    }
+
+    #[test]
+    fn full_facch_block_defers_unstarted_ack_delivery_without_panicking() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 3;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 46,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(timeslot, true);
+
+        // Reproduce the live crash: a group setup fills the FACCH block, then
+        // an acknowledged individual delivery is considered in the same
+        // scheduler pass but cannot write even its MAC-RESOURCE header.
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::new(92, SsiType::Gssi), None, false),
+            BitBuffer::from_bitstr(&"10".repeat(160)),
+            None,
+            AieRequest::clear(AieSubject::Group { gssi: 92 }, AieScope::MacResource),
+        );
+        let addr = TetraAddress::new(430_892, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("10101010"),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let first_time = TdmaTime {
+            t: timeslot,
+            f: 5,
+            m: 4,
+            h: 0,
+        };
+        sched.cur_dltime = first_time.add_timeslots(-1);
+        let _ = sched.finalize_ts_for_tick();
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert!(
+            sched.dltx_queues[timeslot as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::FragBuf(fragger) if !fragger.has_started())),
+            "the untouched individual resource must remain queued"
+        );
+
+        let second_time = first_time.add_timeslots(4);
+        sched.cur_dltime = second_time.add_timeslots(-1);
+        let _ = sched.finalize_ts_for_tick();
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
     }
 
     #[test]
