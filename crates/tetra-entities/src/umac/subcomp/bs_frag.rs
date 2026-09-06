@@ -98,6 +98,14 @@ impl BsFragger {
         self.final_slot_grant_required = true;
     }
 
+    /// A fragmented acknowledged downlink that moves from SACCH to FACCH no
+    /// longer needs an assigned FN18 response grant.  On FACCH the MS can use
+    /// the ordinary access procedure after receiving MAC-END.
+    pub fn allow_ungranted_final_response(&mut self) {
+        self.final_slot_grant = None;
+        self.final_slot_grant_required = false;
+    }
+
     pub fn expects_ack(&self) -> bool {
         self.tx_reporter.as_ref().is_some_and(TxReporter::expects_ack)
     }

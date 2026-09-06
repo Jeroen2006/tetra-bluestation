@@ -226,12 +226,29 @@ impl BsChannelScheduler {
         }
 
         let idx = ts as usize - 1;
+        let was_active = self.hangtime[idx];
+        if was_active == active {
+            return;
+        }
         self.hangtime[idx] = active;
-        // When leaving hangtime, drain stale signaling items that can only be consumed
-        // in signaling mode. Keep Stealing items — they carry D-TX GRANTED/CEASED
-        // that still need FACCH delivery.
-        if !active {
-            self.dl_drop_all_except_stolen(ts);
+
+        // EN 300 392-2 clauses 23.4.2.1.5/.6 let an MS continue downlink
+        // reconstruction when the assigned channel changes between SACCH and
+        // FACCH. Move the queued work with that mode change instead of
+        // discarding it at the exact floor transition.
+        let moved = if active {
+            self.move_associated_control_to_facch(ts)
+        } else {
+            self.move_facch_control_to_sacch(ts)
+        };
+        if moved > 0 {
+            tracing::info!(
+                dltime = %self.cur_dltime,
+                ts,
+                moved,
+                destination = if active { "FACCH" } else { "SACCH" },
+                "preserved pending assigned-channel signalling across mode transition"
+            );
         }
 
         tracing::info!(
@@ -239,6 +256,70 @@ impl BsChannelScheduler {
             if active { "ENABLED" } else { "DISABLED" },
             ts,
         );
+    }
+
+    /// Move normal associated signalling into the fast control queue when a
+    /// traffic slot enters hangtime. Frames 1..17 are then available and the
+    /// message should not remain blocked waiting for a SACCH acknowledgement
+    /// grant that is deliberately unavailable in hangtime.
+    fn move_associated_control_to_facch(&mut self, timeslot: u8) -> usize {
+        let idx = timeslot as usize - 1;
+        let queued = std::mem::take(&mut self.assoc_dltx_queues[idx]);
+        let moved = queued.len();
+        for mut elem in queued {
+            if let DlSchedElem::FragBuf(fragger) = &mut elem {
+                fragger.allow_ungranted_final_response();
+            }
+            self.dltx_queues[idx].push(elem);
+        }
+        moved
+    }
+
+    /// Move pending FACCH signalling into the frame-18 associated queue when
+    /// speech resumes. FACCH slot grants from frames 1..17 are withdrawn by
+    /// the mode change (Core TIP note 113), while their correlated random
+    /// access acknowledgement remains meaningful on the migrated resource.
+    fn move_facch_control_to_sacch(&mut self, timeslot: u8) -> usize {
+        let idx = timeslot as usize - 1;
+        let queued = std::mem::take(&mut self.dltx_queues[idx]);
+        let mut moved = Vec::new();
+        let mut acknowledgements = Vec::new();
+        let mut kept = Vec::new();
+
+        for elem in queued {
+            match elem {
+                elem @ (DlSchedElem::Resource(..) | DlSchedElem::FragBuf(..) | DlSchedElem::AssociatedGrantRequest(..)) => moved.push(elem),
+                DlSchedElem::RandomAccessAck(address, _) => acknowledgements.push(address.ssi),
+                DlSchedElem::Stealing(..) => kept.push(elem),
+                DlSchedElem::Grant(..) | DlSchedElem::Broadcast(_) => {
+                    tracing::debug!(
+                        dltime = %self.cur_dltime,
+                        ts = timeslot,
+                        element = ?elem,
+                        "discarding FACCH-only scheduling metadata while entering traffic mode"
+                    );
+                }
+            }
+        }
+
+        for issi in acknowledgements {
+            let matching_resource = moved.iter_mut().find_map(|elem| match elem {
+                DlSchedElem::Resource(pdu, ..) if pdu.addr.is_some_and(|address| address.ssi == issi) => Some(pdu),
+                _ => None,
+            });
+            if let Some(resource) = matching_resource {
+                resource.random_access_flag = true;
+            } else if !self.pending_ra_acks[idx].contains(&issi) {
+                // A later FACCH/STCH response can still acknowledge this
+                // access if no correlated resource was waiting right now.
+                self.pending_ra_acks[idx].push(issi);
+            }
+        }
+
+        let moved_count = moved.len();
+        self.dltx_queues[idx] = kept;
+        self.assoc_dltx_queues[idx].extend(moved);
+        moved_count
     }
 
     pub fn is_hangtime(&self, ts: u8) -> bool {
@@ -1515,14 +1596,18 @@ impl BsChannelScheduler {
         pdu
     }
 
-    /// Takes and removes all grants and random access acknowledgements from the given timeslot's queue, returning them as a vec.
+    /// Takes and removes all grants, random access acknowledgements and
+    /// deferred grant requests from the given timeslot's queue.
     pub fn dl_take_all_grants_and_acks(&mut self, timeslot: u8) -> Vec<DlSchedElem> {
         let queue = &mut self.dltx_queues[timeslot as usize - 1];
         let mut taken = Vec::new();
 
         let mut i = 0;
         while i < queue.len() {
-            if matches!(queue[i], DlSchedElem::Grant(_, _) | DlSchedElem::RandomAccessAck(..)) {
+            if matches!(
+                queue[i],
+                DlSchedElem::Grant(_, _) | DlSchedElem::RandomAccessAck(..) | DlSchedElem::AssociatedGrantRequest(..)
+            ) {
                 let elem = queue.remove(i);
                 taken.push(elem);
             } else {
@@ -1627,6 +1712,16 @@ impl BsChannelScheduler {
 
         // Process grants and acks
         for elem in grants_and_acks {
+            let elem = match elem {
+                DlSchedElem::AssociatedGrantRequest(addr, res_req) => {
+                    let Some(grant) = self.ul_process_cap_req(ts.t, addr, &res_req) else {
+                        self.dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+                        continue;
+                    };
+                    DlSchedElem::Grant(addr, grant)
+                }
+                elem => elem,
+            };
             // Try to find existing resource for this address
             let addr = match &elem {
                 DlSchedElem::Grant(addr, _) => addr,
@@ -1702,9 +1797,38 @@ impl BsChannelScheduler {
                             unimplemented_log!("finalize_ts_for_tick: Broadcast scheduling not implemented");
                         }
 
-                        DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request) => {
+                        DlSchedElem::Resource(mut pdu, sdu, tx_reporter, aie_request) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            let facch_ack_addr = (self.is_hangtime(ts.t)
+                                && self.circuits.is_active(Direction::Ul, ts.t)
+                                && tx_reporter.as_ref().is_some_and(TxReporter::expects_ack))
+                            .then_some(pdu.addr)
+                            .flatten();
+                            let resource_len_with_grant = pdu.compute_header_len()
+                                + usize::from(pdu.slot_granting_element.is_none() && facch_ack_addr.is_some()) * 8
+                                + sdu.get_len();
+                            let resource_fill = fillbits::addition::compute_required(resource_len_with_grant, buf.get_len_remaining());
+                            let completes_in_resource = resource_len_with_grant + resource_fill <= buf.get_len_remaining();
+                            if completes_in_resource
+                                && pdu.slot_granting_element.is_none()
+                                && let Some(addr) = facch_ack_addr
+                            {
+                                let Some(grant) = self.ul_process_cap_req(ts.t, addr, &ReservationRequirement::Req1Slot) else {
+                                    self.dltx_next_slot_queue
+                                        .push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+                                    buf_opt = Some(buf);
+                                    break;
+                                };
+                                tracing::info!(
+                                    dltime = %ts,
+                                    address = ?addr,
+                                    grant = ?grant,
+                                    "prepared FACCH basic-link acknowledgement grant in complete MAC-RESOURCE"
+                                );
+                                pdu.slot_granting_element = Some(grant);
+                                pdu.update_len_and_fill_ind(sdu.get_len());
+                            }
                             // Create fragger, either to send the whole PDU or to start fragmentation
                             let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
                                 Ok(pdu) => pdu,
@@ -1727,6 +1851,9 @@ impl BsChannelScheduler {
                                 } else {
                                     // Fragmentation was started, or a partially
                                     // occupied block caused a valid deferral.
+                                    if facch_ack_addr.is_some() {
+                                        fragger.require_final_slot_grant();
+                                    }
                                     self.dl_enqueue_tma_frag_next_frame(fragger);
                                 }
                             }
@@ -1736,6 +1863,31 @@ impl BsChannelScheduler {
                         DlSchedElem::FragBuf(mut fragger) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            if self.is_hangtime(ts.t)
+                                && self.circuits.is_active(Direction::Ul, ts.t)
+                                && fragger.expects_ack()
+                                && fragger.can_finish_with_slot_grant(buf.get_len_remaining())
+                            {
+                                let Some(issi) = fragger.individual_issi() else {
+                                    tracing::warn!(dltime = %ts, "FACCH acknowledged fragment has no individual address for its MAC-END grant");
+                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    buf_opt = Some(buf);
+                                    break;
+                                };
+                                let addr = TetraAddress::issi(issi);
+                                let Some(grant) = self.ul_process_cap_req(ts.t, addr, &ReservationRequirement::Req1Slot) else {
+                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    buf_opt = Some(buf);
+                                    break;
+                                };
+                                tracing::info!(
+                                    dltime = %ts,
+                                    address = ?addr,
+                                    grant = ?grant,
+                                    "prepared FACCH basic-link acknowledgement grant in final MAC-END"
+                                );
+                                fragger.set_final_slot_grant(grant);
+                            }
                             let written_before = buf.get_len_written();
                             let complete = fragger.get_next_chunk(&mut buf);
                             if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
@@ -3350,6 +3502,249 @@ mod tests {
         assert!(sched.close_circuit(Direction::Ul, timeslot).is_some());
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
         assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
+    }
+
+    #[test]
+    fn entering_hangtime_finishes_fragmented_sds_on_facch() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 3;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 41,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"10".repeat(115)[..229]),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let first = TdmaTime {
+            t: timeslot,
+            f: 18,
+            m: 3,
+            h: 0,
+        };
+        let mut first_block = sched.dl_build_associated_control_block(first).expect("first SACCH fragment");
+        first_block.seek(0);
+        assert_eq!(
+            MacResource::from_bitbuf(&mut first_block).expect("fragment start").length_ind,
+            tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START
+        );
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+
+        sched.set_hangtime(timeslot, true);
+        assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
+        assert!(matches!(
+            sched.dltx_queues[timeslot as usize - 1].first(),
+            Some(DlSchedElem::FragBuf(_))
+        ));
+
+        let facch_time = TdmaTime {
+            t: timeslot,
+            f: 5,
+            m: 4,
+            h: 0,
+        };
+        sched.cur_dltime = facch_time.add_timeslots(-1);
+        let slot = sched.finalize_ts_for_tick();
+        assert_eq!(slot.ul_phy_chan, PhysicalChannel::Cp);
+        let mut final_block = slot.blk1.expect("final FACCH fragment").mac_block;
+        final_block.seek(0);
+        assert!(
+            MacEndDl::from_bitbuf(&mut final_block)
+                .expect("MAC-END on FACCH")
+                .slot_granting_element
+                .is_some()
+        );
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+    }
+
+    #[test]
+    fn resuming_traffic_finishes_fragmented_sds_on_sacch() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 2;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 42,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(timeslot, true);
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"10".repeat(115)[..229]),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let facch_time = TdmaTime {
+            t: timeslot,
+            f: 5,
+            m: 2,
+            h: 0,
+        };
+        sched.cur_dltime = facch_time.add_timeslots(-1);
+        let first_slot = sched.finalize_ts_for_tick();
+        let mut first_block = first_slot.blk1.expect("first FACCH fragment").mac_block;
+        first_block.seek(0);
+        assert_eq!(
+            MacResource::from_bitbuf(&mut first_block).expect("fragment start").length_ind,
+            tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START
+        );
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+
+        sched.set_hangtime(timeslot, false);
+        assert!(sched.dltx_queues[timeslot as usize - 1].is_empty());
+        assert!(matches!(
+            sched.assoc_dltx_queues[timeslot as usize - 1].first(),
+            Some(DlSchedElem::FragBuf(_))
+        ));
+
+        let sacch_time = (2..=18)
+            .map(|m| TdmaTime {
+                t: timeslot,
+                f: 18,
+                m,
+                h: 0,
+            })
+            .find(|time| !time.is_mandatory_bsch() && !time.is_mandatory_bnch())
+            .expect("usable SACCH frame");
+        sched.cur_dltime = sacch_time.add_timeslots(-1);
+        let final_slot = sched.finalize_ts_for_tick();
+        assert_eq!(final_slot.ul_phy_chan, PhysicalChannel::Tp);
+        let mut final_block = final_slot.blk1.expect("final SACCH fragment").mac_block;
+        final_block.seek(0);
+        let end = MacEndDl::from_bitbuf(&mut final_block).expect("MAC-END on SACCH");
+        assert!(end.slot_granting_element.is_some());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+    }
+
+    #[test]
+    fn resuming_traffic_preserves_unstarted_sds_and_access_ack() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 2;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 43,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(timeslot, true);
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+        sched.dl_enqueue_random_access_ack(
+            timeslot,
+            addr,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        sched.set_hangtime(timeslot, false);
+        assert!(sched.dltx_queues[timeslot as usize - 1].is_empty());
+        let Some(DlSchedElem::Resource(resource, ..)) = sched.assoc_dltx_queues[timeslot as usize - 1].first() else {
+            panic!("SDS resource must move to SACCH");
+        };
+        assert!(
+            resource.random_access_flag,
+            "the correlated MAC-ACCESS acknowledgement must move with the resource"
+        );
+    }
+
+    #[test]
+    fn entering_hangtime_rehomes_pending_associated_capacity_request() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 3;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 44,
+                    direction,
+                    ts: timeslot,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        sched.dl_enqueue_associated_grant_request(timeslot, addr, ReservationRequirement::Req1Subslot);
+        sched.set_hangtime(timeslot, true);
+        assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
+        assert!(matches!(
+            sched.dltx_queues[timeslot as usize - 1].first(),
+            Some(DlSchedElem::AssociatedGrantRequest(..))
+        ));
+
+        let facch_time = TdmaTime {
+            t: timeslot,
+            f: 5,
+            m: 2,
+            h: 0,
+        };
+        sched.cur_dltime = facch_time.add_timeslots(-1);
+        let slot = sched.finalize_ts_for_tick();
+        let mut block = slot.blk1.expect("FACCH grant response").mac_block;
+        block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut block).expect("grant MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|address| address.ssi), Some(addr.ssi));
+        assert!(resource.slot_granting_element.is_some());
+        assert!(sched.dltx_queues[timeslot as usize - 1].is_empty());
     }
 
     #[test]
