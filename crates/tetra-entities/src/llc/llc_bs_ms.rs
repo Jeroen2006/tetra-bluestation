@@ -55,6 +55,10 @@ pub struct ExpectedInAck {
     /// Time the RxReporter signalled the message was fully transmitted. Also set if the Umac discarded the message
     /// This helps attempting to retransmit the message after a brief delay.
     pub t_umac_done: Option<TdmaTime>,
+    /// At least one attempt reached the air interface.  Keep this across
+    /// retries because their shared reporter is reset to Pending while the MS
+    /// may still return a valid, delayed BL-ACK for an earlier copy.
+    pub has_transmitted_attempt: bool,
     /// TxReporter struct. Used by Umac to signal Tx time to Llc, so llc can do retransmissions if needed.
     /// Also used by Llc to signal Ack to upper layer (if appliccable)
     pub tx_reporter: TxReporter,
@@ -211,7 +215,7 @@ impl Llc {
             expected.addr.ssi == addr.ssi
                 && expected.ns == nr
                 && expected.t_submitted_to_umac.is_some()
-                && (expected.t_umac_done.is_some() || expected.tx_reporter.is_transmitted())
+                && (expected.has_transmitted_attempt || expected.t_umac_done.is_some() || expected.tx_reporter.is_transmitted())
                 && matches!(
                     &expected.retransmission_buf.msg,
                     SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
@@ -241,11 +245,12 @@ impl Llc {
         // concrete reporter state as transmitted here so a clear bootstrap
         // BL-ACK cannot race the deferred SC2 activation.
         if expected_ack.t_umac_done.is_none() && expected_ack.tx_reporter.is_transmitted() {
+            expected_ack.has_transmitted_attempt = true;
             expected_ack.t_umac_done = Some(self.dltime);
         }
 
         // Check it was indeed already transmitted by the Umac
-        if expected_ack.t_umac_done.is_none() {
+        if expected_ack.t_umac_done.is_none() && !expected_ack.has_transmitted_attempt {
             // This may be an old retransmission of an ack for the before-last basic link message
             // Let's push the ack back into the head of the queue (not tail)..
             tracing::warn!(
@@ -277,6 +282,14 @@ impl Llc {
         if expected_ack.ns == nr {
             // Successful ACK: N(R) matches N(S)
             tracing::debug!("received ACK for SSI {} N(R) {}", addr.ssi, expected_ack.ns);
+            // A retry may already be queued with the shared reporter reset to
+            // Pending (or have been discarded) when an ACK for an earlier,
+            // transmitted copy arrives.  Restore the legal reporter transition
+            // without requiring that redundant retry to finish first.
+            if !expected_ack.tx_reporter.is_transmitted() {
+                expected_ack.tx_reporter.reset();
+                expected_ack.tx_reporter.mark_transmitted();
+            }
             expected_ack.tx_reporter.mark_acknowledged();
             return;
         } else {
@@ -383,6 +396,7 @@ impl Llc {
         }
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
+        ack.has_transmitted_attempt |= ack.tx_reporter.is_transmitted();
         ack.tx_reporter.reset();
 
         // Send the message
@@ -526,6 +540,7 @@ impl Llc {
             t_first: self.dltime,
             t_submitted_to_umac: None,
             t_umac_done: None,
+            has_transmitted_attempt: false,
             retransmission_buf: sapmsg, // Clone the message to keep a copy for potential retransmission
             retransmit_count: 0,
             tried_delivery_timeslots: prim
@@ -839,6 +854,7 @@ impl Llc {
             // First, check which have newly been txed, or discarded by Umac. If so, start t_umac_done.
             if ack.t_umac_done.is_none() && (ack.tx_reporter.is_transmitted() || ack.tx_reporter.is_discarded()) {
                 // TxReporter has now marked it as txed or dropped, so we can set t_umac_done
+                ack.has_transmitted_attempt |= ack.tx_reporter.is_transmitted();
                 ack.t_umac_done = Some(self.dltime);
                 tracing::trace!("schedule_retransmissions: {} umac_done at {}", ack.addr.ssi, dltime);
             }
@@ -1282,6 +1298,68 @@ mod tests {
         assert_eq!(route.call_id, 8);
         assert_eq!(route.timeslot, 3);
         assert_eq!(route.usage, 11);
+    }
+
+    #[test]
+    fn delayed_ack_for_transmitted_attempt_survives_queued_retry() {
+        let config = test_config();
+        let issi = 77_479;
+        let addr = TetraAddress::issi(issi);
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        config.state_write().subscriber_delivery_routes.insert(
+            issi,
+            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 8,
+                timeslot: 2,
+                usage: 11,
+            }],
+        );
+
+        let reporter = TxReporter::new();
+        let mut llc = Llc::new(config);
+        llc.dltime = start;
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: addr,
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: BitBuffer::from_bitstr("1010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: Some(reporter.clone()),
+                }),
+            ),
+        );
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        queue.pop_front().expect("first attempt queued");
+
+        reporter.mark_transmitted();
+        llc.dltime = start.add_timeslots(1);
+        assert!(!llc.submit_retransmissions_to_umac(&mut queue));
+        assert!(llc.outbound_messages[0].has_transmitted_attempt);
+
+        let retry_timer = Llc::basic_link_retry_timer(&llc.outbound_messages[0]);
+        llc.dltime = llc.dltime.add_timeslots(retry_timer as i32);
+        assert!(llc.submit_retransmissions_to_umac(&mut queue));
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+
+        llc.process_incoming_ack(addr, 0, AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacData));
+        assert!(llc.outbound_messages.is_empty());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Acknowledged);
     }
 
     #[test]

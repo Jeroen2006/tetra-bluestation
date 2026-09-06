@@ -371,6 +371,7 @@ impl BsFragger {
         // If we're done now, we'll report the PDUs full transmission.
         if self.is_fully_transmitted
             && let Some(tx_reporter) = &self.tx_reporter
+            && tx_reporter.get_state() == tetra_core::TxState::Pending
         {
             tx_reporter.mark_transmitted();
         }
@@ -629,6 +630,18 @@ mod tests {
         assert_eq!(reporter.get_state(), TxState::Discarded);
         assert!(reporter.is_in_final_state());
         assert!(!reporter.is_transmitted());
+    }
+
+    #[test]
+    fn completed_retry_preserves_an_already_acknowledged_reporter() {
+        let reporter = TxReporter::new();
+        let mut fragger = BsFragger::new(get_default_resource(), BitBuffer::from_bitstr("10101010"), Some(reporter.clone()));
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        assert!(fragger.get_next_chunk(&mut mac_block));
+        assert_eq!(reporter.get_state(), TxState::Acknowledged);
     }
 
     #[test]
