@@ -67,9 +67,10 @@ pub struct ExpectedInAck {
     pub retransmission_buf: SapMsg,
     /// Number of retransmissions performed so far
     pub retransmit_count: u8,
-    /// Traffic timeslots already tried for this basic-link delivery.  A retry
+    /// Delivery timeslots already tried for this basic-link delivery.  A retry
     /// must resolve the current CC view again, rather than replaying the
-    /// associated channel that was true when the PDU was first built.
+    /// associated channel that was true when the PDU was first built.  TS1
+    /// represents an MCCH attempt; TS2..4 represent associated traffic slots.
     pub tried_delivery_timeslots: HashSet<u8>,
 }
 
@@ -366,30 +367,45 @@ impl Llc {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
         let mut sapmsg = ack.retransmission_buf.clone();
         if ack.retransmit_count > 0 {
-            let untried_route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
-            // Try every other live listener route first.  Once those have all
-            // been attempted, retain a still-active associated basic link;
-            // an MS on TCH is not expected to hear an MCCH retry.
-            let reusing_active_route = untried_route.is_none();
-            let route = untried_route.or_else(|| Self::delivery_route(config, ack.addr.ssi, dltime, &HashSet::new()));
+            let mut route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
+            let mut restarted_route_cycle = false;
+
+            // A scanning MS can autonomously follow any receivable active
+            // group.  Probe each currently valid associated timeslot once,
+            // then MCCH once in case the MS has returned to common control.
+            // If the basic-link retry budget permits another pass, start a
+            // fresh route cycle so a terminal that moved meanwhile can still
+            // receive the same N(S).
+            let use_mcch = if route.is_some() {
+                false
+            } else if !ack.tried_delivery_timeslots.contains(&1) {
+                true
+            } else {
+                ack.tried_delivery_timeslots.clear();
+                restarted_route_cycle = true;
+                route = Self::delivery_route(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
+                route.is_none()
+            };
             if let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg {
-                req.associated_channel = route;
-                if let Some(route) = route {
+                req.associated_channel = if use_mcch { None } else { route };
+                if let Some(route) = req.associated_channel {
                     ack.tried_delivery_timeslots.insert(route.timeslot);
                     ack.ts = route.timeslot;
                     tracing::info!(
                         issi = ack.addr.ssi,
                         timeslot = route.timeslot,
-                        reused = reusing_active_route,
-                        "retrying acknowledged downlink on active listener timeslot"
+                        call_id = route.call_id,
+                        usage = route.usage,
+                        restarted_route_cycle,
+                        "retrying acknowledged downlink on scan-list traffic route"
                     );
                 } else {
-                    // No other valid traffic listener remains.  UMAC will use
-                    // the ordinary MCCH/EE path instead of the stale slot.
+                    ack.tried_delivery_timeslots.insert(1);
                     ack.ts = 1;
-                    tracing::debug!(
+                    tracing::info!(
                         issi = ack.addr.ssi,
-                        "retrying acknowledged downlink through MCCH after listener routes exhausted"
+                        restarted_route_cycle,
+                        "retrying acknowledged downlink through MCCH after scan-list routes"
                     );
                 }
             }
@@ -1247,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn unacknowledged_associated_downlink_reuses_live_listener_route() {
+    fn acknowledged_associated_downlink_tries_mcch_after_only_listener_route() {
         let config = test_config();
         let issi = 77_479;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
@@ -1302,14 +1318,89 @@ mod tests {
         llc.dltime = llc.dltime.add_timeslots(retry_timer as i32);
         assert!(llc.submit_retransmissions_to_umac(&mut queue));
 
-        let retry = queue.pop_front().expect("associated retry queued");
+        let retry = queue.pop_front().expect("MCCH retry queued");
         let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
             panic!("expected TMA retry")
         };
-        let route = retry.associated_channel.expect("live listener route must be retained");
-        assert_eq!(route.call_id, 8);
-        assert_eq!(route.timeslot, 3);
-        assert_eq!(route.usage, 11);
+        assert!(retry.associated_channel.is_none());
+        assert!(llc.outbound_messages[0].tried_delivery_timeslots.contains(&1));
+    }
+
+    #[test]
+    fn acknowledged_retries_rotate_scan_list_routes_then_mcch() {
+        let config = test_config();
+        let issi = 77_468;
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        config.state_write().subscriber_delivery_routes.insert(
+            issi,
+            vec![
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 9,
+                    timeslot: 4,
+                    usage: 12,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 8,
+                    timeslot: 3,
+                    usage: 11,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 7,
+                    timeslot: 2,
+                    usage: 10,
+                },
+            ],
+        );
+
+        let mut llc = Llc::new(config.clone());
+        llc.dltime = start;
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(issi),
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: BitBuffer::from_bitstr("1010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        let first = queue.pop_front().expect("first scan-list route queued");
+        let SapMsgInner::TmaUnitdataReq(first) = first.msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(4));
+
+        for (attempt, expected_timeslot) in [(1, Some(3)), (2, Some(2)), (3, None), (4, Some(4))] {
+            let ack = &mut llc.outbound_messages[0];
+            ack.retransmit_count = attempt;
+            Llc::submit_for_acknowledged_transmission(&config, &mut queue, ack, start);
+            let retry = queue.pop_front().expect("retry route queued");
+            let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
+                panic!("expected TMA retry")
+            };
+            assert_eq!(
+                retry.associated_channel.map(|route| route.timeslot),
+                expected_timeslot,
+                "unexpected route for retry {attempt}"
+            );
+        }
     }
 
     #[test]
