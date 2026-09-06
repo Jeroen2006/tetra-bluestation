@@ -2917,6 +2917,10 @@ impl TetraEntityTrait for UmacBs {
         // recover safely rather than retaining a PDU forever.
         let mut retained = VecDeque::new();
         while let Some(resource) = self.deferred_mcch.pop_front() {
+            if resource.tx_reporter.as_ref().is_some_and(TxReporter::is_discarded) {
+                tracing::debug!(due = %resource.due, "dropping cancelled deferred MCCH copy");
+                continue;
+            }
             if resource.due.age(ts) >= 0 {
                 self.channel_scheduler
                     .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter, resource.aie_request);
@@ -3139,6 +3143,30 @@ mod tests {
         assert!(!UmacBs::ee_replay_is_usable(now.add_timeslots(-1), now, None));
         assert!(!UmacBs::ee_replay_is_usable(activation, now, Some(activation)));
         assert!(!UmacBs::ee_replay_is_usable(activation.add_timeslots(1), now, Some(activation)));
+    }
+
+    #[test]
+    fn cancelled_concurrent_copy_leaves_deferred_mcch_queue() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let reporter = TxReporter::new();
+        let tick = TdmaTime::default().add_timeslots(1);
+        umac.deferred_mcch.push_back(DeferredMcch {
+            due: tick.add_timeslots(20),
+            pdu: BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::issi(77_468), None, false),
+            sdu: BitBuffer::from_bitstr("1010"),
+            tx_reporter: Some(reporter.clone()),
+            aie_request: AieRequest::clear(AieSubject::Individual { issi: 77_468 }, AieScope::MacResource),
+        });
+
+        reporter.mark_discarded();
+        umac.tick_start(&mut MessageQueue::new(), tick);
+
+        assert!(umac.deferred_mcch.is_empty());
     }
 
     #[test]

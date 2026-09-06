@@ -77,11 +77,6 @@ pub struct ExpectedInAck {
     pub retransmission_buf: SapMsg,
     /// Number of retransmissions performed so far
     pub retransmit_count: u8,
-    /// Delivery timeslots already tried for this basic-link delivery.  A retry
-    /// must resolve the current CC view again, rather than replaying the
-    /// associated channel that was true when the PDU was first built.  TS1
-    /// represents an MCCH attempt; TS2..4 represent associated traffic slots.
-    pub tried_delivery_timeslots: HashSet<u8>,
 }
 
 /// Struct that maintains state for an ACK we still need to send back.
@@ -142,12 +137,7 @@ impl Llc {
     /// A fresh MAC-ACCESS response deliberately stays on MCCH; otherwise an
     /// active call route wins so MM/OTAR is not sent to a channel the MS has
     /// stopped monitoring.  The lookup is repeated for every BL attempt.
-    fn delivery_routes(
-        config: &SharedConfig,
-        issi: u32,
-        dltime: TdmaTime,
-        tried_timeslots: &HashSet<u8>,
-    ) -> Vec<tetra_saps::tma::AssociatedChannel> {
+    fn delivery_routes(config: &SharedConfig, issi: u32, dltime: TdmaTime) -> Vec<tetra_saps::tma::AssociatedChannel> {
         let mut state = config.state_write();
         // Registration/authentication is a common-channel procedure. A stale
         // call listener can remain in the CC routing table while the MS has
@@ -161,7 +151,7 @@ impl Llc {
             .get(&issi)
             .into_iter()
             .flat_map(|routes| routes.iter())
-            .filter(|route| (2..=4).contains(&route.timeslot) && !tried_timeslots.contains(&route.timeslot))
+            .filter(|route| (2..=4).contains(&route.timeslot))
             .map(|route| tetra_saps::tma::AssociatedChannel {
                 call_id: route.call_id,
                 timeslot: route.timeslot,
@@ -310,6 +300,7 @@ impl Llc {
                 expected_ack.tx_reporter.mark_transmitted();
             }
             expected_ack.tx_reporter.mark_acknowledged();
+            Self::cancel_pending_attempt_copies(&expected_ack);
             return;
         } else {
             // N(R) mismatch — per ETSI 22.3.2.3(k), not a successful ACK. Maybe a retransmission?
@@ -325,6 +316,18 @@ impl Llc {
         }
 
         // The expected_ack is confirmed as matched and goes out of scope here
+    }
+
+    /// Stop copies which have not reached the air yet.  UMAC treats the
+    /// discarded per-route reporter as cancellation and removes the queued
+    /// resource or fragment.  Copies already transmitted remain valid parts
+    /// of this one basic-link transaction.
+    fn cancel_pending_attempt_copies(ack: &ExpectedInAck) {
+        for reporter in &ack.attempt_reporters {
+            if reporter.get_state() == tetra_core::TxState::Pending {
+                reporter.mark_discarded();
+            }
+        }
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -382,44 +385,17 @@ impl Llc {
 
     /// Schedules a message that was not acked in time for a retransmission
     fn submit_for_acknowledged_transmission(config: &SharedConfig, queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
-        let mut routes = Self::delivery_routes(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
-        let mut restarted_route_cycle = false;
-        if routes.is_empty() && ack.tried_delivery_timeslots.contains(&1) {
-            ack.tried_delivery_timeslots.clear();
-            restarted_route_cycle = true;
-            routes = Self::delivery_routes(config, ack.addr.ssi, dltime, &ack.tried_delivery_timeslots);
-        }
-        let use_mcch = routes.is_empty();
+        let routes = Self::delivery_routes(config, ack.addr.ssi, dltime);
 
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
+        Self::cancel_pending_attempt_copies(ack);
         ack.attempt_reporters.clear();
-
-        if use_mcch {
-            let mut sapmsg = ack.retransmission_buf.clone();
-            let reporter = TxReporter::new();
-            let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg else {
-                unreachable!("basic-link retransmission must retain a TMA request")
-            };
-            req.associated_channel = None;
-            req.tx_reporter = Some(reporter.clone());
-            ack.attempt_reporters.push(reporter);
-            ack.tried_delivery_timeslots.insert(1);
-            ack.ts = 1;
-            tracing::info!(
-                issi = ack.addr.ssi,
-                restarted_route_cycle,
-                "sending acknowledged downlink through MCCH after scan-list routes"
-            );
-            queue.push_back(sapmsg);
-            return;
-        }
 
         tracing::info!(
             issi = ack.addr.ssi,
-            copies = routes.len(),
-            restarted_route_cycle,
-            "sending acknowledged downlink concurrently on scan-list traffic routes"
+            traffic_copies = routes.len(),
+            "sending acknowledged downlink on every plausible active bearer"
         );
         for route in routes {
             let mut sapmsg = ack.retransmission_buf.clone();
@@ -430,7 +406,6 @@ impl Llc {
             req.associated_channel = Some(route);
             req.tx_reporter = Some(reporter.clone());
             ack.attempt_reporters.push(reporter);
-            ack.tried_delivery_timeslots.insert(route.timeslot);
             ack.ts = route.timeslot;
             tracing::info!(
                 issi = ack.addr.ssi,
@@ -441,6 +416,24 @@ impl Llc {
             );
             queue.push_back(sapmsg);
         }
+
+        // Even a non-scanning MS can be on MCCH after missing D-SETUP or
+        // returning from a released call.  Queue MCCH in the same attempt;
+        // its independent reporter lets a traffic-channel ACK cancel this
+        // copy before a deferred EE monitoring occasion transmits it.
+        let mut sapmsg = ack.retransmission_buf.clone();
+        let reporter = TxReporter::new();
+        let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg else {
+            unreachable!("basic-link retransmission must retain a TMA request")
+        };
+        req.associated_channel = None;
+        req.tx_reporter = Some(reporter.clone());
+        ack.attempt_reporters.push(reporter);
+        if ack.attempt_reporters.len() == 1 {
+            ack.ts = 1;
+        }
+        tracing::info!(issi = ack.addr.ssi, "queued concurrent acknowledged downlink MCCH copy");
+        queue.push_back(sapmsg);
     }
 
     fn has_assigned_channel_context(ack: &ExpectedInAck) -> bool {
@@ -512,7 +505,7 @@ impl Llc {
         // table, so in-call D-CK CHANGE/OTAR first went to MCCH and sat behind
         // a missing BL-ACK for one or more multiframes.
         if prim.associated_channel.is_none() {
-            prim.associated_channel = Self::delivery_routes(&self.config, prim.main_address.ssi, self.dltime, &HashSet::new())
+            prim.associated_channel = Self::delivery_routes(&self.config, prim.main_address.ssi, self.dltime)
                 .into_iter()
                 .next();
         }
@@ -603,7 +596,6 @@ impl Llc {
             has_transmitted_attempt: false,
             retransmission_buf: sapmsg, // Clone the message to keep a copy for potential retransmission
             retransmit_count: 0,
-            tried_delivery_timeslots: HashSet::new(),
         });
 
         // The message will now be picked up for transmission at end-of-tick, if the ssi does not yet have
@@ -1230,7 +1222,7 @@ mod tests {
             }],
         );
 
-        let route = Llc::delivery_routes(&config, issi, TdmaTime::default(), &HashSet::new())
+        let route = Llc::delivery_routes(&config, issi, TdmaTime::default())
             .into_iter()
             .next()
             .expect("active call route");
@@ -1288,10 +1280,16 @@ mod tests {
         };
         assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(2));
 
-        // UMAC removes the assigned basic link before its queued FN18 and
-        // reports the item as discarded.  Once that route disappears, LLC's
-        // retry must use the surviving common-control basic link.
+        let mcch = queue.pop_front().expect("concurrent MCCH attempt queued");
+        let SapMsgInner::TmaUnitdataReq(mcch) = mcch.msg else {
+            panic!("expected TMA request")
+        };
+        assert!(mcch.associated_channel.is_none());
+
+        // UMAC removes both queued copies before transmission. Once the
+        // traffic route disappears, the next attempt must contain MCCH only.
         llc.outbound_messages[0].attempt_reporters[0].mark_discarded();
+        llc.outbound_messages[0].attempt_reporters[1].mark_discarded();
         config.state_write().subscriber_delivery_routes.remove(&issi);
         llc.dltime = start.add_timeslots(1);
         assert!(!llc.submit_retransmissions_to_umac(&mut queue));
@@ -1308,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_associated_downlink_tries_mcch_after_only_listener_route() {
+    fn acknowledged_associated_downlink_also_tries_mcch() {
         let config = test_config();
         let issi = 77_479;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
@@ -1355,6 +1353,11 @@ mod tests {
             panic!("expected TMA request")
         };
         assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(3));
+        let mcch = queue.pop_front().expect("concurrent MCCH attempt queued");
+        let SapMsgInner::TmaUnitdataReq(mcch) = mcch.msg else {
+            panic!("expected TMA request")
+        };
+        assert!(mcch.associated_channel.is_none());
 
         llc.outbound_messages[0].attempt_reporters[0].mark_transmitted();
         llc.dltime = start.add_timeslots(1);
@@ -1372,16 +1375,20 @@ mod tests {
         llc.dltime = llc.dltime.add_timeslots((retry_timer - one_sacch_opportunity as u32) as i32);
         assert!(llc.submit_retransmissions_to_umac(&mut queue));
 
-        let retry = queue.pop_front().expect("MCCH retry queued");
-        let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
+        let retry_route = queue.pop_front().expect("traffic retry queued");
+        let SapMsgInner::TmaUnitdataReq(retry_route) = retry_route.msg else {
             panic!("expected TMA retry")
         };
-        assert!(retry.associated_channel.is_none());
-        assert!(llc.outbound_messages[0].tried_delivery_timeslots.contains(&1));
+        assert_eq!(retry_route.associated_channel.map(|route| route.timeslot), Some(3));
+        let retry_mcch = queue.pop_front().expect("MCCH retry queued");
+        let SapMsgInner::TmaUnitdataReq(retry_mcch) = retry_mcch.msg else {
+            panic!("expected TMA retry")
+        };
+        assert!(retry_mcch.associated_channel.is_none());
     }
 
     #[test]
-    fn acknowledged_downlink_fans_out_over_scan_list_routes_then_tries_mcch() {
+    fn acknowledged_downlink_fans_out_over_scan_list_routes_and_mcch() {
         let config = test_config();
         let issi = 77_468;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
@@ -1440,10 +1447,10 @@ mod tests {
             let SapMsgInner::TmaUnitdataReq(request) = message.msg else {
                 panic!("expected TMA request")
             };
-            initial_timeslots.push(request.associated_channel.expect("traffic route").timeslot);
+            initial_timeslots.push(request.associated_channel.map(|route| route.timeslot));
         }
-        assert_eq!(initial_timeslots, vec![4, 3, 2]);
-        assert_eq!(llc.outbound_messages[0].attempt_reporters.len(), 3);
+        assert_eq!(initial_timeslots, vec![Some(4), Some(3), Some(2), None]);
+        assert_eq!(llc.outbound_messages[0].attempt_reporters.len(), 4);
         assert!(
             llc.outbound_messages[0]
                 .attempt_reporters
@@ -1460,15 +1467,16 @@ mod tests {
         assert_eq!(llc.outbound_messages[0].t_umac_done, Some(llc.dltime));
         assert!(llc.outbound_messages[0].tx_reporter.is_transmitted());
 
+        let old_attempt_reporters = llc.outbound_messages[0].attempt_reporters.clone();
         let ack = &mut llc.outbound_messages[0];
         ack.retransmit_count = 1;
         Llc::submit_for_acknowledged_transmission(&config, &mut queue, ack, start);
-        let retry = queue.pop_front().expect("MCCH retry queued");
-        let SapMsgInner::TmaUnitdataReq(retry) = retry.msg else {
-            panic!("expected TMA retry")
-        };
-        assert!(retry.associated_channel.is_none());
-        assert!(queue.pop_front().is_none());
+        assert!(old_attempt_reporters[1..].iter().all(TxReporter::is_discarded));
+        let mut retry_copies = 0;
+        while queue.pop_front().is_some() {
+            retry_copies += 1;
+        }
+        assert_eq!(retry_copies, 4);
 
         let ack = &mut llc.outbound_messages[0];
         ack.retransmit_count = 2;
@@ -1477,7 +1485,7 @@ mod tests {
         while queue.pop_front().is_some() {
             copies += 1;
         }
-        assert_eq!(copies, 3, "a new route cycle must fan out again");
+        assert_eq!(copies, 4, "every retry must cover all plausible bearers again");
     }
 
     #[test]
@@ -1526,6 +1534,7 @@ mod tests {
         );
         assert!(llc.submit_free_messages_to_umac(&mut queue));
         queue.pop_front().expect("first attempt queued");
+        queue.pop_front().expect("concurrent MCCH attempt queued");
 
         llc.outbound_messages[0].attempt_reporters[0].mark_transmitted();
         llc.dltime = start.add_timeslots(1);
@@ -1537,9 +1546,11 @@ mod tests {
         assert!(llc.submit_retransmissions_to_umac(&mut queue));
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
 
+        let redundant_copies = llc.outbound_messages[0].attempt_reporters.clone();
         llc.process_incoming_ack(addr, 0, AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacData));
         assert!(llc.outbound_messages.is_empty());
         assert_eq!(reporter.get_state(), tetra_core::TxState::Acknowledged);
+        assert!(redundant_copies.iter().all(TxReporter::is_discarded));
     }
 
     #[test]
@@ -1560,7 +1571,7 @@ mod tests {
             );
         }
 
-        assert!(Llc::delivery_routes(&config, issi, now, &HashSet::new()).is_empty());
+        assert!(Llc::delivery_routes(&config, issi, now).is_empty());
     }
 
     #[test]
@@ -1581,7 +1592,7 @@ mod tests {
             );
         }
 
-        assert!(Llc::delivery_routes(&config, issi, now.add_timeslots(500), &HashSet::new()).is_empty());
+        assert!(Llc::delivery_routes(&config, issi, now.add_timeslots(500)).is_empty());
     }
 
     #[test]

@@ -128,6 +128,13 @@ impl BsFragger {
         self.tx_reporter.as_ref().is_some_and(TxReporter::expects_ack)
     }
 
+    /// LLC marks a per-route reporter discarded when another concurrent copy
+    /// has already been acknowledged.  Such a fragment chain must leave the
+    /// scheduler without putting a late duplicate on the air.
+    pub fn is_cancelled(&self) -> bool {
+        self.tx_reporter.as_ref().is_some_and(TxReporter::is_discarded)
+    }
+
     pub fn individual_issi(&self) -> Option<u32> {
         match self.aie_request {
             AieRequest::Clear {

@@ -186,6 +186,16 @@ pub enum DlSchedElem {
     Stealing(BitBuffer, Option<TxReporter>, AieRequest, Option<AieCipherRegion>),
 }
 
+impl DlSchedElem {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Resource(_, _, Some(reporter), _) | Self::Stealing(_, Some(reporter), ..) => reporter.is_discarded(),
+            Self::FragBuf(fragger) => fragger.is_cancelled(),
+            _ => false,
+        }
+    }
+}
+
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
     ul1: None,
     ul2: None,
@@ -1174,6 +1184,7 @@ impl BsChannelScheduler {
     fn dl_build_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let item = {
             let queue = &mut self.assoc_dltx_queues[ts.t as usize - 1];
+            queue.retain(|item| !item.is_cancelled());
             // A fragmented TM-SDU owns this SACCH until MAC-END.  EN 300
             // 392-2 clauses 23.4.2.1.5 and 23.4.3.1.1 require the receiver to
             // reconstruct continuation fragments on this control channel;
@@ -2059,6 +2070,7 @@ impl BsChannelScheduler {
         // Map 1-based ts to 0-based index, bail on 0 or out of range.
         let slot = ts.t as usize - 1;
         let q = self.dltx_queues.get_mut(slot).unwrap();
+        q.retain(|item| !item.is_cancelled());
 
         // Return grants first
         if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Grant(_, _))) {
@@ -2915,6 +2927,39 @@ mod tests {
         let _ = sched.dl_build_associated_control_block(TdmaTime { t: 2, f: 18, m: 2, h: 0 });
 
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+    }
+
+    #[test]
+    fn cancelled_concurrent_copies_leave_control_queues() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress::issi(77_468);
+
+        let associated_reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("1010"),
+            Some(associated_reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+        associated_reporter.mark_discarded();
+        assert!(
+            sched
+                .dl_build_associated_control_block(TdmaTime { t: 2, f: 18, m: 2, h: 0 })
+                .is_none()
+        );
+        assert!(sched.assoc_dltx_queues[1].is_empty());
+
+        let mcch_reporter = TxReporter::new();
+        sched.dl_enqueue_tma(
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("1010"),
+            Some(mcch_reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+        mcch_reporter.mark_discarded();
+        assert!(sched.dl_take_prioritized_sched_item(TdmaTime { t: 1, f: 2, m: 2, h: 0 }).is_none());
+        assert!(sched.dltx_queues[0].is_empty());
     }
 
     #[test]
