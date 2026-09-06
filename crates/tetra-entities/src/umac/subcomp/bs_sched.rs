@@ -677,20 +677,23 @@ impl BsChannelScheduler {
         }
     }
 
-    /// Reserve one FN18 uplink subslot needed for the BL-ACK of an
+    /// Reserve one FN18 uplink slot needed for the BL-ACK of an
     /// acknowledged downlink resource sent through the associated SACCH.
     ///
     /// With an active uplink speaker, frames 1..17 belong to that speaker's
     /// TCH. The addressed listener can acknowledge SDS in the corresponding
-    /// frame-18 SCH/F. The grant is included in the same MAC-RESOURCE as the
-    /// BL-DATA and uses the zero-delay FN18 opportunity.
+    /// frame-18 SCH/F.  Traffic-mode transmissions occupy the entire slot
+    /// (EN 300 392-2 clause 19.4.2.4.1), so both uplink subslots must be
+    /// reserved even though the BL-ACK itself is short. The grant is included
+    /// in the same MAC-RESOURCE as the BL-DATA and uses the zero-delay FN18
+    /// opportunity.
     pub fn ul_prepare_associated_basic_link_ack_grant(&mut self, timeslot: u8, addr: TetraAddress) -> Option<BasicSlotgrant> {
         if !(2..=4).contains(&timeslot) || !self.circuits.is_active(Direction::Ul, timeslot) || self.is_hangtime(timeslot) {
             return None;
         }
 
         let grant_frame = self.next_associated_fn18(timeslot);
-        self.ul_process_associated_fn18_cap_req(grant_frame, addr, &ReservationRequirement::Req1Subslot)
+        self.ul_process_associated_fn18_cap_req(grant_frame, addr, &ReservationRequirement::Req1Slot)
     }
 
     /// Prepare an associated BL-ACK grant after the actual downlink FN18 is
@@ -705,7 +708,7 @@ impl BsChannelScheduler {
             return None;
         }
 
-        self.ul_process_associated_fn18_cap_req(tx_time, addr, &ReservationRequirement::Req1Subslot)
+        self.ul_process_associated_fn18_cap_req(tx_time, addr, &ReservationRequirement::Req1Slot)
     }
 
     fn next_associated_fn18(&self, timeslot: u8) -> TdmaTime {
@@ -2881,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_associated_fn18_grant_uses_second_subslot_at_predefined_clch() {
+    fn test_associated_ack_full_slot_waits_past_predefined_clch() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -2901,22 +2904,29 @@ mod tests {
         sched.cur_dltime = TdmaTime { t: 1, f: 18, m: 5, h: 0 };
 
         let addr = TetraAddress::new(1234, SsiType::Issi);
-        let grant = sched
-            .ul_prepare_associated_basic_link_ack_grant(2, addr)
-            .expect("active speaker must provide an associated FN18 grant");
-
-        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::SecondSubslotGranted);
         let clch = TdmaTime { t: 2, f: 18, m: 5, h: 0 };
         assert!(clch.is_mandatory_clch());
-        assert_eq!(
-            sched.ul_get_slot_owner(clch, PhyBlockNum::Block1),
-            None,
-            "the predefined CLCH subslot must remain available"
+        assert!(
+            sched.ul_prepare_associated_basic_link_ack_grant(2, addr).is_none(),
+            "a traffic-mode BL-ACK must not share its full slot with CLCH"
         );
         assert_eq!(
-            sched.ul_get_slot_owner(clch, PhyBlockNum::Block2),
+            sched.ul_get_slot_owner(clch, PhyBlockNum::Both),
+            None,
+            "the predefined CLCH opportunity must remain unreserved"
+        );
+
+        sched.cur_dltime = TdmaTime { t: 1, f: 18, m: 6, h: 0 };
+        let usable = TdmaTime { t: 2, f: 18, m: 6, h: 0 };
+        assert!(!usable.is_mandatory_clch());
+        let grant = sched
+            .ul_prepare_associated_basic_link_ack_grant(2, addr)
+            .expect("the next non-CLCH FN18 must provide a full-slot grant");
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(
+            sched.ul_get_slot_owner(usable, PhyBlockNum::Both),
             Some(1234),
-            "the reserved response must use the second FN18 subslot"
+            "both subslots must belong to the traffic-mode BL-ACK"
         );
     }
 
@@ -2987,13 +2997,10 @@ mod tests {
             resource.slot_granting_element.is_some(),
             "grant must be built at actual FN18 transmission time"
         );
-        let granted_block = match resource.slot_granting_element.expect("grant checked above").capacity_allocation {
-            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
-            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
-            allocation => panic!("unexpected associated ACK allocation: {:?}", allocation),
-        };
+        let grant = resource.slot_granting_element.expect("grant checked above");
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
         assert_eq!(
-            sched.ul_get_slot_owner(usable, granted_block),
+            sched.ul_get_slot_owner(usable, PhyBlockNum::Both),
             Some(1234),
             "ACK reservation must follow the actual transmitted FN18 grant"
         );
@@ -3057,12 +3064,8 @@ mod tests {
         final_block.seek(0);
         let end = MacEndDl::from_bitbuf(&mut final_block).expect("MAC-END with acknowledgement grant");
         let grant = end.slot_granting_element.expect("final MAC-END must grant the BL-ACK response");
-        let granted_block = match grant.capacity_allocation {
-            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
-            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
-            allocation => panic!("unexpected associated ACK allocation: {:?}", allocation),
-        };
-        assert_eq!(sched.ul_get_slot_owner(final_time, granted_block), Some(addr.ssi));
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(sched.ul_get_slot_owner(final_time, PhyBlockNum::Both), Some(addr.ssi));
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
         assert!(sched.assoc_dltx_queues[2].is_empty());
     }
@@ -3155,7 +3158,13 @@ mod tests {
             .expect("active fragment must finish at the next usable SACCH");
         final_block.seek(0);
         let end = MacEndDl::from_bitbuf(&mut final_block).expect("continuation must be MAC-END");
-        assert!(end.slot_granting_element.is_some(), "final fragment must carry the BL-ACK grant");
+        assert_eq!(
+            end.slot_granting_element
+                .expect("final fragment must carry the BL-ACK grant")
+                .capacity_allocation,
+            BasicSlotgrantCapAlloc::Grant1Slot
+        );
+        assert_eq!(sched.ul_get_slot_owner(final_time, PhyBlockNum::Both), Some(addr.ssi));
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
     }
 
