@@ -42,36 +42,6 @@ const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32;
 const MIN_SLOT_CAP_FOR_FRAG: usize = 16;
 
 impl BsFragger {
-    /// Whether an acknowledged resource can start in one STCH half-slot and
-    /// finish in the immediately following SCH/F with its BL-ACK grant.
-    ///
-    /// This keeps an assigned-channel fragment chain in consecutive frames.
-    /// Waiting for two separate FN18 opportunities can exceed an MS's MAC
-    /// defragmentation window, especially when BSCH or BNCH occupies one of
-    /// those opportunities.
-    pub fn can_start_in_stch_and_finish_in_schf(
-        resource: &MacResource,
-        sdu_len_bits: usize,
-        stch_cap_bits: usize,
-        schf_cap_bits: usize,
-    ) -> bool {
-        let mut first_resource = resource.clone();
-        let deferred_chan_alloc = first_resource.chan_alloc_element.take();
-        let first_header_bits = first_resource.compute_header_len();
-        if first_header_bits >= stch_cap_bits {
-            return false;
-        }
-
-        let first_payload_bits = stch_cap_bits - first_header_bits;
-        if sdu_len_bits <= first_payload_bits {
-            return false;
-        }
-
-        let remaining_sdu_bits = sdu_len_bits - first_payload_bits;
-        let final_bits = MacEndDl::compute_hdr_len(None, deferred_chan_alloc) + 8 + remaining_sdu_bits;
-        final_bits.div_ceil(8) * 8 <= schf_cap_bits
-    }
-
     /// Compatibility constructor for deliberately clear control resources.
     pub fn new(resource: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) -> Self {
         Self::new_with_aie(
