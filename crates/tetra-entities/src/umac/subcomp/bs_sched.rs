@@ -831,14 +831,6 @@ impl BsChannelScheduler {
     ) -> Option<BasicSlotgrant> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
-        if requested_cap != 1 {
-            tracing::warn!(
-                "ul_process_associated_fn18_cap_req: cannot grant {} slots on one FN18 for addr {}",
-                requested_cap,
-                addr
-            );
-            return None;
-        }
 
         let target_frame = grant_frame;
 
@@ -886,6 +878,12 @@ impl BsChannelScheduler {
             );
             return None;
         } else if schedule.ul1.is_none() && schedule.ul2.is_none() {
+            // EN 300 392-2 clause 23.5.2.2.4 requires a BS whose assigned
+            // traffic channel is in SACCH to grant only one reserved slot at
+            // a time.  A capacity request can nevertheless ask for two or
+            // more slots while an uplink TM-SDU is being fragmented.  Grant
+            // this FN18 and let the MS carry its remaining requirement in
+            // the fragment, instead of rejecting the request indefinitely.
             schedule.ul1 = Some(addr.ssi);
             schedule.ul2 = Some(addr.ssi);
             BasicSlotgrantCapAlloc::Grant1Slot
@@ -901,6 +899,15 @@ impl BsChannelScheduler {
             grant_frame,
             target_frame
         );
+        if requested_cap > 1 {
+            tracing::info!(
+                requested_slots = requested_cap,
+                granted_slots = 1,
+                address = ?addr,
+                dltime = %target_frame,
+                "partially granting associated SACCH capacity request"
+            );
+        }
         Some(BasicSlotgrant {
             capacity_allocation,
             granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
@@ -1173,18 +1180,15 @@ impl BsChannelScheduler {
             // transmitting another fragment start first would make it discard
             // the partial TM-SDU.  Supported uplink grants remain immediate,
             // while acknowledged downlinks take precedence over ordinary
-            // associated signalling and requests that this single-slot ACCH
-            // cannot currently satisfy.
+            // associated signalling.  Multi-slot capacity requests are
+            // served one FN18 slot at a time as required for SACCH.
             let pos = queue
                 .iter()
                 .position(|item| matches!(item, DlSchedElem::FragBuf(..)))
                 .or_else(|| {
-                    queue.iter().position(|item| {
-                        matches!(
-                            item,
-                            DlSchedElem::AssociatedGrantRequest(_, ReservationRequirement::Req1Subslot | ReservationRequirement::Req1Slot)
-                        )
-                    })
+                    queue
+                        .iter()
+                        .position(|item| matches!(item, DlSchedElem::AssociatedGrantRequest(..)))
                 })
                 .or_else(|| {
                     queue
@@ -3511,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_associated_downlink_keeps_sacch_until_mac_end() {
+    fn multislot_uplink_grant_precedes_and_downlink_keeps_sacch_until_mac_end() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -3537,8 +3541,9 @@ mod tests {
         let ordinary_addr = TetraAddress::new(92, SsiType::Gssi);
         let pending_uplink = TetraAddress::new(77_479, SsiType::Issi);
 
-        // Reproduce the live failure: an unsatisfiable multi-slot request and
-        // ordinary group signalling were already queued when SDS arrived.
+        // Reproduce the live remote-control response: the MS starts an uplink
+        // fragment and asks for two more slots while other control and SDS
+        // are waiting on the same SACCH.
         sched.dl_enqueue_associated_grant_request(timeslot, pending_uplink, ReservationRequirement::Req2Slots);
         sched.dl_enqueue_associated_tma(
             timeslot,
@@ -3562,9 +3567,34 @@ mod tests {
             h: 0,
         };
         assert!(!first_time.is_mandatory_bsch() && !first_time.is_mandatory_bnch());
-        let mut first = sched
+        let mut grant_block = sched
             .dl_build_associated_control_block(first_time)
-            .expect("acknowledged SDS must not wait behind unrelated control");
+            .expect("multi-slot request must receive partial SACCH capacity");
+        grant_block.seek(0);
+        let grant_resource = MacResource::from_bitbuf(&mut grant_block).expect("partial grant MAC-RESOURCE");
+        assert_eq!(
+            grant_resource.addr.map(|address| address.ssi),
+            Some(pending_uplink.ssi)
+        );
+        assert_eq!(
+            grant_resource
+                .slot_granting_element
+                .expect("multi-slot request must be granted one FN18 at a time")
+                .capacity_allocation,
+            BasicSlotgrantCapAlloc::Grant1Slot
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(first_time, PhyBlockNum::Both),
+            Some(pending_uplink.ssi)
+        );
+
+        let mut data_time = first_time.add_timeslots(18 * 4);
+        while data_time.is_mandatory_bsch() || data_time.is_mandatory_bnch() {
+            data_time = data_time.add_timeslots(18 * 4);
+        }
+        let mut first = sched
+            .dl_build_associated_control_block(data_time)
+            .expect("acknowledged SDS must precede unrelated group control");
         first.seek(0);
         let resource = MacResource::from_bitbuf(&mut first).expect("fragmented MAC-RESOURCE");
         assert_eq!(resource.addr.map(|address| address.ssi), Some(addr.ssi));
@@ -3589,7 +3619,7 @@ mod tests {
             AieRequest::clear(AieSubject::Individual { issi: later_addr.ssi }, AieScope::MacResource),
         );
 
-        let mut final_time = first_time.add_timeslots(18 * 4);
+        let mut final_time = data_time.add_timeslots(18 * 4);
         while final_time.is_mandatory_bsch() || final_time.is_mandatory_bnch() {
             final_time = final_time.add_timeslots(18 * 4);
         }
