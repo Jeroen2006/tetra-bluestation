@@ -22,11 +22,11 @@ use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 
-// Assigned-channel signalling has fewer opportunities to return a BL-ACK:
-// while the speaker owns FN1..17, the associated listener normally waits for
-// FN18. Keep the basic-link retry window and retry budget aligned with that
-// delivery path.
-const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 4;
+// T.251 is expressed in downlink signalling frames for the channel on which
+// the response is expected (TS 100 392-2 Annex A). While an active traffic
+// channel owns FN1..17, SACCH has one such frame per 18-frame multiframe.
+// Convert the four-frame T.251 value to four actual SACCH opportunities.
+const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 18;
 const ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS: u8 = 2;
 // Keep a common-channel basic-link transaction alive for one complete TETRA
 // frame after N.252 is exhausted. An MS can only put its BL-ACK on air a few
@@ -1326,7 +1326,16 @@ mod tests {
         llc.dltime = start.add_timeslots(1);
         assert!(!llc.submit_retransmissions_to_umac(&mut queue));
         let retry_timer = Llc::basic_link_retry_timer(&llc.outbound_messages[0]);
-        llc.dltime = llc.dltime.add_timeslots(retry_timer as i32);
+        assert_eq!(retry_timer, T251_SENDER_RETRY_TIMER * 18);
+
+        // One elapsed multiframe is only one downlink signalling frame on
+        // SACCH. In particular, it must not reproduce the live premature
+        // retry that used to add another fragmented SDS after this delay.
+        let one_sacch_opportunity = tetra_core::frames!(18);
+        llc.dltime = llc.dltime.add_timeslots(one_sacch_opportunity);
+        assert!(!llc.submit_retransmissions_to_umac(&mut queue));
+
+        llc.dltime = llc.dltime.add_timeslots((retry_timer - one_sacch_opportunity as u32) as i32);
         assert!(llc.submit_retransmissions_to_umac(&mut queue));
 
         let retry = queue.pop_front().expect("MCCH retry queued");
