@@ -680,6 +680,7 @@ impl CcBsSubentity {
             call_id: candidate.call_id,
             timeslot: candidate.timeslot,
             usage: candidate.usage,
+            best_effort_key: None,
         })
     }
 
@@ -704,6 +705,7 @@ impl CcBsSubentity {
                     call_id: circuit.call_id,
                     timeslot: circuit.ts,
                     usage: circuit.usage,
+                    best_effort_key: None,
                 });
             }
         }
@@ -894,6 +896,24 @@ impl CcBsSubentity {
         result
     }
 
+    /// Active group bearers on which members of another scanned group may
+    /// currently be listening. These are used only for expendable periodic
+    /// late-entry repeats. The destination call's own bearer is excluded: its
+    /// members already receive the call traffic and normal associated control.
+    fn other_group_call_channels(&self, call_id: u16) -> Vec<AssociatedChannel> {
+        self.active_calls
+            .iter()
+            .filter_map(|(&source_call_id, call)| {
+                (source_call_id != call_id && self.circuits.is_active(call.ts).0).then_some(AssociatedChannel {
+                    call_id: source_call_id,
+                    timeslot: call.ts,
+                    usage: call.usage,
+                    best_effort_key: Some(call_id),
+                })
+            })
+            .collect()
+    }
+
     /// Add a tracked channel hint to individually addressed non-stealing
     /// downlink signalling.  LLC/UMAC still validates that the circuit is
     /// alive and falls back to MCCH, so a stale probability can never route a
@@ -931,6 +951,7 @@ impl CcBsSubentity {
                             call_id,
                             timeslot: call.ts,
                             usage: call.usage,
+                            best_effort_key: None,
                         })
                     }),
                     _ => None,
@@ -2014,6 +2035,7 @@ impl CcBsSubentity {
             return false;
         }
 
+        let other_channels = self.other_group_call_channels(call_id);
         let Some((pdu, dest_addr, receipt)) = self.cached_setups.get_mut(&call_id) else {
             tracing::error!(call_id, "no cached D-SETUP");
             return false;
@@ -2046,6 +2068,23 @@ impl CcBsSubentity {
             Layer2Service::Unacknowledged,
             Some(reporter),
         ));
+
+        // Opportunistically advertise this call on every other active group
+        // bearer. A scanner may have missed the MCCH copy or may currently be
+        // following another group. UMAC coalesces these by call id and sends
+        // them only after all ordinary associated control, never on this
+        // call's own bearer.
+        for source_channel in other_channels {
+            let (sdu, chan_alloc) = Self::build_d_setup_prim(pdu, usage, ts, UlDlAssignment::Both);
+            queue.push_back(Self::build_sapmsg_associated(
+                sdu,
+                Some(chan_alloc),
+                *dest_addr,
+                Layer2Service::Unacknowledged,
+                None,
+                source_channel,
+            ));
+        }
         true
     }
 
@@ -3268,6 +3307,7 @@ impl CcBsSubentity {
                         call_id,
                         timeslot: circuit.ts,
                         usage: circuit.usage,
+                        best_effort_key: None,
                     },
                 ));
             }
@@ -5370,6 +5410,7 @@ impl CcBsSubentity {
             call_id,
             timeslot: ts,
             usage,
+            best_effort_key: None,
         };
         tracing::info!(call_id, source_issi, dest_gssi, ?channel, "-> group FN18 D-TX GRANTED");
         queue.push_back(Self::build_sapmsg_associated(
@@ -5738,6 +5779,38 @@ mod tests {
 
         assert!(cc.preferred_listener_channel(issi).is_none());
         assert!(cc.config.state_read().subscriber_delivery_routes.get(&issi).is_none());
+    }
+
+    #[test]
+    fn periodic_setup_is_repeated_only_on_other_active_group_bearers() {
+        let mut cc = test_cc_with_group(91);
+        cc.group_listeners.insert(92, 1);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, 7, 430_892, 91, 1, 430_892, None, false, true);
+        cc.start_remote_swmi_call(&mut queue, 8, 430_893, 92, 2, 430_893, None, false, true);
+        while queue.pop_front().is_some() {}
+
+        let target = cc.active_calls.get(&8).expect("target call").clone();
+        assert!(cc.send_cached_group_d_setup(&mut queue, 8, target.usage, target.ts, true));
+
+        let mut associated = Vec::new();
+        while let Some(message) = queue.pop_front() {
+            if let Some(channel) = (|| {
+                let SapMsgInner::LcmcMleUnitdataReq(prim) = &message.msg else {
+                    return None;
+                };
+                prim.associated_channel
+            })() {
+                associated.push(channel);
+            }
+        }
+        assert_eq!(associated.len(), 1, "one other active call must receive one expendable repeat");
+        assert_eq!(associated[0].call_id, 7);
+        assert_ne!(
+            associated[0].timeslot, target.ts,
+            "a call must never receive its own D-SETUP repeat"
+        );
+        assert_eq!(associated[0].best_effort_key, Some(8));
     }
 
     #[test]

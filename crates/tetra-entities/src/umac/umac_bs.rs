@@ -1890,6 +1890,7 @@ impl UmacBs {
                     call_id: 0,
                     timeslot: *timeslot,
                     usage: *usage,
+                    best_effort_key: None,
                 });
                 self.rx_ul_tma_unitdata_req(
                     queue,
@@ -2232,25 +2233,36 @@ impl UmacBs {
             // at the *new* call.  Do not discard that association merely
             // because the MAC-RESOURCE carries a channel allocation.
             if (2..=4).contains(&channel.timeslot) && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot) {
-                let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
-                let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
-                if !hangtime && ul_active {
-                    // Keep the PDU grant-free until the scheduler knows which
-                    // FN18 will actually transmit it. A mandatory BSCH/BNCH
-                    // can defer this queue entry by one or more multiframes.
-                    tracing::debug!(?channel, "routing ordinary signalling through associated FN18 control queue");
+                if let Some(key) = channel.best_effort_key {
+                    // Periodic cross-call D-SETUP copies are expendable and
+                    // coalesced separately from all ordinary signalling.
                     self.channel_scheduler
-                        .dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
+                        .dl_enqueue_associated_best_effort_tma(channel.timeslot, key, pdu, sdu, aie_request);
                 } else {
-                    tracing::debug!(
-                        ?channel,
-                        hangtime,
-                        ul_active,
-                        "routing ordinary signalling through associated non-traffic signalling queue"
-                    );
-                    self.channel_scheduler
-                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
+                    let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
+                    let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
+                    if !hangtime && ul_active {
+                        // Keep the PDU grant-free until the scheduler knows which
+                        // FN18 will actually transmit it. A mandatory BSCH/BNCH
+                        // can defer this queue entry by one or more multiframes.
+                        tracing::debug!(?channel, "routing ordinary signalling through associated FN18 control queue");
+                        self.channel_scheduler
+                            .dl_enqueue_associated_tma(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
+                    } else {
+                        tracing::debug!(
+                            ?channel,
+                            hangtime,
+                            ul_active,
+                            "routing ordinary signalling through associated non-traffic signalling queue"
+                        );
+                        self.channel_scheduler
+                            .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
+                    }
                 }
+            } else if channel.best_effort_key.is_some() {
+                // The normal MCCH late-entry copy is already queued. A stale
+                // expendable cross-call route must not create another MCCH PDU.
+                tracing::debug!(?channel, "dropping stale best-effort associated repeat");
             } else {
                 tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
                 self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter, aie_request);

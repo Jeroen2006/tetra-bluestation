@@ -158,6 +158,7 @@ impl Llc {
                 call_id: route.call_id,
                 timeslot: route.timeslot,
                 usage: route.usage,
+                best_effort_key: None,
             })
     }
 

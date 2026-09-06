@@ -7,6 +7,9 @@ pub struct AssociatedChannel {
     pub call_id: u16,
     pub timeslot: u8,
     pub usage: u8,
+    /// A present key marks an expendable, coalesced associated repeat. The
+    /// value identifies the repeated call within the target timeslot queue.
+    pub best_effort_key: Option<u16>,
 }
 
 /// Clause 20.4.1.1.1

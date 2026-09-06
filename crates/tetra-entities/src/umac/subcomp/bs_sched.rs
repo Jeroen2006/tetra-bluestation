@@ -120,6 +120,10 @@ pub struct BsChannelScheduler {
     /// Associated-control messages. These are consumed only in FN18 on an
     /// assigned channel and therefore never steal a normal speech frame.
     assoc_dltx_queues: [Vec<DlSchedElem>; 4],
+    /// Expendable periodic associated repeats, keyed by the advertised call.
+    /// They are consumed only when both ordinary signalling queues for the
+    /// target bearer are empty.
+    assoc_best_effort_queues: [Vec<(u16, DlSchedElem)>; 4],
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
     /// Uplink reservations announced in an associated FN18 grant. They are
     /// kept separate from the ordinary 18-frame ring because the associated
@@ -202,6 +206,7 @@ impl BsChannelScheduler {
             dltx_next_slot_queue: Vec::new(),
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             assoc_dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            assoc_best_effort_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             ulsched: EMPTY_SCHED,
             associated_ulsched: Vec::new(),
             circuits: CircuitMgr::new(),
@@ -938,6 +943,27 @@ impl BsChannelScheduler {
         queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
     }
 
+    /// Queue an expendable associated repeat. At most one copy per key waits
+    /// on a bearer, preventing the periodic producer from building backlog
+    /// when speech/control leaves fewer free opportunities than expected.
+    pub fn dl_enqueue_associated_best_effort_tma(&mut self, ts: u8, key: u16, pdu: MacResource, sdu: BitBuffer, aie_request: AieRequest) {
+        assert!((2..=4).contains(&ts), "associated control must use an assigned timeslot");
+        let queue = &mut self.assoc_best_effort_queues[ts as usize - 1];
+        if queue.iter().any(|(queued_key, _)| *queued_key == key) {
+            tracing::trace!(ts, key, "coalescing duplicate best-effort associated repeat");
+            return;
+        }
+        tracing::debug!(
+            ts,
+            key,
+            addr = ?pdu.addr,
+            sdu_bits = sdu.get_len(),
+            queued_before = queue.len(),
+            "queued best-effort associated repeat"
+        );
+        queue.push((key, DlSchedElem::Resource(pdu, sdu, None, aie_request)));
+    }
+
     /// Deliver a capacity grant through the target channel's FN18 control
     /// frame. This makes the preceding AACH reservation and the grant PDU
     /// visible on the same associated channel, without downlink stealing.
@@ -1219,6 +1245,85 @@ impl BsChannelScheduler {
         Some(buf)
     }
 
+    /// Build one expendable associated repeat. This queue is deliberately
+    /// separate from normal control so an in-progress low-priority message can
+    /// be abandoned when SDS, a grant, or any other signalling arrives.
+    fn dl_build_best_effort_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
+        if self.assoc_best_effort_queues[ts.t as usize - 1].is_empty() {
+            return None;
+        }
+        let (key, item) = self.assoc_best_effort_queues[ts.t as usize - 1].remove(0);
+        let mut buf = BitBuffer::new(SCH_F_CAP);
+        match item {
+            DlSchedElem::Resource(pdu, sdu, _, aie_request) => {
+                let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
+                    Ok(pdu) => pdu,
+                    Err(error) => {
+                        tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated repeat without a valid AIE context");
+                        return None;
+                    }
+                };
+                let mut fragger = BsFragger::new_with_aie(pdu, sdu, None, aie_request);
+                let written_before = buf.get_len_written();
+                let complete = fragger.get_next_chunk(&mut buf);
+                if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                    tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated repeat after AIE cipher failure");
+                    return None;
+                }
+                if !complete {
+                    if written_before == 0 && buf.get_len_written() == 0 {
+                        tracing::debug!(dltime = %ts, key, "dropping best-effort associated repeat that cannot make progress");
+                    } else {
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger)));
+                    }
+                }
+            }
+            DlSchedElem::FragBuf(mut fragger) => {
+                let written_before = buf.get_len_written();
+                let complete = fragger.get_next_chunk(&mut buf);
+                if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
+                    tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated fragment after AIE cipher failure");
+                    return None;
+                }
+                if !complete {
+                    if written_before == 0 && buf.get_len_written() == 0 {
+                        tracing::debug!(dltime = %ts, key, "dropping best-effort associated fragment that cannot make progress");
+                    } else {
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger)));
+                    }
+                }
+            }
+            _ => unreachable!("best-effort associated queue accepts only resources and fragments"),
+        }
+
+        let remaining_before = buf.get_len_remaining();
+        finalize_downlink_mac_block(&mut buf);
+        tracing::debug!(
+            dltime = %ts,
+            timeslot = ts.t,
+            key,
+            used_bits = SCH_F_CAP - remaining_before,
+            "building best-effort associated SCH/F control block"
+        );
+        Some(buf)
+    }
+
+    /// A different MAC resource between a MAC-FRAG and MAC-END invalidates
+    /// the receiver's fragment chain. Drop only the partial expendable copy;
+    /// its next periodic occurrence will start again from MAC-RESOURCE.
+    fn cancel_interrupted_best_effort_fragment(&mut self, timeslot: u8) {
+        let queue = &mut self.assoc_best_effort_queues[timeslot as usize - 1];
+        let before = queue.len();
+        queue.retain(|(_, item)| !matches!(item, DlSchedElem::FragBuf(_)));
+        if queue.len() != before {
+            tracing::debug!(
+                dltime = %self.cur_dltime,
+                ts = timeslot,
+                "discarding interrupted best-effort fragment chain"
+            );
+        }
+    }
+
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
     /// this timeslot. Used when building STCH blocks so the MAC-RESOURCE can carry
     /// random_access_flag=true per ETSI 21.4.3.1.
@@ -1485,7 +1590,8 @@ impl BsChannelScheduler {
     /// partial fragger performs the same notification in `BsFragger::drop`.
     fn dl_drop_associated_control(&mut self, timeslot: u8) -> bool {
         let queued = std::mem::take(&mut self.assoc_dltx_queues[timeslot as usize - 1]);
-        let had_items = !queued.is_empty();
+        let best_effort = std::mem::take(&mut self.assoc_best_effort_queues[timeslot as usize - 1]);
+        let had_items = !queued.is_empty() || !best_effort.is_empty();
 
         for elem in queued {
             tracing::warn!(
@@ -1501,6 +1607,15 @@ impl BsChannelScheduler {
                 tx_reporter.mark_discarded();
             }
             // `FragBuf` marks a still-pending reporter discarded on drop.
+        }
+
+        if !best_effort.is_empty() {
+            tracing::debug!(
+                dltime = %self.cur_dltime,
+                ts = timeslot,
+                count = best_effort.len(),
+                "discarding best-effort associated repeats after circuit removal"
+            );
         }
 
         had_items
@@ -1856,12 +1971,16 @@ impl BsChannelScheduler {
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
 
         let frame18_broadcast_slot = ts.is_mandatory_bsch() || ts.is_mandatory_bnch();
-        if ts.f == 18 && frame18_broadcast_slot && !self.assoc_dltx_queues[ts.t as usize - 1].is_empty() {
+        if ts.f == 18
+            && frame18_broadcast_slot
+            && (!self.assoc_dltx_queues[ts.t as usize - 1].is_empty() || !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty())
+        {
             tracing::debug!(
                 dltime = %ts,
                 mandatory_bsch = ts.is_mandatory_bsch(),
                 mandatory_bnch = ts.is_mandatory_bnch(),
                 queued_associated = self.assoc_dltx_queues[ts.t as usize - 1].len(),
+                queued_best_effort = self.assoc_best_effort_queues[ts.t as usize - 1].len(),
                 "deferring associated SACCH control for mandatory frame-18 broadcast"
             );
         }
@@ -1878,7 +1997,17 @@ impl BsChannelScheduler {
             // Associated FN18 remains on the assigned TP physical resource,
             // while its logical channel is SCH/F and therefore uses signalling
             // coding in LMAC (encode_cp), not TCH speech coding.
-            let associated_control = self.dl_build_associated_control_block(ts);
+            let normal_associated_pending = !self.assoc_dltx_queues[ts.t as usize - 1].is_empty();
+            if normal_associated_pending {
+                self.cancel_interrupted_best_effort_fragment(ts.t);
+            }
+            let associated_control = if normal_associated_pending {
+                self.dl_build_associated_control_block(ts)
+            } else if !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty() {
+                self.dl_build_best_effort_associated_control_block(ts)
+            } else {
+                None
+            };
             if associated_control.is_some() {
                 tracing::info!(
                     dltime = %ts,
@@ -1965,8 +2094,18 @@ impl BsChannelScheduler {
             // Integrate all grants and random access acks into resources (either existing or new)
             self.dl_integrate_sched_elems_for_timeslot(ts);
 
-            // Fill our signalling block with scheduled items (if any)
-            let buf = self.dl_build_block_from_signalling_schedule(ts);
+            // Fill our signalling block with scheduled items (if any). Building
+            // may move a fragmented ordinary message back into the queue, so
+            // the emitted block itself is the reliable interruption signal.
+            let normal_buf = self.dl_build_block_from_signalling_schedule(ts);
+            if normal_buf.is_some() {
+                self.cancel_interrupted_best_effort_fragment(ts.t);
+            }
+            let buf = normal_buf.or_else(|| {
+                (ts.f != 18 && hang_effective && dl_circuit_active && !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty())
+                    .then(|| self.dl_build_best_effort_associated_control_block(ts))
+                    .flatten()
+            });
             if let Some(buf) = buf {
                 TmvUnitdataReqSlot {
                     ts,
@@ -3211,6 +3350,180 @@ mod tests {
         assert!(sched.close_circuit(Direction::Ul, timeslot).is_some());
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
         assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
+    }
+
+    #[test]
+    fn best_effort_associated_repeat_waits_for_normal_control_and_coalesces() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 7,
+                    direction,
+                    ts: 2,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let repeated_group = TetraAddress::new(91, SsiType::Gssi);
+        for _ in 0..2 {
+            sched.dl_enqueue_associated_best_effort_tma(
+                2,
+                9,
+                BsChannelScheduler::dl_make_minimal_resource(&repeated_group, None, false),
+                BitBuffer::new(0),
+                AieRequest::clear(AieSubject::Group { gssi: repeated_group.ssi }, AieScope::MacResource),
+            );
+        }
+        assert_eq!(sched.assoc_best_effort_queues[1].len(), 1, "same periodic call must be coalesced");
+
+        let sds_addr = TetraAddress::new(77_468, SsiType::Issi);
+        sched.dl_enqueue_associated_tma(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&sds_addr, None, false),
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: sds_addr.ssi }, AieScope::MacResource),
+        );
+
+        let first = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        assert!(!first.is_mandatory_bsch() && !first.is_mandatory_bnch());
+        sched.cur_dltime = first.add_timeslots(-1);
+        let first_slot = sched.finalize_ts_for_tick();
+        let mut first_bits = first_slot.blk1.expect("associated control").mac_block;
+        first_bits.seek(0);
+        let first_resource = MacResource::from_bitbuf(&mut first_bits).expect("normal control resource");
+        assert_eq!(first_resource.addr.map(|addr| addr.ssi), Some(sds_addr.ssi));
+        assert_eq!(
+            sched.assoc_best_effort_queues[1].len(),
+            1,
+            "best effort must remain queued behind SDS"
+        );
+
+        let second = (3..=18)
+            .map(|m| TdmaTime { t: 2, f: 18, m, h: 0 })
+            .find(|time| !time.is_mandatory_bsch() && !time.is_mandatory_bnch())
+            .expect("another usable FN18");
+        sched.cur_dltime = second.add_timeslots(-1);
+        let second_slot = sched.finalize_ts_for_tick();
+        let mut second_bits = second_slot.blk1.expect("best-effort control").mac_block;
+        second_bits.seek(0);
+        let second_resource = MacResource::from_bitbuf(&mut second_bits).expect("best-effort control resource");
+        assert_eq!(second_resource.addr.map(|addr| addr.ssi), Some(repeated_group.ssi));
+        assert!(sched.assoc_best_effort_queues[1].is_empty());
+    }
+
+    #[test]
+    fn best_effort_associated_repeat_uses_hangtime_frame() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 7,
+                    direction,
+                    ts: 3,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(3, true);
+
+        let repeated_group = TetraAddress::new(92, SsiType::Gssi);
+        sched.dl_enqueue_associated_best_effort_tma(
+            3,
+            10,
+            BsChannelScheduler::dl_make_minimal_resource(&repeated_group, None, false),
+            BitBuffer::new(0),
+            AieRequest::clear(AieSubject::Group { gssi: repeated_group.ssi }, AieScope::MacResource),
+        );
+
+        let time = TdmaTime { t: 3, f: 5, m: 2, h: 0 };
+        sched.cur_dltime = time.add_timeslots(-1);
+        let slot = sched.finalize_ts_for_tick();
+        assert_eq!(slot.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+        let mut bits = slot.blk1.expect("hangtime control").mac_block;
+        bits.seek(0);
+        let resource = MacResource::from_bitbuf(&mut bits).expect("hangtime best-effort resource");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(repeated_group.ssi));
+        assert!(sched.assoc_best_effort_queues[2].is_empty());
+    }
+
+    #[test]
+    fn ordinary_hangtime_control_cancels_partial_best_effort_repeat() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 7,
+                    direction,
+                    ts: 3,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(3, true);
+
+        let repeated_group = TetraAddress::new(92, SsiType::Gssi);
+        let long_sdu = BitBuffer::from_bitstr(&"1".repeat(SCH_F_CAP * 2));
+        sched.dl_enqueue_associated_best_effort_tma(
+            3,
+            10,
+            BsChannelScheduler::dl_make_minimal_resource(&repeated_group, None, false),
+            long_sdu,
+            AieRequest::clear(AieSubject::Group { gssi: repeated_group.ssi }, AieScope::MacResource),
+        );
+
+        let first = TdmaTime { t: 3, f: 5, m: 2, h: 0 };
+        sched.cur_dltime = first.add_timeslots(-1);
+        let first_slot = sched.finalize_ts_for_tick();
+        assert!(first_slot.blk1.is_some());
+        assert!(matches!(
+            sched.assoc_best_effort_queues[2].first(),
+            Some((10, DlSchedElem::FragBuf(_)))
+        ));
+
+        let sds_addr = TetraAddress::new(77_468, SsiType::Issi);
+        sched.dl_enqueue_tma_on_timeslot(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&sds_addr, None, false),
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: sds_addr.ssi }, AieScope::MacResource),
+        );
+
+        let second = first.add_timeslots(4);
+        sched.cur_dltime = second.add_timeslots(-1);
+        let second_slot = sched.finalize_ts_for_tick();
+        let mut bits = second_slot.blk1.expect("ordinary hangtime control").mac_block;
+        bits.seek(0);
+        let resource = MacResource::from_bitbuf(&mut bits).expect("ordinary control resource");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(sds_addr.ssi));
+        assert!(
+            sched.assoc_best_effort_queues[2].is_empty(),
+            "a MAC-RESOURCE between MAC-FRAG and MAC-END must discard the expendable chain"
+        );
     }
 
     #[test]
