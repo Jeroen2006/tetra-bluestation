@@ -385,7 +385,19 @@ impl Llc {
 
     /// Schedules a message that was not acked in time for a retransmission
     fn submit_for_acknowledged_transmission(config: &SharedConfig, queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
-        let routes = Self::delivery_routes(config, ack.addr.ssi, dltime);
+        let preferred_route = match &ack.retransmission_buf.msg {
+            SapMsgInner::TmaUnitdataReq(req) => req.associated_channel.clone(),
+            _ => None,
+        };
+        let mut routes = Self::delivery_routes(config, ack.addr.ssi, dltime);
+        if let Some(route) = preferred_route.filter(|route| (2..=4).contains(&route.timeslot)) {
+            // CMCE may have selected a traffic bearer while registration or a
+            // direct-response window deliberately suppresses inferred LLC
+            // routing. Keep that explicit SDS route: UMAC validates that the
+            // circuit is still active immediately before enqueueing it.
+            routes.retain(|candidate| candidate.timeslot != route.timeslot);
+            routes.insert(0, route);
+        }
 
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
@@ -441,7 +453,8 @@ impl Llc {
             return false;
         };
 
-        req.associated_channel.is_some()
+        ack.ts != 1
+            || req.associated_channel.is_some()
             || req
                 .chan_alloc
                 .as_ref()
@@ -499,17 +512,6 @@ impl Llc {
             panic!("Can't send BL-DATA for GSSI-addressed message. ");
         }
 
-        // MM does not own call-control routing.  Bind an otherwise ordinary
-        // acknowledged downlink to the live listener route here, before its
-        // first attempt.  Previously only a timed-out retry consulted this
-        // table, so in-call D-CK CHANGE/OTAR first went to MCCH and sat behind
-        // a missing BL-ACK for one or more multiframes.
-        if prim.associated_channel.is_none() {
-            prim.associated_channel = Self::delivery_routes(&self.config, prim.main_address.ssi, self.dltime)
-                .into_iter()
-                .next();
-        }
-
         // If an ack still needs to be sent, get the relevant expected sequence number
         let outgoing_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
             AieRequest::clear(
@@ -519,7 +521,16 @@ impl Llc {
                 AieScope::MacResource,
             )
         });
-        let delivery_timeslot = prim.associated_channel.as_ref().map(|channel| channel.timeslot).unwrap_or(1);
+        let delivery_timeslot = prim
+            .associated_channel
+            .as_ref()
+            .map(|channel| channel.timeslot)
+            .or_else(|| {
+                Self::delivery_routes(&self.config, prim.main_address.ssi, self.dltime)
+                    .first()
+                    .map(|channel| channel.timeslot)
+            })
+            .unwrap_or(1);
         let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, delivery_timeslot, outgoing_aie_request);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
@@ -1306,20 +1317,24 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_associated_downlink_also_tries_mcch() {
+    fn explicit_associated_downlink_survives_direct_response_window() {
         let config = test_config();
         let issi = 77_479;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
-        config.state_write().subscriber_delivery_routes.insert(
-            issi,
-            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
-                call_id: 8,
-                timeslot: 3,
-                usage: 11,
-            }],
-        );
+        {
+            let mut state = config.state_write();
+            state.subscribers.mark_direct_response_window(issi, start);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 8,
+                    timeslot: 3,
+                    usage: 11,
+                }],
+            );
+        }
 
-        let mut llc = Llc::new(config);
+        let mut llc = Llc::new(config.clone());
         llc.dltime = start;
         let mut queue = MessageQueue::new();
         llc.rx_tla_tldata_req_bl(
@@ -1342,7 +1357,12 @@ mod tests {
                     req_handle: 0,
                     graceful_degradation: None,
                     chan_alloc: None,
-                    associated_channel: None,
+                    associated_channel: Some(tetra_saps::tma::AssociatedChannel {
+                        call_id: 8,
+                        timeslot: 3,
+                        usage: 11,
+                        best_effort_key: None,
+                    }),
                     tx_reporter: None,
                 }),
             ),
@@ -1358,6 +1378,7 @@ mod tests {
             panic!("expected TMA request")
         };
         assert!(mcch.associated_channel.is_none());
+        assert!(Llc::delivery_routes(&config, issi, start).is_empty());
 
         llc.outbound_messages[0].attempt_reporters[0].mark_transmitted();
         llc.dltime = start.add_timeslots(1);
