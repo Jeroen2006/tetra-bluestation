@@ -51,6 +51,11 @@ const DEFAULT_ACCESS_FRAME_MARKER: BaseFrameLength = BaseFrameLength::Subslots2;
 /// Number of timeslots the scheduler operates on. May become larger when secondary carriers are supported.
 pub const NUM_TIMESLOTS: usize = 4;
 
+/// Values 14 and 15 have special meanings in the four-bit Basic slot
+/// granting delay field, so an ordinary delayed opportunity is encodable only
+/// through 13.
+const MAX_BASIC_SLOT_GRANT_DELAY: usize = 13;
+
 /// Select the SYSINFO variant for an actual BNCH transmission.
 ///
 /// EN 300 392-2 table 9.33 maps the mandatory frame-18 BNCH across all four
@@ -728,6 +733,19 @@ impl BsChannelScheduler {
 
         // If found, reserve the slots and return a BasicSlotgrant
         if let Some((skips, grant_timestamps)) = grant_op {
+            let grant_delay = match skips {
+                0 => BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+                1..=MAX_BASIC_SLOT_GRANT_DELAY => BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8),
+                _ => {
+                    tracing::debug!(
+                        address = ?addr,
+                        res_req = ?res_req,
+                        skips,
+                        "deferring uplink grant beyond encodable Basic slot granting delay"
+                    );
+                    return None;
+                }
+            };
             // Reserve the target granting opportunity. Get subslot (only relevant for halfslot reservation)
             let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
 
@@ -743,11 +761,6 @@ impl BsChannelScheduler {
                 }
             } else {
                 BasicSlotgrantCapAlloc::from_req_slotcount(requested_cap)
-            };
-            let grant_delay = if skips == 0 {
-                BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
-            } else {
-                BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
             };
             Some(BasicSlotgrant {
                 capacity_allocation: cap_alloc,
@@ -3206,6 +3219,58 @@ mod tests {
 
         assert_eq!(grant2.capacity_allocation, BasicSlotgrantCapAlloc::Grant3Slots);
         assert_eq!(grant2.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    }
+
+    #[test]
+    fn grant_beyond_basic_delay_range_waits_without_reserving() {
+        let mut sched = get_testing_slotter();
+        let timeslot = 4;
+        sched.cur_dltime = TdmaTime {
+            t: 3,
+            f: 1,
+            m: 1,
+            h: 0,
+        };
+        let first_opportunity = sched.cur_dltime.forward_to_timeslot(timeslot);
+        let mut occupied = 0;
+        let mut first_unencodable = None;
+
+        for dist in 0..MACSCHED_NUM_FRAMES {
+            let candidate = first_opportunity.add_timeslots(dist as i32 * 4);
+            if candidate.is_mandatory_clch() {
+                continue;
+            }
+            if occupied == MAX_BASIC_SLOT_GRANT_DELAY + 1 {
+                first_unencodable = Some(candidate);
+                break;
+            }
+            let index = sched.ul_ts_to_sched_index(&candidate);
+            sched.ulsched[timeslot as usize - 1][index] = TimeslotSchedule {
+                ul1: Some(90_001),
+                ul2: Some(90_001),
+            };
+            occupied += 1;
+        }
+
+        let first_unencodable = first_unencodable.expect("test schedule must contain a fifteenth ordinary opportunity");
+        assert_eq!(occupied, MAX_BASIC_SLOT_GRANT_DELAY + 1);
+        assert!(
+            sched
+                .ul_find_grant_opportunity(timeslot, 1, false)
+                .is_some_and(|(skips, _)| skips > MAX_BASIC_SLOT_GRANT_DELAY)
+        );
+
+        let grant = sched.ul_process_cap_req(
+            timeslot,
+            TetraAddress::issi(77_468),
+            &ReservationRequirement::Req1Slot,
+        );
+        assert!(grant.is_none(), "an ordinary delay above 13 cannot be encoded in four bits");
+        assert_eq!(
+            sched.ul_get_slot_owner(first_unencodable, PhyBlockNum::Both),
+            None,
+            "an unadvertised future opportunity must not be reserved"
+        );
     }
 
     #[test]
