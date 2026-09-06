@@ -28,6 +28,12 @@ use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator
 // Convert the four-frame T.251 value to four actual SACCH opportunities.
 const ASSIGNED_CHANNEL_ACK_RETRY_TIMER_MULTIPLIER: u32 = 18;
 const ASSIGNED_CHANNEL_ACK_EXTRA_RETRANSMITS: u8 = 2;
+// A routed copy may still be queued or fragmented when another concurrent
+// copy completes and starts T.251.  Allow enough channel opportunities for a
+// maximum-sized basic-link PDU to finish before replacing the whole attempt.
+// The estimate below deliberately includes one extra MAC frame for headers,
+// a grant, or a mandatory broadcast interruption.
+const CONSERVATIVE_SCH_F_PAYLOAD_BITS: usize = 200;
 // Keep a common-channel basic-link transaction alive for one complete TETRA
 // frame after N.252 is exhausted. An MS can only put its BL-ACK on air a few
 // slots after receiving the last fragmented retry.
@@ -72,6 +78,12 @@ pub struct ExpectedInAck {
     /// group bearers.  Each copy needs its own reporter so one congested route
     /// cannot mark a concurrently transmitted copy as discarded.
     pub attempt_reporters: Vec<TxReporter>,
+    /// Physical bearer for each entry in `attempt_reporters`; TS1 denotes the
+    /// MCCH and TS2..4 denote associated traffic-channel control.
+    attempt_timeslots: Vec<u8>,
+    /// Number of route copies whose complete over-air transmission has already
+    /// been observed. A later copy completing restarts T.251 for that copy.
+    observed_transmitted_copies: usize,
 
     // Optional retransmission buffer, to allow for automatic retransmission of the PDU if no acknowledgement is received
     pub retransmission_buf: SapMsg,
@@ -403,6 +415,8 @@ impl Llc {
         ack.t_umac_done = None;
         Self::cancel_pending_attempt_copies(ack);
         ack.attempt_reporters.clear();
+        ack.attempt_timeslots.clear();
+        ack.observed_transmitted_copies = 0;
 
         tracing::info!(
             issi = ack.addr.ssi,
@@ -418,6 +432,7 @@ impl Llc {
             req.associated_channel = Some(route);
             req.tx_reporter = Some(reporter.clone());
             ack.attempt_reporters.push(reporter);
+            ack.attempt_timeslots.push(route.timeslot);
             ack.ts = route.timeslot;
             tracing::info!(
                 issi = ack.addr.ssi,
@@ -441,6 +456,7 @@ impl Llc {
         req.associated_channel = None;
         req.tx_reporter = Some(reporter.clone());
         ack.attempt_reporters.push(reporter);
+        ack.attempt_timeslots.push(1);
         if ack.attempt_reporters.len() == 1 {
             ack.ts = 1;
         }
@@ -467,6 +483,58 @@ impl Llc {
         } else {
             T251_SENDER_RETRY_TIMER
         }
+    }
+
+    fn estimated_mac_frames(ack: &ExpectedInAck) -> u32 {
+        let bits = match &ack.retransmission_buf.msg {
+            SapMsgInner::TmaUnitdataReq(req) => req.pdu.get_len(),
+            _ => 0,
+        };
+        ((bits + CONSERVATIVE_SCH_F_PAYLOAD_BITS - 1) / CONSERVATIVE_SCH_F_PAYLOAD_BITS) as u32 + 1
+    }
+
+    /// Maximum time from attempt submission for every still-pending route to
+    /// get its complete PDU on air. This is separate from T.251: T.251 may
+    /// already be running for an earlier concurrent copy.
+    fn pending_route_completion_window(config: &SharedConfig, ack: &ExpectedInAck) -> u32 {
+        let mac_frames = Self::estimated_mac_frames(ack);
+        let ee_period_multiframes = config
+            .state_read()
+            .subscribers
+            .energy_economy(ack.addr.ssi)
+            .map(|(mode, _, _)| {
+                if mode == 0 {
+                    0
+                } else {
+                    // TETRA defines EG1..EG7. Treat a corrupt persisted value
+                    // as the longest valid period instead of allowing an
+                    // unchecked shift to panic the scheduler.
+                    1_u32 << u32::from(mode.min(7) - 1)
+                }
+            })
+            .unwrap_or(0);
+
+        ack.attempt_reporters
+            .iter()
+            .zip(&ack.attempt_timeslots)
+            .filter(|(reporter, _)| reporter.get_state() == tetra_core::TxState::Pending)
+            .map(|(_, timeslot)| {
+                if *timeslot == 1 {
+                    // An EE-gated MCCH copy first waits for its monitoring
+                    // occasion, then uses ordinary consecutive signalling
+                    // frames for any MAC fragments.
+                    ee_period_multiframes
+                        .saturating_mul(18 * 4)
+                        .saturating_add(mac_frames.saturating_mul(4))
+                } else {
+                    // Associated control has one opportunity per 18-frame
+                    // multiframe. Include the normal T.251 interval as queue
+                    // grace for another PDU already owning this SACCH.
+                    Self::basic_link_retry_timer(ack).saturating_add(mac_frames.saturating_mul(18 * 4))
+                }
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn max_over_air_retransmits(ack: &ExpectedInAck) -> u8 {
@@ -601,6 +669,8 @@ impl Llc {
             bl_type: Layer2Service::Acknowledged,
             tx_reporter,
             attempt_reporters: Vec::new(),
+            attempt_timeslots: Vec::new(),
+            observed_transmitted_copies: 0,
             t_first: self.dltime,
             t_submitted_to_umac: None,
             t_umac_done: None,
@@ -911,25 +981,31 @@ impl Llc {
 
         for ack in self.outbound_messages.iter_mut() {
             // First, check which have newly been txed, or discarded by Umac. If so, start t_umac_done.
-            let any_route_transmitted = ack.attempt_reporters.iter().any(TxReporter::is_transmitted);
+            let transmitted_route_count = ack.attempt_reporters.iter().filter(|reporter| reporter.is_transmitted()).count();
             let all_routes_done = !ack.attempt_reporters.is_empty()
                 && ack
                     .attempt_reporters
                     .iter()
                     .all(|reporter| reporter.is_transmitted() || reporter.is_discarded());
-            if ack.t_umac_done.is_none() && (any_route_transmitted || all_routes_done) {
+            if transmitted_route_count > ack.observed_transmitted_copies {
                 // T.251 belongs to the basic-link transmission, so start it as
-                // soon as one concurrent copy reaches the air.  Waiting for
-                // every candidate route would let one congested traffic slot
-                // block this ISSI indefinitely.  If every route was discarded,
-                // use the same retry window before selecting the next route set.
-                ack.has_transmitted_attempt |= any_route_transmitted;
-                if any_route_transmitted && !ack.tx_reporter.is_transmitted() {
+                // soon as a concurrent copy reaches the air. If another copy
+                // completes later, restart it from that complete transmission;
+                // retransmitting while that route is still fragmented corrupts
+                // the receiver's MAC reconstruction chain.
+                ack.has_transmitted_attempt = true;
+                ack.observed_transmitted_copies = transmitted_route_count;
+                if !ack.tx_reporter.is_transmitted() {
                     ack.tx_reporter.reset();
                     ack.tx_reporter.mark_transmitted();
                 }
                 ack.t_umac_done = Some(self.dltime);
                 tracing::trace!("schedule_retransmissions: {} umac_done at {}", ack.addr.ssi, dltime);
+            } else if ack.t_umac_done.is_none() && all_routes_done {
+                // Every route was discarded before transmission. Use the same
+                // retry window before selecting a fresh live route set.
+                ack.t_umac_done = Some(self.dltime);
+                tracing::trace!("schedule_retransmissions: {} all routes discarded at {}", ack.addr.ssi, dltime);
             }
 
             // If we don't have a t_umac_done, there is no need for a retransmission in any case
@@ -943,6 +1019,18 @@ impl Llc {
             let retry_timer = Self::basic_link_retry_timer(ack);
             let max_retransmits = Self::max_over_air_retransmits(ack);
             if age as u32 >= retry_timer {
+                let pending_window = Self::pending_route_completion_window(&self.config, ack);
+                let attempt_age = ack.t_submitted_to_umac.map(|submitted| dltime.diff(submitted)).unwrap_or(i32::MAX);
+                if pending_window > 0 && attempt_age >= 0 && (attempt_age as u32) < pending_window {
+                    tracing::debug!(
+                        issi = ack.addr.ssi,
+                        ns = ack.ns,
+                        attempt_age,
+                        pending_window,
+                        "deferring basic-link retry while a concurrent route copy is unfinished"
+                    );
+                    continue;
+                }
                 // Time for either retransmitting or giving up
                 if ack.retransmit_count < max_retransmits {
                     // Retransmit
@@ -1479,20 +1567,37 @@ mod tests {
                 .all(|reporter| reporter.get_state() == tetra_core::TxState::Pending)
         );
 
-        // One congested candidate must not hold T.251 open after another copy
-        // has reached the air. The remaining route reporters deliberately stay
-        // Pending here to reproduce that scheduler edge case.
+        // The first route starts T.251, but the other copies may still be
+        // queued or fragmented on their own bearers.
         llc.outbound_messages[0].attempt_reporters[0].mark_transmitted();
         llc.dltime = start.add_timeslots(1);
         assert!(!llc.submit_retransmissions_to_umac(&mut queue));
         assert_eq!(llc.outbound_messages[0].t_umac_done, Some(llc.dltime));
         assert!(llc.outbound_messages[0].tx_reporter.is_transmitted());
 
+        let first_completion = llc.dltime;
+        let retry_timer = Llc::basic_link_retry_timer(&llc.outbound_messages[0]);
+        llc.dltime = first_completion.add_timeslots(retry_timer as i32);
+        assert!(
+            !llc.submit_retransmissions_to_umac(&mut queue),
+            "an unfinished concurrent route must not be cut off at the first copy's T.251 boundary"
+        );
+
+        // A later complete copy restarts T.251. Once all remaining copies are
+        // done, a retry is allowed only after that fresh interval.
+        llc.outbound_messages[0].attempt_reporters[1].mark_transmitted();
+        llc.outbound_messages[0].attempt_reporters[2].mark_discarded();
+        llc.outbound_messages[0].attempt_reporters[3].mark_discarded();
+        llc.dltime = llc.dltime.add_timeslots(1);
+        assert!(!llc.submit_retransmissions_to_umac(&mut queue));
+        let latest_completion = llc.dltime;
+        assert_eq!(llc.outbound_messages[0].t_umac_done, Some(latest_completion));
+
         let old_attempt_reporters = llc.outbound_messages[0].attempt_reporters.clone();
-        let ack = &mut llc.outbound_messages[0];
-        ack.retransmit_count = 1;
-        Llc::submit_for_acknowledged_transmission(&config, &mut queue, ack, start);
-        assert!(old_attempt_reporters[1..].iter().all(TxReporter::is_discarded));
+        llc.dltime = latest_completion.add_timeslots(retry_timer as i32);
+        assert!(llc.submit_retransmissions_to_umac(&mut queue));
+        assert_eq!(llc.outbound_messages[0].retransmit_count, 1);
+        assert!(old_attempt_reporters[2..].iter().all(TxReporter::is_discarded));
         let mut retry_copies = 0;
         while queue.pop_front().is_some() {
             retry_copies += 1;
