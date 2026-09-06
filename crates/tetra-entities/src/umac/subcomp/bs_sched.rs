@@ -1193,6 +1193,83 @@ impl BsChannelScheduler {
         Some(buf)
     }
 
+    /// Start a short acknowledged associated-channel fragment chain in the
+    /// STCH of frame 17 when it can finish in the next frame's SCH/F.  A
+    /// terminal then sees MAC-RESOURCE and MAC-END in consecutive frames,
+    /// while the final MAC-END still carries the reserved BL-ACK subslot.
+    fn dl_build_pre_fn18_associated_fragment(&mut self, ts: TdmaTime) -> Option<(BitBuffer, AieRequest, Option<AieCipherRegion>)> {
+        if ts.f != 17 || !(2..=4).contains(&ts.t) {
+            return None;
+        }
+
+        let next_fn18 = ts.add_timeslots(4);
+        if next_fn18.f != 18 || next_fn18.is_mandatory_bsch() || next_fn18.is_mandatory_bnch() {
+            return None;
+        }
+
+        // Time-critical floor control already queued for stealing wins.
+        if self.dltx_queues[ts.t as usize - 1]
+            .iter()
+            .any(|item| matches!(item, DlSchedElem::Stealing(..)))
+        {
+            return None;
+        }
+
+        // Never interleave a second fragment chain or overtake an uplink
+        // reservation response already waiting for this associated channel.
+        if self.assoc_dltx_queues[ts.t as usize - 1]
+            .iter()
+            .any(|item| matches!(item, DlSchedElem::FragBuf(_) | DlSchedElem::AssociatedGrantRequest(..)))
+        {
+            return None;
+        }
+
+        let pos = self.assoc_dltx_queues[ts.t as usize - 1].iter().position(|item| {
+            let DlSchedElem::Resource(pdu, sdu, reporter, _) = item else {
+                return false;
+            };
+            reporter.as_ref().is_some_and(TxReporter::expects_ack)
+                && BsFragger::can_start_in_stch_and_finish_in_schf(pdu, sdu.get_len(), SCH_HD_CAP, SCH_F_CAP)
+        })?;
+
+        let DlSchedElem::Resource(pdu, sdu, reporter, aie_request) = self.assoc_dltx_queues[ts.t as usize - 1].remove(pos) else {
+            unreachable!()
+        };
+        let clear_pdu = pdu.clone();
+        let prepared = match self.prepare_downlink_resource(pdu, aie_request, ts) {
+            Ok(pdu) => pdu,
+            Err(error) => {
+                tracing::warn!(dltime = %ts, ?error, "deferring pre-FN18 associated fragment without a valid AIE context");
+                self.assoc_dltx_queues[ts.t as usize - 1].insert(pos, DlSchedElem::Resource(clear_pdu, sdu, reporter, aie_request));
+                return None;
+            }
+        };
+
+        let address = prepared.addr;
+        let mut fragger = BsFragger::new_with_aie(prepared, sdu, reporter, aie_request);
+        let mut stch = BitBuffer::new(SCH_HD_CAP);
+        let complete = fragger.get_next_chunk(&mut stch);
+        assert!(!complete, "pre-FN18 associated fragment unexpectedly completed in STCH");
+        assert!(
+            fragger.can_finish_with_slot_grant(SCH_F_CAP),
+            "pre-FN18 associated fragment must finish in the next SCH/F"
+        );
+        let cipher_region = fragger.take_cipher_region().map(|region| {
+            assert!(region.request.same_protection_as(aie_request));
+            AieCipherRegion::new(region.start, region.len)
+        });
+        fragger.require_final_slot_grant();
+        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+
+        tracing::info!(
+            dltime = %ts,
+            next_fn18 = %next_fn18,
+            address = ?address,
+            "starting associated acknowledged fragment in frame-17 STCH"
+        );
+        Some((stch, aie_request, cipher_region))
+    }
+
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
     /// this timeslot. Used when building STCH blocks so the MAC-RESOURCE can carry
     /// random_access_flag=true per ETSI 21.4.3.1.
@@ -1881,7 +1958,9 @@ impl BsChannelScheduler {
                 ul_phy_chan: PhysicalChannel::Tp,
             }
         } else if dl_is_traffic {
+            let pre_fn18_associated_fragment = self.dl_build_pre_fn18_associated_fragment(ts);
             let (tch_buf, traffic_aie, stch_opt) = self.dl_build_traffic_block(ts);
+            let stch_opt = stch_opt.or(pre_fn18_associated_fragment);
 
             if let Some((stch_buf, stch_aie, stch_region)) = stch_opt {
                 // FACCH/Stealing: 1st half = STCH signaling, 2nd half = TCH speech.
@@ -3042,6 +3121,138 @@ mod tests {
         assert_eq!(sched.ul_get_slot_owner(final_time, granted_block), Some(addr.ssi));
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
         assert!(sched.assoc_dltx_queues[2].is_empty());
+    }
+
+    #[test]
+    fn fragmented_associated_downlink_uses_frame17_stch_then_frame18_mac_end() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 3;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 37,
+                    direction,
+                    ts: timeslot,
+                    usage: 40,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"10".repeat(115)[..229]),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let frame17 = TdmaTime {
+            t: timeslot,
+            f: 17,
+            m: 3,
+            h: 0,
+        };
+        let frame18 = frame17.add_timeslots(4);
+        assert!(!frame18.is_mandatory_bsch() && !frame18.is_mandatory_bnch());
+
+        sched.cur_dltime = frame17.add_timeslots(-1);
+        let first_slot = sched.finalize_ts_for_tick();
+        let first = first_slot.blk1.expect("frame 17 must steal one STCH half-slot");
+        assert_eq!(first.logical_channel, LogicalChannel::Stch);
+        let mut first_block = first.mac_block;
+        first_block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut first_block).expect("fragmented STCH MAC-RESOURCE");
+        assert_eq!(
+            resource.length_ind,
+            tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START
+        );
+        assert!(resource.slot_granting_element.is_none());
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert!(matches!(
+            sched.assoc_dltx_queues[timeslot as usize - 1].first(),
+            Some(DlSchedElem::FragBuf(_))
+        ));
+
+        sched.cur_dltime = frame18.add_timeslots(-1);
+        let final_slot = sched.finalize_ts_for_tick();
+        let final_block = final_slot.blk1.expect("frame 18 must finish on SCH/F");
+        assert_eq!(final_block.logical_channel, LogicalChannel::SchF);
+        let mut final_bits = final_block.mac_block;
+        final_bits.seek(0);
+        let end = MacEndDl::from_bitbuf(&mut final_bits).expect("final MAC-END");
+        let grant = end.slot_granting_element.expect("MAC-END must reserve the BL-ACK response");
+        let granted_block = match grant.capacity_allocation {
+            BasicSlotgrantCapAlloc::FirstSubslotGranted => PhyBlockNum::Block1,
+            BasicSlotgrantCapAlloc::SecondSubslotGranted => PhyBlockNum::Block2,
+            allocation => panic!("unexpected associated ACK allocation: {:?}", allocation),
+        };
+        assert_eq!(sched.ul_get_slot_owner(frame18, granted_block), Some(addr.ssi));
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+        assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
+    }
+
+    #[test]
+    fn pre_fn18_fragment_waits_when_next_schf_is_mandatory_broadcast() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let timeslot = 2;
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 37,
+                    direction,
+                    ts: timeslot,
+                    usage: 40,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let addr = TetraAddress::new(77_468, SsiType::Issi);
+        let reporter = TxReporter::new();
+        sched.dl_enqueue_associated_tma(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"10".repeat(115)[..229]),
+            Some(reporter.clone()),
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+
+        let frame17 = TdmaTime {
+            t: timeslot,
+            f: 17,
+            m: 1,
+            h: 0,
+        };
+        let mandatory_frame18 = frame17.add_timeslots(4);
+        assert!(mandatory_frame18.is_mandatory_bsch());
+
+        sched.cur_dltime = frame17.add_timeslots(-1);
+        let frame17_slot = sched.finalize_ts_for_tick();
+        assert_eq!(
+            frame17_slot.blk1.expect("traffic block").logical_channel,
+            LogicalChannel::TchS,
+            "the BS must not start a fragment chain when frame 18 cannot finish it"
+        );
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert!(matches!(
+            sched.assoc_dltx_queues[timeslot as usize - 1].first(),
+            Some(DlSchedElem::Resource(..))
+        ));
     }
 
     #[test]
