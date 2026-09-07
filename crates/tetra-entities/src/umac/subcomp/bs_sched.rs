@@ -175,7 +175,7 @@ pub enum DlSchedElem {
     /// A capacity request received on an active assigned channel. The grant
     /// and its corresponding future FN18 reservation must be built together,
     /// when the actual associated FN18 transmission time is known.
-    AssociatedGrantRequest(TetraAddress, ReservationRequirement),
+    AssociatedGrantRequest(TetraAddress, ReservationRequirement, usize),
 
     /// A FragBuf containing remaining non-transmitted information after a MAC-RESOURCE start has been transmitted
     FragBuf(BsFragger),
@@ -891,9 +891,9 @@ impl BsChannelScheduler {
             // EN 300 392-2 clause 23.5.2.2.4 requires a BS whose assigned
             // traffic channel is in SACCH to grant only one reserved slot at
             // a time.  A capacity request can nevertheless ask for two or
-            // more slots while an uplink TM-SDU is being fragmented.  Grant
-            // this FN18 and let the MS carry its remaining requirement in
-            // the fragment, instead of rejecting the request indefinitely.
+            // more slots while an uplink TM-SDU is being fragmented. Grant
+            // this FN18; the associated scheduler queues the ungranted
+            // remainder because MAC-FRAG cannot repeat the requirement.
             schedule.ul1 = Some(addr.ssi);
             schedule.ul2 = Some(addr.ssi);
             BasicSlotgrantCapAlloc::Grant1Slot
@@ -1099,13 +1099,19 @@ impl BsChannelScheduler {
     /// carries the MAC-RESOURCE.
     pub fn dl_enqueue_associated_grant_request(&mut self, ts: u8, addr: TetraAddress, res_req: ReservationRequirement) {
         assert!((2..=4).contains(&ts), "associated grant must use an assigned timeslot");
+        let requested_slots = if res_req == ReservationRequirement::Req1Subslot {
+            1
+        } else {
+            res_req.to_req_slotcount()
+        };
         tracing::debug!(
             ts,
             address = ?addr,
             res_req = ?res_req,
+            requested_slots,
             "queued associated FN18 grant request"
         );
-        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+        self.assoc_dltx_queues[ts as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req, requested_slots));
     }
 
     /// Bind the upper-layer policy to this exact scheduled downlink slot and
@@ -1315,7 +1321,7 @@ impl BsChannelScheduler {
                     }
                 }
             }
-            DlSchedElem::AssociatedGrantRequest(addr, res_req) => {
+            DlSchedElem::AssociatedGrantRequest(addr, res_req, requested_slots) => {
                 let Some(grant) = self.ul_process_associated_fn18_cap_req(ts, addr, &res_req) else {
                     tracing::warn!(
                         dltime = %ts,
@@ -1323,7 +1329,7 @@ impl BsChannelScheduler {
                         res_req = ?res_req,
                         "associated FN18 grant could not be allocated; retrying request"
                     );
-                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req, requested_slots));
                     return None;
                 };
 
@@ -1338,6 +1344,28 @@ impl BsChannelScheduler {
                 let mut fragger = BsFragger::new_with_aie(pdu, BitBuffer::new(0), None, request);
                 if !fragger.get_next_chunk(&mut buf) {
                     self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                }
+
+                // On SACCH the BS may grant only one reserved slot at a time
+                // (23.5.2.2.4), but the original reservation requirement is
+                // for the complete remainder of the fragmented TM-SDU. A
+                // MAC-FRAG has no reservation-requirement field, so the MS
+                // cannot ask again after using this slot. Queue every
+                // outstanding slot as another one-slot grant for a later
+                // FN18, as explicitly permitted by 23.4.2.1.2.
+                if requested_slots > 1 {
+                    let remaining_slots = requested_slots - 1;
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(
+                        addr,
+                        ReservationRequirement::from_req_slotcount(remaining_slots),
+                        remaining_slots,
+                    ));
+                    tracing::info!(
+                        dltime = %ts,
+                        address = ?addr,
+                        remaining_slots,
+                        "queued remaining associated SACCH capacity"
+                    );
                 }
             }
             _ => unreachable!(),
@@ -1746,9 +1774,9 @@ impl BsChannelScheduler {
         // Process grants and acks
         for elem in grants_and_acks {
             let elem = match elem {
-                DlSchedElem::AssociatedGrantRequest(addr, res_req) => {
+                DlSchedElem::AssociatedGrantRequest(addr, res_req, remaining_slots) => {
                     let Some(grant) = self.ul_process_cap_req(ts.t, addr, &res_req) else {
-                        self.dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req));
+                        self.dltx_queues[ts.t as usize - 1].push(DlSchedElem::AssociatedGrantRequest(addr, res_req, remaining_slots));
                         continue;
                     };
                     DlSchedElem::Grant(addr, grant)
@@ -3728,10 +3756,7 @@ mod tests {
             .expect("multi-slot request must receive partial SACCH capacity");
         grant_block.seek(0);
         let grant_resource = MacResource::from_bitbuf(&mut grant_block).expect("partial grant MAC-RESOURCE");
-        assert_eq!(
-            grant_resource.addr.map(|address| address.ssi),
-            Some(pending_uplink.ssi)
-        );
+        assert_eq!(grant_resource.addr.map(|address| address.ssi), Some(pending_uplink.ssi));
         assert_eq!(
             grant_resource
                 .slot_granting_element
@@ -3739,18 +3764,43 @@ mod tests {
                 .capacity_allocation,
             BasicSlotgrantCapAlloc::Grant1Slot
         );
+        assert_eq!(sched.ul_get_slot_owner(first_time, PhyBlockNum::Both), Some(pending_uplink.ssi));
+
+        assert!(
+            sched.assoc_dltx_queues[timeslot as usize - 1]
+                .iter()
+                .any(|item| matches!(item, DlSchedElem::AssociatedGrantRequest(_, ReservationRequirement::Req1Slot, 1)))
+        );
+
+        let mut second_grant_time = first_time.add_timeslots(18 * 4);
+        while second_grant_time.is_mandatory_bsch() || second_grant_time.is_mandatory_bnch() {
+            second_grant_time = second_grant_time.add_timeslots(18 * 4);
+        }
+        let mut second_grant_block = sched
+            .dl_build_associated_control_block(second_grant_time)
+            .expect("the remainder of a partial request must be granted without another MAC-ACCESS");
+        second_grant_block.seek(0);
+        let second_grant_resource = MacResource::from_bitbuf(&mut second_grant_block).expect("remaining grant MAC-RESOURCE");
+        assert_eq!(second_grant_resource.addr.map(|address| address.ssi), Some(pending_uplink.ssi));
         assert_eq!(
-            sched.ul_get_slot_owner(first_time, PhyBlockNum::Both),
+            second_grant_resource
+                .slot_granting_element
+                .expect("remaining slot must be explicitly granted")
+                .capacity_allocation,
+            BasicSlotgrantCapAlloc::Grant1Slot
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(second_grant_time, PhyBlockNum::Both),
             Some(pending_uplink.ssi)
         );
 
-        let mut data_time = first_time.add_timeslots(18 * 4);
+        let mut data_time = second_grant_time.add_timeslots(18 * 4);
         while data_time.is_mandatory_bsch() || data_time.is_mandatory_bnch() {
             data_time = data_time.add_timeslots(18 * 4);
         }
         let mut first = sched
             .dl_build_associated_control_block(data_time)
-            .expect("acknowledged SDS must precede unrelated group control");
+            .expect("acknowledged SDS must follow the complete uplink grant and precede unrelated group control");
         first.seek(0);
         let resource = MacResource::from_bitbuf(&mut first).expect("fragmented MAC-RESOURCE");
         assert_eq!(resource.addr.map(|address| address.ssi), Some(addr.ssi));
