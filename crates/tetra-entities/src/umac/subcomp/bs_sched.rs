@@ -2518,6 +2518,23 @@ impl BsChannelScheduler {
 
                 // Additional channels (TS2..TS4)
                 2..=4 => {
+                    // ACCESS-ASSIGN has only one access field when the uplink
+                    // is assigned-only, so that field applies to both
+                    // subslots (TS 100 392-2, 23.5.1.4.2).  Once either
+                    // subslot has been granted, advertise both as reserved as
+                    // required by 23.5.2.2.7.  Otherwise another MS may start
+                    // random access in the same uplink slot and collide with
+                    // the individually granted transmission.
+                    let assigned_access_field = AccessField {
+                        access_code: AccessCode::AccessCodeA,
+                        base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some()
+                            || self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some()
+                        {
+                            BaseFrameLength::ReservedSubslot
+                        } else {
+                            DEFAULT_ACCESS_FRAME_MARKER
+                        },
+                    };
                     if self.is_hangtime(ts.t) && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
                         // Hangtime: immediately switch AACH to AssignedControl so radios
                         // detect the end of traffic in the same frame as D-TX CEASED.
@@ -2525,10 +2542,7 @@ impl BsChannelScheduler {
                         // the AACH reflects the new channel state.
                         AccessAssign::DownlinkDefinedUplinkAssignedOnly {
                             downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
-                            access_field: AccessField {
-                                access_code: AccessCode::AccessCodeA,
-                                base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
-                            },
+                            access_field: assigned_access_field,
                         }
                     } else {
                         match (dl_traffic_usage, ul_traffic_usage) {
@@ -2540,10 +2554,7 @@ impl BsChannelScheduler {
                             // FACCH has assigned-only access, not an UL UMt.
                             (Some(dl_usage), None) => AccessAssign::DownlinkDefinedUplinkAssignedOnly {
                                 downlink_usage_marker: AccessAssignDlUsage::Traffic(dl_usage),
-                                access_field: AccessField {
-                                    access_code: AccessCode::AccessCodeA,
-                                    base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
-                                },
+                                access_field: assigned_access_field,
                             },
                             // Core TIP 14.1.1.5: downlink FACCH plus uplink TCH.
                             (None, Some(ul_usage)) => AccessAssign::DownlinkDefinedUplinkDefined {
@@ -2555,10 +2566,7 @@ impl BsChannelScheduler {
                             {
                                 AccessAssign::DownlinkDefinedUplinkAssignedOnly {
                                     downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
-                                    access_field: AccessField {
-                                        access_code: AccessCode::AccessCodeA,
-                                        base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
-                                    },
+                                    access_field: assigned_access_field,
                                 }
                             }
                             (None, None) => AccessAssign::DownlinkDefinedUplinkDefined {
@@ -4615,6 +4623,59 @@ mod tests {
             "hangtime marker must not flap back to traffic while a steal is pending, got {:?}",
             aach
         );
+    }
+
+    /// A grant carried in FACCH while downlink traffic remains active must
+    /// close random access on the corresponding uplink slot.  ACCESS-ASSIGN
+    /// has one assigned-only access field here, so reserving either half
+    /// advertises both halves as reserved (23.5.1.4.2 and 23.5.2.2.7).
+    #[test]
+    fn test_assigned_aach_marks_granted_uplink_reserved() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        let ts = TdmaTime { t: 2, f: 4, m: 1, h: 0 };
+
+        sched.create_circuit(
+            Direction::Dl,
+            Circuit {
+                call_id: 1,
+                direction: Direction::Dl,
+                ts: 2,
+                usage: 6,
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            },
+        );
+
+        let aach = decode_aach(&sched, ts);
+        assert!(matches!(
+            aach,
+            AccessAssign::DownlinkDefinedUplinkAssignedOnly {
+                access_field: AccessField {
+                    base_frame_len: DEFAULT_ACCESS_FRAME_MARKER,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let index = sched.ul_ts_to_sched_index(&ts);
+        sched.ulsched[ts.t as usize - 1][index].ul1 = Some(77_468);
+
+        let aach = decode_aach(&sched, ts);
+        assert!(matches!(
+            aach,
+            AccessAssign::DownlinkDefinedUplinkAssignedOnly {
+                downlink_usage_marker: AccessAssignDlUsage::Traffic(6),
+                access_field: AccessField {
+                    base_frame_len: BaseFrameLength::ReservedSubslot,
+                    ..
+                },
+            }
+        ));
     }
 
     #[test]
