@@ -3560,6 +3560,117 @@ mod tests {
     }
 
     #[test]
+    fn sc3_fragmented_sacch_roundtrip_keeps_mac_end_grant_clear() {
+        use tetra_config::bluestation::{RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3TeaAlgorithm, SharedConfig};
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let parsed_config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example BS configuration");
+        let config = SharedConfig::from_parts(parsed_config, None);
+        let addr = TetraAddress::issi(77_468);
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea3, 23, [0x6c; 10], true, false);
+        sc3.install_dck(addr.ssi, RuntimeSc3Dck::new([0x47; 16], [0xd3; 10], true, None));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config);
+
+        let mut sched = get_testing_slotter();
+        sched.aie_provider = Some(provider.clone());
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 37,
+                    direction,
+                    ts: 3,
+                    usage: 40,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+
+        let original_sdu_bits = &"10".repeat(115)[..229];
+        let request = AieRequest::sc3(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        sched.dl_enqueue_associated_tma(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(original_sdu_bits),
+            Some(TxReporter::new()),
+            request,
+        );
+
+        let first_time = TdmaTime { t: 3, f: 18, m: 3, h: 0 };
+        assert!(!first_time.is_mandatory_bsch() && !first_time.is_mandatory_bnch());
+        let mut first = sched
+            .dl_build_associated_control_block(first_time)
+            .expect("first encrypted associated fragment");
+
+        // MAC-RESOURCE remains parseable before deciphering. Decipher only
+        // its TM-SDU with the KSS for the actual first FN18 occurrence.
+        first.seek(0);
+        let first_resource = MacResource::from_bitbuf(&mut first).expect("clear MAC-RESOURCE header");
+        assert_eq!(
+            first_resource.length_ind,
+            tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START
+        );
+        assert_ne!(first_resource.encryption_mode, 0);
+        let first_payload_start = first.get_raw_pos();
+        let first_context = provider
+            .resolve(request.with_scope(AieScope::MacResource), AieDirection::Downlink, first_time)
+            .expect("first SC3 context");
+        provider
+            .cipher_downlink_mac(first_context, &mut first, first_payload_start, SCH_F_CAP - first_payload_start)
+            .expect("decipher first fragment");
+        first.set_raw_start(first_payload_start);
+        let mut reconstructed = first.to_bitstr();
+
+        let mut final_time = first_time.add_timeslots(18 * 4);
+        while final_time.is_mandatory_bsch() || final_time.is_mandatory_bnch() {
+            final_time = final_time.add_timeslots(18 * 4);
+        }
+        let mut final_block = sched.dl_build_associated_control_block(final_time).expect("encrypted MAC-END");
+
+        // The complete MAC-END header, including its BL-ACK slot grant and
+        // channel-allocation flag, must be usable while the TM-SDU is still
+        // ciphered (EN 300 392-7 clause 6.7.1.2).
+        final_block.seek(0);
+        let end = MacEndDl::from_bitbuf(&mut final_block).expect("clear MAC-END header");
+        let grant = end.slot_granting_element.expect("clear final BL-ACK grant");
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert!(end.chan_alloc_element.is_none());
+        let final_payload_start = final_block.get_raw_pos();
+        let pdu_len_bits = end.length_ind as usize * 8;
+        let fill_bits = if end.fill_bits {
+            fillbits::removal::get_num_fill_bits(&final_block, pdu_len_bits, false)
+        } else {
+            0
+        };
+        let final_payload_len = pdu_len_bits - final_payload_start - fill_bits;
+        let final_context = provider
+            .resolve(request.with_scope(AieScope::MacFragment), AieDirection::Downlink, final_time)
+            .expect("final SC3 context");
+        provider
+            .cipher_downlink_mac(final_context, &mut final_block, final_payload_start, final_payload_len)
+            .expect("decipher final fragment");
+        final_block.set_raw_end(final_payload_start + final_payload_len);
+        final_block.set_raw_start(final_payload_start);
+        reconstructed += &final_block.to_bitstr();
+
+        assert_eq!(reconstructed, original_sdu_bits);
+    }
+
+    #[test]
     fn multislot_uplink_grant_precedes_and_downlink_keeps_sacch_until_mac_end() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;

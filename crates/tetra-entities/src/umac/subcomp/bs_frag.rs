@@ -333,8 +333,13 @@ impl BsFragger {
                 mac_block.write_bit(1);
                 mac_block.write_zeroes(num_fill_bits - 1);
             }
-            let clear_header = MacEndDl::compute_hdr_len(None, None);
             let full_header = MacEndDl::compute_hdr_len(pdu.slot_granting_element.clone(), pdu.chan_alloc_element.clone());
+            // EN 300 392-7 clause 6.7.1.2: the clear MAC-END header runs
+            // through the channel-allocation flag. Only the optional channel
+            // allocation element and the TM-SDU that follow it are ciphered.
+            // A basic slot grant precedes that flag and must remain clear so
+            // the MS can reserve its BL-ACK response slot.
+            let clear_header = full_header - pdu.chan_alloc_element.as_ref().map_or(0, ChanAllocElement::compute_len);
             self.last_cipher_region = Some(MacCipherRegion {
                 request: self.aie_request.with_scope(AieScope::MacFragment),
                 start: chunk_start + clear_header,
