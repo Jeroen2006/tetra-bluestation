@@ -33,7 +33,7 @@ impl EventLabelStore {
 
     /// Create an event label for a TetraAddress. There should not yet exist a label for this address, or we
     /// crash. Returns the generated event label.
-    fn create_label_for_addr(&mut self, addr: TetraAddress) -> EventLabel {
+    pub fn create_label_for_addr(&mut self, addr: TetraAddress) -> EventLabel {
         assert!(self.get_label_by_ssi(addr.ssi).is_none(), "an event label for SSI already exists");
 
         let label = self.get_free_label();
@@ -41,6 +41,19 @@ impl EventLabelStore {
         self.labels.insert(label, entry);
 
         label
+    }
+
+    pub fn bind(&mut self, label: EventLabel, addr: TetraAddress) -> bool {
+        if label == 0 || label > 0x03ff {
+            return false;
+        }
+        self.labels.retain(|_, mapping| mapping.addr.ssi != addr.ssi);
+        self.labels.insert(label, EventLabelMapping { addr, label });
+        true
+    }
+
+    pub fn remove(&mut self, label: EventLabel) {
+        self.labels.remove(&label);
     }
 
     /// Retrieve an address by its label. The returned address may be encrypted if
@@ -72,4 +85,36 @@ impl EventLabelStore {
     // pub fn is_empty(&self) -> bool {
     //     self.labels.is_empty()
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_bind_replaces_an_issis_old_label_and_remove_unbinds_it() {
+        let mut labels = EventLabelStore::new();
+        let address = TetraAddress::issi(77_468);
+
+        assert!(labels.bind(41, address));
+        assert_eq!(labels.get_addr_by_label(41).map(|value| value.ssi), Some(address.ssi));
+        assert_eq!(labels.get_label_by_ssi(address.ssi), Some(41));
+
+        assert!(labels.bind(42, address));
+        assert!(labels.get_addr_by_label(41).is_none());
+        assert_eq!(labels.get_addr_by_label(42).map(|value| value.ssi), Some(address.ssi));
+
+        labels.remove(42);
+        assert_eq!(labels.get_label_by_ssi(address.ssi), None);
+    }
+
+    #[test]
+    fn packet_bind_rejects_reserved_and_out_of_range_labels() {
+        let mut labels = EventLabelStore::new();
+        let address = TetraAddress::issi(77_468);
+
+        assert!(!labels.bind(0, address));
+        assert!(!labels.bind(0x0400, address));
+        assert_eq!(labels.get_label_by_ssi(address.ssi), None);
+    }
 }

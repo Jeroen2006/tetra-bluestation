@@ -446,6 +446,7 @@ impl MleMs {
                 stealing_permission: false,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,
+                packet_data_flag: false,
                 air_interface_encryption: None,
                 stealing_repeats_flag: None,
                 data_class_info: None,
@@ -510,6 +511,7 @@ impl MleMs {
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,
+                packet_data_flag: false,
                 air_interface_encryption: None,
                 stealing_repeats_flag: None,
                 data_class_info: None,

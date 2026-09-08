@@ -5,6 +5,7 @@ use tetra_core::tetra_entities::TetraEntity;
 
 use crate::control::brew::MmSubscriberUpdate;
 use crate::control::call_control::CallControl;
+use crate::control::packet_data::PacketBearerControl;
 use crate::control::sds::CmceSdsData;
 use crate::tmd::TmdCircuitDataInd;
 use crate::tmd::TmdCircuitDataReq;
@@ -77,6 +78,7 @@ pub enum SapMsgInner {
 
     // CMCE -> UMAC control
     CmceCallControl(CallControl),
+    PacketBearerControl(PacketBearerControl),
 
     // MM -> Brew/CMCE subscriber update
     MmSubscriberUpdate(MmSubscriberUpdate),
@@ -86,6 +88,7 @@ pub enum SapMsgInner {
 
     // LTPD-SAP (MLE-LTPD)
     LtpdMleUnitdataInd(LtpdMleUnitdataInd),
+    LtpdMleUnitdataReq(LtpdMleUnitdataReq),
 
     // TNMM-SAP (MM-User)
     TnmmTestDemand(TnmmTestDemand),

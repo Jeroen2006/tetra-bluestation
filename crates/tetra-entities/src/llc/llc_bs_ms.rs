@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic;
 
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter};
+use tetra_core::{AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -15,7 +15,9 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
+use tetra_pdus::llc::consts::timers::T252_ACK_WAITING_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::al::{AlAck, AlDataHeader, AlDisconnect, AlReconnect, AlSetup};
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
@@ -44,6 +46,8 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
+const AL_SEGMENT_PAYLOAD_BITS: usize = 160;
+const PACKET_DATA_USAGE: u8 = 48;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -104,6 +108,46 @@ pub struct ScheduledOutAck {
     pub aie_request: AieRequest,
 }
 
+#[derive(Debug, Clone)]
+struct AdvancedRxSdu {
+    ns: u8,
+    segments: BTreeMap<u8, BitBuffer>,
+    final_segment: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct AdvancedTxSdu {
+    ns: u8,
+    segments: Vec<BitBuffer>,
+    routes: Vec<tetra_saps::tma::AssociatedChannel>,
+    chan_alloc: Option<CmceChanAllocReq>,
+    endpoint_id: u32,
+    aie_request: AieRequest,
+    reporter: TxReporter,
+    attempt_reporter: Option<TxReporter>,
+    sent_at: Option<TdmaTime>,
+    retransmissions: u8,
+    segment_retransmissions: Vec<u8>,
+    pending_segments: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct AdvancedLink {
+    link_number: u8,
+    maximum_sdu: u8,
+    slots: u8,
+    window_size: u8,
+    max_sdu_retransmissions: u8,
+    max_segment_retransmissions: u8,
+    endpoint_id: u32,
+    next_tx_ns: u8,
+    next_rx_ns: u8,
+    last_rx_ns: Option<u8>,
+    receiver_ready: bool,
+    rx: Option<AdvancedRxSdu>,
+    tx: VecDeque<AdvancedTxSdu>,
+}
+
 pub struct Llc {
     config: SharedConfig,
     dltime: TdmaTime,
@@ -120,6 +164,7 @@ pub struct Llc {
 
     /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
+    advanced_links: HashMap<u32, AdvancedLink>,
 }
 
 impl Llc {
@@ -131,6 +176,7 @@ impl Llc {
             outbound_messages: VecDeque::new(),
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
+            advanced_links: HashMap::new(),
         }
     }
 
@@ -566,12 +612,620 @@ impl Llc {
         reporter.mark_lost();
     }
 
+    fn packet_route(timeslot: u8) -> Option<tetra_saps::tma::AssociatedChannel> {
+        (2..=4).contains(&timeslot).then_some(tetra_saps::tma::AssociatedChannel {
+            call_id: 0,
+            timeslot,
+            usage: PACKET_DATA_USAGE,
+            best_effort_key: None,
+        })
+    }
+
+    fn queue_advanced_pdu(
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        endpoint_id: u32,
+        pdu: BitBuffer,
+        route: Option<tetra_saps::tma::AssociatedChannel>,
+        chan_alloc: Option<CmceChanAllocReq>,
+        aie_request: AieRequest,
+        tx_reporter: Option<TxReporter>,
+    ) {
+        queue.push_back(SapMsg::new(
+            Sap::TmaSap,
+            TetraEntity::Llc,
+            TetraEntity::Umac,
+            SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 0,
+                pdu,
+                main_address: address,
+                endpoint_id,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: Some(aie_request.with_scope(AieScope::MacResource)),
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc,
+                associated_channel: route,
+                tx_reporter,
+            }),
+        ));
+    }
+
+    fn advanced_segments(mut tl_sdu: BitBuffer) -> Vec<BitBuffer> {
+        let mut protected = BitBuffer::new_autoexpand(tl_sdu.get_len_remaining() + 32);
+        let length = tl_sdu.get_len_remaining();
+        protected.copy_bits(&mut tl_sdu, length);
+        let checksum = fcs::compute_fcs(&protected, 0, protected.get_len_written());
+        protected.write_bits(checksum.into(), 32);
+        protected.seek(0);
+
+        let mut segments = Vec::new();
+        while protected.get_len_remaining() > 0 {
+            let length = protected.get_len_remaining().min(AL_SEGMENT_PAYLOAD_BITS);
+            let mut segment = BitBuffer::new_autoexpand(length);
+            segment.copy_bits(&mut protected, length);
+            segment.seek(0);
+            segments.push(segment);
+        }
+        segments
+    }
+
+    fn rx_tla_tldata_req_al(&mut self, prim: tetra_saps::tla::TlaTlDataReqBl) -> bool {
+        let issi = prim.main_address.ssi;
+        let Some(link) = self.advanced_links.get_mut(&issi) else {
+            return false;
+        };
+        if link.link_number != 0 || link.tx.len() >= 64 {
+            return false;
+        }
+        let reporter = prim.tx_reporter.unwrap_or_else(TxReporter::new);
+        let segments = Self::advanced_segments(prim.tl_sdu);
+        let mut routes = self
+            .config
+            .state_read()
+            .timeslot_alloc
+            .packet_slots()
+            .into_iter()
+            .take(link.slots as usize)
+            .filter_map(Self::packet_route)
+            .collect::<Vec<_>>();
+        if let Some(primary) = prim.associated_channel {
+            routes.retain(|route| route.timeslot != primary.timeslot);
+            routes.insert(0, primary);
+        }
+        let ns = link.next_tx_ns;
+        link.next_tx_ns = (link.next_tx_ns + 1) & 0x07;
+        link.endpoint_id = prim.endpoint_id;
+        link.tx.push_back(AdvancedTxSdu {
+            ns,
+            segment_retransmissions: vec![0; segments.len()],
+            segments,
+            routes,
+            chan_alloc: prim.chan_alloc,
+            endpoint_id: prim.endpoint_id,
+            aie_request: prim
+                .air_interface_encryption
+                .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+            reporter,
+            attempt_reporter: None,
+            sent_at: None,
+            retransmissions: 0,
+            pending_segments: None,
+        });
+        true
+    }
+
+    fn send_al_ack(
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        endpoint_id: u32,
+        route: Option<tetra_saps::tma::AssociatedChannel>,
+        aie_request: AieRequest,
+        nr: u8,
+        acknowledgement_length: u8,
+        first_missing_segment: Option<u8>,
+        acknowledgement_bitmap: Vec<bool>,
+    ) {
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        if (AlAck {
+            receiver_ready: true,
+            nr,
+            acknowledgement_length,
+            first_missing_segment,
+            acknowledgement_bitmap,
+        })
+        .to_bitbuf(&mut pdu)
+        .is_ok()
+        {
+            pdu.seek(0);
+            Self::queue_advanced_pdu(queue, address, endpoint_id, pdu, route, None, aie_request, None);
+        }
+    }
+
+    fn deliver_advanced_sdu(queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut sdu: BitBuffer) {
+        sdu.seek(0);
+        queue.push_back(SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Llc,
+            TetraEntity::Mle,
+            SapMsgInner::TlaTlDataIndBl(TlaTlDataIndBl {
+                main_address: prim.main_address,
+                link_id: 0,
+                endpoint_id: prim.endpoint_id,
+                new_endpoint_id: prim.new_endpoint_id,
+                css_endpoint_id: prim.css_endpoint_id,
+                tl_sdu: Some(sdu),
+                scrambling_code: prim.scrambling_code,
+                fcs_flag: true,
+                air_interface_encryption: prim.air_interface_encryption,
+                chan_change_resp_req: prim.chan_change_response_req,
+                chan_change_handle: prim.chan_change_handle,
+                chan_info: prim.chan_info,
+                req_handle: 0,
+            }),
+        ));
+    }
+
+    fn handle_al_setup(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+        let Ok(request) = AlSetup::from_bitbuf(&mut pdu) else {
+            tracing::warn!(issi = prim.main_address.ssi, "invalid AL-SETUP");
+            return;
+        };
+        if request.link_number != 0 || request.asymmetric {
+            tracing::warn!(
+                issi = prim.main_address.ssi,
+                link_number = request.link_number,
+                asymmetric = request.asymmetric,
+                "unsupported TIP advanced-link profile"
+            );
+            return;
+        }
+        let requested_slots = request.uplink_slots.unwrap_or(1);
+        let slots = requested_slots.clamp(1, 3);
+        let maximum_sdu = request.maximum_sdu.min(6);
+        let window_size = request.window_size.clamp(1, 3);
+        let changed = slots != requested_slots || maximum_sdu != request.maximum_sdu || window_size != request.window_size;
+        let response = AlSetup {
+            acknowledged: true,
+            link_number: 0,
+            maximum_sdu,
+            connection_width: slots > 1,
+            asymmetric: false,
+            uplink_slots: (slots > 1).then_some(slots),
+            downlink_slots: None,
+            throughput: request.throughput,
+            window_size,
+            sdu_retransmissions: request.sdu_retransmissions,
+            segment_retransmissions: request.segment_retransmissions,
+            report: if changed { 2 } else { 0 },
+        };
+        self.advanced_links.insert(
+            prim.main_address.ssi,
+            AdvancedLink {
+                link_number: 0,
+                maximum_sdu,
+                slots,
+                window_size,
+                max_sdu_retransmissions: request.sdu_retransmissions,
+                max_segment_retransmissions: request.segment_retransmissions,
+                endpoint_id: prim.endpoint_id,
+                next_tx_ns: 0,
+                next_rx_ns: 0,
+                last_rx_ns: None,
+                receiver_ready: true,
+                rx: None,
+                tx: VecDeque::new(),
+            },
+        );
+        let mut response_pdu = BitBuffer::new_autoexpand(32);
+        if response.to_bitbuf(&mut response_pdu).is_ok() {
+            response_pdu.seek(0);
+            let route = Self::packet_route(self.dltime.add_timeslots(-2).t);
+            let aie = prim.air_interface_encryption.unwrap_or_else(|| {
+                AieRequest::clear(
+                    AieSubject::Individual {
+                        issi: prim.main_address.ssi,
+                    },
+                    AieScope::MacResource,
+                )
+            });
+            Self::queue_advanced_pdu(queue, prim.main_address, prim.endpoint_id, response_pdu, route, None, aie, None);
+        }
+        tracing::info!(
+            issi = prim.main_address.ssi,
+            slots,
+            window_size,
+            maximum_sdu,
+            "established original acknowledged advanced link"
+        );
+    }
+
+    fn handle_al_data(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+        let Ok(header) = AlDataHeader::from_bitbuf(&mut pdu) else {
+            tracing::warn!(issi = prim.main_address.ssi, "invalid AL-DATA/FINAL");
+            return;
+        };
+        let issi = prim.main_address.ssi;
+        let route = Self::packet_route(self.dltime.add_timeslots(-2).t);
+        let aie = prim
+            .air_interface_encryption
+            .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        let Some(link) = self.advanced_links.get_mut(&issi) else {
+            tracing::warn!(issi, "AL-DATA received without an established advanced link");
+            return;
+        };
+        if link.last_rx_ns == Some(header.ns) {
+            Self::send_al_ack(
+                queue,
+                prim.main_address,
+                prim.endpoint_id,
+                route,
+                aie,
+                header.ns,
+                0,
+                None,
+                Vec::new(),
+            );
+            return;
+        }
+        if link.rx.as_ref().is_none_or(|rx| rx.ns != header.ns) {
+            if header.ns != link.next_rx_ns {
+                tracing::warn!(
+                    issi,
+                    expected = link.next_rx_ns,
+                    received = header.ns,
+                    "AL-DATA outside receive window"
+                );
+                return;
+            }
+            link.rx = Some(AdvancedRxSdu {
+                ns: header.ns,
+                segments: BTreeMap::new(),
+                final_segment: None,
+            });
+        }
+        let rx = link.rx.as_mut().expect("advanced receive state initialized");
+        pdu.set_raw_start(pdu.get_raw_pos());
+        pdu.seek(0);
+        rx.segments.entry(header.segment).or_insert(pdu);
+        if header.final_segment {
+            rx.final_segment = Some(header.segment);
+        }
+
+        let complete = rx
+            .final_segment
+            .is_some_and(|last| (0..=last).all(|segment| rx.segments.contains_key(&segment)));
+        if complete {
+            let last = rx.final_segment.expect("complete receive state has final segment");
+            let total_bits = (0..=last)
+                .filter_map(|segment| rx.segments.get(&segment))
+                .map(BitBuffer::get_len_remaining)
+                .sum();
+            let mut assembled = BitBuffer::new_autoexpand(total_bits);
+            for segment in 0..=last {
+                let mut bits = rx.segments.get(&segment).expect("complete receive state has segment").clone();
+                let length = bits.get_len_remaining();
+                assembled.copy_bits(&mut bits, length);
+            }
+            assembled.seek(0);
+            if fcs::check_fcs(&assembled) {
+                assembled.set_raw_end(assembled.get_raw_end() - 32);
+                assembled.seek(0);
+                Self::send_al_ack(
+                    queue,
+                    prim.main_address,
+                    prim.endpoint_id,
+                    route,
+                    aie,
+                    header.ns,
+                    0,
+                    None,
+                    Vec::new(),
+                );
+                link.last_rx_ns = Some(header.ns);
+                link.next_rx_ns = (header.ns + 1) & 0x07;
+                link.rx = None;
+                Self::deliver_advanced_sdu(queue, prim, assembled);
+            } else {
+                Self::send_al_ack(
+                    queue,
+                    prim.main_address,
+                    prim.endpoint_id,
+                    route,
+                    aie,
+                    header.ns,
+                    63,
+                    None,
+                    Vec::new(),
+                );
+                link.rx = None;
+            }
+        } else if header.acknowledgement_requested {
+            let highest = rx.final_segment.unwrap_or(header.segment);
+            let missing = (0..=highest)
+                .find(|segment| !rx.segments.contains_key(segment))
+                .unwrap_or(highest.saturating_add(1));
+            Self::send_al_ack(
+                queue,
+                prim.main_address,
+                prim.endpoint_id,
+                route,
+                aie,
+                header.ns,
+                1,
+                Some(missing),
+                Vec::new(),
+            );
+        }
+    }
+
+    fn handle_al_ack(&mut self, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+        let Ok(ack) = AlAck::from_bitbuf(&mut pdu) else {
+            tracing::warn!(issi = prim.main_address.ssi, "invalid AL-ACK/RNR");
+            return;
+        };
+        let Some(link) = self.advanced_links.get_mut(&prim.main_address.ssi) else {
+            return;
+        };
+        link.receiver_ready = ack.receiver_ready;
+        let Some(position) = link.tx.iter().position(|sdu| sdu.ns == ack.nr) else {
+            return;
+        };
+        if ack.acknowledgement_length == 0 {
+            if let Some(sdu) = link.tx.remove(position) {
+                if sdu.reporter.get_state() == TxState::Pending {
+                    sdu.reporter.mark_transmitted();
+                }
+                if sdu.reporter.get_state() == TxState::Transmitted {
+                    sdu.reporter.mark_acknowledged();
+                }
+            }
+            return;
+        }
+        let sdu = &mut link.tx[position];
+        if ack.acknowledgement_length == 63 {
+            sdu.retransmissions = sdu.retransmissions.saturating_add(1);
+            sdu.pending_segments = None;
+        } else if let Some(first) = ack.first_missing_segment {
+            let mut missing = vec![first as usize];
+            for (offset, received) in ack.acknowledgement_bitmap.iter().copied().enumerate() {
+                if !received {
+                    missing.push(first as usize + offset + 1);
+                }
+            }
+            missing.retain(|segment| *segment < sdu.segments.len());
+            let segment_limit_exceeded = missing.iter().any(|segment| {
+                sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
+                sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
+            });
+            if segment_limit_exceeded {
+                sdu.retransmissions = sdu.retransmissions.saturating_add(1);
+                sdu.pending_segments = None;
+            } else {
+                sdu.pending_segments = Some(missing);
+            }
+        }
+        if sdu.reporter.get_state() == TxState::Transmitted {
+            sdu.reporter.reset();
+        }
+        sdu.sent_at = None;
+        sdu.attempt_reporter = None;
+    }
+
+    fn handle_al_reconnect(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+        let Ok(request) = AlReconnect::from_bitbuf(&mut pdu) else {
+            return;
+        };
+        let accepted = request.link_number == 0 && self.advanced_links.contains_key(&prim.main_address.ssi);
+        let response = AlReconnect {
+            acknowledged: true,
+            link_number: request.link_number,
+            report: if accepted { 2 } else { 1 },
+        };
+        let mut response_pdu = BitBuffer::new_autoexpand(16);
+        if response.to_bitbuf(&mut response_pdu).is_ok() {
+            response_pdu.seek(0);
+            let aie = prim.air_interface_encryption.unwrap_or_else(|| {
+                AieRequest::clear(
+                    AieSubject::Individual {
+                        issi: prim.main_address.ssi,
+                    },
+                    AieScope::MacResource,
+                )
+            });
+            Self::queue_advanced_pdu(
+                queue,
+                prim.main_address,
+                prim.endpoint_id,
+                response_pdu,
+                Self::packet_route(self.dltime.add_timeslots(-2).t),
+                None,
+                aie,
+                None,
+            );
+        }
+    }
+
+    fn handle_al_disconnect(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+        let Ok(request) = AlDisconnect::from_bitbuf(&mut pdu) else {
+            return;
+        };
+        if request.link_number != 0 {
+            return;
+        }
+        self.advanced_links.remove(&prim.main_address.ssi);
+        let mut response_pdu = BitBuffer::new_autoexpand(16);
+        AlDisconnect {
+            acknowledged: true,
+            link_number: 0,
+            report: 0,
+        }
+        .to_bitbuf(&mut response_pdu);
+        response_pdu.seek(0);
+        let aie = prim.air_interface_encryption.unwrap_or_else(|| {
+            AieRequest::clear(
+                AieSubject::Individual {
+                    issi: prim.main_address.ssi,
+                },
+                AieScope::MacResource,
+            )
+        });
+        Self::queue_advanced_pdu(
+            queue,
+            prim.main_address,
+            prim.endpoint_id,
+            response_pdu,
+            Self::packet_route(self.dltime.add_timeslots(-2).t),
+            None,
+            aie,
+            None,
+        );
+    }
+
+    fn rx_tma_unitdata_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg, pdu_type: LlcPduType) {
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
+            return;
+        };
+        let Some(pdu) = prim.pdu.take() else {
+            return;
+        };
+        match pdu_type {
+            LlcPduType::AlSetup => self.handle_al_setup(queue, prim, pdu),
+            LlcPduType::AlDataAlFinal => self.handle_al_data(queue, prim, pdu),
+            LlcPduType::AlAckAlRnr => self.handle_al_ack(prim, pdu),
+            LlcPduType::AlReconnect => self.handle_al_reconnect(queue, prim, pdu),
+            LlcPduType::AlDisc => self.handle_al_disconnect(queue, prim, pdu),
+            LlcPduType::AlAlUdataAlUfinal => {
+                tracing::warn!(
+                    issi = prim.main_address.ssi,
+                    "unacknowledged advanced link is outside the TIP profile"
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn submit_advanced_link_messages(&mut self, queue: &mut MessageQueue) -> bool {
+        let now = self.dltime;
+        let mut activity = false;
+        for (issi, link) in &mut self.advanced_links {
+            let mut remove = Vec::new();
+            for (index, sdu) in link.tx.iter_mut().enumerate() {
+                if let Some(attempt) = &sdu.attempt_reporter {
+                    match attempt.get_state() {
+                        TxState::Transmitted | TxState::Acknowledged => {
+                            if sdu.reporter.get_state() == TxState::Pending {
+                                sdu.reporter.mark_transmitted();
+                            }
+                            sdu.sent_at.get_or_insert(now);
+                        }
+                        TxState::Discarded | TxState::Lost => {
+                            sdu.attempt_reporter = None;
+                            sdu.sent_at = None;
+                        }
+                        TxState::Pending => {}
+                    }
+                }
+                let timed_out = sdu.sent_at.is_some_and(|sent| now.diff(sent) >= T252_ACK_WAITING_TIMER as i32);
+                if timed_out {
+                    if sdu.retransmissions >= link.max_sdu_retransmissions {
+                        if sdu.reporter.get_state() == TxState::Pending {
+                            sdu.reporter.mark_transmitted();
+                        }
+                        if sdu.reporter.get_state() == TxState::Transmitted {
+                            sdu.reporter.mark_lost();
+                        }
+                        remove.push(index);
+                    } else {
+                        sdu.retransmissions += 1;
+                        if sdu.reporter.get_state() == TxState::Transmitted {
+                            sdu.reporter.reset();
+                        }
+                        sdu.attempt_reporter = None;
+                        sdu.sent_at = None;
+                        sdu.pending_segments = None;
+                    }
+                }
+            }
+            for index in remove.into_iter().rev() {
+                link.tx.remove(index);
+            }
+
+            if !link.receiver_ready {
+                continue;
+            }
+            let in_flight = link
+                .tx
+                .iter()
+                .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
+                .count();
+            let mut available = link.window_size as usize - in_flight.min(link.window_size as usize);
+            for sdu in link
+                .tx
+                .iter_mut()
+                .filter(|sdu| sdu.attempt_reporter.is_none() && sdu.sent_at.is_none())
+            {
+                if available == 0 || sdu.retransmissions > link.max_sdu_retransmissions {
+                    break;
+                }
+                let selected = sdu
+                    .pending_segments
+                    .clone()
+                    .filter(|segments| !segments.is_empty())
+                    .unwrap_or_else(|| (0..sdu.segments.len()).collect());
+                let attempt_reporter = TxReporter::new_unacked();
+                for (selected_index, segment_index) in selected.iter().copied().enumerate() {
+                    let mut pdu = BitBuffer::new_autoexpand(AL_SEGMENT_PAYLOAD_BITS + 24);
+                    let last_selected = selected_index + 1 == selected.len();
+                    let final_segment = segment_index + 1 == sdu.segments.len();
+                    let header = AlDataHeader {
+                        final_segment,
+                        acknowledgement_requested: last_selected,
+                        ns: sdu.ns,
+                        segment: segment_index as u8,
+                    };
+                    if header.to_bitbuf(&mut pdu).is_err() {
+                        continue;
+                    }
+                    let mut payload = sdu.segments[segment_index].clone();
+                    let length = payload.get_len_remaining();
+                    pdu.copy_bits(&mut payload, length);
+                    pdu.seek(0);
+                    Self::queue_advanced_pdu(
+                        queue,
+                        TetraAddress::issi(*issi),
+                        sdu.endpoint_id,
+                        pdu,
+                        if sdu.routes.is_empty() {
+                            None
+                        } else {
+                            Some(sdu.routes[segment_index % sdu.routes.len()])
+                        },
+                        last_selected.then(|| sdu.chan_alloc.clone()).flatten(),
+                        sdu.aie_request,
+                        last_selected.then(|| attempt_reporter.clone()),
+                    );
+                }
+                sdu.attempt_reporter = Some(attempt_reporter);
+                sdu.pending_segments = None;
+                available -= 1;
+                activity = true;
+            }
+        }
+        activity
+    }
+
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
         let SapMsgInner::TlaTlDataReqBl(mut prim) = message.msg else {
             panic!()
         };
+
+        if prim.packet_data_flag && self.rx_tla_tldata_req_al(prim.clone()) {
+            return;
+        }
 
         if prim.stealing_permission {
             panic!("Can't send BL-DATA for STCH message");
@@ -757,7 +1411,7 @@ impl Llc {
             | LlcPduType::AlAckAlRnr
             | LlcPduType::AlReconnect
             | LlcPduType::AlDisc => {
-                tracing::warn!(issi, ?pdu_type, "discarding unsupported advanced-link LLC PDU");
+                self.rx_tma_unitdata_ind_al(queue, message, pdu_type);
             }
 
             LlcPduType::SuppLlcPdu | LlcPduType::L2SigPdu => {
@@ -1256,6 +1910,10 @@ impl TetraEntityTrait for Llc {
         // Step 4 / 4: Send any U-DATA messages
         had_activity |= self.submit_udata_msgs_to_umac(queue);
 
+        // Packet data is deliberately submitted after all basic-link and
+        // control work; UMAC applies the same ordering inside packet bearers.
+        had_activity |= self.submit_advanced_link_messages(queue);
+
         had_activity
     }
 }
@@ -1263,6 +1921,7 @@ impl TetraEntityTrait for Llc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tetra_saps::tma::TmaUnitdataInd;
 
     fn test_config() -> SharedConfig {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -1271,6 +1930,156 @@ mod tests {
         )))
         .expect("example configuration must remain valid");
         SharedConfig::from_parts(config, None)
+    }
+
+    fn advanced_indication(issi: u32, pdu: BitBuffer) -> SapMsg {
+        SapMsg::new(
+            Sap::TmaSap,
+            TetraEntity::Umac,
+            TetraEntity::Llc,
+            SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                pdu: Some(pdu),
+                main_address: TetraAddress::issi(issi),
+                scrambling_code: 0,
+                endpoint_id: 7,
+                new_endpoint_id: None,
+                css_endpoint_id: None,
+                air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacData)),
+                chan_change_response_req: false,
+                chan_change_handle: None,
+                chan_info: None,
+            }),
+        )
+    }
+
+    fn establish_advanced_link(llc: &mut Llc, queue: &mut MessageQueue, issi: u32) {
+        llc.dltime = TdmaTime { h: 0, m: 1, f: 2, t: 4 };
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        AlSetup {
+            acknowledged: true,
+            link_number: 0,
+            maximum_sdu: 6,
+            connection_width: true,
+            asymmetric: false,
+            uplink_slots: Some(3),
+            downlink_slots: None,
+            throughput: 7,
+            window_size: 2,
+            sdu_retransmissions: 3,
+            segment_retransmissions: 5,
+            report: 1,
+        }
+        .to_bitbuf(&mut pdu)
+        .unwrap();
+        pdu.seek(0);
+        llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
+    }
+
+    #[test]
+    fn ms_al_setup_establishes_tip_link_and_is_answered() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+
+        let link = llc.advanced_links.get(&77_468).expect("advanced link established");
+        assert_eq!(link.link_number, 0);
+        assert_eq!(link.slots, 3);
+        assert_eq!(link.window_size, 2);
+        let response = queue.pop_front().expect("AL-SETUP response");
+        let SapMsgInner::TmaUnitdataReq(mut response) = response.msg else {
+            panic!("expected TMA response")
+        };
+        assert_eq!(response.associated_channel.map(|route| route.timeslot), Some(2));
+        assert_eq!(AlSetup::from_bitbuf(&mut response.pdu).unwrap().report, 0);
+    }
+
+    #[test]
+    fn advanced_uplink_reassembles_and_checks_fcs() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let payload = BitBuffer::from_bitstr(&"10110010".repeat(40));
+        let segments = Llc::advanced_segments(payload.clone());
+        for (index, mut segment) in segments.iter().cloned().enumerate() {
+            let mut pdu = BitBuffer::new_autoexpand(200);
+            AlDataHeader {
+                final_segment: index + 1 == segments.len(),
+                acknowledgement_requested: index + 1 == segments.len(),
+                ns: 0,
+                segment: index as u8,
+            }
+            .to_bitbuf(&mut pdu)
+            .unwrap();
+            let length = segment.get_len_remaining();
+            pdu.copy_bits(&mut segment, length);
+            pdu.seek(0);
+            llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, pdu));
+        }
+
+        let ack = queue.pop_front().unwrap();
+        assert!(matches!(ack.msg, SapMsgInner::TmaUnitdataReq(_)));
+        let delivered = queue.pop_front().unwrap();
+        assert!(queue.pop_front().is_none());
+        let SapMsgInner::TlaTlDataIndBl(delivered) = delivered.msg else {
+            panic!("expected reassembled TL-DATA indication")
+        };
+        assert_eq!(delivered.tl_sdu.unwrap().dump_bin_unformatted(), payload.dump_bin_unformatted());
+    }
+
+    #[test]
+    fn advanced_downlink_completes_only_after_al_ack() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let reporter = TxReporter::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr(&"11001010".repeat(30)),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: Llc::packet_route(2),
+                    tx_reporter: Some(reporter.clone()),
+                }),
+            ),
+        );
+        llc.submit_advanced_link_messages(&mut queue);
+        assert_eq!(reporter.get_state(), TxState::Pending);
+        assert!(queue.pop_front().is_some());
+        assert!(queue.pop_front().is_some());
+        assert!(queue.pop_front().is_none());
+
+        let mut ack = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: true,
+            nr: 0,
+            acknowledgement_length: 0,
+            first_missing_segment: None,
+            acknowledgement_bitmap: Vec::new(),
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+        assert_eq!(reporter.get_state(), TxState::Acknowledged);
+        assert!(llc.advanced_links.get(&77_468).unwrap().tx.is_empty());
     }
 
     #[test]
@@ -1361,6 +2170,7 @@ mod tests {
                     stealing_permission: false,
                     subscriber_class: 0,
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_class_info: None,
@@ -1439,6 +2249,7 @@ mod tests {
                     stealing_permission: false,
                     subscriber_class: 0,
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_class_info: None,
@@ -1539,6 +2350,7 @@ mod tests {
                     stealing_permission: false,
                     subscriber_class: 0,
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_class_info: None,
@@ -1647,6 +2459,7 @@ mod tests {
                     stealing_permission: false,
                     subscriber_class: 0,
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_class_info: None,

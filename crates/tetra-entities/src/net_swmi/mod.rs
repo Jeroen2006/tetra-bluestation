@@ -149,6 +149,7 @@ pub struct SwmiWorkerEndpoint {
     outgoing: Receiver<SwmiMessage>,
     mm_incoming: Sender<SwmiMessage>,
     cmce_incoming: Sender<SwmiMessage>,
+    packet_incoming: Sender<SwmiMessage>,
     mle_incoming: Sender<NeighbourCellSnapshot>,
     media_incoming: Sender<SwmiMessage>,
     online: Arc<AtomicBool>,
@@ -173,6 +174,33 @@ pub struct SwmiMediaEndpoint {
     outgoing: Sender<SwmiMessage>,
     incoming: Receiver<SwmiMessage>,
     online: Arc<AtomicBool>,
+}
+
+/// SNDCP's independent non-blocking control and IPv4 path. Packet bursts
+/// share the worker's ordered egress queue but cannot consume CMCE commands.
+pub struct SwmiPacketEndpoint {
+    outgoing: Sender<SwmiMessage>,
+    incoming: Receiver<SwmiMessage>,
+    online: Arc<AtomicBool>,
+}
+
+impl SwmiPacketEndpoint {
+    pub fn is_online(&self) -> bool {
+        self.online.load(Ordering::Acquire)
+    }
+
+    pub fn submit(&self, message: SwmiMessage) -> Result<(), SwmiMessage> {
+        self.outgoing.try_send(message).map_err(|error| match error {
+            TrySendError::Full(message) | TrySendError::Disconnected(message) => message,
+        })
+    }
+
+    pub fn try_recv(&self) -> Option<SwmiMessage> {
+        match self.incoming.try_recv() {
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
+    }
 }
 
 /// Write-only RF statistics endpoint. UMAC owns correlation and aggregation;
@@ -249,18 +277,21 @@ pub fn channel() -> (
     SwmiMleEndpoint,
     SwmiMediaEndpoint,
     SwmiRfEndpoint,
+    SwmiPacketEndpoint,
 ) {
     let (outgoing_tx, outgoing_rx) = crossbeam_channel::unbounded();
     let (mm_incoming_tx, mm_incoming_rx) = crossbeam_channel::unbounded();
     let (cmce_incoming_tx, cmce_incoming_rx) = crossbeam_channel::unbounded();
     let (mle_incoming_tx, mle_incoming_rx) = crossbeam_channel::unbounded();
     let (media_incoming_tx, media_incoming_rx) = crossbeam_channel::unbounded();
+    let (packet_incoming_tx, packet_incoming_rx) = crossbeam_channel::unbounded();
     let online = Arc::new(AtomicBool::new(false));
     (
         SwmiWorkerEndpoint {
             outgoing: outgoing_rx,
             mm_incoming: mm_incoming_tx,
             cmce_incoming: cmce_incoming_tx,
+            packet_incoming: packet_incoming_tx,
             mle_incoming: mle_incoming_tx,
             media_incoming: media_incoming_tx,
             online: online.clone(),
@@ -282,7 +313,12 @@ pub fn channel() -> (
             online: online.clone(),
         },
         SwmiRfEndpoint {
+            outgoing: outgoing_tx.clone(),
+            online: online.clone(),
+        },
+        SwmiPacketEndpoint {
             outgoing: outgoing_tx,
+            incoming: packet_incoming_rx,
             online,
         },
     )
@@ -804,6 +840,11 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         Ok(message @ (SwmiMessage::VoiceFrame { .. } | SwmiMessage::PrivateVoiceFrame { .. })) => {
                             if self.endpoint.media_incoming.send(message).is_err() {
                                 tracing::warn!("SwMI media endpoint closed; dropping voice frame");
+                            }
+                        }
+                        Ok(message @ SwmiMessage::PacketData(_)) => {
+                            if self.endpoint.packet_incoming.send(message).is_err() {
+                                tracing::warn!("SwMI SNDCP endpoint closed; dropping packet-data action");
                             }
                         }
                         Ok(message) => tracing::debug!(?message, "SwMI message received"),

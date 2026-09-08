@@ -120,7 +120,7 @@ impl ComponentTest {
                     self.router.register_entity(Box::new(mm));
                 }
                 TetraEntity::Sndcp => {
-                    let sndcp = Sndcp::new(self.config.clone());
+                    let sndcp = Sndcp::new(self.config.clone(), None);
                     self.router.register_entity(Box::new(sndcp));
                 }
                 TetraEntity::Cmce => {

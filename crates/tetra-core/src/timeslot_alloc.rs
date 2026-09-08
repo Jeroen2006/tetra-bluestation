@@ -2,6 +2,7 @@
 pub enum TimeslotOwner {
     Brew,
     Cmce,
+    PacketData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,12 +26,14 @@ pub enum TimeslotAllocErr {
 pub struct TimeslotAllocator {
     // Index 0 = TS2, 1 = TS3, 2 = TS4
     owners: [Option<TimeslotOwner>; 3],
+    packet_preemption_requested: bool,
 }
 
 impl Default for TimeslotAllocator {
     fn default() -> Self {
         Self {
             owners: [None, None, None],
+            packet_preemption_requested: false,
         }
     }
 }
@@ -51,7 +54,22 @@ impl TimeslotAllocator {
                 return Some(i as u8 + 2);
             }
         }
+        if owner == TimeslotOwner::Cmce && self.owners.contains(&Some(TimeslotOwner::PacketData)) {
+            self.packet_preemption_requested = true;
+        }
         None
+    }
+
+    pub fn take_packet_preemption_request(&mut self) -> bool {
+        std::mem::take(&mut self.packet_preemption_requested)
+    }
+
+    pub fn packet_slots(&self) -> Vec<u8> {
+        self.owners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, owner)| (*owner == Some(TimeslotOwner::PacketData)).then_some(index as u8 + 2))
+            .collect()
     }
 
     pub fn reserve(&mut self, owner: TimeslotOwner, ts: u8) -> Result<(), TimeslotAllocErr> {
@@ -87,5 +105,36 @@ impl TimeslotAllocator {
 
     pub fn is_free(&self, ts: u8) -> bool {
         self.owner(ts).is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_requests_preemption_only_when_packet_data_blocks_capacity() {
+        let mut allocator = TimeslotAllocator::default();
+        allocator.reserve(TimeslotOwner::PacketData, 2).unwrap();
+        allocator.reserve(TimeslotOwner::Brew, 3).unwrap();
+
+        assert_eq!(allocator.allocate_any(TimeslotOwner::Cmce), Some(4));
+        assert!(!allocator.take_packet_preemption_request());
+
+        assert_eq!(allocator.allocate_any(TimeslotOwner::Cmce), None);
+        assert!(allocator.take_packet_preemption_request());
+        assert!(!allocator.take_packet_preemption_request());
+        assert_eq!(allocator.owner(2), Some(TimeslotOwner::PacketData));
+    }
+
+    #[test]
+    fn non_voice_capacity_requests_never_preempt_packet_data() {
+        let mut allocator = TimeslotAllocator::default();
+        for timeslot in 2..=4 {
+            allocator.reserve(TimeslotOwner::PacketData, timeslot).unwrap();
+        }
+
+        assert_eq!(allocator.allocate_any(TimeslotOwner::Brew), None);
+        assert!(!allocator.take_packet_preemption_request());
     }
 }

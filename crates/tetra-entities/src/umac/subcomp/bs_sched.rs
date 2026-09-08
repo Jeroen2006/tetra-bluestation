@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie};
 use tetra_core::{
     AieCipherRegion, AieContext, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, PhysicalChannel,
@@ -152,6 +154,13 @@ pub struct BsChannelScheduler {
     /// Key-free policy for the downlink speech portion of an active traffic
     /// circuit. A missing policy is deliberately not converted to clear.
     traffic_aie: [Option<AieRequest>; 4],
+    /// Packet-data bearers use an assigned CP/SCH/F resource rather than a
+    /// circuit-mode TCH. The generation fences delayed close commands after
+    /// a voice call has already reused the physical slot.
+    packet_bearers: [Option<(u64, u64)>; 4],
+    /// Highest generation observed for each bearer id. Tombstones remain
+    /// after close so a delayed Open cannot resurrect an older bearer.
+    packet_bearer_generations: HashMap<u64, u64>,
 }
 
 #[derive(Debug)]
@@ -230,7 +239,57 @@ impl BsChannelScheduler {
             random_access_frame_len: 4,
             aie_provider,
             traffic_aie: [None; 4],
+            packet_bearers: [None; 4],
+            packet_bearer_generations: HashMap::new(),
         }
+    }
+
+    pub fn open_packet_bearer(&mut self, bearer_id: u64, generation: u64, bitmap: u8) -> bool {
+        if self
+            .packet_bearer_generations
+            .get(&bearer_id)
+            .is_some_and(|known| generation < *known)
+        {
+            return false;
+        }
+        self.packet_bearer_generations.insert(bearer_id, generation);
+        for slot in &mut self.packet_bearers {
+            if slot.is_some_and(|(id, _)| id == bearer_id) {
+                *slot = None;
+            }
+        }
+        for timeslot in 2..=4 {
+            if bitmap & (1 << (timeslot - 1)) != 0 {
+                self.packet_bearers[timeslot as usize - 1] = Some((bearer_id, generation));
+            }
+        }
+        true
+    }
+
+    pub fn close_packet_bearer(&mut self, bearer_id: u64, generation: u64) -> bool {
+        if self.packet_bearer_generations.get(&bearer_id) != Some(&generation) {
+            return false;
+        }
+        for slot in &mut self.packet_bearers {
+            if *slot == Some((bearer_id, generation)) {
+                *slot = None;
+            }
+        }
+        true
+    }
+
+    pub fn packet_bearer_is_active(&self, timeslot: u8) -> bool {
+        (2..=4).contains(&timeslot) && self.packet_bearers[timeslot as usize - 1].is_some()
+    }
+
+    pub fn packet_bearers_match(&self, bearer_id: u64, generation: u64) -> bool {
+        self.packet_bearers.contains(&Some((bearer_id, generation)))
+    }
+
+    pub fn assigned_channel_is_active(&self, timeslot: u8) -> bool {
+        self.packet_bearer_is_active(timeslot)
+            || self.circuits.is_active(Direction::Dl, timeslot)
+            || self.circuits.is_active(Direction::Ul, timeslot)
     }
 
     /// Enter/leave hangtime for a traffic timeslot (2..=4).
@@ -2561,6 +2620,10 @@ impl BsChannelScheduler {
                                 downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
                                 uplink_usage_marker: AccessAssignUlUsage::Traffic(ul_usage),
                             },
+                            (None, None) if self.packet_bearer_is_active(ts.t) => AccessAssign::DownlinkDefinedUplinkAssignedOnly {
+                                downlink_usage_marker: AccessAssignDlUsage::AssignedControl,
+                                access_field: assigned_access_field,
+                            },
                             (None, None)
                                 if self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t) =>
                             {
@@ -2585,8 +2648,7 @@ impl BsChannelScheduler {
             // Frame 18 is the SACCH control frame for an assigned TCH.
             assert!(ul_traffic_usage.is_none() && dl_traffic_usage.is_none());
 
-            let assigned_channel =
-                ts.t != 1 && (self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t));
+            let assigned_channel = ts.t != 1 && self.assigned_channel_is_active(ts.t);
             let access_field_1 = AccessField {
                 access_code: AccessCode::AccessCodeA,
                 base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
@@ -3310,12 +3372,7 @@ mod tests {
     fn grant_beyond_basic_delay_range_waits_without_reserving() {
         let mut sched = get_testing_slotter();
         let timeslot = 4;
-        sched.cur_dltime = TdmaTime {
-            t: 3,
-            f: 1,
-            m: 1,
-            h: 0,
-        };
+        sched.cur_dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
         let first_opportunity = sched.cur_dltime.forward_to_timeslot(timeslot);
         let mut occupied = 0;
         let mut first_unencodable = None;
@@ -3345,11 +3402,7 @@ mod tests {
                 .is_some_and(|(skips, _)| skips > MAX_BASIC_SLOT_GRANT_DELAY)
         );
 
-        let grant = sched.ul_process_cap_req(
-            timeslot,
-            TetraAddress::issi(77_468),
-            &ReservationRequirement::Req1Slot,
-        );
+        let grant = sched.ul_process_cap_req(timeslot, TetraAddress::issi(77_468), &ReservationRequirement::Req1Slot);
         assert!(grant.is_none(), "an ordinary delay above 13 cannot be encoded in four bits");
         assert_eq!(
             sched.ul_get_slot_owner(first_unencodable, PhyBlockNum::Both),
@@ -4813,5 +4866,38 @@ mod tests {
 
             ts = ts.add_timeslots(1);
         }
+    }
+
+    #[test]
+    fn packet_slots_are_assigned_channels_and_close_by_exact_generation() {
+        let mut sched = get_testing_slotter();
+
+        assert!(sched.open_packet_bearer(17, 3, 0b1100));
+        assert!(sched.packet_bearer_is_active(3));
+        assert!(sched.packet_bearer_is_active(4));
+        assert!(sched.assigned_channel_is_active(3));
+
+        assert!(!sched.close_packet_bearer(17, 2));
+        assert!(sched.packet_bearer_is_active(3));
+        assert!(sched.close_packet_bearer(17, 3));
+        assert!(!sched.packet_bearer_is_active(3));
+        assert!(!sched.packet_bearer_is_active(4));
+    }
+
+    #[test]
+    fn stale_packet_open_cannot_resurrect_or_resize_new_generation() {
+        let mut sched = get_testing_slotter();
+
+        assert!(sched.open_packet_bearer(17, 4, 0b0010));
+        assert!(sched.close_packet_bearer(17, 4));
+        assert!(!sched.open_packet_bearer(17, 3, 0b1000));
+        assert!(!sched.packet_bearers_match(17, 3));
+        assert!(!sched.packet_bearer_is_active(4));
+
+        assert!(sched.open_packet_bearer(17, 5, 0b0100));
+        assert!(!sched.open_packet_bearer(17, 4, 0b1000));
+        assert!(sched.packet_bearers_match(17, 5));
+        assert!(sched.packet_bearer_is_active(3));
+        assert!(!sched.packet_bearer_is_active(4));
     }
 }

@@ -313,6 +313,7 @@ impl MleBs {
                 stealing_permission: false,
                 subscriber_class: 0,
                 fcs_flag: false,
+                packet_data_flag: false,
                 air_interface_encryption,
                 stealing_repeats_flag: None,
                 data_class_info: None,
@@ -489,9 +490,9 @@ impl MleBs {
                 }),
             }),
             MleProtocolDiscriminator::Sndcp => queue.push_back(SapMsg {
-                sap: Sap::LcmcSap,
+                sap: Sap::TlpdSap,
                 src: TetraEntity::Mle,
-                dest: TetraEntity::Cmce,
+                dest: TetraEntity::Sndcp,
                 msg: SapMsgInner::LtpdMleUnitdataInd(LtpdMleUnitdataInd {
                     sdu,
                     endpoint_id,
@@ -589,9 +590,9 @@ impl MleBs {
                     chan_change_handle: None,    // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap: Sap::TlpdSap,
                     src: TetraEntity::Mle,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     msg: SapMsgInner::LcmcMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -710,6 +711,7 @@ impl MleBs {
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption: Some(prim.aie_request),
                     stealing_repeats_flag: None,
                     data_class_info: None,
@@ -734,14 +736,67 @@ impl MleBs {
         }
     }
 
-    fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
+    fn rx_tlpd_prim(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlpd_prim");
-        unimplemented!("rx_tlpd_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
+        let SapMsgInner::LtpdMleUnitdataReq(prim) = &mut message.msg else {
+            panic!("unexpected LTPD primitive")
+        };
+        let sdu_len = prim.sdu.get_len_remaining();
+        let mut pdu = BitBuffer::new(3 + sdu_len);
+        pdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+        pdu.copy_bits(&mut prim.sdu, sdu_len);
+        pdu.seek(0);
+
+        let air_interface_encryption = prim.aie_override.take().or_else(|| self.cmce_downlink_aie(prim.main_address));
+        let sapmsg = if prim.layer2service == Layer2Service::Unacknowledged {
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                    main_address: prim.main_address,
+                    link_id: prim.link_id,
+                    endpoint_id: prim.endpoint_id,
+                    tl_sdu: pdu,
+                    stealing_permission: prim.stealing_permission,
+                    subscriber_class: 0,
+                    fcs_flag: prim.fcs_flag,
+                    air_interface_encryption,
+                    packet_data_flag: true,
+                    n_tlsdu_repeats: prim.unacked_bl_repetitions,
+                    data_class_info: None,
+                    req_handle: prim.handle,
+                    chan_alloc: prim.chan_alloc.take(),
+                    associated_channel: prim.associated_channel.take(),
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            )
+        } else {
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                    main_address: prim.main_address,
+                    link_id: prim.link_id,
+                    endpoint_id: prim.endpoint_id,
+                    tl_sdu: pdu,
+                    stealing_permission: prim.stealing_permission,
+                    subscriber_class: 0,
+                    fcs_flag: prim.fcs_flag,
+                    packet_data_flag: true,
+                    air_interface_encryption,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: prim.handle,
+                    graceful_degradation: None,
+                    chan_alloc: prim.chan_alloc.take(),
+                    associated_channel: prim.associated_channel.take(),
+                    tx_reporter: prim.tx_reporter.take(),
+                }),
+            )
+        };
+        queue.push_back(sapmsg);
     }
 
     fn rx_lcmc_mle_unitdata_req(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -827,6 +882,7 @@ impl MleBs {
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,
+                    packet_data_flag: false,
                     air_interface_encryption,
                     stealing_repeats_flag: None,
                     data_class_info: None,

@@ -1554,6 +1554,9 @@ dependencies = [
 [[package]]
 name = "tetra-swmi-protocol"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "thiserror"

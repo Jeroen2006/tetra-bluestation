@@ -3356,6 +3356,10 @@ impl MmBs {
         self.config
             .state_write()
             .subscribers
+            .set_registration_generation(pending.itsi, command_id);
+        self.config
+            .state_write()
+            .subscribers
             .set_registration_delivery_pending(pending.itsi, true);
         self.store_energy_economy(pending.itsi, energy_economy);
         if energy_economy.mode != 0 {
@@ -4686,6 +4690,7 @@ impl MmBs {
                 stealing_permission: false,
                 subscriber_class: 0,
                 fcs_flag: false,
+                packet_data_flag: false,
                 air_interface_encryption: Some(self.downlink_aie_request(issi)),
                 stealing_repeats_flag: None,
                 data_class_info: None,

@@ -1,7 +1,8 @@
 // Clause 17.3.5 Service state diagram for the LTPD-SAP (MLE-SNDCP)
 
 #![allow(unused)]
-use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo};
+use crate::{lcmc::fields::chan_alloc_req::CmceChanAllocReq, tma::AssociatedChannel};
+use tetra_core::{AieRequest, BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo, TxReporter};
 
 #[derive(Debug, Clone)]
 pub struct LtpdMleActivityReq {
@@ -197,11 +198,12 @@ pub struct LtpdMleResumeInd {
 
 #[derive(Debug, Clone)]
 pub struct LtpdMleUnitdataReq {
-    pub sdu: Todo,
+    pub sdu: BitBuffer,
     pub handle: Todo,
     pub layer2service: Layer2Service,
-    pub unacked_bl_repetitions: Todo,
-    pub pdu_prio: Todo,
+    pub unacked_bl_repetitions: u8,
+    pub pdu_prio: u8,
+    pub main_address: TetraAddress,
     pub endpoint_id: EndpointId,
     pub link_id: LinkId,
     pub stealing_permission: bool,
@@ -214,6 +216,10 @@ pub struct LtpdMleUnitdataReq {
     pub scheduled_data_status: Todo,
     pub max_schedule_interval: Todo,
     pub fcs_flag: bool,
+    pub chan_alloc: Option<CmceChanAllocReq>,
+    pub associated_channel: Option<AssociatedChannel>,
+    pub aie_override: Option<AieRequest>,
+    pub tx_reporter: Option<TxReporter>,
 }
 
 #[derive(Debug, Clone)]

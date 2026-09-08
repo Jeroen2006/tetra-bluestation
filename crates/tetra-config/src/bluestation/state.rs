@@ -1309,6 +1309,9 @@ const DIRECT_RESPONSE_WINDOW_TIMESLOTS: i32 = 2 * 18 * 4;
 #[derive(Debug, Clone)]
 pub struct Subscriber {
     pub issi: u32,
+    /// SwMI registration command that established the current serving-cell
+    /// anchor. Packet-data messages use it as a roaming generation fence.
+    pub registration_generation: Option<u64>,
     // Set of attached GSSIs
     pub attached_groups: HashSet<u32>,
     /// Authoritative EE assignment last accepted by the SwMI (or LST).
@@ -1574,6 +1577,7 @@ impl SubscriberRegistry {
             issi,
             Subscriber {
                 issi,
+                registration_generation: None,
                 attached_groups: HashSet::new(),
                 energy_economy_mode: 0,
                 energy_economy_frame_number: None,
@@ -1589,6 +1593,7 @@ impl SubscriberRegistry {
     pub fn get_subscriber_mut(&mut self, issi: u32) -> &mut Subscriber {
         self.subscribers.entry(issi).or_insert_with(|| Subscriber {
             issi,
+            registration_generation: None,
             attached_groups: HashSet::new(),
             energy_economy_mode: 0,
             energy_economy_frame_number: None,
@@ -1597,6 +1602,16 @@ impl SubscriberRegistry {
             scanning_enabled: true,
             rua_assigned: None,
         })
+    }
+
+    pub fn set_registration_generation(&mut self, issi: u32, generation: u64) {
+        self.get_subscriber_mut(issi).registration_generation = Some(generation);
+    }
+
+    pub fn registration_generation(&self, issi: u32) -> Option<u64> {
+        self.subscribers
+            .get(&issi)
+            .and_then(|subscriber| subscriber.registration_generation)
     }
 
     /// Deregister an ISSI, removing it from the registry and cleaning up any group affiliations

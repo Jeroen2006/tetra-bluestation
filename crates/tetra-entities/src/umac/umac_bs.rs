@@ -9,7 +9,7 @@ use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     AieCipherRegion, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime,
-    TetraAddress, Todo, TxReporter, unimplemented_log,
+    TetraAddress, Todo, TxReporter,
 };
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
@@ -31,6 +31,7 @@ use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 use tetra_pdus::umac::pdus::mac_u_blck::MacUBlck;
 use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
 use tetra_saps::control::call_control::{CallControl, Circuit};
+use tetra_saps::control::packet_data::PacketBearerControl;
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -48,6 +49,7 @@ use crate::umac::subcomp::random_access::RandomAccessController;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
+use super::subcomp::event_label_store::EventLabelStore;
 
 pub struct UmacBs {
     self_component: TetraEntity,
@@ -82,7 +84,7 @@ pub struct UmacBs {
     defrag: BsDefrag,
     /// Pending STCH MAC-DATA spanning block1+block2 (length_ind=0b111110), keyed by timeslot.
     pending_stch: Option<PendingStch>,
-    // event_label_store: EventLabelStore,
+    event_label_store: EventLabelStore,
     /// Contains UL/DL scheduling logic
     /// Access to this field is used only by testing code
     pub channel_scheduler: BsChannelScheduler,
@@ -261,7 +263,7 @@ impl UmacBs {
             endpoint_id: 1,
             defrag: BsDefrag::new(),
             pending_stch: None,
-            // event_label_store: EventLabelStore::new(),
+            event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new_with_aie_provider(scrambling_code, precomps, aie_provider.clone()),
             aie_provider,
             uplink_traffic_aie: [None; 4],
@@ -937,11 +939,15 @@ impl UmacBs {
         };
 
         // Get addr, either from pdu addr field or by resolving the event label
-        if pdu.event_label.is_some() {
-            unimplemented_log!("event labels not implemented");
-            return;
-        }
-        let mut addr = pdu.addr.unwrap();
+        let mut addr = if let Some(label) = pdu.event_label {
+            let Some(address) = self.event_label_store.get_addr_by_label(label) else {
+                tracing::warn!(label, "unknown packet-data event label in MAC-DATA");
+                return;
+            };
+            address
+        } else {
+            pdu.addr.expect("MAC-DATA must carry an SSI or event label")
+        };
 
         let (mut pdu_len_bits, is_frag_start, second_half_stolen, is_null_pdu) = {
             if let Some(len_ind) = pdu.length_ind {
@@ -1143,9 +1149,12 @@ impl UmacBs {
         };
 
         // Resolve event label (if supplied)
-        let mut addr = if let Some(_label) = pdu.event_label {
-            tracing::warn!("event labels not implemented");
-            return;
+        let mut addr = if let Some(label) = pdu.event_label {
+            let Some(address) = self.event_label_store.get_addr_by_label(label) else {
+                tracing::warn!(label, "unknown packet-data event label in MAC-ACCESS");
+                return;
+            };
+            address
         } else if let Some(addr) = pdu.addr {
             addr
         } else {
@@ -1565,7 +1574,7 @@ impl UmacBs {
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
             let active_assigned_channel =
-                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
+                self.channel_scheduler.assigned_channel_is_active(msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
             if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
@@ -2270,12 +2279,16 @@ impl UmacBs {
             // believed to be listening, while its channel allocation points
             // at the *new* call.  Do not discard that association merely
             // because the MAC-RESOURCE carries a channel allocation.
-            if (2..=4).contains(&channel.timeslot) && self.channel_scheduler.circuit_is_active(Direction::Dl, channel.timeslot) {
+            if (2..=4).contains(&channel.timeslot) && self.channel_scheduler.assigned_channel_is_active(channel.timeslot) {
                 if let Some(key) = channel.best_effort_key {
                     // Periodic cross-call D-SETUP copies are expendable and
                     // coalesced separately from all ordinary signalling.
                     self.channel_scheduler
                         .dl_enqueue_associated_best_effort_tma(channel.timeslot, key, pdu, sdu, aie_request);
+                } else if self.channel_scheduler.packet_bearer_is_active(channel.timeslot) {
+                    tracing::debug!(?channel, "routing SNDCP signalling through assigned packet channel");
+                    self.channel_scheduler
+                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
                 } else {
                     let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
                     let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);
@@ -2691,8 +2704,13 @@ impl UmacBs {
 
     fn rx_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_control");
-        let SapMsgInner::CmceCallControl(prim) = message.msg else {
-            panic!()
+        let prim = match message.msg {
+            SapMsgInner::CmceCallControl(prim) => prim,
+            SapMsgInner::PacketBearerControl(prim) => {
+                self.rx_packet_bearer_control(prim);
+                return;
+            }
+            other => panic!("unexpected UMAC control primitive: {other:?}"),
         };
 
         match prim {
@@ -2900,6 +2918,65 @@ impl UmacBs {
             | CallControl::LivelinessCheckRequest { .. }
             | CallControl::LivelinessCheckReady { .. } => {
                 tracing::trace!("rx_control: ignoring CMCE-Brew notification (not for UMAC)");
+            }
+        }
+    }
+
+    fn rx_packet_bearer_control(&mut self, control: PacketBearerControl) {
+        match control {
+            PacketBearerControl::Open {
+                bearer_id,
+                generation,
+                timeslot_bitmap,
+            }
+            | PacketBearerControl::Resize {
+                bearer_id,
+                generation,
+                timeslot_bitmap,
+            } => {
+                self.channel_scheduler.close_packet_bearer(bearer_id, generation);
+                if !self.channel_scheduler.open_packet_bearer(bearer_id, generation, timeslot_bitmap) {
+                    tracing::warn!(bearer_id, generation, "ignoring stale packet bearer activation");
+                    return;
+                }
+                tracing::info!(bearer_id, generation, timeslot_bitmap, "packet bearer active");
+            }
+            PacketBearerControl::Attach {
+                bearer_id,
+                generation,
+                issi,
+                event_label,
+            } => {
+                if !self.channel_scheduler.packet_bearers_match(bearer_id, generation) {
+                    tracing::warn!(bearer_id, generation, issi, "ignoring stale packet event-label binding");
+                    return;
+                }
+                if !self.event_label_store.bind(event_label, TetraAddress::issi(issi)) {
+                    tracing::warn!(event_label, issi, "invalid packet event-label binding");
+                }
+            }
+            PacketBearerControl::Detach {
+                bearer_id,
+                generation,
+                event_label,
+            } => {
+                if self.channel_scheduler.packet_bearers_match(bearer_id, generation) {
+                    self.event_label_store.remove(event_label);
+                }
+            }
+            PacketBearerControl::Drain { bearer_id, generation } => {
+                tracing::info!(bearer_id, generation, "packet bearer draining; new packet grants disabled");
+            }
+            PacketBearerControl::Close {
+                bearer_id,
+                generation,
+                forced,
+            } => {
+                if self.channel_scheduler.close_packet_bearer(bearer_id, generation) {
+                    tracing::info!(bearer_id, generation, forced, "packet bearer closed");
+                } else {
+                    tracing::warn!(bearer_id, generation, forced, "ignoring stale packet bearer close");
+                }
             }
         }
     }
@@ -3265,10 +3342,7 @@ mod tests {
                     endpoint_id: 0,
                     stealing_permission: false,
                     subscriber_class: 0,
-                    air_interface_encryption: Some(AieRequest::sc3(
-                        AieSubject::Individual { issi },
-                        AieScope::MacResource,
-                    )),
+                    air_interface_encryption: Some(AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_category: None,
                     chan_alloc: None,
@@ -3282,16 +3356,10 @@ mod tests {
         assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
         assert!(!umac.aie_provider.request_sc3_dck(issi), "DCK request must be coalesced");
 
-        config
-            .state_write()
-            .aie
-            .sc3
-            .as_mut()
-            .expect("SC3 configured")
-            .install_dck(
-                issi,
-                tetra_config::bluestation::RuntimeSc3Dck::new([0x22; 16], [0x33; 10], true, None),
-            );
+        config.state_write().aie.sc3.as_mut().expect("SC3 configured").install_dck(
+            issi,
+            tetra_config::bluestation::RuntimeSc3Dck::new([0x22; 16], [0x33; 10], true, None),
+        );
         let tick = TdmaTime::default().add_timeslots(1);
         umac.tick_start(&mut queue, tick);
 

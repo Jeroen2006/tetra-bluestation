@@ -105,6 +105,9 @@ pub struct TlaTlDataReqBl {
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,
+    /// Selects the acknowledged advanced link after it has been established.
+    /// SNDCP control PDUs may still fall back to basic link before AL-SETUP.
+    pub packet_data_flag: bool,
     pub air_interface_encryption: Option<AieRequest>,
     pub stealing_repeats_flag: Option<bool>,
     pub data_class_info: Option<Todo>,
