@@ -1,3 +1,4 @@
+mod capacity;
 use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::{SharedConfig, SubscriberDeliveryRoute};
@@ -51,6 +52,119 @@ use tetra_swmi_protocol::{HandoverChannelAllocation, SwmiMessage, TalkingPartyPr
 const NOTIFICATION_LE_BROADCAST: u64 = 0;
 const NOTIFICATION_LE_ACKNOWLEDGEMENT: u64 = 1;
 const NOTIFICATION_CALL_WAITING: u64 = 10;
+
+fn generic_type3_bits(field: &Type3FieldGeneric) -> Option<Vec<u8>> {
+    if field.len == 0 || field.len > 2047 {
+        return None;
+    }
+    if field.len <= 64 {
+        return Some(
+            (0..field.len)
+                .map(|index| ((field.data >> (field.len - 1 - index)) & 1) as u8)
+                .collect(),
+        );
+    }
+    if field.raw.len() * 8 < field.len {
+        return None;
+    }
+    Some((0..field.len).map(|index| (field.raw[index / 8] >> (7 - index % 8)) & 1).collect())
+}
+
+fn generic_type3_from_bits(field_id: CmceType3ElemId, bits: &[u8]) -> Type3FieldGeneric {
+    let prefix_len = bits.len().min(64);
+    let data = bits[..prefix_len].iter().fold(0u64, |value, bit| (value << 1) | u64::from(*bit));
+    let raw = if bits.len() > 64 {
+        let mut raw = vec![0u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.iter().enumerate() {
+            raw[index / 8] |= *bit << (7 - index % 8);
+        }
+        raw
+    } else {
+        Vec::new()
+    };
+    Type3FieldGeneric {
+        field_id: field_id as u64,
+        len: bits.len(),
+        data,
+        raw,
+    }
+}
+
+fn decode_external_subscriber_number(field: &Type3FieldGeneric) -> Option<String> {
+    if field.field_id != CmceType3ElemId::ExtSubscriberNum as u64 || !(4..=96).contains(&field.len) || field.len % 4 != 0 {
+        return None;
+    }
+    let bits = generic_type3_bits(field)?;
+    let mut number = String::with_capacity(field.len / 4);
+    for nibble in bits.chunks_exact(4) {
+        let value = nibble.iter().fold(0u8, |value, bit| (value << 1) | *bit);
+        number.push(match value {
+            0..=9 => char::from(b'0' + value),
+            10 => '*',
+            11 => '#',
+            12 => '+',
+            _ => return None,
+        });
+    }
+    Some(number)
+}
+
+fn encode_external_subscriber_number(number: &str) -> Option<Type3FieldGeneric> {
+    if number.is_empty() || number.len() > 24 {
+        return None;
+    }
+    let mut bits = Vec::with_capacity(number.len() * 4);
+    for digit in number.bytes() {
+        let value = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'*' => 10,
+            b'#' => 11,
+            b'+' => 12,
+            _ => return None,
+        };
+        bits.extend((0..4).rev().map(|shift| (value >> shift) & 1));
+    }
+    Some(generic_type3_from_bits(CmceType3ElemId::ExtSubscriberNum, &bits))
+}
+
+fn decode_dtmf(field: &Type3FieldGeneric) -> Option<(u8, Vec<u8>)> {
+    if field.field_id != CmceType3ElemId::Dtmf as u64 || field.len < 3 {
+        return None;
+    }
+    let bits = generic_type3_bits(field)?;
+    let tone_type = (bits[0] << 2) | (bits[1] << 1) | bits[2];
+    if tone_type > 3 {
+        return None;
+    }
+    if tone_type == 0 {
+        if field.len < 7 || (field.len - 3) % 4 != 0 {
+            return None;
+        }
+        let digits = bits[3..]
+            .chunks_exact(4)
+            .map(|nibble| nibble.iter().fold(0u8, |value, bit| (value << 1) | *bit))
+            .collect();
+        Some((tone_type, digits))
+    } else if field.len == 3 {
+        Some((tone_type, Vec::new()))
+    } else {
+        None
+    }
+}
+
+fn encode_dtmf(tone_type: u8, digits: &[u8]) -> Option<Type3FieldGeneric> {
+    if tone_type > 3
+        || (tone_type == 0 && (digits.is_empty() || digits.iter().any(|digit| *digit > 15)))
+        || (tone_type != 0 && !digits.is_empty())
+    {
+        return None;
+    }
+    let mut bits = vec![(tone_type >> 2) & 1, (tone_type >> 1) & 1, tone_type & 1];
+    for digit in digits {
+        bits.extend((0..4).rev().map(|shift| (digit >> shift) & 1));
+    }
+    Some(generic_type3_from_bits(CmceType3ElemId::Dtmf, &bits))
+}
 /// A D-TX-INTERRUPT must reach the current speaker before the replacement
 /// holder receives D-TX-GRANTED.  The UMAC scheduler emits FACCH a few slots
 /// ahead of CMCE, so six complete TDMA frames leaves a deterministic receive
@@ -70,6 +184,7 @@ const SS_TPI_AIR_INTERFACE_ENABLED: bool = true;
 
 /// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {
+    capacity: capacity::RadioCapacity,
     config: SharedConfig,
     dltime: TdmaTime,
     /// Cached D-SETUP PDUs for late-entry re-sends: call_id -> (D-SETUP PDU, dest address, tx reporter)
@@ -120,6 +235,12 @@ pub struct CcBsSubentity {
     /// SwMI-scheduled acknowledged D-INFO probes for simplex private-call
     /// hangtime. The LLC TxReporter is the authoritative BL-ACK outcome.
     pending_private_keepalives: HashMap<(u16, u32, u64), TxReporter>,
+    /// Brew represents a DTMF key as one event. For RF delivery the BS first
+    /// sends an acknowledged tone-start and emits tone-end only after that
+    /// start has actually been acknowledged.
+    pending_private_dtmf_ends: HashMap<(u16, u32, u32), TxReporter>,
+    /// Active tone direction, used to suppress repeated start/end signalling.
+    active_private_dtmf: HashSet<(u16, u32, u32)>,
     /// SwMI liveliness checks held until their target is no longer using a
     /// local traffic circuit. A set coalesces duplicate checks per terminal.
     pending_liveliness_checks: HashSet<u32>,
@@ -233,6 +354,7 @@ struct PrivateCallLocal {
     duplex: bool,
     request_to_transmit: bool,
     priority: u8,
+    external_number: Option<String>,
     waiting_required: bool,
     waiting_invoked: bool,
     /// Current central simplex floor holder; zero means private-call
@@ -263,6 +385,7 @@ struct ListeningCandidate {
 impl CcBsSubentity {
     fn circuit_lifetime_protected_call_ids(&self) -> HashSet<u16> {
         let mut protected: HashSet<u16> = self.active_calls.keys().chain(self.private_calls.keys()).copied().collect();
+        protected.extend(self.capacity.reserved_groups.keys().copied());
         protected.extend(self.releasing_calls.iter().map(|call| call.call_id));
         protected.extend(self.releasing_private_circuits.iter().map(|circuit| circuit.call_id));
         protected
@@ -349,6 +472,7 @@ impl CcBsSubentity {
 
     pub fn new(config: SharedConfig, swmi: Option<SwmiCmceEndpoint>) -> Self {
         CcBsSubentity {
+            capacity: capacity::RadioCapacity::default(),
             config,
             dltime: TdmaTime::default(),
             cached_setups: HashMap::new(),
@@ -372,6 +496,8 @@ impl CcBsSubentity {
             pending_private_floor_requests: HashMap::new(),
             pending_restore_floor_indications: HashMap::new(),
             pending_private_keepalives: HashMap::new(),
+            pending_private_dtmf_ends: HashMap::new(),
+            active_private_dtmf: HashSet::new(),
             pending_liveliness_checks: HashSet::new(),
             next_swmi_command: 1,
             private_calls: HashMap::new(),
@@ -1256,7 +1382,7 @@ impl CcBsSubentity {
             call_priority: Some(call_priority as u64),
             basic_service_information: None,
             temporary_address: None,
-            notification_indicator: None,
+            notification_indicator: self.capacity.limited_groups.contains(&call_id).then_some(27),
             facility: self.group_tpi_facility(call_id, true),
             proprietary: None,
         };
@@ -1563,29 +1689,49 @@ impl CcBsSubentity {
             );
         }
 
-        // Allocate circuit (DL+UL for group call)
-        let circuit = match {
-            let mut state = self.config.state_write();
-            match central_call_id {
-                Some(call_id) => self.circuits.allocate_circuit_with_allocator_and_call_id(
-                    Direction::Both,
-                    pdu.basic_service_information.communication_type,
-                    &mut state.timeslot_alloc,
-                    TimeslotOwner::Cmce,
-                    call_id,
-                ),
-                None => self.circuits.allocate_circuit_with_allocator(
-                    Direction::Both,
-                    pdu.basic_service_information.communication_type,
-                    &mut state.timeslot_alloc,
-                    TimeslotOwner::Cmce,
-                ),
-            }
-        } {
-            Ok(circuit) => circuit.clone(),
-            Err(e) => {
-                tracing::error!("Failed to allocate circuit for U-SETUP: {:?}", e);
-                return;
+        if self.swmi.as_ref().is_none_or(|s| !s.is_online())
+            && central_call_id.is_none()
+            && self.capacity_local_setup(queue, original_message, &pdu, calling_party)
+        {
+            return;
+        }
+
+        // Admission may have reserved the circuit before central commit.
+        let reserved = central_call_id.and_then(|id| self.capacity.reserved_groups.remove(&id));
+        let circuit = if let Some(circuit) = reserved {
+            circuit
+        } else {
+            let result = {
+                let mut state = self.config.state_write();
+                match central_call_id {
+                    Some(id) => self
+                        .circuits
+                        .allocate_circuit_with_allocator_and_call_id(
+                            Direction::Both,
+                            pdu.basic_service_information.communication_type,
+                            &mut state.timeslot_alloc,
+                            TimeslotOwner::Cmce,
+                            id,
+                        )
+                        .cloned(),
+                    None => self
+                        .circuits
+                        .allocate_circuit_with_allocator(
+                            Direction::Both,
+                            pdu.basic_service_information.communication_type,
+                            &mut state.timeslot_alloc,
+                            TimeslotOwner::Cmce,
+                        )
+                        .cloned(),
+                }
+            };
+            match result {
+                Ok(c) => c,
+                Err(error) => {
+                    tracing::warn!(?error, "group call has no radio capacity");
+                    self.send_d_release_for_setup_reject(queue, &message, DisconnectCause::CongestionInInfrastructure);
+                    return;
+                }
             }
         };
 
@@ -1802,6 +1948,9 @@ impl CcBsSubentity {
                 return;
             }
         };
+        if self.capacity_waiting_restore(queue, itsi, &pdu) {
+            return;
+        }
         let group_call = self.active_calls.get(&pdu.call_identifier).filter(|call| {
             self.subscriber_groups
                 .get(&itsi)
@@ -1968,6 +2117,66 @@ impl CcBsSubentity {
             tracing::warn!(itsi, "cannot parse U-INFO");
             return;
         };
+        if let Some(dtmf) = pdu.dtmf.as_ref() {
+            let Some((tone_type, digits)) = decode_dtmf(dtmf) else {
+                tracing::warn!(itsi, call_id = pdu.call_identifier, "discarding malformed U-INFO DTMF element");
+                return;
+            };
+            let Some(call) = self.private_calls.get(&pdu.call_identifier) else {
+                tracing::warn!(itsi, call_id = pdu.call_identifier, "discarding DTMF for unknown private call");
+                return;
+            };
+            if !call.connected || (itsi != call.caller_itsi && itsi != call.callee_itsi) {
+                tracing::warn!(
+                    itsi,
+                    call_id = pdu.call_identifier,
+                    "discarding DTMF outside an established private call"
+                );
+                return;
+            }
+            let destination_itsi = if itsi == call.caller_itsi {
+                call.callee_itsi
+            } else {
+                call.caller_itsi
+            };
+            let key = (pdu.call_identifier, itsi, destination_itsi);
+            match tone_type {
+                0 if !self.active_private_dtmf.insert(key) => {
+                    tracing::debug!(itsi, call_id = pdu.call_identifier, "duplicate DTMF tone-start suppressed");
+                    return;
+                }
+                1 if !self.active_private_dtmf.remove(&key) => {
+                    tracing::debug!(itsi, call_id = pdu.call_identifier, "duplicate DTMF tone-end suppressed");
+                    return;
+                }
+                _ => {}
+            }
+            let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) else {
+                if tone_type == 0 {
+                    self.active_private_dtmf.remove(&key);
+                }
+                return;
+            };
+            if let Err(error) = swmi.submit(SwmiMessage::PrivateCallDtmf {
+                call_id: pdu.call_identifier as u64,
+                source_itsi: itsi as u64,
+                destination_itsi: destination_itsi as u64,
+                tone_type,
+                digits,
+                one_shot: false,
+            }) {
+                if tone_type == 0 {
+                    self.active_private_dtmf.remove(&key);
+                }
+                tracing::warn!(
+                    itsi,
+                    call_id = pdu.call_identifier,
+                    ?error,
+                    "cannot forward private-call DTMF to SwMI"
+                );
+            }
+            return;
+        }
         if !pdu.poll_response {
             tracing::debug!(itsi, call_id = pdu.call_identifier, "non-poll U-INFO ignored for late entry");
             return;
@@ -2121,9 +2330,11 @@ impl CcBsSubentity {
             }
         }
 
+        self.capacity_tick(queue);
         self.process_pending_preemptive_floor_grants(queue);
         self.process_pending_private_floor_requests(queue);
         self.process_pending_private_keepalives();
+        self.process_pending_private_dtmf_ends(queue);
         self.process_pending_restore_floor_indications(queue);
 
         // Check hangtime expiry for active local calls
@@ -2201,6 +2412,7 @@ impl CcBsSubentity {
         let expired: Vec<u16> = self
             .active_calls
             .iter()
+            .chain(self.capacity.suspended_groups.iter())
             .filter_map(|(&call_id, call)| {
                 // While the SwMI link is alive, only the SwMI's configured
                 // hangtime can end a central call.  LST recovery falls back
@@ -2426,6 +2638,13 @@ impl CcBsSubentity {
         self.pending_private_floor_requests.remove(&(call_id, departed_itsi));
         self.pending_private_keepalives
             .retain(|(pending_call_id, pending_itsi, _), _| *pending_call_id != call_id || *pending_itsi != departed_itsi);
+        self.pending_private_dtmf_ends
+            .retain(|(pending_call_id, source_itsi, destination_itsi), _| {
+                *pending_call_id != call_id || (*source_itsi != departed_itsi && *destination_itsi != departed_itsi)
+            });
+        self.active_private_dtmf.retain(|(pending_call_id, source_itsi, destination_itsi)| {
+            *pending_call_id != call_id || (*source_itsi != departed_itsi && *destination_itsi != departed_itsi)
+        });
         let departed_circuit = self.private_circuits.remove(&(call_id, departed_itsi));
         if let Some(local) = self.private_calls.get_mut(&call_id) {
             local.local_mask &= !endpoint_mask;
@@ -2482,7 +2701,9 @@ impl CcBsSubentity {
 
     /// Apply a central call/floor decision received over the SwMI WSS link.
     fn handle_swmi_action(&mut self, queue: &mut MessageQueue, action: SwmiMessage) {
+        self.capacity_observe(queue, &action);
         match action {
+            SwmiMessage::Capacity(message) => self.capacity_handle(queue, message),
             SwmiMessage::HandoverReserveGroupCall {
                 reservation_id,
                 itsi,
@@ -2715,6 +2936,7 @@ impl CcBsSubentity {
                         duplex,
                         request_to_transmit,
                         priority,
+                        external_number: pdu.external_subscriber_number.as_ref().and_then(decode_external_subscriber_number),
                         waiting_required: false,
                         waiting_invoked: false,
                         floor_itsi: 0,
@@ -2742,6 +2964,7 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    external_number: None,
                     waiting_required: false,
                     waiting_invoked: false,
                     floor_itsi: 0,
@@ -2755,6 +2978,63 @@ impl CcBsSubentity {
                     .or_insert_with(|| call.clone());
                 self.send_private_d_setup(queue, call_id, &call);
                 tracing::info!(call_id, caller_itsi, callee_itsi, "private D-SETUP sent to called terminal");
+            }
+            SwmiMessage::ExternalCallOffer {
+                call_id,
+                caller_itsi,
+                gateway_itsi,
+                external_number,
+                hook,
+                duplex,
+                request_to_transmit,
+                priority,
+                waiting,
+                invoked,
+            } => {
+                let Ok(call_id) = u16::try_from(call_id) else {
+                    return;
+                };
+                if encode_external_subscriber_number(&external_number).is_none() {
+                    tracing::warn!(call_id, "SwMI supplied invalid external subscriber number");
+                    return;
+                }
+                let callee_already_local = self.private_calls.get(&call_id).is_some_and(|call| call.local_mask & 0x02 != 0);
+                let call = PrivateCallLocal {
+                    caller_itsi: caller_itsi as u32,
+                    callee_itsi: gateway_itsi as u32,
+                    hook,
+                    duplex,
+                    request_to_transmit,
+                    priority,
+                    external_number: Some(external_number.clone()),
+                    waiting_required: waiting,
+                    waiting_invoked: invoked,
+                    floor_itsi: 0,
+                    connected: false,
+                    local_mask: 0x02,
+                    talking_party: None,
+                };
+                self.private_calls
+                    .entry(call_id)
+                    .and_modify(|existing| {
+                        existing.local_mask |= 0x02;
+                        existing.external_number = Some(external_number.clone());
+                        existing.waiting_required = waiting;
+                        existing.waiting_invoked |= invoked;
+                    })
+                    .or_insert_with(|| call.clone());
+                if !invoked && !callee_already_local {
+                    self.send_private_d_setup(queue, call_id, &call);
+                }
+                tracing::info!(
+                    call_id,
+                    caller_itsi,
+                    gateway_itsi,
+                    external_number,
+                    waiting,
+                    invoked,
+                    "external-call D-SETUP sent to TETRA gateway"
+                );
             }
             SwmiMessage::PrivateCallWaitingOffer {
                 call_id,
@@ -2776,6 +3056,7 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    external_number: None,
                     waiting_required: true,
                     waiting_invoked: invoked,
                     floor_itsi: 0,
@@ -3007,6 +3288,7 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    external_number: None,
                     waiting_required: false,
                     waiting_invoked: false,
                     floor_itsi: initial_floor_itsi as u32,
@@ -3126,6 +3408,10 @@ impl CcBsSubentity {
                 let Ok(call_id) = u16::try_from(call_id) else {
                     return;
                 };
+                // Capacity admission also synchronizes endpoint masks after
+                // U-CONNECT. Do not page an already offered local callee
+                // again: it may have answered and now be waiting for a TCH.
+                let callee_already_local = self.private_calls.get(&call_id).is_some_and(|call| call.local_mask & 0x02 != 0);
                 let call = PrivateCallLocal {
                     caller_itsi: caller_itsi as u32,
                     callee_itsi: callee_itsi as u32,
@@ -3133,6 +3419,7 @@ impl CcBsSubentity {
                     duplex,
                     request_to_transmit,
                     priority,
+                    external_number: None,
                     waiting_required,
                     waiting_invoked: invoked,
                     floor_itsi: 0,
@@ -3148,7 +3435,7 @@ impl CcBsSubentity {
                         existing.waiting_invoked |= invoked;
                     })
                     .or_insert_with(|| call.clone());
-                if endpoint_mask & 0x02 != 0 && !invoked {
+                if endpoint_mask & 0x02 != 0 && !invoked && !callee_already_local {
                     self.send_private_d_setup(queue, call_id, &call);
                 }
                 tracing::info!(
@@ -3261,6 +3548,58 @@ impl CcBsSubentity {
                             }
                         }
                     }
+                }
+            }
+            SwmiMessage::PrivateCallDtmf {
+                call_id,
+                source_itsi,
+                destination_itsi,
+                tone_type,
+                digits,
+                one_shot,
+            } => {
+                let (Ok(call_id), Ok(source_itsi), Ok(destination_itsi)) =
+                    (u16::try_from(call_id), u32::try_from(source_itsi), u32::try_from(destination_itsi))
+                else {
+                    return;
+                };
+                let key = (call_id, source_itsi, destination_itsi);
+                match tone_type {
+                    0 if !self.active_private_dtmf.insert(key) => {
+                        tracing::debug!(
+                            call_id,
+                            source_itsi,
+                            destination_itsi,
+                            "duplicate downlink DTMF tone-start suppressed"
+                        );
+                        return;
+                    }
+                    1 if !self.active_private_dtmf.remove(&key) => {
+                        tracing::debug!(
+                            call_id,
+                            source_itsi,
+                            destination_itsi,
+                            "duplicate downlink DTMF tone-end suppressed"
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+                let reporter = one_shot.then(TxReporter::new);
+                if !self.queue_private_dtmf(queue, call_id, destination_itsi, tone_type, &digits, reporter.clone()) {
+                    if tone_type == 0 {
+                        self.active_private_dtmf.remove(&key);
+                    }
+                    tracing::warn!(
+                        call_id,
+                        source_itsi,
+                        destination_itsi,
+                        "cannot route private-call DTMF to local RF circuit"
+                    );
+                    return;
+                }
+                if let Some(reporter) = reporter {
+                    self.pending_private_dtmf_ends.insert(key, reporter);
                 }
             }
             SwmiMessage::PrivateCallKeepalive { call_id, itsi, sequence } => {
@@ -3475,6 +3814,82 @@ impl CcBsSubentity {
         }
     }
 
+    fn queue_private_dtmf(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        destination_itsi: u32,
+        tone_type: u8,
+        digits: &[u8],
+        reporter: Option<TxReporter>,
+    ) -> bool {
+        let Some(call) = self.private_calls.get(&call_id) else {
+            return false;
+        };
+        if !call.connected || (destination_itsi != call.caller_itsi && destination_itsi != call.callee_itsi) {
+            return false;
+        }
+        let Some(circuit) = self.private_circuits.get(&(call_id, destination_itsi)) else {
+            return false;
+        };
+        let Some(dtmf) = encode_dtmf(tone_type, digits) else {
+            return false;
+        };
+        let pdu = DInfo {
+            call_identifier: call_id,
+            reset_call_time_out_timer_t310_: false,
+            poll_request: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_time_out_set_up_phase_t301_t302_: None,
+            call_ownership: None,
+            modify: None,
+            call_status: None,
+            temporary_address: None,
+            notification_indicator: None,
+            poll_response_percentage: None,
+            poll_response_number: None,
+            dtmf: Some(dtmf),
+            facility: None,
+            poll_response_addresses: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        if pdu.to_bitbuf(&mut sdu).is_err() {
+            return false;
+        }
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg_associated(
+            sdu,
+            None,
+            TetraAddress::new(destination_itsi, SsiType::Issi),
+            Layer2Service::Acknowledged,
+            reporter,
+            AssociatedChannel {
+                call_id,
+                timeslot: circuit.ts,
+                usage: circuit.usage,
+                best_effort_key: None,
+            },
+        ));
+        true
+    }
+
+    fn process_pending_private_dtmf_ends(&mut self, queue: &mut MessageQueue) {
+        let completed = self
+            .pending_private_dtmf_ends
+            .iter()
+            .filter_map(|(&key, reporter)| reporter.is_in_final_state().then_some((key, reporter.is_acknowledged())))
+            .collect::<Vec<_>>();
+        for ((call_id, source_itsi, destination_itsi), acknowledged) in completed {
+            self.pending_private_dtmf_ends.remove(&(call_id, source_itsi, destination_itsi));
+            if acknowledged {
+                let _ = self.queue_private_dtmf(queue, call_id, destination_itsi, 1, &[], None);
+            }
+            self.active_private_dtmf.remove(&(call_id, source_itsi, destination_itsi));
+        }
+    }
+
     fn process_pending_restore_floor_indications(&mut self, queue: &mut MessageQueue) {
         let ready: Vec<_> = self
             .pending_restore_floor_indications
@@ -3569,35 +3984,39 @@ impl CcBsSubentity {
         if !self.has_listener(gssi) || self.active_calls.contains_key(&call_id) {
             return;
         }
-        let circuit = match {
-            let mut state = self.config.state_write();
-            self.circuits.allocate_circuit_with_allocator_and_call_id(
-                Direction::Both,
-                if acknowledged {
-                    CommunicationType::P2MpAcked
-                } else {
-                    CommunicationType::P2Mp
-                },
-                &mut state.timeslot_alloc,
-                TimeslotOwner::Cmce,
-                call_id,
-            )
-        } {
-            Ok(circuit) => circuit.clone(),
-            Err(error) => {
-                self.pending_remote_swmi_calls.insert(
-                    call_id,
-                    PendingRemoteSwmiCall {
-                        owner_itsi,
-                        gssi,
-                        priority,
-                        floor_itsi,
-                        talking_party,
-                        acknowledged,
+        let circuit = if let Some(circuit) = self.capacity.reserved_groups.remove(&call_id) {
+            circuit
+        } else {
+            match {
+                let mut state = self.config.state_write();
+                self.circuits.allocate_circuit_with_allocator_and_call_id(
+                    Direction::Both,
+                    if acknowledged {
+                        CommunicationType::P2MpAcked
+                    } else {
+                        CommunicationType::P2Mp
                     },
-                );
-                tracing::warn!(call_id, gssi, ?error, "deferring SwMI group call until a local circuit is released");
-                return;
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                    call_id,
+                )
+            } {
+                Ok(circuit) => circuit.clone(),
+                Err(error) => {
+                    self.pending_remote_swmi_calls.insert(
+                        call_id,
+                        PendingRemoteSwmiCall {
+                            owner_itsi,
+                            gssi,
+                            priority,
+                            floor_itsi,
+                            talking_party,
+                            acknowledged,
+                        },
+                    );
+                    tracing::warn!(call_id, gssi, ?error, "deferring SwMI group call until a local circuit is released");
+                    return;
+                }
             }
         };
         Self::signal_umac_circuit_open(queue, &circuit);
@@ -3786,6 +4205,13 @@ impl CcBsSubentity {
     /// traffic mode. With no cached D-SETUP there is no D-RELEASE to send, so it tears down
     /// at once.
     fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        self.capacity_observe(
+            queue,
+            &SwmiMessage::CallRelease {
+                call_id: call_id.into(),
+                cause: disconnect_cause.into_raw() as u8,
+            },
+        );
         self.pending_preemptive_floor_grants.remove(&call_id);
         self.restore_prepared_calls.remove(&call_id);
         self.pending_restore_floor_indications
@@ -4022,15 +4448,38 @@ impl CcBsSubentity {
             self.send_d_release_for_setup_reject(queue, &original, DisconnectCause::RequestedServiceNotAvailable);
             return;
         }
+        let external_number = match pdu.external_subscriber_number.as_ref() {
+            Some(field) => match decode_external_subscriber_number(field) {
+                Some(number) => Some(number),
+                None => {
+                    self.send_d_release_for_setup_reject(queue, &original, DisconnectCause::RequestedServiceNotAvailable);
+                    return;
+                }
+            },
+            None => None,
+        };
         let command_id = self.next_swmi_command_id();
-        let request = SwmiMessage::PrivateCallRequest {
-            command_id,
-            caller_itsi: caller.ssi as u64,
-            callee_itsi: callee_itsi as u64,
-            hook: pdu.hook_method_selection,
-            duplex: pdu.simplex_duplex_selection,
-            request_to_transmit: pdu.request_to_transmit_send_data,
-            priority: pdu.call_priority,
+        let request = if let Some(external_number) = external_number.as_ref() {
+            SwmiMessage::ExternalCallRequest {
+                command_id,
+                caller_itsi: caller.ssi as u64,
+                gateway_itsi: callee_itsi as u64,
+                external_number: external_number.clone(),
+                hook: pdu.hook_method_selection,
+                duplex: pdu.simplex_duplex_selection,
+                request_to_transmit: pdu.request_to_transmit_send_data,
+                priority: pdu.call_priority,
+            }
+        } else {
+            SwmiMessage::PrivateCallRequest {
+                command_id,
+                caller_itsi: caller.ssi as u64,
+                callee_itsi: callee_itsi as u64,
+                hook: pdu.hook_method_selection,
+                duplex: pdu.simplex_duplex_selection,
+                request_to_transmit: pdu.request_to_transmit_send_data,
+                priority: pdu.call_priority,
+            }
         };
         let submitted = self.swmi.as_ref().is_some_and(|swmi| swmi.submit(request).is_ok());
         if submitted {
@@ -4038,8 +4487,9 @@ impl CcBsSubentity {
             tracing::info!(
                 caller_itsi = caller.ssi,
                 callee_itsi,
+                external_number = ?external_number,
                 command_id,
-                "private U-SETUP forwarded to central SwMI"
+                "private/external U-SETUP forwarded to central SwMI"
             );
         } else {
             let rejected_request = self.pending_private_setups.remove(&caller.ssi).unwrap_or(original);
@@ -4070,7 +4520,7 @@ impl CcBsSubentity {
             temporary_address: None,
             calling_party_address_ssi: Some(call.caller_itsi),
             calling_party_extension: None,
-            external_subscriber_number: None,
+            external_subscriber_number: call.external_number.as_deref().and_then(encode_external_subscriber_number),
             facility: None,
             dm_ms_address: None,
             proprietary: None,
@@ -4160,6 +4610,9 @@ impl CcBsSubentity {
         circuit: &CmceCircuit,
         initial_floor_itsi: u32,
     ) {
+        if self.capacity.resuming.contains(&call_id) {
+            return;
+        }
         let mut timeslots = [false; 4];
         timeslots[circuit.ts as usize - 1] = true;
         let grant = if call.duplex || initial_floor_itsi == itsi {
@@ -4237,6 +4690,10 @@ impl CcBsSubentity {
             .retain(|(pending_call_id, _), _| *pending_call_id != call_id);
         self.pending_private_keepalives
             .retain(|(pending_call_id, _, _), _| *pending_call_id != call_id);
+        self.pending_private_dtmf_ends
+            .retain(|(pending_call_id, _, _), _| *pending_call_id != call_id);
+        self.active_private_dtmf
+            .retain(|(pending_call_id, _, _)| *pending_call_id != call_id);
         let Some(call) = self.private_calls.remove(&call_id) else { return };
         let mut teardown_timeslots = HashSet::new();
         for (mask, itsi) in [(0x01, call.caller_itsi), (0x02, call.callee_itsi)] {
@@ -4420,6 +4877,33 @@ impl CcBsSubentity {
                 let _ = swmi.submit(SwmiMessage::PrivateFloorReleased {
                     call_id: call_id as u64,
                     itsi: prim.received_tetra_address.ssi as u64,
+                });
+            }
+            return;
+        }
+
+        if self.capacity.suspended_groups.contains_key(&call_id) {
+            let itsi = prim.received_tetra_address.ssi;
+            if let Some(call) = self.capacity.suspended_groups.get_mut(&call_id) {
+                if call.source_issi == itsi {
+                    call.tx_active = false;
+                    call.source_issi = 0;
+                    call.hangtime_start = Some(self.dltime);
+                }
+            }
+            self.capacity_observe(
+                queue,
+                &SwmiMessage::FloorReleased {
+                    call_id: call_id.into(),
+                    itsi: itsi.into(),
+                },
+            );
+            let command_id = self.next_swmi_command_id();
+            if let Some(swmi) = self.swmi.as_ref().filter(|s| s.is_online()) {
+                let _ = swmi.submit(SwmiMessage::FloorReleaseRequest {
+                    command_id,
+                    call_id: call_id.into(),
+                    itsi: itsi.into(),
                 });
             }
             return;
@@ -5710,7 +6194,7 @@ mod tests {
     use crate::umac::subcomp::bs_sched::SCH_F_CAP;
     use tetra_pdus::umac::{fields::channel_allocation::ChanAllocElement, pdus::mac_resource::MacResource};
 
-    fn test_cc_with_group(gssi: u32) -> CcBsSubentity {
+    pub(super) fn test_cc_with_group(gssi: u32) -> CcBsSubentity {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../example_config/config.toml"
@@ -5743,6 +6227,22 @@ mod tests {
         cc.subscriber_groups.insert(430_892, HashSet::from([gssi]));
         cc.group_listeners.insert(gssi, 1);
         cc
+    }
+
+    #[test]
+    fn external_number_and_dtmf_type3_elements_roundtrip() {
+        let number = "+312012345678901234567#";
+        let encoded = encode_external_subscriber_number(number).expect("valid external number");
+        assert!(encoded.len > 64);
+        assert!(!encoded.raw.is_empty());
+        assert_eq!(decode_external_subscriber_number(&encoded).as_deref(), Some(number));
+
+        for (tone_type, digits) in [(0, vec![0, 5, 10, 11, 15]), (1, Vec::new()), (2, Vec::new()), (3, Vec::new())] {
+            let encoded = encode_dtmf(tone_type, &digits).expect("valid DTMF element");
+            assert_eq!(decode_dtmf(&encoded), Some((tone_type, digits)));
+        }
+        assert!(encode_dtmf(0, &[]).is_none());
+        assert!(encode_dtmf(1, &[1]).is_none());
     }
 
     #[test]
@@ -5954,6 +6454,7 @@ mod tests {
             duplex: false,
             request_to_transmit: true,
             priority: 0,
+            external_number: None,
             waiting_required: false,
             waiting_invoked: false,
             floor_itsi: 430_905,
@@ -6016,6 +6517,7 @@ mod tests {
             duplex: false,
             request_to_transmit: false,
             priority: 0,
+            external_number: None,
             waiting_required: true,
             waiting_invoked: false,
             floor_itsi: 0,
@@ -6340,6 +6842,7 @@ mod tests {
                 duplex: true,
                 request_to_transmit: false,
                 priority: 0,
+                external_number: None,
                 waiting_required: false,
                 waiting_invoked: false,
                 floor_itsi: 0,
