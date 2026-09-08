@@ -7,8 +7,8 @@ use serde::Deserialize;
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, NeighbourCellsDto, NetInfoDto, NetworkBroadcastDto, apply_control_patch, cell_dto_to_cfg,
-    neighbour_cells_dto_to_cfg, net_dto_to_cfg, network_broadcast_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgRuaDto, NeighbourCellsDto, NetInfoDto, NetworkBroadcastDto, apply_control_patch, apply_rua_patch,
+    cell_dto_to_cfg, neighbour_cells_dto_to_cfg, net_dto_to_cfg, network_broadcast_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -94,6 +94,9 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             return Err(format!("Unrecognized fields in swmi config: {:?}", sorted_keys(&swmi.extra)).into());
         }
     }
+    if !root.rua.extra.is_empty() {
+        return Err(format!("Unrecognized fields in rua config: {:?}", sorted_keys(&root.rua.extra)).into());
+    }
 
     // Optional telemetry section
     if let Some(ref telemetry) = root.telemetry {
@@ -112,6 +115,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         cell: cell_dto_to_cfg(root.cell_info),
         neighbour_cells: neighbour_cells_dto_to_cfg(root.neighbour_cells),
         network_broadcast: network_broadcast_dto_to_cfg(root.network_broadcast, legacy_timezone)?,
+        rua: apply_rua_patch(root.rua),
         brew: None,
         swmi: None,
         telemetry: None,
@@ -170,6 +174,8 @@ struct TomlConfigRoot {
     neighbour_cells: NeighbourCellsDto,
     #[serde(default)]
     network_broadcast: NetworkBroadcastDto,
+    #[serde(default)]
+    rua: CfgRuaDto,
 
     brew: Option<CfgBrewDto>,
     swmi: Option<CfgSwmiDto>,

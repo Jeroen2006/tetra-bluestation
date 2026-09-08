@@ -4623,10 +4623,10 @@ impl MmBs {
             cell_type_control: None,
             proprietary: rua_requested.then(|| Type3FieldGeneric {
                 field_id: MmType34ElemIdDl::Proprietary.into(),
-                // TTR 001-17 table 1: TETRA MoU (0x01), RUA requested (0x2),
-                // assignment requested with alpha-tag RUI (0b100).
+                // TTR 001-17 table 1: TETRA MoU (0x01), RUA requested
+                // (0x2), followed by the configured requested RUI type.
                 len: 15,
-                data: (1 << 7) | (2 << 3) | 4,
+                data: (1 << 7) | (2 << 3) | u64::from(self.config.config().rua.requested_rui_type.assignment_request()),
                 raw: Vec::new(),
             }),
         };
@@ -6456,6 +6456,49 @@ mod tests {
             queue.pop_front().is_none(),
             "the associations belong to the single registration PDU"
         );
+    }
+
+    #[test]
+    fn registration_accept_requests_the_configured_rui_type() {
+        use tetra_config::bluestation::CfgRuiType;
+
+        for (rui_type, expected) in [
+            (CfgRuiType::Run, 0b001_u64),
+            (CfgRuiType::Ssi, 0b010),
+            (CfgRuiType::MsIsdn, 0b011),
+            (CfgRuiType::AlphaTag, 0b100),
+        ] {
+            let mut config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../example_config/config.toml"
+            )))
+            .expect("example configuration must remain valid");
+            config.rua.requested_rui_type = rui_type;
+            let mm = MmBs::new(SharedConfig::from_parts(config, None), None, None, None);
+            let mut queue = MessageQueue::new();
+
+            mm.send_d_location_update_accept_with_handover(
+                &mut queue,
+                77_468,
+                0,
+                LocationUpdateType::ItsiAttach,
+                None,
+                true,
+                &AieLocationUpdateDecision::default(),
+                AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                None,
+                Vec::new(),
+                None,
+                true,
+            );
+
+            let SapMsgInner::LmmMleUnitdataReq(mut request) = queue.pop_front().expect("registration accept").msg else {
+                panic!("registration accept must be an LMM downlink")
+            };
+            let accept = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid D-LOCATION UPDATE ACCEPT");
+            let proprietary = accept.proprietary.expect("RUA request must be present");
+            assert_eq!(proprietary.data & 0b111, expected);
+        }
     }
 
     #[test]

@@ -3,7 +3,8 @@ use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
 use crate::bluestation::{
-    CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, PhyBackend, RuntimeNetworkBroadcast, StackState,
+    CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, CfgRua, PhyBackend, RuntimeNetworkBroadcast,
+    StackState,
 };
 
 use super::sec_brew::CfgBrew;
@@ -65,6 +66,9 @@ pub struct StackConfig {
     pub cell: CfgCellInfo,
     pub neighbour_cells: CfgNeighbourCells,
     pub network_broadcast: CfgNetworkBroadcast,
+
+    /// TTR 001-17 Radio User Assignment policy for the air interface.
+    pub rua: CfgRua,
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,

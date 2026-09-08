@@ -1,5 +1,5 @@
 use tetra_config::bluestation::{
-    CfgCellInfo, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, PhyBackend, StackConfig, StackMode,
+    CfgCellInfo, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, CfgRua, PhyBackend, StackConfig, StackMode,
 };
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
@@ -20,6 +20,7 @@ pub fn default_test_config_bs() -> StackConfig {
         cell: cell_info,
         neighbour_cells: CfgNeighbourCells::default(),
         network_broadcast: CfgNetworkBroadcast::default(),
+        rua: CfgRua::default(),
         brew: None,
         swmi: None,
         telemetry: None,

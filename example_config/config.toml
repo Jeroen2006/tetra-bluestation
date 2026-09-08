@@ -196,6 +196,13 @@ time_enabled = false
 
 ###############################################################################
 
+# TTR 001-17 identity type requested when the SwMI requires Radio User
+# Assignment. Supported values: "run", "ssi", "ms_isdn" and "alpha_tag".
+[rua]
+requested_rui_type = "alpha_tag"
+
+###############################################################################
+
 # Native central SwMI connection. MCC, MNC and location area are centrally
 # owned. The existing net_info and cell_info.location_area values are a
 # bootstrap/LST cache until the air-interface stack reads CellConfig at runtime.
