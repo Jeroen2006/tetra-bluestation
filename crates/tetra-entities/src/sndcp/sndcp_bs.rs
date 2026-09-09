@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::{SharedConfig, SubscriberDeliveryRoute};
 use tetra_core::{
-    BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, TxState,
-    tetra_entities::TetraEntity,
+    AieRequest, AieScope, AieSubject, BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner,
+    TxReporter, TxState, tetra_entities::TetraEntity,
 };
+use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::sndcp::tip::{
     SndcpAddressRequest, SndcpDownlink, SndcpResourceRequest, SndcpUplink, ready_timer_code, response_wait_timer_code, standby_timer_code,
 };
@@ -15,6 +16,7 @@ use tetra_saps::{
         enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment},
         fields::chan_alloc_req::CmceChanAllocReq,
     },
+    lmm::LmmMleUnitdataReq,
     ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq},
     tma::AssociatedChannel,
 };
@@ -216,6 +218,42 @@ impl Sndcp {
     fn remove_context(&mut self, issi: u32) -> Option<RadioContext> {
         self.config.state_write().subscriber_packet_delivery_routes.remove(&issi);
         self.contexts.remove(&issi)
+    }
+
+    fn queue_registration_recovery(&self, queue: &mut MessageQueue, issi: u32, handle: EndpointId) {
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        DLocationUpdateCommand {
+            group_identity_report: true,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension: None,
+            cell_type_control: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("fixed D-LOCATION UPDATE COMMAND must encode");
+        sdu.seek(0);
+        queue.push_back(SapMsg::new(
+            Sap::LmmSap,
+            TetraEntity::Sndcp,
+            TetraEntity::Mle,
+            SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                // After a BS restart no usable terminal AIE context exists;
+                // the MM registration procedure establishes a fresh one.
+                aie_request: AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource),
+                is_null_pdu: false,
+                tx_reporter: None,
+                seamless_handover: None,
+            }),
+        ));
+        tracing::info!(issi, "requested registration recovery after SNDCP access from unknown terminal");
     }
 
     /// Move one activated PDP context off its current PDCH while retaining
@@ -469,6 +507,9 @@ impl Sndcp {
                         Layer2Service::Acknowledged,
                         None,
                     );
+                    if cause == 1 {
+                        self.queue_registration_recovery(queue, issi, prim.endpoint_id);
+                    }
                     self.remove_context(issi);
                     return;
                 }
@@ -1529,6 +1570,7 @@ impl TetraEntityTrait for Sndcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
     use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::SnActivatePdpContextAccept;
     use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnEndOfData, SnReconnect};
 
@@ -1584,6 +1626,24 @@ mod tests {
         );
         assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::SystemResourcesUnavailable)), 1);
         assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::ContextUnsupported)), 2);
+    }
+
+    #[test]
+    fn unknown_packet_terminal_is_told_to_register_again() {
+        let sndcp = test_sndcp();
+        let mut queue = MessageQueue::new();
+
+        sndcp.queue_registration_recovery(&mut queue, 77_479, 7);
+
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = queue.pop_front().unwrap().msg else {
+            panic!("expected D-LOCATION UPDATE COMMAND")
+        };
+        let command = DLocationUpdateCommand::from_bitbuf(&mut request.sdu).unwrap();
+        assert!(command.group_identity_report);
+        assert!(!command.cipher_control);
+        assert_eq!(request.address.ssi, 77_479);
+        assert_eq!(request.address.ssi_type, SsiType::Issi);
+        assert_eq!(request.handle, 7);
     }
 
     #[test]
