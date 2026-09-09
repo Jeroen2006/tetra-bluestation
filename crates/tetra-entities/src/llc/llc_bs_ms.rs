@@ -46,14 +46,13 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
-// ETSI TTR 001-05 sections 6.5 and 6.6 define 222 payload bits for an
-// original advanced-link downlink segment carried by a pi/4-DQPSK
-// MAC-RESOURCE with the mandatory assigned event label and no reserved slot
-// grant. Together with the 17-bit AL-DATA header and the 29-bit event-label
-// MAC-RESOURCE header this fills one 268-bit SCH/F block exactly. A shorter
-// arbitrary segment leaves unusable space in the MAC block and is not the
-// negotiated advanced-link mapping.
-const AL_SEGMENT_PAYLOAD_BITS: usize = 222;
+// TTR 001-05 section 6.5 defines 214 payload bits for an original advanced-
+// link downlink segment carried by a pi/4-DQPSK MAC-RESOURCE with event-label
+// addressing and provision for an eventual 8-bit slot grant.  Keeping every
+// non-final segment at that size lets AL-FINAL-AR carry the anticipated
+// AL-ACK grant without creating a MAC fragment or changing segment size on a
+// retransmission.
+const AL_SEGMENT_PAYLOAD_BITS: usize = 214;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -1352,7 +1351,12 @@ impl Llc {
                     .clone()
                     .filter(|segments| !segments.is_empty())
                     .unwrap_or_else(|| (0..sdu.segments.len()).collect());
-                let attempt_reporter = TxReporter::new_unacked();
+                // AL-FINAL-AR needs an anticipated uplink slot for the MS's
+                // AL-ACK (TTR 001-05 figure 41).  Keep this per-attempt
+                // reporter in the acknowledged state machine so UMAC can add
+                // that grant to the final MAC-RESOURCE.  LLC still owns the
+                // actual AL acknowledgement and timeout processing below.
+                let attempt_reporter = TxReporter::new();
                 for (selected_index, segment_index) in selected.iter().copied().enumerate() {
                     let mut pdu = BitBuffer::new_autoexpand(AL_SEGMENT_PAYLOAD_BITS + 24);
                     let last_selected = selected_index + 1 == selected.len();

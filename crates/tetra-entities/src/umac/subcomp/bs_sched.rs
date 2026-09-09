@@ -709,6 +709,21 @@ impl BsChannelScheduler {
     /// Returns (opportunities_to_skip, Vec<timestamps_of_granted_slots>)
     /// Returns None if no suitable opportunity is found in the schedule
     pub fn ul_find_grant_opportunity(&self, t: u8, num_slots: usize, is_halfslot: bool) -> Option<(usize, Vec<TdmaTime>)> {
+        self.ul_find_grant_opportunity_after(t, num_slots, is_halfslot, 0)
+    }
+
+    /// Find an uplink grant after at least `minimum_delay` signalling
+    /// opportunities on the current channel.  An anticipated advanced-link
+    /// acknowledgement needs receiver processing time; on a multislot
+    /// pi/4-DQPSK PDCH TTR 001-05 table 5 requires a minimum delay equal to
+    /// the number of assigned timeslots.
+    fn ul_find_grant_opportunity_after(
+        &self,
+        t: u8,
+        num_slots: usize,
+        is_halfslot: bool,
+        minimum_delay: usize,
+    ) -> Option<(usize, Vec<TdmaTime>)> {
         let first_opportunity = self.cur_dltime.forward_to_timeslot(t);
         let channel_timeslots = self.basic_grant_timeslots(t);
         let mut grant_timeslots = Vec::with_capacity(num_slots);
@@ -736,6 +751,11 @@ impl BsChannelScheduler {
 
             if candidate_t.is_mandatory_clch() {
                 // Not an opportunity; skip
+                continue;
+            }
+
+            if opportunities_skipped < minimum_delay {
+                opportunities_skipped += 1;
                 continue;
             }
 
@@ -804,6 +824,16 @@ impl BsChannelScheduler {
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
     /// If successful, returns a BasicSlotgrant with the granting delay and capacity allocation.
     pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
+        self.ul_process_cap_req_after(timeslot, addr, res_req, 0)
+    }
+
+    fn ul_process_cap_req_after(
+        &mut self,
+        timeslot: u8,
+        addr: TetraAddress,
+        res_req: &ReservationRequirement,
+        minimum_delay: usize,
+    ) -> Option<BasicSlotgrant> {
         if self.circuits.is_active(Direction::Ul, timeslot) && !self.is_hangtime(timeslot) {
             let grant_frame = self.next_associated_fn18(timeslot);
             return self.ul_process_associated_fn18_cap_req(grant_frame, addr, res_req);
@@ -813,7 +843,7 @@ impl BsChannelScheduler {
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
 
         // Find a suitable grant opportunity
-        let grant_op = self.ul_find_grant_opportunity(timeslot, requested_cap, is_halfslot);
+        let grant_op = self.ul_find_grant_opportunity_after(timeslot, requested_cap, is_halfslot, minimum_delay);
 
         tracing::debug!(
             "ul_process_cap_req: addr {}, res_req {:?}, requested_cap {}, is_halfslot {}, grant_op: {:?}",
@@ -1964,16 +1994,47 @@ impl BsChannelScheduler {
                                 && tx_reporter.as_ref().is_some_and(TxReporter::expects_ack))
                             .then_some(pdu.addr)
                             .flatten();
+                            let advanced_ack_addr = (self.packet_bearer_is_active(ts.t)
+                                && tx_reporter.as_ref().is_some_and(TxReporter::expects_ack)
+                                && sdu
+                                    .peek_bits(6)
+                                    .is_some_and(|header| header >> 2 == LlcPduType::AlDataAlFinal.into_raw() && header & 1 == 1))
+                            .then(|| {
+                                pdu.addr.or_else(|| match aie_request {
+                                    AieRequest::Clear {
+                                        subject: AieSubject::Individual { issi },
+                                        ..
+                                    }
+                                    | AieRequest::Sc2 {
+                                        subject: AieSubject::Individual { issi },
+                                        ..
+                                    }
+                                    | AieRequest::Sc3 {
+                                        subject: AieSubject::Individual { issi },
+                                        ..
+                                    } => Some(TetraAddress::issi(issi)),
+                                    _ => None,
+                                })
+                            })
+                            .flatten();
+                            let acknowledged_addr = facch_ack_addr.or(advanced_ack_addr);
                             let resource_len_with_grant = pdu.compute_header_len()
-                                + usize::from(pdu.slot_granting_element.is_none() && facch_ack_addr.is_some()) * 8
+                                + usize::from(pdu.slot_granting_element.is_none() && acknowledged_addr.is_some()) * 8
                                 + sdu.get_len();
                             let resource_fill = fillbits::addition::compute_required(resource_len_with_grant, buf.get_len_remaining());
                             let completes_in_resource = resource_len_with_grant + resource_fill <= buf.get_len_remaining();
                             if completes_in_resource
                                 && pdu.slot_granting_element.is_none()
-                                && let Some(addr) = facch_ack_addr
+                                && let Some(addr) = acknowledged_addr
                             {
-                                let Some(grant) = self.ul_process_cap_req(ts.t, addr, &ReservationRequirement::Req1Slot) else {
+                                let minimum_delay = if advanced_ack_addr.is_some() {
+                                    self.basic_grant_timeslots(ts.t).len()
+                                } else {
+                                    0
+                                };
+                                let Some(grant) =
+                                    self.ul_process_cap_req_after(ts.t, addr, &ReservationRequirement::Req1Slot, minimum_delay)
+                                else {
                                     self.dltx_next_slot_queue
                                         .push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
                                     buf_opt = Some(buf);
@@ -1983,7 +2044,8 @@ impl BsChannelScheduler {
                                     dltime = %ts,
                                     address = ?addr,
                                     grant = ?grant,
-                                    "prepared FACCH basic-link acknowledgement grant in complete MAC-RESOURCE"
+                                    advanced_link = advanced_ack_addr.is_some(),
+                                    "prepared anticipated acknowledgement grant in complete MAC-RESOURCE"
                                 );
                                 pdu.slot_granting_element = Some(grant);
                                 pdu.update_len_and_fill_ind(sdu.get_len());
@@ -3480,6 +3542,52 @@ mod tests {
             None,
             "TS1 is not part of the packet bearer"
         );
+    }
+
+    #[test]
+    fn anticipated_advanced_ack_grant_waits_one_multislot_frame() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let minimum_delay = sched.basic_grant_timeslots(2).len();
+
+        let grant = sched
+            .ul_process_cap_req_after(2, TetraAddress::issi(77_479), &ReservationRequirement::Req1Slot, minimum_delay)
+            .expect("three-slot PDCH must leave enough AL-ACK processing time");
+
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(3));
+    }
+
+    #[test]
+    fn packet_al_final_ar_carries_anticipated_ack_grant() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let issi = 77_479;
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::issi(issi), None, false);
+        resource.addr = None;
+        resource.event_label = Some(3);
+        let sdu = BitBuffer::from_bitstr("10011100000000000");
+        resource.update_len_and_fill_ind(sdu.get_len());
+        sched.dl_enqueue_tma_on_timeslot(
+            2,
+            resource,
+            sdu,
+            Some(TxReporter::new()),
+            AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource),
+        );
+
+        let time = TdmaTime { t: 2, f: 3, m: 1, h: 0 };
+        sched.cur_dltime = time;
+        let mut block = sched
+            .dl_build_block_from_signalling_schedule(time)
+            .expect("AL-FINAL-AR must be scheduled");
+        block.seek(0);
+        let decoded = MacResource::from_bitbuf(&mut block).expect("MAC-RESOURCE must decode");
+        let grant = decoded.slot_granting_element.expect("AL-FINAL-AR must contain a slot grant");
+
+        assert_eq!(decoded.event_label, Some(3));
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(3));
     }
 
     #[test]
