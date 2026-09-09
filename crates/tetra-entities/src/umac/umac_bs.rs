@@ -11,6 +11,7 @@ use tetra_core::{
     AieCipherRegion, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime,
     TetraAddress, Todo, TxReporter,
 };
+use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -239,6 +240,69 @@ struct PendingSc3Downlink {
 }
 
 impl UmacBs {
+    fn apply_packet_event_label_addressing(
+        &self,
+        main_address: TetraAddress,
+        associated_channel: Option<AssociatedChannel>,
+        chan_alloc: Option<&CmceChanAllocReq>,
+        sdu: &BitBuffer,
+        pdu: &mut MacResource,
+    ) {
+        if main_address.ssi_type != SsiType::Issi {
+            return;
+        }
+        let Some(event_label) = self.event_label_store.get_label_by_ssi(main_address.ssi) else {
+            return;
+        };
+        let packet_assignment = chan_alloc.is_some_and(|allocation| {
+            let mut assigned = allocation
+                .timeslots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, assigned)| assigned.then_some(index as u8 + 1));
+            let Some(first) = assigned.next() else {
+                return false;
+            };
+            self.channel_scheduler.packet_bearer_is_active(first)
+                && assigned.all(|timeslot| self.channel_scheduler.packet_bearer_is_active(timeslot))
+        });
+        if packet_assignment {
+            // TTR 001-05 section 6.6 assigns the label with SSI + event label
+            // in the MAC-RESOURCE carrying the PDCH allocation. A usage
+            // marker cannot coexist with that address type and is not needed
+            // for an assigned SCCH.
+            pdu.addr = Some(main_address);
+            pdu.event_label = Some(event_label);
+            pdu.usage_marker = None;
+            return;
+        }
+        let on_packet_bearer = associated_channel.is_some_and(|channel| self.channel_scheduler.packet_bearer_is_active(channel.timeslot));
+        if !on_packet_bearer {
+            return;
+        }
+        let mut header = sdu.clone();
+        let Ok(raw_type) = header.read_field(4, "llc_pdu_type") else {
+            return;
+        };
+        let advanced_link = matches!(
+            LlcPduType::try_from(raw_type),
+            Ok(LlcPduType::AlSetup
+                | LlcPduType::AlDataAlFinal
+                | LlcPduType::AlAlUdataAlUfinal
+                | LlcPduType::AlAckAlRnr
+                | LlcPduType::AlReconnect
+                | LlcPduType::AlDisc)
+        );
+        if advanced_link {
+            // Once assigned, the packet-data profile requires every advanced
+            // link PDU to use the short event label. Basic-link SNDCP and SDS
+            // continue to use the ISSI on the same PDCH.
+            pdu.addr = None;
+            pdu.event_label = Some(event_label);
+            pdu.usage_marker = None;
+        }
+    }
+
     pub fn new(config: SharedConfig) -> Self {
         Self::new_with_swmi(config, None)
     }
@@ -2135,7 +2199,7 @@ impl UmacBs {
         // traffic-channel delivery remains a bypass: the MS listens there on
         // every frame and must not get MCCH duplicates.
         let group_ee_replay = associated_channel.is_none() && prim.main_address.ssi_type == SsiType::Gssi;
-        let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc {
+        let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc.as_ref() {
             (
                 chan_alloc.usage,
                 Some(Self::cmce_to_mac_chanalloc(&chan_alloc, self.config.config().cell.main_carrier)),
@@ -2164,6 +2228,7 @@ impl UmacBs {
             slot_granting_element: None,
             chan_alloc_element: mac_chan_alloc,
         };
+        self.apply_packet_event_label_addressing(prim.main_address, associated_channel, prim.chan_alloc.as_ref(), &sdu, &mut pdu);
         pdu.update_len_and_fill_ind(sdu.get_len());
 
         if group_ee_replay {
@@ -3424,5 +3489,89 @@ mod tests {
             .front()
             .expect("TG91 must be replayed at the EE monitoring occasion");
         assert!(replay.due.age(umac.dltime) < 0, "queued EE replay must lie in the future");
+    }
+
+    #[test]
+    fn packet_assignment_assigns_event_label_without_usage_marker() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let issi = 77_479;
+        assert!(umac.channel_scheduler.open_packet_bearer(83, 1, 0b1110));
+        assert!(umac.event_label_store.bind(3, TetraAddress::issi(issi)));
+        let allocation = CmceChanAllocReq {
+            usage: Some(51),
+            carrier: None,
+            timeslots: [false, true, true, true],
+            alloc_type: ChanAllocType::Replace,
+            cell_change_flag: false,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+        let mut pdu = MacResource {
+            addr: Some(TetraAddress::issi(issi)),
+            usage_marker: Some(51),
+            ..MacResource::default()
+        };
+
+        umac.apply_packet_event_label_addressing(
+            TetraAddress::issi(issi),
+            None,
+            Some(&allocation),
+            &BitBuffer::from_bitstr("0101"),
+            &mut pdu,
+        );
+
+        assert_eq!(pdu.addr.map(|address| address.ssi), Some(issi));
+        assert_eq!(pdu.event_label, Some(3));
+        assert_eq!(pdu.usage_marker, None);
+    }
+
+    #[test]
+    fn packet_advanced_link_uses_event_label_while_basic_link_keeps_issi() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let issi = 77_479;
+        assert!(umac.channel_scheduler.open_packet_bearer(83, 1, 0b1110));
+        assert!(umac.event_label_store.bind(3, TetraAddress::issi(issi)));
+        let route = Some(AssociatedChannel {
+            call_id: 83,
+            timeslot: 2,
+            usage: 51,
+            best_effort_key: None,
+        });
+        let mut advanced = MacResource {
+            addr: Some(TetraAddress::issi(issi)),
+            ..MacResource::default()
+        };
+        umac.apply_packet_event_label_addressing(
+            TetraAddress::issi(issi),
+            route,
+            None,
+            &BitBuffer::from_bitstr("10010000000000000"),
+            &mut advanced,
+        );
+        assert!(advanced.addr.is_none());
+        assert_eq!(advanced.event_label, Some(3));
+
+        let mut basic = MacResource {
+            addr: Some(TetraAddress::issi(issi)),
+            ..MacResource::default()
+        };
+        umac.apply_packet_event_label_addressing(
+            TetraAddress::issi(issi),
+            route,
+            None,
+            &BitBuffer::from_bitstr("01010000"),
+            &mut basic,
+        );
+        assert_eq!(basic.addr.map(|address| address.ssi), Some(issi));
+        assert_eq!(basic.event_label, None);
     }
 }

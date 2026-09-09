@@ -46,14 +46,14 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
-// ETSI TTR 001-05 section 6.5 defines 208 payload bits for an original
-// advanced-link downlink segment carried by a pi/4-DQPSK MAC-RESOURCE with
-// SSI addressing and no reserved space for a slot grant. Together with the
-// 17-bit AL-DATA header and the 43-bit MAC-RESOURCE header this fills one
-// 268-bit SCH/F block exactly. A shorter arbitrary segment lets UMAC start a
-// second LLC PDU in the remaining block space and MAC-fragment it, which is
-// not a valid mapping of advanced-link segments.
-const AL_SEGMENT_PAYLOAD_BITS: usize = 208;
+// ETSI TTR 001-05 sections 6.5 and 6.6 define 222 payload bits for an
+// original advanced-link downlink segment carried by a pi/4-DQPSK
+// MAC-RESOURCE with the mandatory assigned event label and no reserved slot
+// grant. Together with the 17-bit AL-DATA header and the 29-bit event-label
+// MAC-RESOURCE header this fills one 268-bit SCH/F block exactly. A shorter
+// arbitrary segment leaves unusable space in the MAC block and is not the
+// negotiated advanced-link mapping.
+const AL_SEGMENT_PAYLOAD_BITS: usize = 222;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
