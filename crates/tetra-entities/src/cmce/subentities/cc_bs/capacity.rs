@@ -272,6 +272,23 @@ mod tests {
         assert_eq!(cc.capacity.suspending.len(), 1);
         assert!(cc.capacity.suspending.contains_key(&((1 << 63) | 1)));
     }
+
+    #[test]
+    fn queued_voice_requests_graceful_packet_bearer_preemption() {
+        let mut cc = super::super::tests::test_cc_with_group(204);
+        let mut q = MessageQueue::new();
+        {
+            let mut state = cc.config.state_write();
+            for timeslot in 2..=4 {
+                state.timeslot_alloc.reserve(TimeslotOwner::PacketData, timeslot).unwrap();
+            }
+        }
+
+        offer(&mut cc, &mut q, 1, 1, 1, false);
+
+        assert_eq!(cc.capacity.queue.entries[&1].status, CapacityStatus::Queued);
+        assert!(cc.config.state_write().timeslot_alloc.take_packet_preemption_request());
+    }
     #[test]
     fn capacity_local_release_removes_admission_record() {
         let mut cc = super::super::tests::test_cc_with_group(204);
@@ -929,6 +946,13 @@ impl CcBsSubentity {
             }
             let need = self.capacity_slots_needed(token);
             let ready = need <= free;
+            if !ready && need != usize::MAX && need > 0 {
+                // A queued voice call must initiate the graceful SNDCP drain
+                // itself. Waiting until circuit allocation cannot work when
+                // packet data owns every traffic slot, because the queue does
+                // not attempt allocation until capacity is already free.
+                self.config.state_write().timeslot_alloc.request_packet_preemption();
+            }
             if ready {
                 free -= need;
             }

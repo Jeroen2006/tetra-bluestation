@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, SubscriberDeliveryRoute};
 use tetra_core::{
     BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, TxState,
     tetra_entities::TetraEntity,
@@ -173,6 +173,41 @@ impl Sndcp {
         })
     }
 
+    fn publish_delivery_routes(&self, context: &RadioContext) {
+        let Some(bearer_id) = context.bearer_id else {
+            self.config.state_write().subscriber_packet_delivery_routes.remove(&context.issi);
+            return;
+        };
+        let usage = context
+            .event_label
+            .map(|label| PACKET_USAGE_BASE + (label as u8 & 0x0f))
+            .unwrap_or(PACKET_USAGE_BASE);
+        let routes = (2..=4)
+            .filter(|timeslot| context.timeslot_bitmap & (1 << (timeslot - 1)) != 0)
+            .map(|timeslot| SubscriberDeliveryRoute {
+                call_id: bearer_id as u16,
+                timeslot,
+                usage,
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.config.state_write();
+        if routes.is_empty() {
+            state.subscriber_packet_delivery_routes.remove(&context.issi);
+        } else {
+            state.subscriber_packet_delivery_routes.insert(context.issi, routes);
+        }
+    }
+
+    fn insert_context(&mut self, context: RadioContext) {
+        self.publish_delivery_routes(&context);
+        self.contexts.insert(context.issi, context);
+    }
+
+    fn remove_context(&mut self, issi: u32) -> Option<RadioContext> {
+        self.config.state_write().subscriber_packet_delivery_routes.remove(&issi);
+        self.contexts.remove(&issi)
+    }
+
     fn queue_downlink(
         &self,
         queue: &mut MessageQueue,
@@ -332,7 +367,7 @@ impl Sndcp {
                     chap_identifier: chap.as_ref().map(|proof| proof.identifier),
                     dynamic_address,
                 };
-                self.contexts.insert(issi, context.clone());
+                self.insert_context(context.clone());
                 let local_reject = if version != 1 {
                     Some(16)
                 } else if nsapi != DEFAULT_NSAPI {
@@ -358,7 +393,7 @@ impl Sndcp {
                         Layer2Service::Acknowledged,
                         None,
                     );
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                     return;
                 }
                 let command_id = self.next_command();
@@ -379,7 +414,7 @@ impl Sndcp {
                             Layer2Service::Acknowledged,
                             None,
                         );
-                        self.contexts.remove(&issi);
+                        self.remove_context(issi);
                         return;
                     }
                 };
@@ -411,7 +446,7 @@ impl Sndcp {
                         Layer2Service::Acknowledged,
                         None,
                     );
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             SndcpUplink::DeactivateDemand {
@@ -470,7 +505,7 @@ impl Sndcp {
                     None,
                 );
                 if identifies_context {
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             SndcpUplink::DeactivateAccept {
@@ -496,7 +531,7 @@ impl Sndcp {
                     accepted: context_matches,
                 });
                 if context_matches {
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             SndcpUplink::Data { nsapi, payload } => {
@@ -532,24 +567,21 @@ impl Sndcp {
                         tracing::warn!(issi, "cannot recover roaming SNDCP context without SNEI");
                         return;
                     };
-                    self.contexts.insert(
+                    self.insert_context(RadioContext {
                         issi,
-                        RadioContext {
-                            issi,
-                            endpoint_id: prim.endpoint_id,
-                            link_id: prim.link_id,
-                            nsapi: nsapi.unwrap_or(DEFAULT_NSAPI),
-                            snei: Some(snei),
-                            session_id: None,
-                            session_generation: None,
-                            bearer_id: None,
-                            bearer_generation: None,
-                            timeslot_bitmap: 0,
-                            event_label: None,
-                            chap_identifier: None,
-                            dynamic_address: true,
-                        },
-                    );
+                        endpoint_id: prim.endpoint_id,
+                        link_id: prim.link_id,
+                        nsapi: nsapi.unwrap_or(DEFAULT_NSAPI),
+                        snei: Some(snei),
+                        session_id: None,
+                        session_generation: None,
+                        bearer_id: None,
+                        bearer_generation: None,
+                        timeslot_bitmap: 0,
+                        event_label: None,
+                        chap_identifier: None,
+                        dynamic_address: true,
+                    });
                 }
                 self.request_access(issi, prim.endpoint_id, prim.link_id, resource, true, data_to_send);
             }
@@ -777,6 +809,9 @@ impl Sndcp {
         };
         {
             let mut state = self.config.state_write();
+            for issi in &bearer.members {
+                state.subscriber_packet_delivery_routes.remove(issi);
+            }
             for timeslot in 2..=4 {
                 if bearer.timeslot_bitmap & (1 << (timeslot - 1)) != 0 {
                     let _ = state.timeslot_alloc.release(TimeslotOwner::PacketData, timeslot);
@@ -887,7 +922,7 @@ impl Sndcp {
                 };
                 self.queue_downlink(queue, &context, pdu, Layer2Service::Acknowledged, None);
                 if !accepted {
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             PacketDataMessage::DeactivateResult {
@@ -922,7 +957,7 @@ impl Sndcp {
                             "SwMI did not recognize MS deactivation; closing radio context to converge"
                         );
                     }
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             PacketDataMessage::AccessResult {
@@ -976,6 +1011,7 @@ impl Sndcp {
                     }
                 }
                 let context = context.clone();
+                self.publish_delivery_routes(&context);
                 let chan_alloc = (accepted && response != PacketAccessResponse::None).then(|| {
                     let usage = PACKET_USAGE_BASE + (event_label as u8 & 0x0f);
                     Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)
@@ -1010,7 +1046,7 @@ impl Sndcp {
                     PacketAccessResponse::TransmitRequest | PacketAccessResponse::None => {}
                 }
                 if !accepted && recovering {
-                    self.contexts.remove(&issi);
+                    self.remove_context(issi);
                 }
             }
             PacketDataMessage::Page {
@@ -1042,7 +1078,7 @@ impl Sndcp {
                         chap_identifier: None,
                         dynamic_address: true,
                     });
-                self.contexts.insert(issi, context.clone());
+                self.insert_context(context.clone());
                 self.pending_commands.insert(command_id, issi);
                 self.queue_downlink(
                     queue,
@@ -1170,7 +1206,7 @@ impl Sndcp {
                 else {
                     return;
                 };
-                self.contexts.remove(&issi);
+                self.remove_context(issi);
                 self.pending_commands.retain(|_, pending_issi| *pending_issi != issi);
                 self.pending_ms_deactivations.retain(|_, pending| pending.issi != issi);
                 self.pending_network_deactivations.remove(&issi);
@@ -1474,6 +1510,9 @@ mod tests {
                 dynamic_address: true,
             },
         );
+        let context = sndcp.contexts.get(&77_468).unwrap().clone();
+        sndcp.publish_delivery_routes(&context);
+        assert_eq!(sndcp.config.state_read().subscriber_packet_delivery_routes[&77_468].len(), 1);
         let mut queue = MessageQueue::new();
 
         sndcp.handle_swmi(
@@ -1486,6 +1525,7 @@ mod tests {
         );
 
         assert!(!sndcp.contexts.contains_key(&77_468));
+        assert!(!sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
         assert!(!sndcp.bearers.contains_key(&17));
         assert!(sndcp.config.state_read().timeslot_alloc.is_free(2));
         assert!(queue.iter_mut().any(|message| {
@@ -1498,6 +1538,33 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[test]
+    fn active_multislot_bearer_publishes_every_sds_delivery_route() {
+        let mut sndcp = test_sndcp();
+        let context = RadioContext {
+            issi: 77_479,
+            endpoint_id: 7,
+            link_id: 8,
+            nsapi: 1,
+            snei: Some(3),
+            session_id: Some(8),
+            session_generation: Some(1),
+            bearer_id: Some(11),
+            bearer_generation: Some(4),
+            timeslot_bitmap: 0b1110,
+            event_label: Some(4),
+            chap_identifier: None,
+            dynamic_address: true,
+        };
+
+        sndcp.insert_context(context);
+
+        let state = sndcp.config.state_read();
+        let routes = &state.subscriber_packet_delivery_routes[&77_479];
+        assert_eq!(routes.iter().map(|route| route.timeslot).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert!(routes.iter().all(|route| route.call_id == 11 && route.usage == 52));
     }
 
     #[test]

@@ -1765,6 +1765,10 @@ pub struct StackState {
     /// Ordered, currently valid traffic-channel opportunities for individual
     /// downlink signalling.  Empty means that LLC must use MCCH/EE delivery.
     pub subscriber_delivery_routes: HashMap<u32, Vec<SubscriberDeliveryRoute>>,
+    /// Packet-data bearers on which an individual subscriber is currently
+    /// listening. SNDCP owns this map separately from CMCE so a call-route
+    /// refresh cannot accidentally erase an active packet route.
+    pub subscriber_packet_delivery_routes: HashMap<u32, Vec<SubscriberDeliveryRoute>>,
     /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
     /// API. The worker reports each version to the SwMI.
     pub network_broadcast: RuntimeNetworkBroadcast,
@@ -2454,6 +2458,7 @@ impl Default for StackState {
             subscribers: SubscriberRegistry::new(),
             dm_gateways: DmGatewayRegistry::default(),
             subscriber_delivery_routes: HashMap::new(),
+            subscriber_packet_delivery_routes: HashMap::new(),
             network_broadcast: RuntimeNetworkBroadcast {
                 version: 0,
                 neighbours: Default::default(),

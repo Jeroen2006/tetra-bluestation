@@ -64,6 +64,18 @@ impl TimeslotAllocator {
         std::mem::take(&mut self.packet_preemption_requested)
     }
 
+    /// Ask the packet-data owner to drain a bearer because queued CMCE voice
+    /// needs capacity. The owner performs the over-air deassignment before
+    /// releasing any slot.
+    pub fn request_packet_preemption(&mut self) -> bool {
+        if self.owners.contains(&Some(TimeslotOwner::PacketData)) {
+            self.packet_preemption_requested = true;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn packet_slots(&self) -> Vec<u8> {
         self.owners
             .iter()
@@ -136,5 +148,15 @@ mod tests {
 
         assert_eq!(allocator.allocate_any(TimeslotOwner::Brew), None);
         assert!(!allocator.take_packet_preemption_request());
+    }
+
+    #[test]
+    fn queued_voice_can_request_packet_preemption_before_allocation() {
+        let mut allocator = TimeslotAllocator::default();
+        allocator.reserve(TimeslotOwner::PacketData, 2).unwrap();
+
+        assert!(allocator.request_packet_preemption());
+        assert!(allocator.take_packet_preemption_request());
+        assert_eq!(allocator.owner(2), Some(TimeslotOwner::PacketData));
     }
 }

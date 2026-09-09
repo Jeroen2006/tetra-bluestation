@@ -204,10 +204,11 @@ impl Llc {
         if state.subscribers.is_registration_pending(issi) || state.subscribers.direct_response_window_active(issi, dltime) {
             return Vec::new();
         }
-        state
+        let mut routes = state
             .subscriber_delivery_routes
             .get(&issi)
             .into_iter()
+            .chain(state.subscriber_packet_delivery_routes.get(&issi))
             .flat_map(|routes| routes.iter())
             .filter(|route| (2..=4).contains(&route.timeslot))
             .map(|route| tetra_saps::tma::AssociatedChannel {
@@ -216,7 +217,13 @@ impl Llc {
                 usage: route.usage,
                 best_effort_key: None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // A subscriber can briefly be present in both CMCE and SNDCP state
+        // while packet capacity is draining. One physical timeslot needs only
+        // one concurrent copy; UMAC validates its live owner before enqueue.
+        let mut seen_timeslots = HashSet::new();
+        routes.retain(|route| seen_timeslots.insert(route.timeslot));
+        routes
     }
 
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
@@ -2191,6 +2198,45 @@ mod tests {
     }
 
     #[test]
+    fn delivery_routes_combine_call_and_all_packet_slots_without_duplicates() {
+        let config = test_config();
+        let issi = 77_479;
+        let mut state = config.state_write();
+        state.subscriber_delivery_routes.insert(
+            issi,
+            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 7,
+                timeslot: 2,
+                usage: 10,
+            }],
+        );
+        state.subscriber_packet_delivery_routes.insert(
+            issi,
+            vec![
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 11,
+                    timeslot: 2,
+                    usage: 52,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 11,
+                    timeslot: 3,
+                    usage: 52,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 11,
+                    timeslot: 4,
+                    usage: 52,
+                },
+            ],
+        );
+        drop(state);
+
+        let routes = Llc::delivery_routes(&config, issi, TdmaTime::default());
+        assert_eq!(routes.iter().map(|route| route.timeslot).collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
     fn discarded_associated_downlink_retries_over_mcch() {
         let config = test_config();
         let issi = 77_468;
@@ -2557,6 +2603,14 @@ mod tests {
                     call_id: 7,
                     timeslot: 2,
                     usage: 10,
+                }],
+            );
+            state.subscriber_packet_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 11,
+                    timeslot: 3,
+                    usage: 52,
                 }],
             );
         }
