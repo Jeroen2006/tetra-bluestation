@@ -82,6 +82,14 @@ struct PendingDelivery {
 }
 
 #[derive(Debug, Clone)]
+struct PendingStandby {
+    issi: u32,
+    session_id: u64,
+    session_generation: u64,
+    reporter: TxReporter,
+}
+
+#[derive(Debug, Clone)]
 struct PendingMsDeactivation {
     issi: u32,
     deactivation_type: u8,
@@ -108,6 +116,7 @@ pub struct Sndcp {
     pending_network_deactivations: HashMap<u32, PendingNetworkDeactivation>,
     bearers: HashMap<u64, Bearer>,
     pending_deliveries: Vec<PendingDelivery>,
+    pending_standby: Vec<PendingStandby>,
 }
 
 impl Sndcp {
@@ -124,6 +133,7 @@ impl Sndcp {
             pending_network_deactivations: HashMap::new(),
             bearers: HashMap::new(),
             pending_deliveries: Vec::new(),
+            pending_standby: Vec::new(),
         }
     }
 
@@ -206,6 +216,72 @@ impl Sndcp {
     fn remove_context(&mut self, issi: u32) -> Option<RadioContext> {
         self.config.state_write().subscriber_packet_delivery_routes.remove(&issi);
         self.contexts.remove(&issi)
+    }
+
+    /// Move one activated PDP context off its current PDCH while retaining
+    /// the context for a later SN-DATA TRANSMIT REQUEST.  A shared packet
+    /// bearer remains open for its other members; the final member releases
+    /// the timeslots back to voice/control service.
+    fn detach_packet_bearer(&mut self, queue: &mut MessageQueue, issi: u32) {
+        self.config.state_write().subscriber_packet_delivery_routes.remove(&issi);
+        let association = self.contexts.get_mut(&issi).and_then(|context| {
+            let value = context
+                .bearer_id
+                .zip(context.bearer_generation)
+                .zip(context.event_label)
+                .map(|((id, generation), event_label)| (id, generation, event_label));
+            context.bearer_id = None;
+            context.bearer_generation = None;
+            context.timeslot_bitmap = 0;
+            context.event_label = None;
+            value
+        });
+        let Some((bearer_id, generation, event_label)) = association else {
+            return;
+        };
+        let bearer_state = self
+            .bearers
+            .get_mut(&bearer_id)
+            .filter(|bearer| bearer.generation == generation)
+            .map(|bearer| {
+                bearer.members.remove(&issi);
+                (
+                    bearer.members.is_empty(),
+                    bearer.draining,
+                    bearer.command_id,
+                    bearer.timeslot_bitmap,
+                    bearer.members.len().min(u16::MAX as usize) as u16,
+                )
+            });
+        let Some((empty, draining, command_id, timeslot_bitmap, member_count)) = bearer_state else {
+            return;
+        };
+        queue.push_back(SapMsg::new(
+            Sap::Control,
+            TetraEntity::Sndcp,
+            TetraEntity::Umac,
+            SapMsgInner::PacketBearerControl(PacketBearerControl::Detach {
+                bearer_id,
+                generation,
+                event_label,
+            }),
+        ));
+        if empty {
+            self.release_bearer(queue, bearer_id, generation, false);
+        } else {
+            self.submit(PacketDataMessage::BearerReport {
+                command_id,
+                bearer_id,
+                bearer_generation: generation,
+                state: if draining {
+                    PacketBearerState::Draining
+                } else {
+                    PacketBearerState::Ready
+                },
+                timeslot_bitmap,
+                member_count,
+            });
+        }
     }
 
     fn queue_downlink(
@@ -1145,6 +1221,53 @@ impl Sndcp {
                     });
                 }
             }
+            PacketDataMessage::EndOfData {
+                itsi,
+                session_id,
+                session_generation,
+                immediate_service_change,
+                ..
+            } => {
+                let issi = itsi as u32;
+                let Some(context) = self
+                    .contexts
+                    .get(&issi)
+                    .cloned()
+                    .filter(|context| context.session() == Some((session_id, session_generation)))
+                else {
+                    return;
+                };
+                if immediate_service_change {
+                    self.pending_standby.retain(|pending| pending.issi != issi);
+                    self.detach_packet_bearer(queue, issi);
+                    return;
+                }
+                if self.pending_standby.iter().any(|pending| {
+                    pending.issi == issi && pending.session_id == session_id && pending.session_generation == session_generation
+                }) {
+                    return;
+                }
+                let reporter = TxReporter::new();
+                if self.queue_downlink_with_reporter(
+                    queue,
+                    &context,
+                    SndcpDownlink::EndOfData {
+                        immediate_service_change: false,
+                    },
+                    Layer2Service::Acknowledged,
+                    Some(Self::channel_allocation(0, 0, ChanAllocType::QuitAndGo)),
+                    Some(reporter.clone()),
+                ) {
+                    self.pending_standby.push(PendingStandby {
+                        issi,
+                        session_id,
+                        session_generation,
+                        reporter,
+                    });
+                } else {
+                    self.detach_packet_bearer(queue, issi);
+                }
+            }
             PacketDataMessage::Deactivate {
                 command_id,
                 itsi,
@@ -1290,7 +1413,6 @@ impl Sndcp {
             | PacketDataMessage::Activate { .. }
             | PacketDataMessage::Access { .. }
             | PacketDataMessage::PageResponse { .. }
-            | PacketDataMessage::EndOfData { .. }
             | PacketDataMessage::BearerReport { .. } => {}
         }
     }
@@ -1352,6 +1474,27 @@ impl Sndcp {
             });
         }
     }
+
+    fn process_standby_reports(&mut self, queue: &mut MessageQueue) {
+        let mut completed = Vec::new();
+        let mut index = 0;
+        while index < self.pending_standby.len() {
+            if self.pending_standby[index].reporter.is_in_final_state() {
+                completed.push(self.pending_standby.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        for pending in completed {
+            let context_matches = self
+                .contexts
+                .get(&pending.issi)
+                .is_some_and(|context| context.session() == Some((pending.session_id, pending.session_generation)));
+            if context_matches {
+                self.detach_packet_bearer(queue, pending.issi);
+            }
+        }
+    }
 }
 
 impl TetraEntityTrait for Sndcp {
@@ -1378,6 +1521,7 @@ impl TetraEntityTrait for Sndcp {
         }
         self.process_preemption(queue);
         self.process_delivery_reports();
+        self.process_standby_reports(queue);
         self.process_drains(queue);
     }
 }
@@ -1386,7 +1530,7 @@ impl TetraEntityTrait for Sndcp {
 mod tests {
     use super::*;
     use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::SnActivatePdpContextAccept;
-    use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnReconnect};
+    use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnEndOfData, SnReconnect};
 
     fn test_sndcp() -> Sndcp {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -1598,6 +1742,60 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[test]
+    fn end_of_data_response_releases_bearer_after_link_ack() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        sndcp.contexts.insert(
+            77_468,
+            RadioContext {
+                issi: 77_468,
+                endpoint_id: 7,
+                link_id: 8,
+                nsapi: 1,
+                snei: Some(8),
+                session_id: Some(8),
+                session_generation: Some(1),
+                bearer_id: Some(17),
+                bearer_generation: Some(4),
+                timeslot_bitmap: 0b0010,
+                event_label: Some(23),
+                chap_identifier: None,
+                dynamic_address: true,
+            },
+        );
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::EndOfData {
+                command_id: 51,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 1,
+                immediate_service_change: false,
+            },
+        );
+
+        let SapMsgInner::LtpdMleUnitdataReq(mut response) = queue.pop_front().unwrap().msg else {
+            panic!("expected SN-END OF DATA response")
+        };
+        assert!(!SnEndOfData::from_bitbuf(&mut response.sdu).unwrap().immediate_service_change);
+        assert!(response.chan_alloc.is_some());
+        assert!(sndcp.bearers.contains_key(&17));
+        assert_eq!(sndcp.pending_standby.len(), 1);
+
+        sndcp.pending_standby[0].reporter.mark_transmitted();
+        sndcp.pending_standby[0].reporter.mark_acknowledged();
+        sndcp.process_standby_reports(&mut queue);
+
+        assert!(!sndcp.bearers.contains_key(&17));
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(2), None);
+        let context = sndcp.contexts.get(&77_468).unwrap();
+        assert_eq!(context.session(), Some((8, 1)));
+        assert_eq!(context.bearer_id, None);
     }
 
     #[test]
