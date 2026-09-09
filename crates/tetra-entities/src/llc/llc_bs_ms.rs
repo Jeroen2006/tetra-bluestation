@@ -17,7 +17,7 @@ use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::consts::timers::T252_ACK_WAITING_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
-use tetra_pdus::llc::pdus::al::{AlAck, AlDataHeader, AlDisconnect, AlReconnect, AlSetup};
+use tetra_pdus::llc::pdus::al::{AlAck, AlAckBlock, AlDataHeader, AlDisconnect, AlReconnect, AlSetup};
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
@@ -119,6 +119,42 @@ struct AdvancedRxSdu {
     ns: u8,
     segments: BTreeMap<u8, BitBuffer>,
     final_segment: Option<u8>,
+    /// A correctly reassembled TL-SDU waits here until every older TL-SDU in
+    /// the negotiated receive window has also completed.  EN 300 392-2
+    /// 22.3.3.2.2 requires delivery in N(S) order even when radio segments
+    /// arrive on different slots out of order.
+    complete: Option<BitBuffer>,
+}
+
+impl AdvancedRxSdu {
+    fn acknowledgement_block(&self) -> AlAckBlock {
+        if self.complete.is_some() {
+            return AlAckBlock {
+                nr: self.ns,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            };
+        }
+
+        let highest = self
+            .final_segment
+            .or_else(|| self.segments.last_key_value().map(|(segment, _)| *segment))
+            .unwrap_or(0);
+        let first_missing = (0..=highest)
+            .find(|segment| !self.segments.contains_key(segment))
+            .unwrap_or(highest.saturating_add(1));
+        let acknowledgement_length = highest.saturating_sub(first_missing).saturating_add(1).max(1);
+        let acknowledgement_bitmap = ((first_missing.saturating_add(1))..=highest)
+            .map(|segment| self.segments.contains_key(&segment))
+            .collect();
+        AlAckBlock {
+            nr: self.ns,
+            acknowledgement_length,
+            first_missing_segment: Some(first_missing),
+            acknowledgement_bitmap,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,11 +183,33 @@ struct AdvancedLink {
     max_segment_retransmissions: u8,
     endpoint_id: u32,
     next_tx_ns: u8,
+    /// Lower boundary of the modulo-8 original advanced-link receive window.
     next_rx_ns: u8,
-    last_rx_ns: Option<u8>,
     receiver_ready: bool,
-    rx: Option<AdvancedRxSdu>,
+    rx_sdus: BTreeMap<u8, AdvancedRxSdu>,
     tx: VecDeque<AdvancedTxSdu>,
+}
+
+impl AdvancedLink {
+    fn acknowledgement_blocks(&self, override_block: Option<AlAckBlock>) -> Vec<AlAckBlock> {
+        (0..self.window_size)
+            .map(|offset| {
+                let nr = (self.next_rx_ns + offset) & 0x07;
+                if override_block.as_ref().is_some_and(|block| block.nr == nr) {
+                    return override_block.clone().expect("matching acknowledgement override");
+                }
+                self.rx_sdus.get(&nr).map_or(
+                    AlAckBlock {
+                        nr,
+                        acknowledgement_length: 1,
+                        first_missing_segment: Some(0),
+                        acknowledgement_bitmap: Vec::new(),
+                    },
+                    AdvancedRxSdu::acknowledgement_block,
+                )
+            })
+            .collect()
+    }
 }
 
 pub struct Llc {
@@ -757,18 +815,12 @@ impl Llc {
         endpoint_id: u32,
         route: Option<tetra_saps::tma::AssociatedChannel>,
         aie_request: AieRequest,
-        nr: u8,
-        acknowledgement_length: u8,
-        first_missing_segment: Option<u8>,
-        acknowledgement_bitmap: Vec<bool>,
+        blocks: Vec<AlAckBlock>,
     ) {
         let mut pdu = BitBuffer::new_autoexpand(32);
         if (AlAck {
             receiver_ready: true,
-            nr,
-            acknowledgement_length,
-            first_missing_segment,
-            acknowledgement_bitmap,
+            blocks,
         })
         .to_bitbuf(&mut pdu)
         .is_ok()
@@ -847,9 +899,8 @@ impl Llc {
                 endpoint_id: prim.endpoint_id,
                 next_tx_ns: 0,
                 next_rx_ns: 0,
-                last_rx_ns: None,
                 receiver_ready: true,
-                rx: None,
+                rx_sdus: BTreeMap::new(),
                 tx: VecDeque::new(),
             },
         );
@@ -890,37 +941,54 @@ impl Llc {
             tracing::warn!(issi, "AL-DATA received without an established advanced link");
             return;
         };
-        if link.last_rx_ns == Some(header.ns) {
-            Self::send_al_ack(
-                queue,
-                prim.main_address,
-                prim.endpoint_id,
-                route,
-                aie,
-                header.ns,
-                0,
-                None,
-                Vec::new(),
-            );
-            return;
-        }
-        if link.rx.as_ref().is_none_or(|rx| rx.ns != header.ns) {
-            if header.ns != link.next_rx_ns {
+        let distance = header.ns.wrapping_sub(link.next_rx_ns) & 0x07;
+        if distance >= link.window_size {
+            // An acknowledgement may be lost even though the complete SDU
+            // was delivered.  Note 6 of 22.3.3.2.7 requires the receiver to
+            // positively acknowledge retransmissions from every N(S) in the
+            // N.272 positions below its current window.
+            let behind = link.next_rx_ns.wrapping_sub(header.ns) & 0x07;
+            if (1..=link.window_size).contains(&behind) {
+                tracing::debug!(
+                    issi,
+                    lower = link.next_rx_ns,
+                    received = header.ns,
+                    "acknowledging retransmitted TL-SDU below receive window"
+                );
+                let blocks = (0..behind)
+                    .map(|offset| AlAckBlock {
+                        nr: (header.ns + offset) & 0x07,
+                        acknowledgement_length: 0,
+                        first_missing_segment: None,
+                        acknowledgement_bitmap: Vec::new(),
+                    })
+                    .collect();
+                Self::send_al_ack(queue, prim.main_address, prim.endpoint_id, route, aie, blocks);
+            } else {
                 tracing::warn!(
                     issi,
-                    expected = link.next_rx_ns,
+                    lower = link.next_rx_ns,
+                    window_size = link.window_size,
                     received = header.ns,
                     "AL-DATA outside receive window"
                 );
-                return;
             }
-            link.rx = Some(AdvancedRxSdu {
-                ns: header.ns,
-                segments: BTreeMap::new(),
-                final_segment: None,
-            });
+            return;
         }
-        let rx = link.rx.as_mut().expect("advanced receive state initialized");
+
+        let rx = link.rx_sdus.entry(header.ns).or_insert_with(|| AdvancedRxSdu {
+            ns: header.ns,
+            segments: BTreeMap::new(),
+            final_segment: None,
+            complete: None,
+        });
+        if rx.complete.is_some() {
+            // This SDU is complete but cannot be delivered until a gap at the
+            // lower edge closes.  Repeat its positive acknowledgement.
+            let blocks = link.acknowledgement_blocks(None);
+            Self::send_al_ack(queue, prim.main_address, prim.endpoint_id, route, aie, blocks);
+            return;
+        }
         pdu.set_raw_start(pdu.get_raw_pos());
         pdu.seek(0);
         rx.segments.entry(header.segment).or_insert(pdu);
@@ -931,7 +999,8 @@ impl Llc {
         let complete = rx
             .final_segment
             .is_some_and(|last| (0..=last).all(|segment| rx.segments.contains_key(&segment)));
-        if complete {
+        let mut fcs_failed = false;
+        let should_ack = if complete {
             let last = rx.final_segment.expect("complete receive state has final segment");
             let total_bits = (0..=last)
                 .filter_map(|segment| rx.segments.get(&segment))
@@ -947,51 +1016,51 @@ impl Llc {
             if fcs::check_fcs(&assembled) {
                 assembled.set_raw_end(assembled.get_raw_end() - 32);
                 assembled.seek(0);
-                Self::send_al_ack(
-                    queue,
-                    prim.main_address,
-                    prim.endpoint_id,
-                    route,
-                    aie,
-                    header.ns,
-                    0,
-                    None,
-                    Vec::new(),
-                );
-                link.last_rx_ns = Some(header.ns);
-                link.next_rx_ns = (header.ns + 1) & 0x07;
-                link.rx = None;
-                Self::deliver_advanced_sdu(queue, prim, assembled);
+                rx.complete = Some(assembled);
             } else {
-                Self::send_al_ack(
-                    queue,
-                    prim.main_address,
-                    prim.endpoint_id,
-                    route,
-                    aie,
-                    header.ns,
-                    63,
-                    None,
-                    Vec::new(),
-                );
-                link.rx = None;
+                fcs_failed = true;
             }
+            true
         } else if header.acknowledgement_requested {
-            let highest = rx.final_segment.unwrap_or(header.segment);
-            let missing = (0..=highest)
-                .find(|segment| !rx.segments.contains_key(segment))
-                .unwrap_or(highest.saturating_add(1));
-            Self::send_al_ack(
-                queue,
-                prim.main_address,
-                prim.endpoint_id,
-                route,
-                aie,
-                header.ns,
-                1,
-                Some(missing),
-                Vec::new(),
-            );
+            true
+        } else {
+            false
+        };
+
+        if fcs_failed {
+            // The sender must retransmit this same N(S) from segment 0.
+            link.rx_sdus.remove(&header.ns);
+        }
+        if should_ack {
+            let override_block = fcs_failed.then_some(AlAckBlock {
+                nr: header.ns,
+                acknowledgement_length: 63,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            });
+            let blocks = link.acknowledgement_blocks(override_block);
+            Self::send_al_ack(queue, prim.main_address, prim.endpoint_id, route, aie, blocks);
+        }
+
+        // Completion and acknowledgement are independent from ordered
+        // delivery.  Advance the receive window only over a consecutive run
+        // of correct TL-SDUs beginning at its lower boundary.
+        let mut delivered = Vec::new();
+        loop {
+            let lower = link.next_rx_ns;
+            let Some(mut ready) = link.rx_sdus.remove(&lower) else {
+                break;
+            };
+            let Some(sdu) = ready.complete.take() else {
+                link.rx_sdus.insert(lower, ready);
+                break;
+            };
+            debug_assert_eq!(ready.ns, lower);
+            delivered.push(sdu);
+            link.next_rx_ns = (lower + 1) & 0x07;
+        }
+        for sdu in delivered {
+            Self::deliver_advanced_sdu(queue, prim, sdu);
         }
     }
 
@@ -1004,55 +1073,87 @@ impl Llc {
             return;
         };
         link.receiver_ready = ack.receiver_ready;
-        let Some(position) = link.tx.iter().position(|sdu| sdu.ns == ack.nr) else {
-            return;
-        };
-        if ack.acknowledgement_length == 0 {
-            if let Some(sdu) = link.tx.remove(position) {
-                if sdu.reporter.get_state() == TxState::Pending {
-                    sdu.reporter.mark_transmitted();
-                }
-                if sdu.reporter.get_state() == TxState::Transmitted {
-                    sdu.reporter.mark_acknowledged();
-                }
+        for block in ack.blocks {
+            let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
+                continue;
+            };
+            let was_sent = {
+                let sdu = &link.tx[position];
+                sdu.attempt_reporter.is_some() || sdu.sent_at.is_some() || sdu.reporter.get_state() != TxState::Pending
+            };
+            // A TIP acknowledgement covers the whole N.272 receive window,
+            // which can include a TL-SDU that this transmitter has queued but
+            // has not put on air yet.  Such a block carries no information for
+            // the local sending state.
+            if !was_sent {
+                continue;
             }
-            return;
-        }
-        let sdu = &mut link.tx[position];
-        if ack.acknowledgement_length == 63 {
-            sdu.retransmissions = sdu.retransmissions.saturating_add(1);
-            sdu.pending_segments = None;
-        } else if let Some(first) = ack.first_missing_segment {
-            let mut missing = vec![first as usize];
-            for (offset, received) in ack.acknowledgement_bitmap.iter().copied().enumerate() {
-                if !received {
-                    missing.push(first as usize + offset + 1);
+            if block.acknowledgement_length == 0 {
+                if let Some(sdu) = link.tx.remove(position) {
+                    if sdu.reporter.get_state() == TxState::Pending {
+                        sdu.reporter.mark_transmitted();
+                    }
+                    if sdu.reporter.get_state() == TxState::Transmitted {
+                        sdu.reporter.mark_acknowledged();
+                    }
                 }
+                continue;
             }
-            missing.retain(|segment| *segment < sdu.segments.len());
-            let segment_limit_exceeded = missing.iter().any(|segment| {
-                sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
-                sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
-            });
-            if segment_limit_exceeded {
+
+            let sdu = &mut link.tx[position];
+            if block.acknowledgement_length == 63 {
                 sdu.retransmissions = sdu.retransmissions.saturating_add(1);
                 sdu.pending_segments = None;
-            } else {
-                sdu.pending_segments = Some(missing);
+            } else if let Some(first) = block.first_missing_segment {
+                let mut missing = vec![first as usize];
+                for (offset, received) in block.acknowledgement_bitmap.iter().copied().enumerate() {
+                    if !received {
+                        missing.push(first as usize + offset + 1);
+                    }
+                }
+                missing.retain(|segment| *segment < sdu.segments.len());
+                let segment_limit_exceeded = missing.iter().any(|segment| {
+                    sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
+                    sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
+                });
+                if segment_limit_exceeded {
+                    sdu.retransmissions = sdu.retransmissions.saturating_add(1);
+                    sdu.pending_segments = None;
+                } else if !missing.is_empty() {
+                    sdu.pending_segments = Some(missing);
+                }
             }
+            if sdu.reporter.get_state() == TxState::Transmitted {
+                sdu.reporter.reset();
+            }
+            sdu.sent_at = None;
+            sdu.attempt_reporter = None;
         }
-        if sdu.reporter.get_state() == TxState::Transmitted {
-            sdu.reporter.reset();
-        }
-        sdu.sent_at = None;
-        sdu.attempt_reporter = None;
     }
 
     fn handle_al_reconnect(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
         let Ok(request) = AlReconnect::from_bitbuf(&mut pdu) else {
             return;
         };
-        let accepted = request.link_number == 0 && self.advanced_links.contains_key(&prim.main_address.ssi);
+        // Only the MS initiates advanced-link roaming.  Accepting or replying
+        // to an "accept"/"reject" report here would turn a response into a
+        // new request and can create an AL-RECONNECT exchange loop.
+        if request.report != 0 {
+            tracing::warn!(
+                issi = prim.main_address.ssi,
+                report = request.report,
+                "ignored non-propose AL-RECONNECT from MS"
+            );
+            return;
+        }
+        let accepted = request.link_number == 0
+            && self.advanced_links.get_mut(&prim.main_address.ssi).is_some_and(|link| {
+                // Reconnection carries every link parameter and sequence
+                // variable forward.  Only the MAC endpoint changes with
+                // the new cell/resource.
+                link.endpoint_id = prim.endpoint_id;
+                true
+            });
         let response = AlReconnect {
             acknowledged: true,
             link_number: request.link_number,
@@ -1566,7 +1667,7 @@ impl Llc {
         }
 
         // If ns is present, we need to send an ACK
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         if let Some(ns) = ns {
             // Send ACK
             let incoming_aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
@@ -2039,6 +2140,25 @@ mod tests {
         llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
     }
 
+    fn receive_advanced_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, ns: u8, payload: BitBuffer) {
+        let segments = Llc::advanced_segments(payload);
+        for (index, mut segment) in segments.iter().cloned().enumerate() {
+            let mut pdu = BitBuffer::new_autoexpand(AL_SEGMENT_PAYLOAD_BITS + 24);
+            AlDataHeader {
+                final_segment: index + 1 == segments.len(),
+                acknowledgement_requested: index + 1 == segments.len(),
+                ns,
+                segment: index as u8,
+            }
+            .to_bitbuf(&mut pdu)
+            .unwrap();
+            let length = segment.get_len_remaining();
+            pdu.copy_bits(&mut segment, length);
+            pdu.seek(0);
+            llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
+        }
+    }
+
     #[test]
     fn ms_al_setup_establishes_tip_link_and_is_answered() {
         let mut llc = Llc::new(test_config());
@@ -2100,6 +2220,218 @@ mod tests {
     }
 
     #[test]
+    fn advanced_receive_window_buffers_out_of_order_sdus() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let first = BitBuffer::from_bitstr(&"10100110".repeat(8));
+        let second = BitBuffer::from_bitstr(&"01101001".repeat(8));
+
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 1, second.clone());
+        let SapMsgInner::TmaUnitdataReq(mut acknowledgement) = queue.pop_front().unwrap().msg else {
+            panic!("expected AL-ACK")
+        };
+        let acknowledgement = AlAck::from_bitbuf(&mut acknowledgement.pdu).unwrap();
+        assert_eq!(acknowledgement.blocks.len(), 2);
+        assert_eq!(acknowledgement.blocks[0].nr, 0);
+        assert_eq!(acknowledgement.blocks[0].acknowledgement_length, 1);
+        assert_eq!(acknowledgement.blocks[0].first_missing_segment, Some(0));
+        assert_eq!(acknowledgement.blocks[1].nr, 1);
+        assert_eq!(acknowledgement.blocks[1].acknowledgement_length, 0);
+        assert!(queue.pop_front().is_none(), "N(S)=1 must wait for the lower window edge");
+
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 0, first.clone());
+        assert!(matches!(queue.pop_front().unwrap().msg, SapMsgInner::TmaUnitdataReq(_)));
+        for expected in [first, second] {
+            let SapMsgInner::TlaTlDataIndBl(delivered) = queue.pop_front().unwrap().msg else {
+                panic!("expected ordered advanced-link delivery")
+            };
+            assert_eq!(delivered.tl_sdu.unwrap().dump_bin_unformatted(), expected.dump_bin_unformatted());
+        }
+        assert!(queue.pop_front().is_none());
+        assert_eq!(llc.advanced_links[&77_468].next_rx_ns, 2);
+    }
+
+    #[test]
+    fn advanced_partial_ack_reports_holes_and_received_segments() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        let mut pdu = BitBuffer::new_autoexpand(64);
+        AlDataHeader {
+            final_segment: false,
+            acknowledgement_requested: true,
+            ns: 0,
+            segment: 1,
+        }
+        .to_bitbuf(&mut pdu)
+        .unwrap();
+        pdu.write_bits(0x55, 8);
+        pdu.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, pdu));
+
+        let SapMsgInner::TmaUnitdataReq(mut acknowledgement) = queue.pop_front().unwrap().msg else {
+            panic!("expected AL-ACK")
+        };
+        let acknowledgement = AlAck::from_bitbuf(&mut acknowledgement.pdu).unwrap();
+        assert_eq!(acknowledgement.blocks.len(), 2);
+        assert_eq!(
+            acknowledgement.blocks[0],
+            AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 2,
+                first_missing_segment: Some(0),
+                acknowledgement_bitmap: vec![true],
+            }
+        );
+        assert_eq!(
+            acknowledgement.blocks[1],
+            AlAckBlock {
+                nr: 1,
+                acknowledgement_length: 1,
+                first_missing_segment: Some(0),
+                acknowledgement_bitmap: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn advanced_receive_window_reacks_recently_delivered_sdu() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 0, BitBuffer::from_bitstr(&"11001010".repeat(8)));
+        while queue.pop_front().is_some() {}
+
+        let mut duplicate = BitBuffer::new_autoexpand(32);
+        AlDataHeader {
+            final_segment: true,
+            acknowledgement_requested: true,
+            ns: 0,
+            segment: 0,
+        }
+        .to_bitbuf(&mut duplicate)
+        .unwrap();
+        duplicate.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, duplicate));
+
+        let SapMsgInner::TmaUnitdataReq(mut acknowledgement) = queue.pop_front().unwrap().msg else {
+            panic!("expected repeated AL-ACK")
+        };
+        let acknowledgement = AlAck::from_bitbuf(&mut acknowledgement.pdu).unwrap();
+        assert_eq!(acknowledgement.blocks[0].nr, 0);
+        assert_eq!(acknowledgement.blocks[0].acknowledgement_length, 0);
+        assert!(queue.pop_front().is_none(), "a retransmitted old SDU must not be delivered twice");
+        assert_eq!(llc.advanced_links[&77_468].next_rx_ns, 1);
+    }
+
+    #[test]
+    fn advanced_receive_window_handles_modulo_wrap() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        llc.advanced_links.get_mut(&77_468).unwrap().next_rx_ns = 7;
+        let seven = BitBuffer::from_bitstr(&"11110000".repeat(8));
+        let zero = BitBuffer::from_bitstr(&"00001111".repeat(8));
+
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 0, zero.clone());
+        assert!(matches!(queue.pop_front().unwrap().msg, SapMsgInner::TmaUnitdataReq(_)));
+        assert!(queue.pop_front().is_none());
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 7, seven.clone());
+        assert!(matches!(queue.pop_front().unwrap().msg, SapMsgInner::TmaUnitdataReq(_)));
+        for expected in [seven, zero] {
+            let SapMsgInner::TlaTlDataIndBl(delivered) = queue.pop_front().unwrap().msg else {
+                panic!("expected wrapped ordered delivery")
+            };
+            assert_eq!(delivered.tl_sdu.unwrap().dump_bin_unformatted(), expected.dump_bin_unformatted());
+        }
+        assert_eq!(llc.advanced_links[&77_468].next_rx_ns, 1);
+    }
+
+    #[test]
+    fn advanced_receive_window_rejects_future_jump() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        receive_advanced_sdu(&mut llc, &mut queue, 77_468, 3, BitBuffer::from_bitstr(&"10101010".repeat(8)));
+        assert!(queue.pop_front().is_none());
+        let link = &llc.advanced_links[&77_468];
+        assert_eq!(link.next_rx_ns, 0);
+        assert!(link.rx_sdus.is_empty());
+    }
+
+    #[test]
+    fn advanced_reconnect_preserves_link_windows_and_buffers() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let reporter = TxReporter::new();
+        {
+            let link = llc.advanced_links.get_mut(&77_468).unwrap();
+            link.next_tx_ns = 3;
+            link.next_rx_ns = 7;
+            link.rx_sdus.insert(
+                7,
+                AdvancedRxSdu {
+                    ns: 7,
+                    segments: BTreeMap::from([(0, BitBuffer::from_bitstr("1010"))]),
+                    final_segment: None,
+                    complete: None,
+                },
+            );
+            link.tx.push_back(AdvancedTxSdu {
+                ns: 2,
+                segments: vec![BitBuffer::from_bitstr("0101")],
+                routes: Vec::new(),
+                chan_alloc: None,
+                endpoint_id: 7,
+                aie_request: AieRequest::clear(AieSubject::Individual { issi: 77_468 }, AieScope::MacData),
+                reporter,
+                attempt_reporter: None,
+                sent_at: None,
+                retransmissions: 0,
+                segment_retransmissions: vec![0],
+                pending_segments: None,
+            });
+        }
+
+        let mut reconnect = BitBuffer::new_autoexpand(16);
+        AlReconnect {
+            acknowledged: true,
+            link_number: 0,
+            report: 0,
+        }
+        .to_bitbuf(&mut reconnect)
+        .unwrap();
+        reconnect.seek(0);
+        let mut indication = advanced_indication(77_468, reconnect);
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut indication.msg else {
+            unreachable!()
+        };
+        prim.endpoint_id = 99;
+        llc.rx_tma_unitdata_ind(&mut queue, indication);
+
+        let link = &llc.advanced_links[&77_468];
+        assert_eq!(link.next_tx_ns, 3);
+        assert_eq!(link.next_rx_ns, 7);
+        assert_eq!(link.tx.len(), 1);
+        assert_eq!(link.rx_sdus.len(), 1);
+        assert_eq!(link.endpoint_id, 99);
+        let SapMsgInner::TmaUnitdataReq(mut response) = queue.pop_front().unwrap().msg else {
+            panic!("expected AL-RECONNECT response")
+        };
+        assert_eq!(AlReconnect::from_bitbuf(&mut response.pdu).unwrap().report, 2);
+    }
+
+    #[test]
     fn advanced_downlink_completes_only_after_al_ack() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
@@ -2156,10 +2488,12 @@ mod tests {
         let mut ack = BitBuffer::new_autoexpand(16);
         AlAck {
             receiver_ready: true,
-            nr: 0,
-            acknowledgement_length: 0,
-            first_missing_segment: None,
-            acknowledgement_bitmap: Vec::new(),
+            blocks: vec![AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
         }
         .to_bitbuf(&mut ack)
         .unwrap();
@@ -2167,6 +2501,73 @@ mod tests {
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert_eq!(reporter.get_state(), TxState::Acknowledged);
         assert!(llc.advanced_links.get(&77_468).unwrap().tx.is_empty());
+    }
+
+    #[test]
+    fn advanced_downlink_processes_every_ack_block_in_the_window() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let mut reporters = Vec::new();
+        for bit in ["0", "1"] {
+            let reporter = TxReporter::new();
+            reporters.push(reporter.clone());
+            llc.rx_tla_tldata_req_bl(
+                &mut queue,
+                SapMsg::new(
+                    Sap::TlaSap,
+                    TetraEntity::Mle,
+                    TetraEntity::Llc,
+                    SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                        main_address: TetraAddress::issi(77_468),
+                        link_id: 0,
+                        endpoint_id: 7,
+                        tl_sdu: BitBuffer::from_bitstr(&bit.repeat(64)),
+                        stealing_permission: false,
+                        subscriber_class: 0,
+                        fcs_flag: true,
+                        packet_data_flag: true,
+                        air_interface_encryption: None,
+                        stealing_repeats_flag: None,
+                        data_class_info: None,
+                        req_handle: 0,
+                        graceful_degradation: None,
+                        chan_alloc: None,
+                        associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                        tx_reporter: Some(reporter),
+                    }),
+                ),
+            );
+        }
+        llc.submit_advanced_link_messages(&mut queue);
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 2);
+
+        let mut ack = BitBuffer::new_autoexpand(32);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![
+                AlAckBlock {
+                    nr: 0,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 1,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+            ],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+
+        assert!(llc.advanced_links[&77_468].tx.is_empty());
+        assert!(reporters.iter().all(|reporter| reporter.get_state() == TxState::Acknowledged));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use tetra_pdus::umac::enums::access_code::AccessCode;
 use tetra_pdus::umac::structs::access_field::AccessField;
 use tetra_pdus::umac::structs::base_frame_length::BaseFrameLength;
 use tetra_pdus::{
+    llc::enums::llc_pdu_type::LlcPduType,
     mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
     umac::{
         enums::{
@@ -202,6 +203,14 @@ impl DlSchedElem {
             Self::FragBuf(fragger) => fragger.is_cancelled(),
             _ => false,
         }
+    }
+
+    fn is_original_advanced_data(&self) -> bool {
+        matches!(
+            self,
+            Self::Resource(_, sdu, _, _)
+                if sdu.peek_bits(4) == Some(LlcPduType::AlDataAlFinal.into_raw())
+        )
     }
 }
 
@@ -1935,6 +1944,19 @@ impl BsChannelScheduler {
                         DlSchedElem::Resource(mut pdu, sdu, tx_reporter, aie_request) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            if sdu.peek_bits(4) == Some(LlcPduType::AlDataAlFinal.into_raw()) && buf.get_len_written() != 0 {
+                                // TIP 6.5 sizes a normal original-link segment
+                                // for a complete SCH/F MAC-RESOURCE.  Starting
+                                // it in the tail of an associated block forces
+                                // an avoidable MAC fragment chain and changes
+                                // the radio retransmission unit.  Finish the
+                                // higher-priority block and start this packet
+                                // data segment in the next slot instead.
+                                self.dltx_next_slot_queue
+                                    .push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+                                buf_opt = Some(buf);
+                                break;
+                            }
                             let facch_ack_addr = (self.is_hangtime(ts.t)
                                 && self.circuits.is_active(Direction::Ul, ts.t)
                                 && tx_reporter.as_ref().is_some_and(TxReporter::expects_ack))
@@ -2184,8 +2206,19 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
-        // Return Resources last
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _, _))) {
+        // Non-packet signalling precedes advanced-link packet data.  This
+        // also ensures that a full-sized AL segment starts in an otherwise
+        // empty SCH/F block instead of forcing a control PDU to wait behind
+        // low-priority IP traffic.
+        if let Some(i) = q
+            .iter()
+            .position(|e| matches!(e, DlSchedElem::Resource(_, _, _, _)) && !e.is_original_advanced_data())
+        {
+            return Some(q.remove(i));
+        }
+
+        // Return advanced-link Resources last.
+        if let Some(i) = q.iter().position(DlSchedElem::is_original_advanced_data) {
             return Some(q.remove(i));
         }
 
@@ -4188,6 +4221,50 @@ mod tests {
         sched.cur_dltime = second_time.add_timeslots(-1);
         let _ = sched.finalize_ts_for_tick();
         assert_eq!(reporter.get_state(), tetra_core::TxState::Transmitted);
+    }
+
+    #[test]
+    fn packet_advanced_segment_waits_for_empty_sch_f_block() {
+        let mut sched = get_testing_slotter();
+        let timeslot = 2;
+        let addr = TetraAddress::issi(77_468);
+        let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+
+        // Deliberately enqueue packet data first.  Ordinary control still has
+        // formatter priority and consumes part of this block.
+        let advanced = BitBuffer::from_bitstr(&format!("1001{}", "0".repeat(221)));
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            advanced,
+            None,
+            aie,
+        );
+        sched.dl_enqueue_tma_on_timeslot(
+            timeslot,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr("00010000"),
+            None,
+            aie,
+        );
+
+        let time = TdmaTime {
+            h: 0,
+            m: 1,
+            f: 1,
+            t: timeslot,
+        };
+        assert!(sched.dl_build_block_from_signalling_schedule(time).is_some());
+        assert!(sched.dltx_next_slot_queue.is_empty());
+        assert_eq!(sched.dltx_queues[timeslot as usize - 1].len(), 1);
+        assert!(
+            sched.dltx_queues[timeslot as usize - 1][0].is_original_advanced_data(),
+            "the AL segment must remain intact for an empty next SCH/F block"
+        );
+        assert!(
+            !matches!(sched.dltx_queues[timeslot as usize - 1][0], DlSchedElem::FragBuf(_)),
+            "the AL segment must not start a MAC fragment chain in residual capacity"
+        );
     }
 
     #[test]

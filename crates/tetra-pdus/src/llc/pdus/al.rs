@@ -134,18 +134,15 @@ impl AlDataHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AlAck {
-    pub receiver_ready: bool,
+pub struct AlAckBlock {
     pub nr: u8,
     pub acknowledgement_length: u8,
     pub first_missing_segment: Option<u8>,
     pub acknowledgement_bitmap: Vec<bool>,
 }
 
-impl AlAck {
-    pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
-        expect_type(buffer, LlcPduType::AlAckAlRnr)?;
-        let receiver_ready = buffer.read_field(1, "flow_control")? != 0;
+impl AlAckBlock {
+    fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
         let nr = buffer.read_field(3, "nr")? as u8;
         let acknowledgement_length = buffer.read_field(6, "acknowledgement_length")? as u8;
         let first_missing_segment = if (1..=62).contains(&acknowledgement_length) {
@@ -170,7 +167,6 @@ impl AlAck {
             }
         }
         Ok(Self {
-            receiver_ready,
             nr,
             acknowledgement_length,
             first_missing_segment,
@@ -178,7 +174,7 @@ impl AlAck {
         })
     }
 
-    pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+    fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
         if self.nr > 7
             || self.acknowledgement_length > 63
             || ((1..=62).contains(&self.acknowledgement_length) != self.first_missing_segment.is_some())
@@ -189,8 +185,6 @@ impl AlAck {
                 reason: "invalid acknowledgement block",
             });
         }
-        buffer.write_bits(LlcPduType::AlAckAlRnr.into_raw(), 4);
-        buffer.write_bit(self.receiver_ready as u8);
         buffer.write_bits(self.nr.into(), 3);
         buffer.write_bits(self.acknowledgement_length.into(), 6);
         if let Some(segment) = self.first_missing_segment {
@@ -198,6 +192,58 @@ impl AlAck {
             for received in &self.acknowledgement_bitmap {
                 buffer.write_bit(*received as u8);
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlAck {
+    pub receiver_ready: bool,
+    /// Original-link acknowledgement blocks, oldest TL-SDU first.  There is
+    /// no block count on the air interface: blocks continue to the end of the
+    /// LLC PDU and may cover up to the negotiated N.272 window.
+    pub blocks: Vec<AlAckBlock>,
+}
+
+impl AlAck {
+    pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
+        expect_type(buffer, LlcPduType::AlAckAlRnr)?;
+        let receiver_ready = buffer.read_field(1, "flow_control")? != 0;
+        let mut blocks = Vec::new();
+        while buffer.get_len_remaining() != 0 {
+            if buffer.get_len_remaining() < 9 {
+                return Err(PduParseErr::BufferEnded {
+                    field: Some("acknowledgement_block"),
+                });
+            }
+            blocks.push(AlAckBlock::from_bitbuf(buffer)?);
+            if blocks.len() > 3 {
+                return Err(PduParseErr::InvalidValue {
+                    field: "acknowledgement_blocks",
+                    value: (blocks.len() as u8).into(),
+                });
+            }
+        }
+        if blocks.is_empty() {
+            return Err(PduParseErr::BufferEnded {
+                field: Some("first_acknowledgement_block"),
+            });
+        }
+        Ok(Self { receiver_ready, blocks })
+    }
+
+    pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        if self.blocks.is_empty() || self.blocks.len() > 3 {
+            return Err(PduParseErr::Inconsistency {
+                field: "al_ack",
+                reason: "original advanced link requires one to three acknowledgement blocks",
+            });
+        }
+        buffer.write_bits(LlcPduType::AlAckAlRnr.into_raw(), 4);
+        buffer.write_bit(self.receiver_ready as u8);
+        for block in &self.blocks {
+            block.to_bitbuf(buffer)?;
         }
         Ok(())
     }
@@ -320,15 +366,49 @@ mod tests {
     fn whole_sdu_ack_has_no_segment_fields() {
         let ack = AlAck {
             receiver_ready: true,
-            nr: 5,
-            acknowledgement_length: 0,
-            first_missing_segment: None,
-            acknowledgement_bitmap: Vec::new(),
+            blocks: vec![AlAckBlock {
+                nr: 5,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
         };
         let mut bits = BitBuffer::new_autoexpand(16);
         ack.to_bitbuf(&mut bits).unwrap();
         assert_eq!(bits.get_len_written(), 14);
         bits.seek(0);
         assert_eq!(AlAck::from_bitbuf(&mut bits).unwrap(), ack);
+    }
+
+    #[test]
+    fn original_ack_round_trips_multiple_window_blocks() {
+        let ack = AlAck {
+            receiver_ready: true,
+            blocks: vec![
+                AlAckBlock {
+                    nr: 7,
+                    acknowledgement_length: 3,
+                    first_missing_segment: Some(1),
+                    acknowledgement_bitmap: vec![true, false],
+                },
+                AlAckBlock {
+                    nr: 0,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 1,
+                    acknowledgement_length: 1,
+                    first_missing_segment: Some(0),
+                    acknowledgement_bitmap: Vec::new(),
+                },
+            ],
+        };
+        let mut bits = BitBuffer::new_autoexpand(64);
+        ack.to_bitbuf(&mut bits).unwrap();
+        bits.seek(0);
+        assert_eq!(AlAck::from_bitbuf(&mut bits).unwrap(), ack);
+        assert_eq!(bits.get_len_remaining(), 0);
     }
 }
