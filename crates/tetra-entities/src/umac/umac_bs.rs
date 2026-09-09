@@ -694,6 +694,22 @@ impl UmacBs {
         })
     }
 
+    /// Resolve the cipher context of an event-label-addressed uplink.  The
+    /// event label has already identified the terminal, so there is no ESI
+    /// in this MAC header to invert.  Assigned-channel packet data still
+    /// uses the terminal's normal SC2/SC3 policy and the exact uplink slot.
+    fn resolve_assigned_uplink_context(
+        &self,
+        issi: u32,
+        time: TdmaTime,
+        scope: AieScope,
+    ) -> Result<tetra_core::AieContext, AieContextError> {
+        let request = self
+            .active_aie_request(AieSubject::Individual { issi }, scope)
+            .ok_or(AieContextError::InvalidContext)?;
+        self.aie_provider.resolve(request, AieDirection::Uplink, time)
+    }
+
     fn private_endpoint_traffic_subjects(call_id: u16, rf_endpoint_issi: u32) -> (AieSubject, AieSubject) {
         let endpoint = AieSubject::Call {
             call_id: u32::from(call_id),
@@ -1085,18 +1101,41 @@ impl UmacBs {
         // Handle reservation if present
         let msg_dltime = prim.ul_time;
         let aie_request = if pdu.encrypted {
-            // MAC-DATA's header and ESI are clear.  Resolve the ESI and
-            // decrypt only the remaining TM-SDU at the exact received UL
-            // TDMA time, before either defragmentation or LLC/FCS handling.
-            if addr.ssi_type != SsiType::Esi {
-                tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-DATA without an ESI");
-                return;
-            }
-            let (issi, context) = match self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(?error, "rejecting encrypted MAC-DATA with unknown or stale SC2 ESI");
+            // An event label identifies the assigned terminal directly; an
+            // ordinary MAC-DATA header instead carries the reversible ESI.
+            // In both cases only the remaining TM-SDU is ciphered.
+            let (issi, context) = if pdu.event_label.is_some() {
+                if addr.ssi_type != SsiType::Issi {
+                    tracing::warn!(address_type = ?addr.ssi_type, "rejecting event-label MAC-DATA without an ISSI binding");
                     return;
+                }
+                let issi = addr.ssi;
+                let context = match self.resolve_assigned_uplink_context(issi, msg_dltime, AieScope::MacData) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        if matches!(error, AieContextError::DckNotProvisioned(_) | AieContextError::DckExpired(_)) {
+                            self.aie_provider.request_sc3_dck(issi);
+                        }
+                        tracing::warn!(
+                            ?error,
+                            issi,
+                            "rejecting encrypted event-label MAC-DATA without an active cipher context"
+                        );
+                        return;
+                    }
+                };
+                (issi, context)
+            } else {
+                if addr.ssi_type != SsiType::Esi {
+                    tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-DATA without an ESI");
+                    return;
+                }
+                match self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(?error, "rejecting encrypted MAC-DATA with unknown or stale SC2 ESI");
+                        return;
+                    }
                 }
             };
             addr = TetraAddress::issi(issi);
@@ -1286,15 +1325,28 @@ impl UmacBs {
         // first fragment is queued, otherwise a MAC-ACCESS ACK/grant cannot
         // be returned and the MS must retry the registration in clear.
         let aie_request = if pdu.encrypted {
-            if addr.ssi_type != SsiType::Esi {
-                tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-ACCESS without an ESI");
-                return;
-            }
             let payload_start = prim.pdu.get_pos();
             let payload_len = prim.pdu.get_len_remaining();
-            match self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
+            let event_label_addressed = pdu.event_label.is_some();
+            let resolved = if event_label_addressed {
+                if addr.ssi_type != SsiType::Issi {
+                    tracing::warn!(address_type = ?addr.ssi_type, "rejecting event-label MAC-ACCESS without an ISSI binding");
+                    return;
+                }
+                let issi = addr.ssi;
+                self.resolve_assigned_uplink_context(issi, msg_dltime, AieScope::MacData)
+                    .map(|context| (issi, context))
+            } else {
+                if addr.ssi_type != SsiType::Esi {
+                    tracing::warn!(address_type = ?addr.ssi_type, "rejecting encrypted MAC-ACCESS without an ESI");
+                    return;
+                }
+                self.aie_provider.resolve_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData)
+            };
+            match resolved {
                 // Ordinary post-registration SC2: resolve the existing
                 // session before forwarding its real ISSI to higher layers.
+                // On a PDCH, the event-label binding already supplies ISSI.
                 Ok((issi, context)) => {
                     if let Err(error) = self
                         .aie_provider
@@ -1315,7 +1367,7 @@ impl UmacBs {
                 // with inverse TA61 and establish a provisional cipher
                 // binding; SwMI authentication/registration remains the
                 // authority for access.
-                Err(AieContextError::SubjectNotProvisioned) => {
+                Err(AieContextError::SubjectNotProvisioned) if !event_label_addressed => {
                     let (issi, context) = match self.aie_provider.bind_unbound_uplink_esi(addr.ssi, msg_dltime, AieScope::MacData) {
                         Ok(value) => value,
                         Err(error) => {
@@ -1332,6 +1384,13 @@ impl UmacBs {
                     }
                     addr = TetraAddress::issi(issi);
                     AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacData)
+                }
+                Err(AieContextError::SubjectNotProvisioned) => {
+                    tracing::warn!(
+                        issi = addr.ssi,
+                        "rejecting encrypted event-label MAC-ACCESS without an active terminal session"
+                    );
+                    return;
                 }
                 Err(AieContextError::DckNotProvisioned(issi) | AieContextError::DckExpired(issi)) => {
                     self.aie_provider.request_sc3_dck(issi);
@@ -3527,6 +3586,50 @@ mod tests {
         assert_eq!(pdu.addr.map(|address| address.ssi), Some(issi));
         assert_eq!(pdu.event_label, Some(3));
         assert_eq!(pdu.usage_marker, None);
+    }
+
+    #[test]
+    fn packet_event_label_resolves_the_assigned_terminals_uplink_dck() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let config = SharedConfig::from_parts(config, None);
+        let issi = 77_479;
+        {
+            let mut state = config.state_write();
+            state.aie.enabled = true;
+            state.aie.sc3 = Some(tetra_config::bluestation::RuntimeSc3Aie::new(
+                tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea1,
+                1,
+                [0x11; 10],
+                true,
+                true,
+            ));
+            state.aie.sc3.as_mut().expect("SC3 configured").install_dck(
+                issi,
+                tetra_config::bluestation::RuntimeSc3Dck::new([0x22; 16], [0x33; 10], true, None),
+            );
+            state.aie_sessions.set_terminal_class(issi, TerminalSecurityClass::Sc3, None);
+        }
+        let mut umac = UmacBs::new(config);
+        assert!(umac.event_label_store.bind(4, TetraAddress::issi(issi)));
+
+        let address = umac.event_label_store.get_addr_by_label(4).expect("assigned label");
+        let context = umac
+            .resolve_assigned_uplink_context(address.ssi, TdmaTime::default(), AieScope::MacData)
+            .expect("assigned SC3 uplink context");
+
+        assert!(matches!(
+            context,
+            tetra_core::AieContext::Sc3 {
+                subject: AieSubject::Individual { issi: found },
+                direction: AieDirection::Uplink,
+                scope: AieScope::MacData,
+                ..
+            } if found == issi
+        ));
     }
 
     #[test]
