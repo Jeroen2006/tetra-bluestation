@@ -1141,6 +1141,79 @@ impl Sndcp {
                     });
                 }
             }
+            PacketDataMessage::ContextRelease {
+                itsi,
+                session_id,
+                session_generation,
+            } => {
+                let issi = itsi as u32;
+                let Some(context) = self
+                    .contexts
+                    .get(&issi)
+                    .filter(|context| context.session() == Some((session_id, session_generation)))
+                    .cloned()
+                else {
+                    return;
+                };
+                self.contexts.remove(&issi);
+                self.pending_commands.retain(|_, pending_issi| *pending_issi != issi);
+                self.pending_ms_deactivations.retain(|_, pending| pending.issi != issi);
+                self.pending_network_deactivations.remove(&issi);
+                self.pending_deliveries
+                    .retain(|pending| pending.session_id != session_id || pending.session_generation != session_generation);
+
+                let Some((bearer_id, bearer_generation, event_label)) = context
+                    .bearer_id
+                    .zip(context.bearer_generation)
+                    .zip(context.event_label)
+                    .map(|((bearer_id, generation), event_label)| (bearer_id, generation, event_label))
+                else {
+                    return;
+                };
+                let bearer_state = self
+                    .bearers
+                    .get_mut(&bearer_id)
+                    .filter(|bearer| bearer.generation == bearer_generation)
+                    .map(|bearer| {
+                        bearer.members.remove(&issi);
+                        (
+                            bearer.members.is_empty(),
+                            bearer.draining,
+                            bearer.command_id,
+                            bearer.timeslot_bitmap,
+                            bearer.members.len().min(u16::MAX as usize) as u16,
+                        )
+                    });
+                let Some((empty, draining, command_id, timeslot_bitmap, member_count)) = bearer_state else {
+                    return;
+                };
+                queue.push_back(SapMsg::new(
+                    Sap::Control,
+                    TetraEntity::Sndcp,
+                    TetraEntity::Umac,
+                    SapMsgInner::PacketBearerControl(PacketBearerControl::Detach {
+                        bearer_id,
+                        generation: bearer_generation,
+                        event_label,
+                    }),
+                ));
+                if empty {
+                    self.release_bearer(queue, bearer_id, bearer_generation, false);
+                } else {
+                    self.submit(PacketDataMessage::BearerReport {
+                        command_id,
+                        bearer_id,
+                        bearer_generation,
+                        state: if draining {
+                            PacketBearerState::Draining
+                        } else {
+                            PacketBearerState::Ready
+                        },
+                        timeslot_bitmap,
+                        member_count,
+                    });
+                }
+            }
             PacketDataMessage::BearerControl {
                 command_id,
                 bearer_id,
@@ -1362,6 +1435,54 @@ mod tests {
         assert_eq!(context.nsapi, 1);
         assert_eq!(context.snei, Some(8));
         assert_eq!(context.session(), None);
+    }
+
+    #[test]
+    fn roaming_release_removes_old_context_and_empty_bearer() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        sndcp.contexts.insert(
+            77_468,
+            RadioContext {
+                issi: 77_468,
+                endpoint_id: 7,
+                link_id: 8,
+                nsapi: 1,
+                snei: Some(8),
+                session_id: Some(8),
+                session_generation: Some(1),
+                bearer_id: Some(17),
+                bearer_generation: Some(4),
+                timeslot_bitmap: 0b0010,
+                event_label: Some(23),
+                chap_identifier: None,
+                dynamic_address: true,
+            },
+        );
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::ContextRelease {
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 1,
+            },
+        );
+
+        assert!(!sndcp.contexts.contains_key(&77_468));
+        assert!(!sndcp.bearers.contains_key(&17));
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(2));
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                message.msg,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Detach {
+                    bearer_id: 17,
+                    generation: 4,
+                    event_label: 23,
+                })
+            )
+        }));
     }
 
     #[test]

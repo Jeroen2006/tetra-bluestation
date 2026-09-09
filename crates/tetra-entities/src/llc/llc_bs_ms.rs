@@ -1260,6 +1260,10 @@ impl Llc {
 
         // Construct PDU, write header
         let mut pdu_buf = BitBuffer::new_autoexpand(32);
+        let sdu_len = prim.tl_sdu.get_len_remaining();
+        let checksum = prim
+            .fcs_flag
+            .then(|| fcs::compute_fcs(&prim.tl_sdu, prim.tl_sdu.get_pos(), prim.tl_sdu.get_len()));
 
         // Determine message type and build
         if let Some(out_ack_n) = out_ack_n {
@@ -1271,8 +1275,10 @@ impl Llc {
             };
             pdu.to_bitbuf(&mut pdu_buf);
             // Append SDU
-            let sdu_len = prim.tl_sdu.get_len_remaining();
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+            if let Some(checksum) = checksum {
+                pdu_buf.write_bits(checksum.into(), 32);
+            }
             pdu_buf.seek(0);
             tracing::debug!(ts=%self.dltime, "-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         } else {
@@ -1283,8 +1289,10 @@ impl Llc {
             };
             pdu.to_bitbuf(&mut pdu_buf);
             // Append SDU
-            let sdu_len = prim.tl_sdu.get_len_remaining();
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+            if let Some(checksum) = checksum {
+                pdu_buf.write_bits(checksum.into(), 32);
+            }
             pdu_buf.seek(0);
             tracing::debug!(ts=%self.dltime, "-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         }
@@ -2080,6 +2088,49 @@ mod tests {
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert_eq!(reporter.get_state(), TxState::Acknowledged);
         assert!(llc.advanced_links.get(&77_468).unwrap().tx.is_empty());
+    }
+
+    #[test]
+    fn basic_downlink_with_fcs_appends_a_valid_checksum() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        let payload = BitBuffer::from_bitstr("10100101100101101010010110010");
+        let payload_len = payload.get_len_remaining();
+
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: payload,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: false,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        let SapMsgInner::TmaUnitdataReq(mut request) = llc.outbound_messages[0].retransmission_buf.msg.clone() else {
+            panic!("expected buffered TMA request")
+        };
+        assert_eq!(request.pdu.get_len_remaining(), 5 + payload_len + 32);
+        let header = BlData::from_bitbuf(&mut request.pdu).expect("BL-DATA header");
+        assert!(header.has_fcs);
+        assert!(fcs::check_fcs(&request.pdu));
     }
 
     #[test]
