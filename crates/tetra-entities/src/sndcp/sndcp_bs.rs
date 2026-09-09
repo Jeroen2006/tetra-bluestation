@@ -1161,6 +1161,11 @@ impl Sndcp {
                 if !recovering && context.session_generation != Some(session_generation) {
                     return;
                 }
+                let bearer_unchanged = accepted
+                    && response != PacketAccessResponse::None
+                    && context.bearer_id == Some(bearer_id)
+                    && context.timeslot_bitmap == timeslot_bitmap
+                    && context.event_label == Some(event_label);
                 if accepted {
                     context.session_id = Some(session_id);
                     context.session_generation = Some(session_generation);
@@ -1172,7 +1177,7 @@ impl Sndcp {
                         if let Some(bearer) = self.bearers.get_mut(&bearer_id) {
                             bearer.members.insert(issi);
                         }
-                        if let Some(generation) = context.bearer_generation {
+                        if !bearer_unchanged && let Some(generation) = context.bearer_generation {
                             queue.push_back(SapMsg::new(
                                 Sap::Control,
                                 TetraEntity::Sndcp,
@@ -1189,7 +1194,11 @@ impl Sndcp {
                 }
                 let context = context.clone();
                 self.publish_delivery_routes(&context);
-                let chan_alloc = (accepted && response != PacketAccessResponse::None).then(|| {
+                // A repeated READY-state access on the same bearer is answered
+                // on that PDCH. Repeating the Replace allocation forces LLC
+                // back to CCCH after the MS has already changed channel and
+                // leaves the MS retransmitting SN-RECONNECT indefinitely.
+                let chan_alloc = (accepted && response != PacketAccessResponse::None && !bearer_unchanged).then(|| {
                     let usage = PACKET_USAGE_BASE + (event_label as u8 & 0x0f);
                     Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)
                 });
@@ -1840,6 +1849,58 @@ mod tests {
         assert_eq!(context.snei, Some(8));
         assert_eq!(context.session(), None);
         assert_eq!(sndcp.pending_commands.get(&1), Some(&77_468));
+    }
+
+    #[test]
+    fn repeated_access_response_stays_on_existing_pdch() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        let bearer = sndcp.bearers.get_mut(&17).unwrap();
+        bearer.draining = false;
+        bearer.timeslot_bitmap = 0b0010;
+        sndcp.contexts.insert(
+            77_468,
+            RadioContext {
+                issi: 77_468,
+                endpoint_id: 7,
+                link_id: 8,
+                nsapi: 1,
+                snei: Some(8),
+                session_id: Some(8),
+                session_generation: Some(2),
+                bearer_id: Some(17),
+                bearer_generation: Some(4),
+                timeslot_bitmap: 0b0010,
+                event_label: Some(23),
+                chap_identifier: None,
+                dynamic_address: true,
+            },
+        );
+        sndcp.pending_commands.insert(9, 77_468);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::AccessResult {
+                command_id: 9,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 2,
+                accepted: true,
+                cause: None,
+                response: PacketAccessResponse::TransmitResponse,
+                bearer_id: 17,
+                timeslot_bitmap: 0b0010,
+                event_label: 23,
+            },
+        );
+
+        let SapMsgInner::LtpdMleUnitdataReq(request) = queue.pop_front().expect("transmit response").msg else {
+            panic!("expected LTPD unitdata request");
+        };
+        assert!(request.chan_alloc.is_none());
+        assert_eq!(request.associated_channel.as_ref().map(|route| route.timeslot), Some(2));
+        assert!(queue.pop_front().is_none(), "existing bearer must not be attached twice");
     }
 
     #[test]
