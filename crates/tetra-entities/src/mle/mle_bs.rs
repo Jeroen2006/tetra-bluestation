@@ -23,10 +23,20 @@ use tetra_pdus::mle::pdus::{
     d_new_cell::DNewCell, d_prepare_fail::DPrepareFail, d_restore_ack::DRestoreAck, d_restore_fail::DRestoreFail, u_prepare::UPrepare,
     u_restore::URestore,
 };
+
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+
+fn mle_upper_layer_route(discriminator: MleProtocolDiscriminator) -> Option<(Sap, TetraEntity)> {
+    match discriminator {
+        MleProtocolDiscriminator::Mm => Some((Sap::LmmSap, TetraEntity::Mm)),
+        MleProtocolDiscriminator::Cmce => Some((Sap::LcmcSap, TetraEntity::Cmce)),
+        MleProtocolDiscriminator::Sndcp => Some((Sap::TlpdSap, TetraEntity::Sndcp)),
+        MleProtocolDiscriminator::Mle | MleProtocolDiscriminator::TetraManagementEntity => None,
+    }
+}
 
 pub struct MleBs {
     config: SharedConfig,
@@ -580,6 +590,7 @@ impl MleBs {
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Cmce => {
+                let (sap, dest) = mle_upper_layer_route(pdu_type).expect("CMCE upper-layer route");
                 let m = LcmcMleUnitdataInd {
                     sdu,
                     handle: 0,
@@ -590,14 +601,15 @@ impl MleBs {
                     chan_change_handle: None,    // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::TlpdSap,
+                    sap,
                     src: TetraEntity::Mle,
-                    dest: TetraEntity::Sndcp,
+                    dest,
                     msg: SapMsgInner::LcmcMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Sndcp => {
+                let (sap, dest) = mle_upper_layer_route(pdu_type).expect("SNDCP upper-layer route");
                 let m = LtpdMleUnitdataInd {
                     sdu,
                     endpoint_id: prim.endpoint_id,
@@ -607,9 +619,9 @@ impl MleBs {
                     chan_change_handle: None,    // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap,
                     src: TetraEntity::Mle,
-                    dest: TetraEntity::Cmce,
+                    dest,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -1063,6 +1075,18 @@ impl TetraEntityTrait for MleBs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledged_mle_payloads_route_to_their_own_upper_layer() {
+        assert_eq!(
+            mle_upper_layer_route(MleProtocolDiscriminator::Cmce),
+            Some((Sap::LcmcSap, TetraEntity::Cmce))
+        );
+        assert_eq!(
+            mle_upper_layer_route(MleProtocolDiscriminator::Sndcp),
+            Some((Sap::TlpdSap, TetraEntity::Sndcp))
+        );
+    }
 
     #[test]
     fn network_broadcast_repeats_every_five_multiframes_on_ts1() {
