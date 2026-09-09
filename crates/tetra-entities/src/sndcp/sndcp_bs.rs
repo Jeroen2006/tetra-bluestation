@@ -348,7 +348,16 @@ impl Sndcp {
             return false;
         }
         sdu.seek(0);
-        let associated_channel = if chan_alloc.is_some() { None } else { self.route_for(context) };
+        // A Replace allocation is the CCCH-to-PDCH assignment and therefore
+        // has to be sent on the current common channel.  QuitAndGo is the
+        // inverse transition: the MS is still listening on its PDCH until it
+        // receives this PDU, so route it over the existing bearer.  Sending a
+        // QuitAndGo on the CCCH leaves the MS unaware of the release and the
+        // acknowledged link reporter can never complete.
+        let associated_channel = match chan_alloc.as_ref().map(|allocation| allocation.alloc_type) {
+            Some(ChanAllocType::QuitAndGo) | None => self.route_for(context),
+            Some(_) => None,
+        };
         queue.push_back(SapMsg::new(
             Sap::TlpdSap,
             TetraEntity::Sndcp,
@@ -1844,6 +1853,15 @@ mod tests {
         };
         assert!(!SnEndOfData::from_bitbuf(&mut response.sdu).unwrap().immediate_service_change);
         assert!(response.chan_alloc.is_some());
+        assert_eq!(
+            response.associated_channel,
+            Some(AssociatedChannel {
+                call_id: 17,
+                timeslot: 2,
+                usage: PACKET_USAGE_BASE + (23 & 0x0f),
+                best_effort_key: None,
+            })
+        );
         assert!(sndcp.bearers.contains_key(&17));
         assert_eq!(sndcp.pending_standby.len(), 1);
 
