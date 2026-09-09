@@ -679,30 +679,45 @@ impl BsChannelScheduler {
 
     ///////// UPLINK GRANT PROCESSING /////////
 
-    /// Finds a grant opportunity for uplink transmission
+    /// Return the timeslots that count as consecutive signalling
+    /// opportunities for a basic slot grant received on `timeslot`.
+    ///
+    /// TTR 001-05 section 6.10 requires every timeslot in a multislot PDCH to
+    /// be counted for granting delay and reserved access. Circuit and common
+    /// control channels continue to have one opportunity per TDMA frame.
+    fn basic_grant_timeslots(&self, timeslot: u8) -> Vec<u8> {
+        let Some(bearer) = self.packet_bearers.get(timeslot as usize - 1).copied().flatten() else {
+            return vec![timeslot];
+        };
+
+        (2..=4)
+            .filter(|candidate| self.packet_bearers[*candidate as usize - 1] == Some(bearer))
+            .collect()
+    }
+
+    /// Finds a grant opportunity for uplink transmission.
     /// If num_slots is 1, is_halfslot may specifiy whether only a half slot is needed
     /// Returns (opportunities_to_skip, Vec<timestamps_of_granted_slots>)
     /// Returns None if no suitable opportunity is found in the schedule
     pub fn ul_find_grant_opportunity(&self, t: u8, num_slots: usize, is_halfslot: bool) -> Option<(usize, Vec<TdmaTime>)> {
         let first_opportunity = self.cur_dltime.forward_to_timeslot(t);
+        let channel_timeslots = self.basic_grant_timeslots(t);
         let mut grant_timeslots = Vec::with_capacity(num_slots);
         let mut opportunities_skipped = 0;
 
         assert!(!is_halfslot || num_slots == 1, "is_halfslot set for num_slots > 1");
 
-        // Include all 18 frames.  In an active UL-TCH only FN18 remains an
-        // eligible associated-access opportunity for another terminal.
-        for dist in 0..MACSCHED_NUM_FRAMES {
-            // let candidate_t = self.cur_ts.add_timeslots(dist as i32 * 4);
-            // Base off of internal perception of time, convert to UL time
-            // Below may crash someday, but I'd want to investigate that situation
-            let candidate_t = first_opportunity.add_timeslots(dist as i32 * 4);
-            assert!(
-                candidate_t.t == first_opportunity.t,
-                "ul_find_grant_opportunity: candidate_t.ts {} does not match requested ts {}. Please report this to developer. ",
-                candidate_t.t,
-                first_opportunity.t
-            );
+        // Include all 18 schedule frames. In an active UL-TCH only FN18
+        // remains an eligible associated-access opportunity for another
+        // terminal.
+        // Walk absolute slots so all members of a multislot PDCH are counted.
+        // The ring contains 18 frames per physical timeslot, hence 18 * 4 is
+        // the largest useful search horizon without revisiting a reservation.
+        for dist in 0..MACSCHED_NUM_FRAMES * 4 {
+            let candidate_t = first_opportunity.add_timeslots(dist as i32);
+            if !channel_timeslots.contains(&candidate_t.t) {
+                continue;
+            }
 
             tracing::debug!(
                 "ul_find_grant_opportunity: considering candidate ul_ts {}, have {:?}",
@@ -719,12 +734,12 @@ impl BsChannelScheduler {
             // receive associated access only in the control frame, avoiding a
             // collision with the active speaker.  During hangtime the slot is
             // FACCH again and normal grant selection remains available.
-            if self.circuits.is_active(Direction::Ul, t) && !self.is_hangtime(t) && candidate_t.f != 18 {
+            if self.circuits.is_active(Direction::Ul, candidate_t.t) && !self.is_hangtime(candidate_t.t) && candidate_t.f != 18 {
                 continue;
             }
 
             let index = self.ul_ts_to_sched_index(&candidate_t);
-            let elem = &self.ulsched[t as usize - 1][index];
+            let elem = &self.ulsched[candidate_t.t as usize - 1][index];
             // tracing::debug!("ul_find_grant_opportunity: sched[{}] ts {}: {:?}", index, candidate_t, elem);
             if (elem.ul1.is_none() && elem.ul2.is_none()) || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none())) {
                 // Free UL slot, add this timeslot to result vec
@@ -3366,6 +3381,32 @@ mod tests {
 
         assert_eq!(grant2.capacity_allocation, BasicSlotgrantCapAlloc::Grant3Slots);
         assert_eq!(grant2.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    }
+
+    #[test]
+    fn multislot_packet_grant_counts_every_assigned_timeslot() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+
+        let grant = sched
+            .ul_process_cap_req(4, TetraAddress::issi(77_479), &ReservationRequirement::Req8Slots)
+            .expect("three-slot PDCH must provide eight consecutive opportunities");
+
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant8Slots);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity);
+        let first = sched.cur_dltime.forward_to_timeslot(4);
+        let expected_offsets = [0, 2, 3, 4, 6, 7, 8, 10];
+        for offset in expected_offsets {
+            assert_eq!(
+                sched.ul_get_slot_owner(first.add_timeslots(offset), PhyBlockNum::Both),
+                Some(77_479)
+            );
+        }
+        assert_eq!(
+            sched.ul_get_slot_owner(first.add_timeslots(1), PhyBlockNum::Both),
+            None,
+            "TS1 is not part of the packet bearer"
+        );
     }
 
     #[test]
