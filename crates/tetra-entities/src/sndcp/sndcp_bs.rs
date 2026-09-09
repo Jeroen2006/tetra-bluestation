@@ -19,8 +19,8 @@ use tetra_saps::{
     tma::AssociatedChannel,
 };
 use tetra_swmi_protocol::{
-    ChapProof, PacketAddressRequest, PacketBearerAction, PacketBearerState, PacketDataMessage, PacketDeliveryStatus, PacketRejectCause,
-    PacketResourceRequest, SwmiMessage,
+    ChapProof, PacketAccessResponse, PacketAddressRequest, PacketBearerAction, PacketBearerState, PacketDataMessage, PacketDeliveryStatus,
+    PacketRejectCause, PacketResourceRequest, SwmiMessage,
 };
 
 use crate::{MessageQueue, TetraEntityTrait, net_swmi::SwmiPacketEndpoint};
@@ -519,10 +519,39 @@ impl Sndcp {
                 });
             }
             SndcpUplink::TransmitRequest { resource, .. } => {
-                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, false);
+                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, false, true);
             }
-            SndcpUplink::Reconnect { resource, .. } => {
-                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, true);
+            SndcpUplink::Reconnect {
+                data_to_send,
+                nsapi,
+                snei,
+                resource,
+            } => {
+                if !self.contexts.contains_key(&issi) {
+                    let Some(snei) = snei else {
+                        tracing::warn!(issi, "cannot recover roaming SNDCP context without SNEI");
+                        return;
+                    };
+                    self.contexts.insert(
+                        issi,
+                        RadioContext {
+                            issi,
+                            endpoint_id: prim.endpoint_id,
+                            link_id: prim.link_id,
+                            nsapi: nsapi.unwrap_or(DEFAULT_NSAPI),
+                            snei: Some(snei),
+                            session_id: None,
+                            session_generation: None,
+                            bearer_id: None,
+                            bearer_generation: None,
+                            timeslot_bitmap: 0,
+                            event_label: None,
+                            chap_identifier: None,
+                            dynamic_address: true,
+                        },
+                    );
+                }
+                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, true, data_to_send);
             }
             SndcpUplink::EndOfData { immediate_service_change } => {
                 let Some(context) = self.contexts.get(&issi).cloned() else {
@@ -540,10 +569,20 @@ impl Sndcp {
                     immediate_service_change,
                 });
             }
-            SndcpUplink::PageResponse { available, resource, .. } => {
+            SndcpUplink::PageResponse {
+                nsapi,
+                available,
+                logical_link_status: _,
+                snei,
+                resource,
+            } => {
                 let Some(context) = self.contexts.get_mut(&issi) else {
                     return;
                 };
+                if nsapi != context.nsapi || snei.is_some_and(|value| context.snei != Some(value)) {
+                    tracing::warn!(issi, nsapi, ?snei, "ignoring SNDCP page response for another context");
+                    return;
+                }
                 context.endpoint_id = prim.endpoint_id;
                 context.link_id = prim.link_id;
                 let context = context.clone();
@@ -573,6 +612,7 @@ impl Sndcp {
         link_id: LinkId,
         resource: Option<SndcpResourceRequest>,
         reconnect: bool,
+        data_to_send: bool,
     ) {
         let Some(context) = self.contexts.get_mut(&issi) else {
             return;
@@ -580,9 +620,10 @@ impl Sndcp {
         context.endpoint_id = endpoint_id;
         context.link_id = link_id;
         let context = context.clone();
-        let Some((session_id, session_generation)) = context.session() else {
+        let (session_id, session_generation) = context.session().unwrap_or((0, 0));
+        if session_id == 0 && (!reconnect || context.snei.is_none()) {
             return;
-        };
+        }
         let command_id = self.next_command();
         self.pending_commands.insert(command_id, issi);
         self.submit(PacketDataMessage::Access {
@@ -592,8 +633,9 @@ impl Sndcp {
             registration_generation: self.registration_generation(issi),
             session_id,
             session_generation,
-            data_to_send: true,
+            data_to_send,
             reconnect,
+            snei: context.snei,
             resource: Self::resource(resource),
         });
     }
@@ -886,8 +928,10 @@ impl Sndcp {
             PacketDataMessage::AccessResult {
                 command_id,
                 itsi,
+                session_id,
                 accepted,
                 cause,
+                response,
                 bearer_id,
                 timeslot_bitmap,
                 event_label,
@@ -901,46 +945,73 @@ impl Sndcp {
                 let Some(context) = self.contexts.get_mut(&issi) else {
                     return;
                 };
-                if context.session_generation != Some(session_generation) {
+                let recovering = context.session_id.is_none() && context.session_generation.is_none();
+                if !recovering && context.session_generation != Some(session_generation) {
                     return;
                 }
                 if accepted {
-                    context.bearer_id = Some(bearer_id);
-                    context.bearer_generation = self.bearers.get(&bearer_id).map(|bearer| bearer.generation);
-                    context.timeslot_bitmap = timeslot_bitmap;
-                    context.event_label = Some(event_label);
-                    if let Some(bearer) = self.bearers.get_mut(&bearer_id) {
-                        bearer.members.insert(issi);
-                    }
-                    if let Some(generation) = context.bearer_generation {
-                        queue.push_back(SapMsg::new(
-                            Sap::Control,
-                            TetraEntity::Sndcp,
-                            TetraEntity::Umac,
-                            SapMsgInner::PacketBearerControl(PacketBearerControl::Attach {
-                                bearer_id,
-                                generation,
-                                issi,
-                                event_label,
-                            }),
-                        ));
+                    context.session_id = Some(session_id);
+                    context.session_generation = Some(session_generation);
+                    if response != PacketAccessResponse::None {
+                        context.bearer_id = Some(bearer_id);
+                        context.bearer_generation = self.bearers.get(&bearer_id).map(|bearer| bearer.generation);
+                        context.timeslot_bitmap = timeslot_bitmap;
+                        context.event_label = Some(event_label);
+                        if let Some(bearer) = self.bearers.get_mut(&bearer_id) {
+                            bearer.members.insert(issi);
+                        }
+                        if let Some(generation) = context.bearer_generation {
+                            queue.push_back(SapMsg::new(
+                                Sap::Control,
+                                TetraEntity::Sndcp,
+                                TetraEntity::Umac,
+                                SapMsgInner::PacketBearerControl(PacketBearerControl::Attach {
+                                    bearer_id,
+                                    generation,
+                                    issi,
+                                    event_label,
+                                }),
+                            ));
+                        }
                     }
                 }
                 let context = context.clone();
-                let usage = PACKET_USAGE_BASE + (event_label as u8 & 0x0f);
-                let chan_alloc = accepted.then(|| Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace));
-                self.queue_downlink(
-                    queue,
-                    &context,
-                    SndcpDownlink::TransmitResponse {
-                        nsapi: context.nsapi,
-                        accepted,
-                        cause: (!accepted).then_some(Self::transmit_reject_cause(cause)),
-                        snei: context.snei,
-                    },
-                    Layer2Service::Acknowledged,
-                    chan_alloc,
-                );
+                let chan_alloc = (accepted && response != PacketAccessResponse::None).then(|| {
+                    let usage = PACKET_USAGE_BASE + (event_label as u8 & 0x0f);
+                    Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)
+                });
+                match response {
+                    PacketAccessResponse::TransmitResponse => {
+                        self.queue_downlink(
+                            queue,
+                            &context,
+                            SndcpDownlink::TransmitResponse {
+                                nsapi: context.nsapi,
+                                accepted,
+                                cause: (!accepted).then_some(Self::transmit_reject_cause(cause)),
+                                snei: context.snei,
+                            },
+                            Layer2Service::Acknowledged,
+                            chan_alloc,
+                        );
+                    }
+                    PacketAccessResponse::TransmitRequest if accepted => {
+                        self.queue_downlink(
+                            queue,
+                            &context,
+                            SndcpDownlink::TransmitRequest {
+                                nsapi: context.nsapi,
+                                snei: context.snei,
+                            },
+                            Layer2Service::Acknowledged,
+                            chan_alloc,
+                        );
+                    }
+                    PacketAccessResponse::TransmitRequest | PacketAccessResponse::None => {}
+                }
+                if !accepted && recovering {
+                    self.contexts.remove(&issi);
+                }
             }
             PacketDataMessage::Page {
                 command_id,
@@ -1185,7 +1256,7 @@ impl TetraEntityTrait for Sndcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand};
+    use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnReconnect};
 
     fn test_sndcp() -> Sndcp {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -1265,6 +1336,32 @@ mod tests {
         assert_eq!(accept.deactivation_type, 0);
         assert_eq!(accept.nsapi, None);
         assert!(!sndcp.contexts.contains_key(&77_468));
+    }
+
+    #[test]
+    fn reconnect_recovers_a_missing_local_radio_context_from_snei() {
+        let mut sndcp = test_sndcp();
+        let mut encoded = BitBuffer::new_autoexpand(64);
+        SnReconnect {
+            data_to_send: true,
+            nsapi: Some(1),
+            enhanced_pi_4_dqpsk_service: false,
+            resource_request: None,
+            sndcp_network_endpoint_identifier: Some(8),
+            nsapi_for_reconnection: Vec::new(),
+        }
+        .to_bitbuf(&mut encoded)
+        .unwrap();
+        encoded.seek(0);
+
+        sndcp.handle_uplink(&mut MessageQueue::new(), uplink(encoded, 77_468));
+
+        let context = sndcp.contexts.get(&77_468).expect("recovered radio context");
+        assert_eq!(context.endpoint_id, 7);
+        assert_eq!(context.link_id, 8);
+        assert_eq!(context.nsapi, 1);
+        assert_eq!(context.snei, Some(8));
+        assert_eq!(context.session(), None);
     }
 
     #[test]

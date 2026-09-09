@@ -97,13 +97,19 @@ pub enum SndcpUplink {
         resource: Option<SndcpResourceRequest>,
     },
     Reconnect {
+        data_to_send: bool,
+        nsapi: Option<u8>,
+        snei: Option<u16>,
         resource: Option<SndcpResourceRequest>,
     },
     EndOfData {
         immediate_service_change: bool,
     },
     PageResponse {
+        nsapi: u8,
         available: bool,
+        logical_link_status: bool,
+        snei: Option<u16>,
         resource: Option<SndcpResourceRequest>,
     },
 }
@@ -143,6 +149,10 @@ pub enum SndcpDownlink {
         nsapi: u8,
         accepted: bool,
         cause: Option<u8>,
+        snei: Option<u16>,
+    },
+    TransmitRequest {
+        nsapi: u8,
         snei: Option<u16>,
     },
     EndOfData {
@@ -214,6 +224,9 @@ impl SndcpUplink {
             SnPduType::Reconnect => {
                 let pdu = SnReconnect::from_bitbuf(buffer)?;
                 Ok(Self::Reconnect {
+                    data_to_send: pdu.data_to_send,
+                    nsapi: pdu.nsapi,
+                    snei: pdu.sndcp_network_endpoint_identifier,
                     resource: pdu.resource_request.map(TryInto::try_into).transpose()?,
                 })
             }
@@ -226,7 +239,10 @@ impl SndcpUplink {
             SnPduType::Page => {
                 let pdu = SnPageResponse::from_bitbuf(buffer)?;
                 Ok(Self::PageResponse {
+                    nsapi: pdu.nsapi,
                     available: pdu.pd_service_available,
+                    logical_link_status: pdu.logical_link_status,
+                    snei: pdu.sndcp_network_endpoint_identifier,
                     resource: pdu.resource_request.map(TryInto::try_into).transpose()?,
                 })
             }
@@ -333,6 +349,15 @@ impl SndcpDownlink {
                 nsapi: *nsapi,
                 accept: *accepted,
                 transmit_response_reject_cause: *cause,
+                sndcp_network_endpoint_identifier: *snei,
+                nsapi_additional: Vec::new(),
+            }
+            .to_bitbuf(buffer),
+            Self::TransmitRequest { nsapi, snei } => SnDataTransmitRequest {
+                nsapi: *nsapi,
+                logical_link_status: false,
+                enhanced_pi_4_dqpsk_service: false,
+                resource_request: None,
                 sndcp_network_endpoint_identifier: *snei,
                 nsapi_additional: Vec::new(),
             }
