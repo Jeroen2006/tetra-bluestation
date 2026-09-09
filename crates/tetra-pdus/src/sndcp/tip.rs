@@ -79,7 +79,16 @@ pub enum SndcpUplink {
         apn_index: Option<u16>,
         chap: Option<SndcpChapProof>,
     },
-    DeactivateDemand,
+    DeactivateDemand {
+        deactivation_type: u8,
+        nsapi: Option<u8>,
+        snei: Option<u16>,
+    },
+    DeactivateAccept {
+        deactivation_type: u8,
+        nsapi: Option<u8>,
+        snei: Option<u16>,
+    },
     Data {
         nsapi: u8,
         payload: Vec<u8>,
@@ -104,6 +113,7 @@ pub enum SndcpDownlink {
     ActivateAccept {
         nsapi: u8,
         ipv4: u32,
+        dynamic_address: bool,
         ready_timer: u8,
         standby_timer: u8,
         response_wait_timer: u8,
@@ -168,8 +178,20 @@ impl SndcpUplink {
                 })
             }
             SnPduType::DeactivatePdpContextDemand => {
-                let _ = SnDeactivatePdpContextDemand::from_bitbuf(buffer)?;
-                Ok(Self::DeactivateDemand)
+                let pdu = SnDeactivatePdpContextDemand::from_bitbuf(buffer)?;
+                Ok(Self::DeactivateDemand {
+                    deactivation_type: pdu.deactivation_type,
+                    nsapi: pdu.nsapi,
+                    snei: pdu.sndcp_network_endpoint_identifier,
+                })
+            }
+            SnPduType::DeactivatePdpContextAccept => {
+                let pdu = SnDeactivatePdpContextAccept::from_bitbuf(buffer)?;
+                Ok(Self::DeactivateAccept {
+                    deactivation_type: pdu.deactivation_type,
+                    nsapi: pdu.nsapi,
+                    snei: pdu.sndcp_network_endpoint_identifier,
+                })
             }
             SnPduType::Data => {
                 let pdu = SnData::from_bitbuf(buffer)?;
@@ -222,6 +244,7 @@ impl SndcpDownlink {
             Self::ActivateAccept {
                 nsapi,
                 ipv4,
+                dynamic_address,
                 ready_timer,
                 standby_timer,
                 response_wait_timer,
@@ -233,7 +256,11 @@ impl SndcpDownlink {
                 ready_timer: *ready_timer,
                 standby_timer: *standby_timer,
                 response_wait_timer: *response_wait_timer,
-                type_identifier_in_accept: TypeIdentifierInAccept::Ipv4Dynamic,
+                type_identifier_in_accept: if *dynamic_address {
+                    TypeIdentifierInAccept::Ipv4Dynamic
+                } else {
+                    TypeIdentifierInAccept::Ipv4Static
+                },
                 ipv4_address: Some(*ipv4),
                 pcomp_negotiation: 0,
                 vj_compression_state_slots: None,
@@ -335,6 +362,9 @@ fn chap_proof(pdu: &SnActivatePdpContextDemand) -> Result<Option<SndcpChapProof>
         let Some(options) = SndcpProtocolConfigurationOptions::from_type34_element(element)? else {
             continue;
         };
+        if options.configuration_protocol != PCO_CONFIGURATION_PROTOCOL_PPP {
+            continue;
+        }
         for unit in options.protocols.iter().filter(|unit| unit.protocol_identity == PCO_PROTOCOL_CHAP) {
             if unit.contents.len() < 5 {
                 continue;
@@ -459,6 +489,7 @@ mod tests {
         let pdu = SndcpDownlink::ActivateAccept {
             nsapi: 1,
             ipv4: 0xc0a8_0102,
+            dynamic_address: true,
             ready_timer: ready_timer_code(10_000).unwrap(),
             standby_timer: standby_timer_code(1_800).unwrap(),
             response_wait_timer: response_wait_timer_code(5_000).unwrap(),
@@ -474,5 +505,65 @@ mod tests {
         assert_eq!(decoded.response_wait_timer, 7);
         assert_eq!(decoded.maximum_transmission_unit, 4);
         assert_eq!(decoded.ipv4_address, Some(0xc0a8_0102));
+    }
+
+    #[test]
+    fn activation_accept_preserves_static_address_negotiation() {
+        let pdu = SndcpDownlink::ActivateAccept {
+            nsapi: 1,
+            ipv4: 0xc0a8_0102,
+            dynamic_address: false,
+            ready_timer: ready_timer_code(10_000).unwrap(),
+            standby_timer: standby_timer_code(1_800).unwrap(),
+            response_wait_timer: response_wait_timer_code(5_000).unwrap(),
+            snei: None,
+            chap_success: None,
+        };
+        let mut bits = BitBuffer::new_autoexpand(128);
+        pdu.to_bitbuf(&mut bits).unwrap();
+        bits.seek(0);
+
+        let decoded = SnActivatePdpContextAccept::from_bitbuf(&mut bits).unwrap();
+        assert_eq!(decoded.type_identifier_in_accept, TypeIdentifierInAccept::Ipv4Static);
+        assert_eq!(decoded.ipv4_address, Some(0xc0a8_0102));
+    }
+
+    #[test]
+    fn decodes_both_uplink_deactivation_messages() {
+        let mut demand = BitBuffer::new_autoexpand(64);
+        SnDeactivatePdpContextDemand {
+            deactivation_type: 1,
+            nsapi: Some(1),
+            sndcp_network_endpoint_identifier: Some(9),
+        }
+        .to_bitbuf(&mut demand)
+        .unwrap();
+        demand.seek(0);
+        assert_eq!(
+            SndcpUplink::from_bitbuf(&mut demand).unwrap(),
+            SndcpUplink::DeactivateDemand {
+                deactivation_type: 1,
+                nsapi: Some(1),
+                snei: Some(9),
+            }
+        );
+
+        let mut accept = BitBuffer::new_autoexpand(64);
+        SnDeactivatePdpContextAccept {
+            deactivation_type: 0,
+            nsapi: None,
+            sndcp_network_endpoint_identifier: None,
+        }
+        .to_bitbuf(&mut accept)
+        .unwrap();
+        accept.seek(0);
+        assert_eq!(
+            SndcpUplink::from_bitbuf(&mut accept).unwrap(),
+            SndcpUplink::DeactivateAccept {
+                deactivation_type: 0,
+                nsapi: None,
+                snei: None,
+            }
+        );
     }
 }

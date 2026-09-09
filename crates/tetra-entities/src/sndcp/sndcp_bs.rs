@@ -43,6 +43,7 @@ struct RadioContext {
     timeslot_bitmap: u8,
     event_label: Option<u16>,
     chap_identifier: Option<u8>,
+    dynamic_address: bool,
 }
 
 impl RadioContext {
@@ -80,6 +81,21 @@ struct PendingDelivery {
     reporter: TxReporter,
 }
 
+#[derive(Debug, Clone)]
+struct PendingMsDeactivation {
+    issi: u32,
+    deactivation_type: u8,
+    nsapi: Option<u8>,
+    snei: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingNetworkDeactivation {
+    command_id: u64,
+    session_id: u64,
+    session_generation: u64,
+}
+
 pub struct Sndcp {
     config: SharedConfig,
     swmi: Option<SwmiPacketEndpoint>,
@@ -88,6 +104,8 @@ pub struct Sndcp {
     next_packet_id: u64,
     contexts: HashMap<u32, RadioContext>,
     pending_commands: HashMap<u64, u32>,
+    pending_ms_deactivations: HashMap<u64, PendingMsDeactivation>,
+    pending_network_deactivations: HashMap<u32, PendingNetworkDeactivation>,
     bearers: HashMap<u64, Bearer>,
     pending_deliveries: Vec<PendingDelivery>,
 }
@@ -102,6 +120,8 @@ impl Sndcp {
             next_packet_id: 1,
             contexts: HashMap::new(),
             pending_commands: HashMap::new(),
+            pending_ms_deactivations: HashMap::new(),
+            pending_network_deactivations: HashMap::new(),
             bearers: HashMap::new(),
             pending_deliveries: Vec::new(),
         }
@@ -228,14 +248,35 @@ impl Sndcp {
         }
     }
 
-    fn reject_cause(cause: Option<PacketRejectCause>) -> u8 {
+    fn activation_reject_cause(cause: Option<PacketRejectCause>) -> u8 {
         match cause.unwrap_or(PacketRejectCause::ProtocolError) {
-            PacketRejectCause::AuthenticationFailed => 0x23,
-            PacketRejectCause::ContextUnsupported => 0x20,
-            PacketRejectCause::ServiceTemporarilyUnavailable => 0x11,
-            PacketRejectCause::SystemResourcesUnavailable => 0x13,
-            PacketRejectCause::InvalidAddress => 0x21,
-            PacketRejectCause::ProtocolError => 0x6f,
+            PacketRejectCause::AuthenticationFailed => 20,
+            // The only context validation delegated to the SwMI is its
+            // configured APN index.
+            PacketRejectCause::ContextUnsupported => 22,
+            PacketRejectCause::ServiceTemporarilyUnavailable => 34,
+            PacketRejectCause::SystemResourcesUnavailable => 7,
+            PacketRejectCause::InvalidAddress => 8,
+            PacketRejectCause::ProtocolError => 0,
+        }
+    }
+
+    fn transmit_reject_cause(cause: Option<PacketRejectCause>) -> u8 {
+        match cause.unwrap_or(PacketRejectCause::ProtocolError) {
+            PacketRejectCause::SystemResourcesUnavailable => 1,
+            PacketRejectCause::ContextUnsupported => 2,
+            PacketRejectCause::ServiceTemporarilyUnavailable => 34,
+            PacketRejectCause::AuthenticationFailed | PacketRejectCause::InvalidAddress | PacketRejectCause::ProtocolError => 0,
+        }
+    }
+
+    fn unsupported_address_reject_cause(address_type: u8) -> u8 {
+        match address_type {
+            2 => 3,
+            3 => 17,
+            4 => 18,
+            5 => 27,
+            _ => 0,
         }
     }
 
@@ -275,6 +316,7 @@ impl Sndcp {
                 apn_index,
                 chap,
             } => {
+                let dynamic_address = matches!(&address, SndcpAddressRequest::Dynamic);
                 let context = RadioContext {
                     issi,
                     endpoint_id: prim.endpoint_id,
@@ -288,20 +330,35 @@ impl Sndcp {
                     timeslot_bitmap: 0,
                     event_label: None,
                     chap_identifier: chap.as_ref().map(|proof| proof.identifier),
+                    dynamic_address,
                 };
                 self.contexts.insert(issi, context.clone());
-                if version != 1 || nsapi != DEFAULT_NSAPI || !registered || !online {
+                let local_reject = if version != 1 {
+                    Some(16)
+                } else if nsapi != DEFAULT_NSAPI {
+                    Some(19)
+                } else if !matches!(ms_type, 1 | 2) {
+                    Some(15)
+                } else if !registered {
+                    Some(1)
+                } else if !online {
+                    Some(34)
+                } else {
+                    None
+                };
+                if let Some(cause) = local_reject {
                     self.queue_downlink(
                         queue,
                         &context,
                         SndcpDownlink::ActivateReject {
                             nsapi,
-                            cause: if !registered { 0x0b } else { 0x11 },
-                            chap_failure: chap.as_ref().map(|proof| (proof.identifier, "authentication unavailable".into())),
+                            cause,
+                            chap_failure: None,
                         },
                         Layer2Service::Acknowledged,
                         None,
                     );
+                    self.contexts.remove(&issi);
                     return;
                 }
                 let command_id = self.next_command();
@@ -309,19 +366,20 @@ impl Sndcp {
                 let packet_address = match address {
                     SndcpAddressRequest::Dynamic => PacketAddressRequest::Dynamic,
                     SndcpAddressRequest::Static(ipv4) => PacketAddressRequest::Static(ipv4),
-                    SndcpAddressRequest::Unsupported(_) => {
+                    SndcpAddressRequest::Unsupported(address_type) => {
                         self.pending_commands.remove(&command_id);
                         self.queue_downlink(
                             queue,
                             &context,
                             SndcpDownlink::ActivateReject {
                                 nsapi,
-                                cause: 0x20,
+                                cause: Self::unsupported_address_reject_cause(address_type),
                                 chap_failure: None,
                             },
                             Layer2Service::Acknowledged,
                             None,
                         );
+                        self.contexts.remove(&issi);
                         return;
                     }
                 };
@@ -342,24 +400,104 @@ impl Sndcp {
                     }),
                 }) {
                     self.pending_commands.remove(&command_id);
+                    self.queue_downlink(
+                        queue,
+                        &context,
+                        SndcpDownlink::ActivateReject {
+                            nsapi,
+                            cause: 34,
+                            chap_failure: None,
+                        },
+                        Layer2Service::Acknowledged,
+                        None,
+                    );
+                    self.contexts.remove(&issi);
                 }
             }
-            SndcpUplink::DeactivateDemand { .. } => {
-                let Some(context) = self.contexts.get(&issi).cloned() else {
-                    return;
-                };
-                let Some((session_id, session_generation)) = context.session() else {
-                    return;
-                };
-                let command_id = self.next_command();
-                self.pending_commands.insert(command_id, issi);
-                self.submit(PacketDataMessage::Deactivate {
-                    command_id,
-                    itsi: u64::from(issi),
-                    session_id,
-                    session_generation,
-                    network_initiated: false,
+            SndcpUplink::DeactivateDemand {
+                deactivation_type,
+                nsapi,
+                snei,
+            } => {
+                let context = self.contexts.get(&issi).cloned().unwrap_or(RadioContext {
+                    issi,
+                    endpoint_id: prim.endpoint_id,
+                    link_id: prim.link_id,
+                    nsapi: nsapi.unwrap_or(DEFAULT_NSAPI),
+                    snei,
+                    session_id: None,
+                    session_generation: None,
+                    bearer_id: None,
+                    bearer_generation: None,
+                    timeslot_bitmap: 0,
+                    event_label: None,
+                    chap_identifier: None,
+                    dynamic_address: true,
                 });
+                let identifies_context =
+                    deactivation_type == 0 || (nsapi == Some(context.nsapi) && snei.is_none_or(|value| context.snei == Some(value)));
+                if let Some((session_id, session_generation)) = context.session().filter(|_| identifies_context) {
+                    let command_id = self.next_command();
+                    self.pending_ms_deactivations.insert(
+                        command_id,
+                        PendingMsDeactivation {
+                            issi,
+                            deactivation_type,
+                            nsapi,
+                            snei,
+                        },
+                    );
+                    if self.submit(PacketDataMessage::Deactivate {
+                        command_id,
+                        itsi: u64::from(issi),
+                        session_id,
+                        session_generation,
+                        network_initiated: false,
+                    }) {
+                        return;
+                    }
+                    self.pending_ms_deactivations.remove(&command_id);
+                }
+                self.queue_downlink(
+                    queue,
+                    &context,
+                    SndcpDownlink::DeactivateAccept {
+                        deactivation_type,
+                        nsapi,
+                        snei,
+                    },
+                    Layer2Service::Acknowledged,
+                    None,
+                );
+                if identifies_context {
+                    self.contexts.remove(&issi);
+                }
+            }
+            SndcpUplink::DeactivateAccept {
+                deactivation_type,
+                nsapi,
+                snei,
+            } => {
+                let Some(pending) = self.pending_network_deactivations.remove(&issi) else {
+                    tracing::warn!(issi, "unexpected SNDCP deactivation accept");
+                    return;
+                };
+                let context_matches = self.contexts.get(&issi).is_some_and(|context| {
+                    deactivation_type == 1
+                        && nsapi == Some(context.nsapi)
+                        && snei.is_none_or(|value| context.snei == Some(value))
+                        && context.session() == Some((pending.session_id, pending.session_generation))
+                });
+                self.submit(PacketDataMessage::DeactivateResult {
+                    command_id: pending.command_id,
+                    itsi: u64::from(issi),
+                    session_id: pending.session_id,
+                    session_generation: pending.session_generation,
+                    accepted: context_matches,
+                });
+                if context_matches {
+                    self.contexts.remove(&issi);
+                }
             }
             SndcpUplink::Data { nsapi, payload } => {
                 let Some(context) = self.contexts.get(&issi).cloned() else {
@@ -652,6 +790,7 @@ impl Sndcp {
             PacketDataMessage::ActivateResult {
                 command_id,
                 itsi,
+                air_handle,
                 accepted,
                 cause,
                 session_id,
@@ -669,6 +808,15 @@ impl Sndcp {
                 let Some(context) = self.contexts.get_mut(&issi) else {
                     return;
                 };
+                if context.endpoint_id != air_handle {
+                    tracing::warn!(
+                        command_id,
+                        itsi,
+                        air_handle,
+                        "stale SNDCP activation result for replaced air endpoint"
+                    );
+                    return;
+                }
                 if accepted {
                     context.session_id = Some(session_id);
                     context.session_generation = Some(session_generation);
@@ -679,6 +827,7 @@ impl Sndcp {
                     SndcpDownlink::ActivateAccept {
                         nsapi: context.nsapi,
                         ipv4: ipv4.unwrap_or_default(),
+                        dynamic_address: context.dynamic_address,
                         ready_timer: ready_timer_code(timers.ready_ms).unwrap_or(8),
                         standby_timer: standby_timer_code(timers.standby_seconds).unwrap_or(6),
                         response_wait_timer: response_wait_timer_code(timers.response_wait_ms).unwrap_or(7),
@@ -688,11 +837,16 @@ impl Sndcp {
                 } else {
                     SndcpDownlink::ActivateReject {
                         nsapi: context.nsapi,
-                        cause: Self::reject_cause(cause),
-                        chap_failure: context.chap_identifier.map(|id| (id, "authentication failed".into())),
+                        cause: Self::activation_reject_cause(cause),
+                        chap_failure: (cause == Some(PacketRejectCause::AuthenticationFailed))
+                            .then(|| context.chap_identifier.map(|id| (id, "authentication failed".into())))
+                            .flatten(),
                     }
                 };
                 self.queue_downlink(queue, &context, pdu, Layer2Service::Acknowledged, None);
+                if !accepted {
+                    self.contexts.remove(&issi);
+                }
             }
             PacketDataMessage::DeactivateResult {
                 command_id,
@@ -701,7 +855,10 @@ impl Sndcp {
                 ..
             } => {
                 let issi = itsi as u32;
-                if self.pending_commands.remove(&command_id) != Some(issi) {
+                let Some(pending) = self.pending_ms_deactivations.remove(&command_id) else {
+                    return;
+                };
+                if pending.issi != issi {
                     return;
                 }
                 if let Some(context) = self.contexts.get(&issi).cloned() {
@@ -709,16 +866,21 @@ impl Sndcp {
                         queue,
                         &context,
                         SndcpDownlink::DeactivateAccept {
-                            deactivation_type: 1,
-                            nsapi: Some(context.nsapi),
-                            snei: context.snei,
+                            deactivation_type: pending.deactivation_type,
+                            nsapi: pending.nsapi,
+                            snei: pending.snei,
                         },
                         Layer2Service::Acknowledged,
                         None,
                     );
-                    if accepted {
-                        self.contexts.remove(&issi);
+                    if !accepted {
+                        tracing::warn!(
+                            issi,
+                            command_id,
+                            "SwMI did not recognize MS deactivation; closing radio context to converge"
+                        );
                     }
+                    self.contexts.remove(&issi);
                 }
             }
             PacketDataMessage::AccessResult {
@@ -773,7 +935,7 @@ impl Sndcp {
                     SndcpDownlink::TransmitResponse {
                         nsapi: context.nsapi,
                         accepted,
-                        cause: (!accepted).then_some(Self::reject_cause(cause)),
+                        cause: (!accepted).then_some(Self::transmit_reject_cause(cause)),
                         snei: context.snei,
                     },
                     Layer2Service::Acknowledged,
@@ -870,8 +1032,15 @@ impl Sndcp {
                     .cloned()
                     .filter(|context| context.session() == Some((session_id, session_generation)))
                 {
-                    self.pending_commands.insert(command_id, issi);
-                    self.queue_downlink(
+                    self.pending_network_deactivations.insert(
+                        issi,
+                        PendingNetworkDeactivation {
+                            command_id,
+                            session_id,
+                            session_generation,
+                        },
+                    );
+                    if !self.queue_downlink(
                         queue,
                         &context,
                         SndcpDownlink::DeactivateDemand {
@@ -881,7 +1050,24 @@ impl Sndcp {
                         },
                         Layer2Service::Acknowledged,
                         None,
-                    );
+                    ) {
+                        self.pending_network_deactivations.remove(&issi);
+                        self.submit(PacketDataMessage::DeactivateResult {
+                            command_id,
+                            itsi,
+                            session_id,
+                            session_generation,
+                            accepted: false,
+                        });
+                    }
+                } else {
+                    self.submit(PacketDataMessage::DeactivateResult {
+                        command_id,
+                        itsi,
+                        session_id,
+                        session_generation,
+                        accepted: false,
+                    });
                 }
             }
             PacketDataMessage::BearerControl {
@@ -999,6 +1185,7 @@ impl TetraEntityTrait for Sndcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand};
 
     fn test_sndcp() -> Sndcp {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -1030,6 +1217,54 @@ mod tests {
                 drain_reporters: reporters,
             },
         );
+    }
+
+    fn uplink(sdu: BitBuffer, issi: u32) -> LtpdMleUnitdataInd {
+        LtpdMleUnitdataInd {
+            sdu,
+            endpoint_id: 7,
+            link_id: 8,
+            received_tetra_address: TetraAddress::issi(issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }
+    }
+
+    #[test]
+    fn reject_causes_match_etsi_sndcp_tables() {
+        assert_eq!(Sndcp::activation_reject_cause(Some(PacketRejectCause::AuthenticationFailed)), 20);
+        assert_eq!(
+            Sndcp::activation_reject_cause(Some(PacketRejectCause::ServiceTemporarilyUnavailable)),
+            34
+        );
+        assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::SystemResourcesUnavailable)), 1);
+        assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::ContextUnsupported)), 2);
+    }
+
+    #[test]
+    fn unknown_ms_deactivation_is_acknowledged_without_leaving_state() {
+        let mut sndcp = test_sndcp();
+        let mut encoded = BitBuffer::new_autoexpand(64);
+        SnDeactivatePdpContextDemand {
+            deactivation_type: 0,
+            nsapi: None,
+            sndcp_network_endpoint_identifier: None,
+        }
+        .to_bitbuf(&mut encoded)
+        .unwrap();
+        encoded.seek(0);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_uplink(&mut queue, uplink(encoded, 77_468));
+
+        let message = queue.pop_front().expect("deactivation accept");
+        let SapMsgInner::LtpdMleUnitdataReq(mut primitive) = message.msg else {
+            panic!("expected LTPD unitdata request");
+        };
+        let accept = SnDeactivatePdpContextAccept::from_bitbuf(&mut primitive.sdu).unwrap();
+        assert_eq!(accept.deactivation_type, 0);
+        assert_eq!(accept.nsapi, None);
+        assert!(!sndcp.contexts.contains_key(&77_468));
     }
 
     #[test]
