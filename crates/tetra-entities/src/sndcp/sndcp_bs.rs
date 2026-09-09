@@ -1018,16 +1018,31 @@ impl Sndcp {
                 itsi,
                 session_id,
                 session_generation,
+                nsapi,
+                snei,
             } => {
                 let issi = itsi as u32;
-                let Some(context) = self
+                let context = self
                     .contexts
                     .get(&issi)
                     .cloned()
                     .filter(|context| context.session() == Some((session_id, session_generation)))
-                else {
-                    return;
-                };
+                    .unwrap_or_else(|| RadioContext {
+                        issi,
+                        endpoint_id: 0,
+                        link_id: 0,
+                        nsapi,
+                        snei,
+                        session_id: Some(session_id),
+                        session_generation: Some(session_generation),
+                        bearer_id: None,
+                        bearer_generation: None,
+                        timeslot_bitmap: 0,
+                        event_label: None,
+                        chap_identifier: None,
+                        dynamic_address: true,
+                    });
+                self.contexts.insert(issi, context.clone());
                 self.pending_commands.insert(command_id, issi);
                 self.queue_downlink(
                     queue,
@@ -1483,6 +1498,34 @@ mod tests {
                 })
             )
         }));
+    }
+
+    #[test]
+    fn network_page_restores_context_lost_during_bs_restart() {
+        let mut sndcp = test_sndcp();
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::Page {
+                command_id: 18,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 3,
+                nsapi: 1,
+                snei: Some(8),
+            },
+        );
+
+        let context = sndcp.contexts.get(&77_468).expect("restored context");
+        assert_eq!(context.nsapi, 1);
+        assert_eq!(context.snei, Some(8));
+        assert_eq!(context.session(), Some((8, 3)));
+        assert_eq!(sndcp.pending_commands.get(&18), Some(&77_468));
+        assert!(matches!(
+            queue.pop_front().map(|message| message.msg),
+            Some(SapMsgInner::LtpdMleUnitdataReq(_))
+        ));
     }
 
     #[test]
