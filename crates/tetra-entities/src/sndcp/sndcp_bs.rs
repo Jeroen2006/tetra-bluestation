@@ -909,7 +909,12 @@ impl Sndcp {
                         standby_timer: standby_timer_code(timers.standby_seconds).unwrap_or(6),
                         response_wait_timer: response_wait_timer_code(timers.response_wait_ms).unwrap_or(7),
                         snei,
-                        chap_success: context.chap_identifier.map(|id| (id, "OK".into())),
+                        // The MS completes CHAP towards the TE itself.  The
+                        // success PCO is optional on the air interface and is
+                        // not relayed to the TE (TTR 001-05, 7.1.4).  Omitting
+                        // it also keeps this time-critical response well below
+                        // the capacity of one SCH/F MAC block.
+                        chap_success: None,
                     }
                 } else {
                     SndcpDownlink::ActivateReject {
@@ -1380,6 +1385,7 @@ impl TetraEntityTrait for Sndcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::SnActivatePdpContextAccept;
     use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnReconnect};
 
     fn test_sndcp() -> Sndcp {
@@ -1434,6 +1440,60 @@ mod tests {
         );
         assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::SystemResourcesUnavailable)), 1);
         assert_eq!(Sndcp::transmit_reject_cause(Some(PacketRejectCause::ContextUnsupported)), 2);
+    }
+
+    #[test]
+    fn successful_chap_activation_uses_compact_accept_without_pco() {
+        let mut sndcp = test_sndcp();
+        sndcp.contexts.insert(
+            77_479,
+            RadioContext {
+                issi: 77_479,
+                endpoint_id: 7,
+                link_id: 0,
+                nsapi: 1,
+                snei: None,
+                session_id: None,
+                session_generation: None,
+                bearer_id: None,
+                bearer_generation: None,
+                timeslot_bitmap: 0,
+                event_label: None,
+                chap_identifier: Some(4),
+                dynamic_address: true,
+            },
+        );
+        sndcp.pending_commands.insert(9, 77_479);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::ActivateResult {
+                command_id: 9,
+                itsi: 77_479,
+                air_handle: 7,
+                accepted: true,
+                cause: None,
+                session_id: 4,
+                session_generation: 1,
+                ipv4: Some(u32::from_be_bytes([10, 45, 0, 164])),
+                snei: Some(4),
+                timers: tetra_swmi_protocol::PacketTimers {
+                    ready_ms: 10_000,
+                    standby_seconds: 1_800,
+                    response_wait_ms: 5_000,
+                },
+            },
+        );
+
+        let SapMsgInner::LtpdMleUnitdataReq(mut primitive) = queue.pop_front().expect("activation accept").msg else {
+            panic!("expected LTPD unitdata request");
+        };
+        assert_eq!(primitive.sdu.get_len_remaining(), 90);
+        let accept = SnActivatePdpContextAccept::from_bitbuf(&mut primitive.sdu).unwrap();
+        assert_eq!(accept.ipv4_address, Some(u32::from_be_bytes([10, 45, 0, 164])));
+        assert_eq!(accept.sndcp_network_endpoint_identifier, Some(4));
+        assert!(accept.type34_elements.is_empty());
     }
 
     #[test]
