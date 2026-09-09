@@ -707,6 +707,16 @@ impl Llc {
             .into_iter()
             .take(slots as usize)
             .collect::<Vec<_>>();
+        // TTR 001-05 sections 6.5 and 7.12 restrict advanced-link data
+        // transfer to an assigned PDCH.  The advanced link itself remains
+        // established while the MS is in STANDBY, so its mere presence is
+        // not proof that an AL-DATA PDU can currently be sent.  In
+        // particular, PDP activation/deactivation signalling on the CCCH
+        // must fall back to acknowledged basic link instead of disappearing
+        // into an unroutable advanced-link queue.
+        if routes.is_empty() && prim.associated_channel.is_none() {
+            return false;
+        }
         let Some(link) = self.advanced_links.get_mut(&issi) else {
             return false;
         };
@@ -2157,6 +2167,54 @@ mod tests {
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert_eq!(reporter.get_state(), TxState::Acknowledged);
         assert!(llc.advanced_links.get(&77_468).unwrap().tx.is_empty());
+    }
+
+    #[test]
+    fn established_advanced_link_in_standby_falls_back_to_basic_link() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        // TTR 001-05 section 6.5 keeps the AL established in STANDBY, while
+        // section 7.1 performs PDP activation signalling on the CCCH.  Model
+        // that state by withdrawing the assigned packet bearer only.
+        llc.config.state_write().subscriber_packet_delivery_routes.remove(&77_468);
+
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr("1010001"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        let link = llc.advanced_links.get(&77_468).unwrap();
+        assert!(link.tx.is_empty(), "STANDBY signalling must not enter the AL queue");
+        assert_eq!(llc.outbound_messages.len(), 1, "STANDBY signalling must use BL-DATA");
+        let SapMsgInner::TmaUnitdataReq(request) = &llc.outbound_messages[0].retransmission_buf.msg else {
+            panic!("expected buffered basic-link request")
+        };
+        assert!(request.associated_channel.is_none());
     }
 
     #[test]
