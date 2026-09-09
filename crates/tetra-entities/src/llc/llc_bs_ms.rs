@@ -68,6 +68,11 @@ pub struct ExpectedInAck {
 
     pub bl_type: Layer2Service,
 
+    /// The SNDCP response which assigns an MS from CCCH to a PDCH must stay
+    /// on the common channel even if an earlier advanced link and packet
+    /// delivery route still exist for the same PDP context.
+    force_common_channel: bool,
+
     /// Time this message was received from the MLE
     pub t_first: TdmaTime,
     /// Time this message was actually passed down to the Umac. If a previous message on the basic link is already
@@ -518,7 +523,11 @@ impl Llc {
             SapMsgInner::TmaUnitdataReq(req) => req.associated_channel.clone(),
             _ => None,
         };
-        let mut routes = Self::delivery_routes(config, ack.addr.ssi, dltime);
+        let mut routes = if ack.force_common_channel {
+            Vec::new()
+        } else {
+            Self::delivery_routes(config, ack.addr.ssi, dltime)
+        };
         if let Some(route) = preferred_route.filter(|route| (2..=4).contains(&route.timeslot)) {
             // CMCE may have selected a traffic bearer while registration or a
             // direct-response window deliberately suppresses inferred LLC
@@ -868,61 +877,94 @@ impl Llc {
             );
             return;
         }
+        // TTR 001-05 figures 26 and 29 make AL-SETUP a negotiation: a
+        // Service definition or Service change is answered, while Success
+        // completes the exchange.  Answering a Success with another Success
+        // causes the MS and SwMI to keep the setup transaction alive while
+        // user data is already waiting behind it.
+        if !matches!(request.report, 0..=4) {
+            tracing::warn!(
+                issi = prim.main_address.ssi,
+                report = request.report,
+                "ignored reserved AL-SETUP report"
+            );
+            return;
+        }
         let requested_slots = request.uplink_slots.unwrap_or(1);
         let slots = requested_slots.clamp(1, 3);
         let maximum_sdu = request.maximum_sdu.min(6);
         let window_size = request.window_size.clamp(1, 3);
-        let changed = slots != requested_slots || maximum_sdu != request.maximum_sdu || window_size != request.window_size;
-        let response = AlSetup {
-            acknowledged: true,
+        let successful_response = matches!(request.report, 0 | 4);
+        let negotiated_link = AdvancedLink {
             link_number: 0,
             maximum_sdu,
-            connection_width: slots > 1,
-            asymmetric: false,
-            uplink_slots: (slots > 1).then_some(slots),
-            downlink_slots: None,
-            throughput: request.throughput,
+            slots,
             window_size,
-            sdu_retransmissions: request.sdu_retransmissions,
-            segment_retransmissions: request.segment_retransmissions,
-            report: if changed { 2 } else { 0 },
+            max_sdu_retransmissions: request.sdu_retransmissions,
+            max_segment_retransmissions: request.segment_retransmissions,
+            endpoint_id: prim.endpoint_id,
+            next_tx_ns: 0,
+            next_rx_ns: 0,
+            receiver_ready: true,
+            rx_sdus: BTreeMap::new(),
+            tx: VecDeque::new(),
         };
-        self.advanced_links.insert(
-            prim.main_address.ssi,
-            AdvancedLink {
+        if successful_response {
+            if let Some(link) = self.advanced_links.get_mut(&prim.main_address.ssi) {
+                // Keep sequence variables and queued data from the proposal
+                // that this Success confirms.
+                link.maximum_sdu = maximum_sdu;
+                link.slots = slots;
+                link.window_size = window_size;
+                link.max_sdu_retransmissions = request.sdu_retransmissions;
+                link.max_segment_retransmissions = request.segment_retransmissions;
+                link.endpoint_id = prim.endpoint_id;
+            } else {
+                self.advanced_links.insert(prim.main_address.ssi, negotiated_link);
+            }
+        } else {
+            self.advanced_links.insert(prim.main_address.ssi, negotiated_link);
+        }
+        if !successful_response {
+            let changed = slots != requested_slots || maximum_sdu != request.maximum_sdu || window_size != request.window_size;
+            let response = AlSetup {
+                acknowledged: true,
                 link_number: 0,
                 maximum_sdu,
-                slots,
+                connection_width: slots > 1,
+                asymmetric: false,
+                uplink_slots: (slots > 1).then_some(slots),
+                downlink_slots: None,
+                throughput: request.throughput,
                 window_size,
-                max_sdu_retransmissions: request.sdu_retransmissions,
-                max_segment_retransmissions: request.segment_retransmissions,
-                endpoint_id: prim.endpoint_id,
-                next_tx_ns: 0,
-                next_rx_ns: 0,
-                receiver_ready: true,
-                rx_sdus: BTreeMap::new(),
-                tx: VecDeque::new(),
-            },
-        );
-        let mut response_pdu = BitBuffer::new_autoexpand(32);
-        if response.to_bitbuf(&mut response_pdu).is_ok() {
-            response_pdu.seek(0);
-            let route = Self::packet_route(&self.config, prim.main_address.ssi, self.dltime.add_timeslots(-2).t);
-            let aie = prim.air_interface_encryption.unwrap_or_else(|| {
-                AieRequest::clear(
-                    AieSubject::Individual {
-                        issi: prim.main_address.ssi,
-                    },
-                    AieScope::MacResource,
-                )
-            });
-            Self::queue_advanced_pdu(queue, prim.main_address, prim.endpoint_id, response_pdu, route, None, aie, None);
+                sdu_retransmissions: request.sdu_retransmissions,
+                segment_retransmissions: request.segment_retransmissions,
+                // A Service change received from the MS is accepted with
+                // Success.  A locally constrained Service definition is
+                // answered with Service change and awaits the MS Success.
+                report: if request.report == 1 && changed { 2 } else { 0 },
+            };
+            let mut response_pdu = BitBuffer::new_autoexpand(32);
+            if response.to_bitbuf(&mut response_pdu).is_ok() {
+                response_pdu.seek(0);
+                let route = Self::packet_route(&self.config, prim.main_address.ssi, self.dltime.add_timeslots(-2).t);
+                let aie = prim.air_interface_encryption.unwrap_or_else(|| {
+                    AieRequest::clear(
+                        AieSubject::Individual {
+                            issi: prim.main_address.ssi,
+                        },
+                        AieScope::MacResource,
+                    )
+                });
+                Self::queue_advanced_pdu(queue, prim.main_address, prim.endpoint_id, response_pdu, route, None, aie, None);
+            }
         }
         tracing::info!(
             issi = prim.main_address.ssi,
             slots,
             window_size,
             maximum_sdu,
+            setup_report = request.report,
             "established original acknowledged advanced link"
         );
     }
@@ -1359,7 +1401,15 @@ impl Llc {
             panic!()
         };
 
-        if prim.packet_data_flag && self.rx_tla_tldata_req_al(prim.clone()) {
+        let force_common_channel = prim.packet_data_flag
+            && prim
+                .chan_alloc
+                .as_ref()
+                .is_some_and(|allocation| allocation.alloc_type == ChanAllocType::Replace);
+        // TTR 001-05 figures 13 and 15 carry the SN-DATA TRANSMIT RESPONSE
+        // and its Replace allocation on CCCH.  An existing AL is retained in
+        // STANDBY, but must not capture this new CCCH-to-PDCH assignment.
+        if prim.packet_data_flag && !force_common_channel && self.rx_tla_tldata_req_al(prim.clone()) {
             return;
         }
 
@@ -1465,6 +1515,7 @@ impl Llc {
             addr: prim.main_address,
             ts: ack_timeslot,
             bl_type: Layer2Service::Acknowledged,
+            force_common_channel,
             tx_reporter,
             attempt_reporters: Vec::new(),
             attempt_timeslots: Vec::new(),
@@ -2186,6 +2237,49 @@ mod tests {
     }
 
     #[test]
+    fn al_setup_success_completes_service_change_without_response() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        let mut definition = BitBuffer::new_autoexpand(32);
+        AlSetup {
+            acknowledged: true,
+            link_number: 0,
+            maximum_sdu: 6,
+            connection_width: true,
+            asymmetric: false,
+            uplink_slots: Some(4),
+            downlink_slots: None,
+            throughput: 7,
+            window_size: 3,
+            sdu_retransmissions: 0,
+            segment_retransmissions: 3,
+            report: 1,
+        }
+        .to_bitbuf(&mut definition)
+        .unwrap();
+        definition.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_479, definition));
+
+        let SapMsgInner::TmaUnitdataReq(mut change) = queue.pop_front().expect("service change response").msg else {
+            panic!("expected TMA response")
+        };
+        let change = AlSetup::from_bitbuf(&mut change.pdu).unwrap();
+        assert_eq!(change.uplink_slots, Some(3));
+        assert_eq!(change.report, 2);
+        llc.advanced_links.get_mut(&77_479).unwrap().next_tx_ns = 5;
+
+        let mut success = BitBuffer::new_autoexpand(32);
+        AlSetup { report: 0, ..change }.to_bitbuf(&mut success).unwrap();
+        success.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_479, success));
+
+        assert!(queue.pop_front().is_none(), "AL-SETUP Success must not be answered");
+        let link = &llc.advanced_links[&77_479];
+        assert_eq!(link.slots, 3);
+        assert_eq!(link.next_tx_ns, 5, "confirming a proposal must preserve queued-link state");
+    }
+
+    #[test]
     fn advanced_uplink_reassembles_and_checks_fcs() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
@@ -2616,6 +2710,62 @@ mod tests {
             panic!("expected buffered basic-link request")
         };
         assert!(request.associated_channel.is_none());
+    }
+
+    #[test]
+    fn packet_replace_assignment_bypasses_existing_advanced_link_and_pdch_routes() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr("1000111000111100000000000001010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: Some(CmceChanAllocReq {
+                        usage: Some(54),
+                        carrier: None,
+                        timeslots: [false, true, true, true],
+                        alloc_type: ChanAllocType::Replace,
+                        cell_change_flag: false,
+                        ul_dl_assigned: UlDlAssignment::Both,
+                    }),
+                    associated_channel: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        assert!(llc.advanced_links[&77_468].tx.is_empty());
+        assert_eq!(llc.outbound_messages.len(), 1);
+        assert!(llc.outbound_messages[0].force_common_channel);
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        let SapMsgInner::TmaUnitdataReq(request) = queue.pop_front().expect("MCCH assignment").msg else {
+            panic!("expected TMA request")
+        };
+        assert!(request.associated_channel.is_none());
+        assert_eq!(request.chan_alloc.unwrap().alloc_type, ChanAllocType::Replace);
+        assert!(
+            queue.pop_front().is_none(),
+            "packet assignment must not be copied onto its old PDCH"
+        );
     }
 
     #[test]
