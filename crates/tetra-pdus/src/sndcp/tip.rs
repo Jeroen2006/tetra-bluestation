@@ -94,6 +94,9 @@ pub enum SndcpUplink {
         payload: Vec<u8>,
     },
     TransmitRequest {
+        nsapi: u8,
+        logical_link_connected: bool,
+        snei: Option<u16>,
         resource: Option<SndcpResourceRequest>,
     },
     Reconnect {
@@ -218,6 +221,9 @@ impl SndcpUplink {
             SnPduType::DataTransmitRequest => {
                 let pdu = SnDataTransmitRequest::from_bitbuf(buffer)?;
                 Ok(Self::TransmitRequest {
+                    nsapi: pdu.nsapi,
+                    logical_link_connected: pdu.logical_link_status,
+                    snei: pdu.sndcp_network_endpoint_identifier,
                     resource: pdu.resource_request.map(TryInto::try_into).transpose()?,
                 })
             }

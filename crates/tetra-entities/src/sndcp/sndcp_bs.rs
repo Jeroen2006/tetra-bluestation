@@ -679,8 +679,54 @@ impl Sndcp {
                     payload,
                 });
             }
-            SndcpUplink::TransmitRequest { resource, .. } => {
-                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, false, true);
+            SndcpUplink::TransmitRequest {
+                nsapi,
+                logical_link_connected,
+                snei,
+                resource,
+            } => {
+                let recovering = !self.contexts.contains_key(&issi);
+                if recovering {
+                    let Some(snei) = snei else {
+                        tracing::warn!(
+                            issi,
+                            nsapi,
+                            logical_link_connected,
+                            "cannot recover SNDCP transmit request without SNEI"
+                        );
+                        return;
+                    };
+                    tracing::info!(
+                        issi,
+                        nsapi,
+                        snei,
+                        logical_link_connected,
+                        "recovering retained SNDCP context from transmit request"
+                    );
+                    self.insert_context(RadioContext {
+                        issi,
+                        endpoint_id: prim.endpoint_id,
+                        link_id: prim.link_id,
+                        nsapi,
+                        snei: Some(snei),
+                        session_id: None,
+                        session_generation: None,
+                        bearer_id: None,
+                        bearer_generation: None,
+                        timeslot_bitmap: 0,
+                        event_label: None,
+                        chap_identifier: None,
+                        dynamic_address: true,
+                    });
+                } else if !self
+                    .contexts
+                    .get(&issi)
+                    .is_some_and(|context| context.nsapi == nsapi && snei.is_none_or(|value| context.snei == Some(value)))
+                {
+                    tracing::warn!(issi, nsapi, ?snei, "ignoring SNDCP transmit request for another context");
+                    return;
+                }
+                self.request_access(issi, prim.endpoint_id, prim.link_id, resource, recovering, true);
             }
             SndcpUplink::Reconnect {
                 data_to_send,
@@ -1582,6 +1628,7 @@ mod tests {
     use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
     use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::SnActivatePdpContextAccept;
     use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnEndOfData, SnReconnect};
+    use tetra_pdus::sndcp::pdus::sn_transmit::SnDataTransmitRequest;
 
     fn test_sndcp() -> Sndcp {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -1759,6 +1806,40 @@ mod tests {
         assert_eq!(context.nsapi, 1);
         assert_eq!(context.snei, Some(8));
         assert_eq!(context.session(), None);
+    }
+
+    #[test]
+    fn transmit_request_recovers_retained_context_after_bs_restart() {
+        let mut sndcp = test_sndcp();
+        let mut encoded = BitBuffer::new_autoexpand(64);
+        SnDataTransmitRequest {
+            nsapi: 1,
+            logical_link_status: false,
+            enhanced_pi_4_dqpsk_service: true,
+            resource_request: Some(tetra_pdus::sndcp::pdus::resource_request::SndcpResourceRequest {
+                asymmetric_connection: false,
+                data_transfer_throughput: 7,
+                uplink_or_symmetric_timeslots: 2,
+                downlink_timeslots: None,
+                full_phase_modulation_capability: 3,
+                reserved: 3,
+            }),
+            sndcp_network_endpoint_identifier: Some(8),
+            nsapi_additional: Vec::new(),
+        }
+        .to_bitbuf(&mut encoded)
+        .unwrap();
+        encoded.seek(0);
+
+        sndcp.handle_uplink(&mut MessageQueue::new(), uplink(encoded, 77_468));
+
+        let context = sndcp.contexts.get(&77_468).expect("recovered radio context");
+        assert_eq!(context.endpoint_id, 7);
+        assert_eq!(context.link_id, 8);
+        assert_eq!(context.nsapi, 1);
+        assert_eq!(context.snei, Some(8));
+        assert_eq!(context.session(), None);
+        assert_eq!(sndcp.pending_commands.get(&1), Some(&77_468));
     }
 
     #[test]
