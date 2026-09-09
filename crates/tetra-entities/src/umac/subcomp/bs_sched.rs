@@ -1198,32 +1198,34 @@ impl BsChannelScheduler {
     }
 
     /// Bind the upper-layer policy to this exact scheduled downlink slot and
-    /// prepare the clear MAC header. SC2 resources use an ESI: this is an
-    /// IESI for individual control and a GESI for group control.
+    /// prepare the clear MAC header. Addressed encrypted resources use an
+    /// IESI or GESI; an assigned packet advanced link keeps its clear event
+    /// label because that label replaces the SSI in the MAC header.
     fn prepare_downlink_resource(&self, mut pdu: MacResource, request: AieRequest, time: TdmaTime) -> Result<MacResource, AieContextError> {
         let context = self.resolve_downlink_context(request, time)?;
         if context.is_encrypted() {
-            let Some(address) = pdu.addr.as_mut() else {
-                return Err(AieContextError::InvalidContext);
-            };
             match request {
                 AieRequest::Sc2 { subject, .. } | AieRequest::Sc3 { subject, .. } => {
-                    let expected_type = match subject {
-                        AieSubject::Individual { .. } => SsiType::Issi,
-                        AieSubject::Group { .. } => SsiType::Gssi,
-                        _ => return Err(AieContextError::InvalidContext),
-                    };
-                    if address.ssi_type != expected_type
-                        && !(matches!(subject, AieSubject::Individual { .. }) && address.ssi_type == SsiType::Ssi)
-                    {
+                    if let Some(address) = pdu.addr.as_mut() {
+                        let expected_type = match subject {
+                            AieSubject::Individual { .. } => SsiType::Issi,
+                            AieSubject::Group { .. } => SsiType::Gssi,
+                            _ => return Err(AieContextError::InvalidContext),
+                        };
+                        if address.ssi_type != expected_type
+                            && !(matches!(subject, AieSubject::Individual { .. }) && address.ssi_type == SsiType::Ssi)
+                        {
+                            return Err(AieContextError::InvalidContext);
+                        }
+                        address.ssi = self
+                            .aie_provider
+                            .as_ref()
+                            .ok_or(AieContextError::Sc2Disabled)?
+                            .encrypted_short_identity(context, address.ssi)?;
+                        address.ssi_type = SsiType::Esi;
+                    } else if pdu.event_label.is_none() || !matches!(subject, AieSubject::Individual { .. }) {
                         return Err(AieContextError::InvalidContext);
                     }
-                    address.ssi = self
-                        .aie_provider
-                        .as_ref()
-                        .ok_or(AieContextError::Sc2Disabled)?
-                        .encrypted_short_identity(context, address.ssi)?;
-                    address.ssi_type = SsiType::Esi;
                 }
                 _ => return Err(AieContextError::InvalidContext),
             }
@@ -3073,6 +3075,44 @@ mod tests {
         let _ = sched.dl_build_associated_control_block(TdmaTime { t: 2, f: 18, m: 2, h: 0 });
 
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+    }
+
+    #[test]
+    fn encrypted_packet_resource_keeps_its_event_label() {
+        use tetra_config::bluestation::{RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3TeaAlgorithm, SharedConfig};
+
+        let parsed_config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example BS configuration");
+        let config = SharedConfig::from_parts(parsed_config, None);
+        let issi = 77_479;
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea3, 23, [0x6c; 10], true, false);
+        sc3.install_dck(issi, RuntimeSc3Dck::new([0x47; 16], [0xd3; 10], true, None));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mut sched = get_testing_slotter();
+        sched.aie_provider = Some(BsAieKeyProvider::new(config));
+        let request = AieRequest::sc3(AieSubject::Individual { issi }, AieScope::MacResource);
+        let resource = MacResource {
+            addr: None,
+            event_label: Some(5),
+            ..MacResource::default()
+        };
+
+        let prepared = sched
+            .prepare_downlink_resource(resource, request, TdmaTime::default())
+            .expect("encrypted event-label resource");
+
+        assert!(prepared.addr.is_none());
+        assert_eq!(prepared.event_label, Some(5));
+        assert_ne!(prepared.encryption_mode, 0);
     }
 
     #[test]
