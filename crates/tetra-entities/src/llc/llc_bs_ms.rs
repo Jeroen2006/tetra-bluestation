@@ -46,8 +46,14 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
-const AL_SEGMENT_PAYLOAD_BITS: usize = 160;
-const PACKET_DATA_USAGE: u8 = 48;
+// ETSI TTR 001-05 section 6.5 defines 208 payload bits for an original
+// advanced-link downlink segment carried by a pi/4-DQPSK MAC-RESOURCE with
+// SSI addressing and no reserved space for a slot grant. Together with the
+// 17-bit AL-DATA header and the 43-bit MAC-RESOURCE header this fills one
+// 268-bit SCH/F block exactly. A shorter arbitrary segment lets UMAC start a
+// second LLC PDU in the remaining block space and MAC-fragment it, which is
+// not a valid mapping of advanced-link segments.
+const AL_SEGMENT_PAYLOAD_BITS: usize = 208;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -619,13 +625,27 @@ impl Llc {
         reporter.mark_lost();
     }
 
-    fn packet_route(timeslot: u8) -> Option<tetra_saps::tma::AssociatedChannel> {
-        (2..=4).contains(&timeslot).then_some(tetra_saps::tma::AssociatedChannel {
-            call_id: 0,
-            timeslot,
-            usage: PACKET_DATA_USAGE,
-            best_effort_key: None,
-        })
+    fn packet_routes(config: &SharedConfig, issi: u32) -> Vec<tetra_saps::tma::AssociatedChannel> {
+        config
+            .state_read()
+            .subscriber_packet_delivery_routes
+            .get(&issi)
+            .into_iter()
+            .flat_map(|routes| routes.iter())
+            .filter(|route| (2..=4).contains(&route.timeslot))
+            .map(|route| tetra_saps::tma::AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+                best_effort_key: None,
+            })
+            .collect()
+    }
+
+    fn packet_route(config: &SharedConfig, issi: u32, timeslot: u8) -> Option<tetra_saps::tma::AssociatedChannel> {
+        Self::packet_routes(config, issi)
+            .into_iter()
+            .find(|route| route.timeslot == timeslot)
     }
 
     fn queue_advanced_pdu(
@@ -680,6 +700,13 @@ impl Llc {
 
     fn rx_tla_tldata_req_al(&mut self, prim: tetra_saps::tla::TlaTlDataReqBl) -> bool {
         let issi = prim.main_address.ssi;
+        let Some(slots) = self.advanced_links.get(&issi).map(|link| link.slots) else {
+            return false;
+        };
+        let mut routes = Self::packet_routes(&self.config, issi)
+            .into_iter()
+            .take(slots as usize)
+            .collect::<Vec<_>>();
         let Some(link) = self.advanced_links.get_mut(&issi) else {
             return false;
         };
@@ -688,15 +715,6 @@ impl Llc {
         }
         let reporter = prim.tx_reporter.unwrap_or_else(TxReporter::new);
         let segments = Self::advanced_segments(prim.tl_sdu);
-        let mut routes = self
-            .config
-            .state_read()
-            .timeslot_alloc
-            .packet_slots()
-            .into_iter()
-            .take(link.slots as usize)
-            .filter_map(Self::packet_route)
-            .collect::<Vec<_>>();
         if let Some(primary) = prim.associated_channel {
             routes.retain(|route| route.timeslot != primary.timeslot);
             routes.insert(0, primary);
@@ -828,7 +846,7 @@ impl Llc {
         let mut response_pdu = BitBuffer::new_autoexpand(32);
         if response.to_bitbuf(&mut response_pdu).is_ok() {
             response_pdu.seek(0);
-            let route = Self::packet_route(self.dltime.add_timeslots(-2).t);
+            let route = Self::packet_route(&self.config, prim.main_address.ssi, self.dltime.add_timeslots(-2).t);
             let aie = prim.air_interface_encryption.unwrap_or_else(|| {
                 AieRequest::clear(
                     AieSubject::Individual {
@@ -854,7 +872,7 @@ impl Llc {
             return;
         };
         let issi = prim.main_address.ssi;
-        let route = Self::packet_route(self.dltime.add_timeslots(-2).t);
+        let route = Self::packet_route(&self.config, issi, self.dltime.add_timeslots(-2).t);
         let aie = prim
             .air_interface_encryption
             .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
@@ -1046,7 +1064,7 @@ impl Llc {
                 prim.main_address,
                 prim.endpoint_id,
                 response_pdu,
-                Self::packet_route(self.dltime.add_timeslots(-2).t),
+                Self::packet_route(&self.config, prim.main_address.ssi, self.dltime.add_timeslots(-2).t),
                 None,
                 aie,
                 None,
@@ -1083,7 +1101,7 @@ impl Llc {
             prim.main_address,
             prim.endpoint_id,
             response_pdu,
-            Self::packet_route(self.dltime.add_timeslots(-2).t),
+            Self::packet_route(&self.config, prim.main_address.ssi, self.dltime.add_timeslots(-2).t),
             None,
             aie,
             None,
@@ -1944,7 +1962,28 @@ mod tests {
             "/../../example_config/config.toml"
         )))
         .expect("example configuration must remain valid");
-        SharedConfig::from_parts(config, None)
+        let shared = SharedConfig::from_parts(config, None);
+        shared.state_write().subscriber_packet_delivery_routes.insert(
+            77_468,
+            vec![
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 32,
+                    timeslot: 2,
+                    usage: 55,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 32,
+                    timeslot: 3,
+                    usage: 55,
+                },
+                tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 32,
+                    timeslot: 4,
+                    usage: 55,
+                },
+            ],
+        );
+        shared
     }
 
     fn advanced_indication(issi: u32, pdu: BitBuffer) -> SapMsg {
@@ -2004,7 +2043,15 @@ mod tests {
         let SapMsgInner::TmaUnitdataReq(mut response) = response.msg else {
             panic!("expected TMA response")
         };
-        assert_eq!(response.associated_channel.map(|route| route.timeslot), Some(2));
+        assert_eq!(
+            response.associated_channel,
+            Some(tetra_saps::tma::AssociatedChannel {
+                call_id: 32,
+                timeslot: 2,
+                usage: 55,
+                best_effort_key: None,
+            })
+        );
         assert_eq!(AlSetup::from_bitbuf(&mut response.pdu).unwrap().report, 0);
     }
 
@@ -2070,16 +2117,31 @@ mod tests {
                     req_handle: 0,
                     graceful_degradation: None,
                     chan_alloc: None,
-                    associated_channel: Llc::packet_route(2),
+                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
                     tx_reporter: Some(reporter.clone()),
                 }),
             ),
         );
         llc.submit_advanced_link_messages(&mut queue);
         assert_eq!(reporter.get_state(), TxState::Pending);
-        assert!(queue.pop_front().is_some());
-        assert!(queue.pop_front().is_some());
+        let first = queue.pop_front().expect("first advanced-link segment");
+        let second = queue.pop_front().expect("final advanced-link segment");
         assert!(queue.pop_front().is_none());
+        let SapMsgInner::TmaUnitdataReq(first) = first.msg else {
+            panic!("expected first TMA segment")
+        };
+        let SapMsgInner::TmaUnitdataReq(second) = second.msg else {
+            panic!("expected final TMA segment")
+        };
+        assert_eq!(first.pdu.get_len_remaining(), 17 + AL_SEGMENT_PAYLOAD_BITS);
+        assert_eq!(
+            first.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
+            Some((32, 2, 55))
+        );
+        assert_eq!(
+            second.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
+            Some((32, 3, 55))
+        );
 
         let mut ack = BitBuffer::new_autoexpand(16);
         AlAck {
