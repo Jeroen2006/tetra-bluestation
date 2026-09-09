@@ -9,10 +9,12 @@ use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
 use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
 use tetra_pdus::cmce::pdus::u_status::UStatus;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::control::sds::CmceSdsData;
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tla::TlaTlDataIndBl;
 
 use crate::common::ComponentTest;
 
@@ -55,6 +57,38 @@ fn build_u_sds_data_msg(source_issi: u32, dest_ssi: u32, payload: u16) -> SapMsg
             received_tetra_address: TetraAddress::new(source_issi, SsiType::Issi),
             chan_change_resp_req: false,
             chan_change_handle: None,
+        }),
+    }
+}
+
+fn build_acknowledged_u_sds_data_msg(source_issi: u32, dest_ssi: u32, payload: u16) -> SapMsg {
+    let SapMsgInner::LcmcMleUnitdataInd(mut cmce) = build_u_sds_data_msg(source_issi, dest_ssi, payload).msg else {
+        unreachable!()
+    };
+    let cmce_len = cmce.sdu.get_len_remaining();
+    let mut tl_sdu = BitBuffer::new_autoexpand(3 + cmce_len);
+    tl_sdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+    tl_sdu.copy_bits(&mut cmce.sdu, cmce_len);
+    tl_sdu.seek(0);
+
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::TlaTlDataIndBl(TlaTlDataIndBl {
+            main_address: TetraAddress::new(source_issi, SsiType::Issi),
+            link_id: 1,
+            endpoint_id: 1,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            tl_sdu: Some(tl_sdu),
+            scrambling_code: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+            req_handle: 1,
         }),
     }
 }
@@ -108,7 +142,7 @@ fn test_sds_local_delivery() {
 }
 
 #[test]
-fn test_sds_brew_forward() {
+fn test_sds_offline_does_not_use_legacy_brew_route() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -130,17 +164,50 @@ fn test_sds_brew_forward() {
     let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
     test.populate_entities(components, sinks);
 
-    // Do NOT register dest ISSI — should forward to Brew
+    // A configured RX-only Brew client is not an SDS route. When the SwMI is
+    // offline, the BS keeps SDS local and reports an unknown destination.
+    register_subscriber(&mut test, 1000001);
     let msg = build_u_sds_data_msg(1000001, 5000001, 0x1234);
     test.submit_message(msg);
     test.run_stack(Some(1));
 
     let sink_msgs = test.dump_sinks();
     let brew_count = count_brew_sds(&sink_msgs);
-    assert!(brew_count > 0, "Expected CmceSdsData at Brew sink for non-local ISSI");
+    assert_eq!(brew_count, 0, "BS must not bypass the central SwMI SDS router");
 
-    let d_sds_count = count_d_sds_data(&sink_msgs);
-    assert_eq!(d_sds_count, 0, "Should not deliver locally when dest is not registered");
+    let reports: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|message| match &message.msg {
+            SapMsgInner::LcmcMleUnitdataReq(primitive) => Some(primitive),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].main_address.ssi, 1000001);
+    assert_eq!(reports[0].main_address.ssi_type, SsiType::Issi);
+}
+
+#[test]
+fn test_acknowledged_mle_cmce_sds_reaches_llc_downlink() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Mle, TetraEntity::Cmce], vec![TetraEntity::Llc]);
+    register_subscriber(&mut test, 2000001);
+
+    test.submit_message(build_acknowledged_u_sds_data_msg(1000001, 2000001, 0x1234));
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    assert!(sink_msgs.iter().any(|message| {
+        matches!(
+            &message.msg,
+            SapMsgInner::TlaTlDataReqBl(primitive)
+                if primitive.main_address.ssi == 2000001
+                    && primitive.main_address.ssi_type == SsiType::Issi
+        )
+    }));
 }
 
 #[test]
@@ -310,7 +377,7 @@ fn test_u_status_forwarded_as_d_status() {
 }
 
 #[test]
-fn test_u_status_brew_forward() {
+fn test_u_status_offline_reports_unreachable_without_legacy_brew_route() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -332,7 +399,8 @@ fn test_u_status_brew_forward() {
     let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
     test.populate_entities(components, sinks);
 
-    // Only register source, NOT dest — should forward to Brew
+    // Only register source, NOT dest. The offline BS reports the failure to
+    // the source and does not bypass the central router through Brew.
     register_subscriber(&mut test, 1000001);
 
     let u_status = UStatus {
@@ -369,27 +437,22 @@ fn test_u_status_brew_forward() {
 
     let sink_msgs = test.dump_sinks();
 
-    // Should forward to Brew as CmceSdsData with Type1 payload
     let brew_count = count_brew_sds(&sink_msgs);
-    assert_eq!(brew_count, 1, "Expected 1 CmceSdsData at Brew sink for U-STATUS");
-
-    // Verify the payload is Type1 with the original pre-coded status value
-    let brew_msg = sink_msgs.iter().find(|m| m.dest == TetraEntity::Brew).unwrap();
-    if let SapMsgInner::CmceSdsData(ref sds) = brew_msg.msg {
-        assert_eq!(sds.source_issi, 1000001);
-        assert_eq!(sds.dest_issi, 5000001);
-        assert_eq!(sds.user_defined_data, SdsUserData::Type1(0x8210));
-    } else {
-        panic!("Expected CmceSdsData message at Brew sink");
-    }
-
-    // Should NOT deliver locally
-    let d_sds_count = count_d_sds_data(&sink_msgs);
-    assert_eq!(d_sds_count, 0, "Should not deliver locally when dest is not registered");
+    assert_eq!(brew_count, 0, "BS must not bypass the central SwMI status router");
+    let reports: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|message| match &message.msg {
+            SapMsgInner::LcmcMleUnitdataReq(primitive) => Some(primitive),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].main_address.ssi, 1000001);
+    assert_eq!(reports[0].main_address.ssi_type, SsiType::Issi);
 }
 
 #[test]
-fn test_u_status_unregistered_dest_dropped() {
+fn test_u_status_unregistered_dest_reports_unreachable() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -435,6 +498,14 @@ fn test_u_status_unregistered_dest_dropped() {
     test.run_stack(Some(1));
 
     let sink_msgs = test.dump_sinks();
-    let d_status_count = count_d_sds_data(&sink_msgs);
-    assert_eq!(d_status_count, 0, "Should not deliver D-STATUS when dest is not registered");
+    let reports: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|message| match &message.msg {
+            SapMsgInner::LcmcMleUnitdataReq(primitive) => Some(primitive),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 1, "Should report an unreachable destination to the source");
+    assert_eq!(reports[0].main_address.ssi, 1000001);
+    assert_eq!(reports[0].main_address.ssi_type, SsiType::Issi);
 }
