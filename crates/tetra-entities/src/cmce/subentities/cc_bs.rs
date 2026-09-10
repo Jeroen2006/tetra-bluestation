@@ -814,6 +814,28 @@ impl CcBsSubentity {
         self.listener_channels_for(issi).into_iter().next()
     }
 
+    /// Return the PDCH on which an MS currently receives packet-data and
+    /// basic-link signalling.  TTR 001-05 section 6.7 permits call setup to
+    /// start and finish on a PDCH, while TTR 001-12 section 6.6.4 requires the
+    /// final D-CONNECT channel allocation to move the MS to the TCH.  This is
+    /// deliberately separate from `preferred_listener_channel`: once CMCE
+    /// has allocated the new call that helper can already prefer the new TCH,
+    /// even though the MS has not received the channel change yet.
+    fn packet_listener_channel(&self, issi: u32) -> Option<AssociatedChannel> {
+        self.config
+            .state_read()
+            .subscriber_packet_delivery_routes
+            .get(&issi)
+            .and_then(|routes| routes.first())
+            .copied()
+            .map(|route| AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+                best_effort_key: None,
+            })
+    }
+
     /// Return every currently usable channel for this MS in delivery order.
     /// The first is the preferred route; the remaining entries let LLC make a
     /// later BL retry on another live timeslot instead of pinning it to the
@@ -1072,12 +1094,12 @@ impl CcBsSubentity {
             // frame-18 SCH/F provides 268 bits and supports fragmentation.
             // During hangtime UMAC deliberately sends this ordinary resource
             // in the available FACCH frames 1..17 instead.
-            // D-CALL-PROCEEDING is the immediate response to a U-SETUP on
-            // the MCCH.  At this point the terminal is not yet reliably
-            // assigned to, or listening on, the new traffic slot.  Routing
-            // it through FN18 delayed it by almost a multiframe in practice,
-            // which made the terminal cancel its PTT attempt.  Only ordinary
-            // in-call delivery (such as D-SDS-DATA) uses the tracked channel.
+            // D-CALL-PROCEEDING is the immediate response to U-SETUP. A
+            // request received while the MS is on PDCH is explicitly pinned
+            // to that packet bearer when the response is created. An
+            // unassociated request came from MCCH and must remain there; the
+            // newly allocated TCH is not a valid route until D-CONNECT has
+            // delivered its channel allocation.
             let mut cmce_sdu = prim.sdu.clone();
             cmce_sdu.seek(0);
             let pdu_type = cmce_sdu.read_field(5, "cmce_pdu_type").ok();
@@ -1110,7 +1132,7 @@ impl CcBsSubentity {
                 continue;
             }
             if pdu_type == Some(CmcePduTypeDl::DCallProceeding.into_raw()) {
-                tracing::debug!(issi = prim.main_address.ssi, "keeping D-CALL-PROCEEDING on MCCH");
+                tracing::debug!(issi = prim.main_address.ssi, "keeping unassociated D-CALL-PROCEEDING on MCCH");
                 continue;
             }
             if let Some(channel) = self.preferred_listener_channel(prim.main_address.ssi) {
@@ -1318,6 +1340,7 @@ impl CcBsSubentity {
         sdu.seek(0);
         tracing::info!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
 
+        let packet_channel = self.packet_listener_channel(prim.received_tetra_address.ssi);
         let msg = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -1334,12 +1357,21 @@ impl CcBsSubentity {
                 stealing_repeats_flag: false,
 
                 chan_alloc: None,
-                associated_channel: None,
+                associated_channel: packet_channel,
                 main_address: prim.received_tetra_address,
                 aie_override: None,
                 tx_reporter: None,
             }),
         };
+        if let Some(channel) = packet_channel {
+            tracing::info!(
+                issi = prim.received_tetra_address.ssi,
+                call_id,
+                packet_bearer_id = channel.call_id,
+                packet_timeslot = channel.timeslot,
+                "routing D-CALL-PROCEEDING on the originating PDCH"
+            );
+        }
         queue.push_back(msg);
     }
 
@@ -1398,6 +1430,7 @@ impl CcBsSubentity {
             "connecting U-SETUP to existing group call"
         );
 
+        let packet_channel = self.packet_listener_channel(calling_party.ssi);
         queue.push_back(SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -1420,12 +1453,22 @@ impl CcBsSubentity {
                     cell_change_flag: false,
                     ul_dl_assigned: UlDlAssignment::Both,
                 }),
-                associated_channel: None,
+                associated_channel: packet_channel,
                 main_address: calling_party,
                 aie_override: None,
                 tx_reporter: None,
             }),
         });
+        if let Some(channel) = packet_channel {
+            tracing::info!(
+                issi = calling_party.ssi,
+                call_id,
+                packet_bearer_id = channel.call_id,
+                packet_timeslot = channel.timeslot,
+                voice_timeslot = ts,
+                "routing D-CONNECT with voice allocation on the originating PDCH"
+            );
+        }
     }
 
     fn next_swmi_command_id(&mut self) -> u64 {

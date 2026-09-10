@@ -18,18 +18,26 @@ use tetra_saps::{
     },
     lmm::LmmMleUnitdataReq,
     ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq},
-    tma::AssociatedChannel,
+    tma::{AssociatedChannel, TmaUnitdataReq},
 };
 use tetra_swmi_protocol::{
     ChapProof, PacketAccessResponse, PacketAddressRequest, PacketBearerAction, PacketBearerState, PacketDataMessage, PacketDeliveryStatus,
-    PacketRejectCause, PacketResourceRequest, SwmiMessage,
+    PacketRejectCause, PacketResourceRequest, SwmiMessage, TerminalSecurityClass,
 };
 
 use crate::{MessageQueue, TetraEntityTrait, net_swmi::SwmiPacketEndpoint};
 
 const DEFAULT_NSAPI: u8 = 1;
 const PACKET_USAGE_BASE: u8 = 48;
-const DRAIN_GRACE_TIMESLOTS: i32 = 2 * 18 * 4;
+// A successful acknowledged SN-END OF DATA already proves that the MS was
+// told to leave the PDCH. Do not add a fixed multi-frame delay afterwards;
+// the force deadline remains the bounded fallback for a missing terminal.
+const DRAIN_GRACE_TIMESLOTS: i32 = 0;
+// TxReporter becomes Transmitted when the MAC block is built ahead of RF.
+// Retain the old PDCH for a short guard after that point so the channel
+// allocation reaches air before voice reuses the removed physical slot.
+const PDCH_RESIZE_RF_GUARD_TIMESLOTS: i32 = 8;
+const PDCH_RESIZE_TIMEOUT_TIMESLOTS: i32 = 2 * 18 * 4;
 
 #[derive(Debug, Clone)]
 struct RadioContext {
@@ -67,12 +75,29 @@ struct Bearer {
     id: u64,
     generation: u64,
     timeslot_bitmap: u8,
+    /// Slot set requested by the SwMI/MS. A temporarily unavailable slot is
+    /// added later, after a circuit releases it, using the ETSI resize order.
+    desired_timeslot_bitmap: u8,
     members: HashSet<u32>,
     draining: bool,
     release_at: Option<TdmaTime>,
     force_at: Option<TdmaTime>,
     command_id: u64,
     drain_reporters: Vec<TxReporter>,
+    resize: Option<PendingBearerResize>,
+    expand_not_before: Option<TdmaTime>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBearerResize {
+    from_bitmap: u8,
+    to_bitmap: u8,
+    /// Slots reserved in advance for an expansion. They are released again
+    /// if the new channel allocation cannot be put on air.
+    expansion_bitmap: u8,
+    reporters: Vec<TxReporter>,
+    deadline: TdmaTime,
+    commit_at: Option<TdmaTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +413,53 @@ impl Sndcp {
             }),
         ));
         true
+    }
+
+    fn individual_downlink_aie(&self, issi: u32) -> AieRequest {
+        let state = self.config.state_read();
+        let subject = AieSubject::Individual { issi };
+        if !state.aie.enabled || state.aie_sessions.terminal_allows_clear(issi) {
+            return AieRequest::clear(subject, AieScope::MacResource);
+        }
+        match state.aie_sessions.terminal_class(issi) {
+            TerminalSecurityClass::Sc1 => AieRequest::clear(subject, AieScope::MacResource),
+            TerminalSecurityClass::Sc2 => AieRequest::sc2(subject, AieScope::MacResource),
+            TerminalSecurityClass::Sc3 => AieRequest::sc3(subject, AieScope::MacResource),
+            TerminalSecurityClass::Unknown if state.aie.sc3.is_some() => AieRequest::sc3(subject, AieScope::MacResource),
+            TerminalSecurityClass::Unknown => AieRequest::sc2(subject, AieScope::MacResource),
+        }
+    }
+
+    /// Put a MAC-only Replace allocation on the MS's current PDCH. TTR
+    /// 001-05 section 7.11.1 defines PDCH width changes as a MAC procedure:
+    /// for shrinking, the allocation is sent before the removed AACH changes;
+    /// for expansion, the new AACH is enabled before this allocation.
+    fn queue_standalone_channel_allocation(&self, queue: &mut MessageQueue, context: &RadioContext, timeslot_bitmap: u8) -> TxReporter {
+        let reporter = TxReporter::new_unacked();
+        let usage = context
+            .event_label
+            .map(|label| PACKET_USAGE_BASE + (label as u8 & 0x0f))
+            .unwrap_or(PACKET_USAGE_BASE);
+        queue.push_back(SapMsg::new(
+            Sap::TmaSap,
+            TetraEntity::Sndcp,
+            TetraEntity::Umac,
+            SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 0,
+                pdu: BitBuffer::new(0),
+                main_address: context.address(),
+                endpoint_id: context.endpoint_id,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: Some(self.individual_downlink_aie(context.issi)),
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: Some(Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)),
+                associated_channel: self.route_for(context),
+                tx_reporter: Some(reporter.clone()),
+            }),
+        ));
+        reporter
     }
 
     fn channel_allocation(bitmap: u8, usage: u8, alloc_type: ChanAllocType) -> CmceChanAllocReq {
@@ -892,12 +964,15 @@ impl Sndcp {
                 id,
                 generation,
                 timeslot_bitmap: allocated,
+                desired_timeslot_bitmap: requested & 0b1110,
                 members: HashSet::new(),
                 draining: false,
                 release_at: None,
                 force_at: None,
                 command_id,
                 drain_reporters: Vec::new(),
+                resize: None,
+                expand_not_before: None,
             },
         );
         queue.push_back(SapMsg::new(
@@ -920,7 +995,239 @@ impl Sndcp {
         });
     }
 
+    fn start_bearer_resize(&mut self, queue: &mut MessageQueue, id: u64, generation: u64, to_bitmap: u8, expansion_bitmap: u8) -> bool {
+        let Some((from_bitmap, mut members)) = self
+            .bearers
+            .get(&id)
+            .filter(|bearer| bearer.generation == generation && !bearer.draining && bearer.resize.is_none())
+            .map(|bearer| (bearer.timeslot_bitmap, bearer.members.clone()))
+        else {
+            return false;
+        };
+        if to_bitmap == 0 || to_bitmap == from_bitmap {
+            return false;
+        }
+
+        // Bearer reservation and radio access are separate SwMI messages. A
+        // BS restart or a delayed AccessResult can therefore leave the local
+        // bearer member set temporarily behind a recovered radio context.
+        // Include every context that already names this bearer so an attached
+        // MS always receives the Replace allocation before its AACH changes.
+        members.extend(self.contexts.iter().filter_map(|(&issi, context)| {
+            (context.bearer_id == Some(id) && context.bearer_generation == Some(generation)).then_some(issi)
+        }));
+        let members = members.into_iter().collect::<Vec<_>>();
+        let member_count = members.len();
+
+        // For an expansion, UMAC must advertise Uma on the added slots before
+        // the MS receives the larger Replace allocation (TTR 001-05 7.11.1).
+        if expansion_bitmap != 0 {
+            queue.push_back(SapMsg::new(
+                Sap::Control,
+                TetraEntity::Sndcp,
+                TetraEntity::Umac,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Resize {
+                    bearer_id: id,
+                    generation,
+                    timeslot_bitmap: to_bitmap,
+                }),
+            ));
+        }
+
+        let reporters = members
+            .iter()
+            .filter_map(|issi| self.contexts.get(issi))
+            .filter(|context| context.bearer_id == Some(id) && context.bearer_generation == Some(generation))
+            .map(|context| self.queue_standalone_channel_allocation(queue, context, to_bitmap))
+            .collect::<Vec<_>>();
+        self.bearers.get_mut(&id).expect("validated bearer").resize = Some(PendingBearerResize {
+            from_bitmap,
+            to_bitmap,
+            expansion_bitmap,
+            reporters,
+            deadline: self.dltime.add_timeslots(PDCH_RESIZE_TIMEOUT_TIMESLOTS),
+            // A reserved bearer can legitimately have no attached MS yet. In
+            // that case there is nobody to notify over RF and the resize may
+            // commit immediately instead of blocking a higher-priority call.
+            commit_at: (member_count == 0).then_some(self.dltime),
+        });
+        tracing::info!(
+            bearer_id = id,
+            generation,
+            from_bitmap,
+            to_bitmap,
+            member_count,
+            "packet bearer resize announced to attached terminals"
+        );
+        true
+    }
+
+    fn commit_bearer_resize(&mut self, queue: &mut MessageQueue, id: u64, generation: u64) {
+        let Some((resize, members, command_id)) =
+            self.bearers
+                .get_mut(&id)
+                .filter(|bearer| bearer.generation == generation)
+                .and_then(|bearer| {
+                    let resize = bearer.resize.take()?;
+                    bearer.timeslot_bitmap = resize.to_bitmap;
+                    bearer.expand_not_before = (resize.expansion_bitmap == 0).then(|| self.dltime.add_timeslots(18 * 4));
+                    Some((resize, bearer.members.iter().copied().collect::<Vec<_>>(), bearer.command_id))
+                })
+        else {
+            return;
+        };
+
+        // On shrink the old AACH remains Uma until this point, after the
+        // Replace allocation reached RF. Only now may voice take that slot.
+        if resize.expansion_bitmap == 0 {
+            queue.push_back(SapMsg::new(
+                Sap::Control,
+                TetraEntity::Sndcp,
+                TetraEntity::Umac,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Resize {
+                    bearer_id: id,
+                    generation,
+                    timeslot_bitmap: resize.to_bitmap,
+                }),
+            ));
+            let removed = resize.from_bitmap & !resize.to_bitmap;
+            let mut state = self.config.state_write();
+            for timeslot in 2..=4 {
+                if removed & (1 << (timeslot - 1)) != 0 {
+                    let _ = state.timeslot_alloc.release(TimeslotOwner::PacketData, timeslot);
+                }
+            }
+        }
+
+        for issi in members {
+            if let Some(context) = self.contexts.get_mut(&issi) {
+                context.timeslot_bitmap = resize.to_bitmap;
+                let context = context.clone();
+                self.publish_delivery_routes(&context);
+            }
+        }
+        self.submit(PacketDataMessage::BearerReport {
+            command_id,
+            bearer_id: id,
+            bearer_generation: generation,
+            state: PacketBearerState::Ready,
+            timeslot_bitmap: resize.to_bitmap,
+            member_count: self.bearers[&id].members.len().min(u16::MAX as usize) as u16,
+        });
+        tracing::info!(
+            bearer_id = id,
+            generation,
+            from_bitmap = resize.from_bitmap,
+            to_bitmap = resize.to_bitmap,
+            "packet bearer resize committed after over-air notification"
+        );
+    }
+
+    fn rollback_bearer_resize(&mut self, queue: &mut MessageQueue, id: u64, generation: u64) {
+        let Some(resize) = self
+            .bearers
+            .get_mut(&id)
+            .filter(|bearer| bearer.generation == generation)
+            .and_then(|bearer| bearer.resize.take())
+        else {
+            return;
+        };
+        if resize.expansion_bitmap != 0 {
+            queue.push_back(SapMsg::new(
+                Sap::Control,
+                TetraEntity::Sndcp,
+                TetraEntity::Umac,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Resize {
+                    bearer_id: id,
+                    generation,
+                    timeslot_bitmap: resize.from_bitmap,
+                }),
+            ));
+            let mut state = self.config.state_write();
+            for timeslot in 2..=4 {
+                if resize.expansion_bitmap & (1 << (timeslot - 1)) != 0 {
+                    let _ = state.timeslot_alloc.release(TimeslotOwner::PacketData, timeslot);
+                }
+            }
+        }
+        tracing::warn!(
+            bearer_id = id,
+            generation,
+            "packet bearer resize did not reach every attached terminal; retaining old slot set"
+        );
+    }
+
+    fn process_bearer_resizes(&mut self, queue: &mut MessageQueue) {
+        let pending = self
+            .bearers
+            .iter_mut()
+            .filter_map(|(&id, bearer)| {
+                let resize = bearer.resize.as_mut()?;
+                if resize
+                    .reporters
+                    .iter()
+                    .any(|reporter| matches!(reporter.get_state(), TxState::Discarded | TxState::Lost))
+                    || resize.deadline.age(self.dltime) >= 0
+                {
+                    return Some((id, bearer.generation, false));
+                }
+                if resize.reporters.iter().all(TxReporter::is_in_final_state) {
+                    let commit_at = *resize
+                        .commit_at
+                        .get_or_insert_with(|| self.dltime.add_timeslots(PDCH_RESIZE_RF_GUARD_TIMESLOTS));
+                    if commit_at.age(self.dltime) >= 0 {
+                        return Some((id, bearer.generation, true));
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        for (id, generation, commit) in pending {
+            if commit {
+                self.commit_bearer_resize(queue, id, generation);
+            } else {
+                self.rollback_bearer_resize(queue, id, generation);
+            }
+        }
+    }
+
+    fn process_bearer_expansions(&mut self, queue: &mut MessageQueue) {
+        let candidates = self
+            .bearers
+            .iter()
+            .filter(|(_, bearer)| {
+                !bearer.draining && bearer.resize.is_none() && bearer.expand_not_before.is_none_or(|due| due.age(self.dltime) >= 0)
+            })
+            .filter_map(|(&id, bearer)| {
+                let missing = bearer.desired_timeslot_bitmap & !bearer.timeslot_bitmap;
+                (missing != 0).then_some((id, bearer.generation, bearer.timeslot_bitmap, missing))
+            })
+            .collect::<Vec<_>>();
+        for (id, generation, current, missing) in candidates {
+            let mut added = 0u8;
+            {
+                let mut state = self.config.state_write();
+                for timeslot in 2..=4 {
+                    let bit = 1 << (timeslot - 1);
+                    if missing & bit != 0 && state.timeslot_alloc.reserve(TimeslotOwner::PacketData, timeslot).is_ok() {
+                        added |= bit;
+                    }
+                }
+            }
+            if added != 0 {
+                let _ = self.start_bearer_resize(queue, id, generation, current | added, added);
+            }
+        }
+    }
+
     fn begin_drain(&mut self, queue: &mut MessageQueue, command_id: u64, id: u64, generation: u64, force_after_ms: u32) {
+        if self
+            .bearers
+            .get(&id)
+            .is_some_and(|bearer| bearer.generation == generation && bearer.resize.is_some())
+        {
+            self.rollback_bearer_resize(queue, id, generation);
+        }
         let member_ids = self
             .bearers
             .get(&id)
@@ -979,13 +1286,14 @@ impl Sndcp {
         let Some(bearer) = self.bearers.remove(&id) else {
             return;
         };
+        let reserved_bitmap = bearer.timeslot_bitmap | bearer.resize.as_ref().map(|resize| resize.expansion_bitmap).unwrap_or_default();
         {
             let mut state = self.config.state_write();
             for issi in &bearer.members {
                 state.subscriber_packet_delivery_routes.remove(issi);
             }
             for timeslot in 2..=4 {
-                if bearer.timeslot_bitmap & (1 << (timeslot - 1)) != 0 {
+                if reserved_bitmap & (1 << (timeslot - 1)) != 0 {
                     let _ = state.timeslot_alloc.release(TimeslotOwner::PacketData, timeslot);
                 }
             }
@@ -1077,7 +1385,10 @@ impl Sndcp {
                         nsapi: context.nsapi,
                         ipv4: ipv4.unwrap_or_default(),
                         dynamic_address: context.dynamic_address,
-                        ready_timer: ready_timer_code(timers.ready_ms).unwrap_or(8),
+                        // PacketTimers is validated by the SwMI. Retain the
+                        // network's conventional 60-second READY value if a
+                        // future peer nevertheless supplies an invalid value.
+                        ready_timer: ready_timer_code(timers.ready_ms).unwrap_or(11),
                         standby_timer: standby_timer_code(timers.standby_seconds).unwrap_or(6),
                         response_wait_timer: response_wait_timer_code(timers.response_wait_ms).unwrap_or(7),
                         snei,
@@ -1236,7 +1547,7 @@ impl Sndcp {
                 }
             }
             PacketDataMessage::Page {
-                command_id,
+                command_id: _,
                 itsi,
                 session_id,
                 session_generation,
@@ -1265,7 +1576,6 @@ impl Sndcp {
                         dynamic_address: true,
                     });
                 self.insert_context(context.clone());
-                self.pending_commands.insert(command_id, issi);
                 self.queue_downlink(
                     queue,
                     &context,
@@ -1527,14 +1837,30 @@ impl Sndcp {
         if !requested {
             return;
         }
-        let active = self
-            .bearers
-            .values()
-            .find(|bearer| !bearer.draining)
-            .map(|bearer| (bearer.command_id, bearer.id, bearer.generation));
-        if let Some((command_id, id, generation)) = active {
-            tracing::info!(bearer_id = id, "voice capacity requested; draining lower-priority packet bearer");
-            self.begin_drain(queue, command_id, id, generation, 2_500);
+        let active = self.bearers.values().find(|bearer| !bearer.draining).map(|bearer| {
+            (
+                bearer.command_id,
+                bearer.id,
+                bearer.generation,
+                bearer.timeslot_bitmap,
+                bearer.resize.is_some(),
+            )
+        });
+        if let Some((command_id, id, generation, bitmap, resizing)) = active {
+            if resizing {
+                // The capacity queue repeats its request. Let the in-progress
+                // atomic resize finish before attempting another one.
+                return;
+            }
+            let slots = (2..=4).filter(|timeslot| bitmap & (1 << (timeslot - 1)) != 0).collect::<Vec<_>>();
+            if slots.len() > 1 {
+                let released = *slots.last().expect("multislot bearer");
+                let reduced = bitmap & !(1 << (released - 1));
+                let _ = self.start_bearer_resize(queue, id, generation, reduced, 0);
+            } else {
+                tracing::info!(bearer_id = id, "voice capacity requested; draining final packet-data slot");
+                self.begin_drain(queue, command_id, id, generation, 2_500);
+            }
         }
     }
 
@@ -1627,7 +1953,9 @@ impl TetraEntityTrait for Sndcp {
         self.process_preemption(queue);
         self.process_delivery_reports();
         self.process_standby_reports(queue);
+        self.process_bearer_resizes(queue);
         self.process_drains(queue);
+        self.process_bearer_expansions(queue);
     }
 }
 
@@ -1661,14 +1989,66 @@ mod tests {
                 id: 17,
                 generation,
                 timeslot_bitmap: 0b0010,
+                desired_timeslot_bitmap: 0b0010,
                 members,
                 draining: true,
                 release_at: Some(sndcp.dltime),
                 force_at: Some(sndcp.dltime.add_timeslots(100)),
                 command_id: 9,
                 drain_reporters: reporters,
+                resize: None,
+                expand_not_before: None,
             },
         );
+    }
+
+    fn insert_active_multislot_bearer(sndcp: &mut Sndcp) {
+        let members = HashSet::from([77_468]);
+        for timeslot in 2..=4 {
+            sndcp
+                .config
+                .state_write()
+                .timeslot_alloc
+                .reserve(TimeslotOwner::PacketData, timeslot)
+                .unwrap();
+        }
+        sndcp.bearers.insert(
+            17,
+            Bearer {
+                id: 17,
+                generation: 4,
+                timeslot_bitmap: 0b1110,
+                desired_timeslot_bitmap: 0b1110,
+                members,
+                draining: false,
+                release_at: None,
+                force_at: None,
+                command_id: 9,
+                drain_reporters: Vec::new(),
+                resize: None,
+                expand_not_before: None,
+            },
+        );
+        sndcp.contexts.insert(
+            77_468,
+            RadioContext {
+                issi: 77_468,
+                endpoint_id: 7,
+                link_id: 8,
+                nsapi: 1,
+                snei: Some(8),
+                session_id: Some(8),
+                session_generation: Some(1),
+                bearer_id: Some(17),
+                bearer_generation: Some(4),
+                timeslot_bitmap: 0b1110,
+                event_label: Some(23),
+                chap_identifier: None,
+                dynamic_address: true,
+            },
+        );
+        let context = sndcp.contexts[&77_468].clone();
+        sndcp.publish_delivery_routes(&context);
     }
 
     fn uplink(sdu: BitBuffer, issi: u32) -> LtpdMleUnitdataInd {
@@ -2066,7 +2446,10 @@ mod tests {
         assert_eq!(context.nsapi, 1);
         assert_eq!(context.snei, Some(8));
         assert_eq!(context.session(), Some((8, 3)));
-        assert_eq!(sndcp.pending_commands.get(&18), Some(&77_468));
+        assert!(
+            !sndcp.pending_commands.contains_key(&18),
+            "a page command completes through the MS response and must not leak into the BS command map"
+        );
         assert!(matches!(
             queue.pop_front().map(|message| message.msg),
             Some(SapMsgInner::LtpdMleUnitdataReq(_))
@@ -2092,6 +2475,171 @@ mod tests {
 
         assert_eq!(sndcp.bearers.get(&17).map(|bearer| bearer.generation), Some(4));
         assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+    }
+
+    #[test]
+    fn voice_preemption_shrinks_multislot_bearer_then_restores_released_slot() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        let mut queue = MessageQueue::new();
+        assert!(sndcp.config.state_write().timeslot_alloc.request_packet_preemption());
+
+        sndcp.process_preemption(&mut queue);
+
+        let resize = sndcp.bearers[&17].resize.as_ref().expect("shrink pending");
+        assert_eq!((resize.from_bitmap, resize.to_bitmap, resize.expansion_bitmap), (0b1110, 0b0110, 0));
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                &message.msg,
+                SapMsgInner::TmaUnitdataReq(request)
+                    if request.chan_alloc.as_ref().is_some_and(|allocation| allocation.timeslots == [false, true, true, false])
+            )
+        }));
+
+        for reporter in &resize.reporters {
+            reporter.mark_transmitted();
+        }
+        sndcp.process_bearer_resizes(&mut queue);
+        assert!(sndcp.bearers[&17].resize.is_some(), "RF guard must retain TS4");
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        sndcp.dltime = sndcp.dltime.add_timeslots(PDCH_RESIZE_RF_GUARD_TIMESLOTS - 1);
+        sndcp.process_bearer_resizes(&mut queue);
+        assert!(sndcp.bearers[&17].resize.is_some());
+
+        sndcp.dltime = sndcp.dltime.add_timeslots(1);
+        sndcp.process_bearer_resizes(&mut queue);
+
+        assert_eq!(sndcp.bearers[&17].timeslot_bitmap, 0b0110);
+        assert_eq!(sndcp.contexts[&77_468].timeslot_bitmap, 0b0110);
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(4));
+        assert_eq!(
+            sndcp.config.state_read().subscriber_packet_delivery_routes[&77_468]
+                .iter()
+                .map(|route| route.timeslot)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        sndcp.config.state_write().timeslot_alloc.reserve(TimeslotOwner::Cmce, 4).unwrap();
+        sndcp.dltime = sndcp.dltime.add_timeslots(18 * 4);
+        sndcp.process_bearer_expansions(&mut queue);
+        assert!(sndcp.bearers[&17].resize.is_none(), "active voice must keep TS4");
+        sndcp.config.state_write().timeslot_alloc.release(TimeslotOwner::Cmce, 4).unwrap();
+
+        sndcp.process_bearer_expansions(&mut queue);
+
+        let expansion = sndcp.bearers[&17].resize.as_ref().expect("expansion pending");
+        assert_eq!(
+            (expansion.from_bitmap, expansion.to_bitmap, expansion.expansion_bitmap),
+            (0b0110, 0b1110, 0b1000)
+        );
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        for reporter in &expansion.reporters {
+            reporter.mark_transmitted();
+        }
+        sndcp.process_bearer_resizes(&mut queue);
+        sndcp.dltime = sndcp.dltime.add_timeslots(PDCH_RESIZE_RF_GUARD_TIMESLOTS);
+        sndcp.process_bearer_resizes(&mut queue);
+
+        assert_eq!(sndcp.bearers[&17].timeslot_bitmap, 0b1110);
+        assert_eq!(sndcp.contexts[&77_468].timeslot_bitmap, 0b1110);
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(
+            sndcp.config.state_read().subscriber_packet_delivery_routes[&77_468]
+                .iter()
+                .map(|route| route.timeslot)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn voice_preemption_immediately_shrinks_reserved_bearer_without_members() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        sndcp.bearers.get_mut(&17).unwrap().members.clear();
+        sndcp.contexts.clear();
+        sndcp.config.state_write().subscriber_packet_delivery_routes.clear();
+        let mut queue = MessageQueue::new();
+        assert!(sndcp.config.state_write().timeslot_alloc.request_packet_preemption());
+
+        sndcp.process_preemption(&mut queue);
+        assert_eq!(sndcp.bearers[&17].resize.as_ref().unwrap().reporters.len(), 0);
+        sndcp.process_bearer_resizes(&mut queue);
+
+        assert_eq!(sndcp.bearers[&17].timeslot_bitmap, 0b0110);
+        assert!(sndcp.bearers[&17].resize.is_none());
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(4));
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                message.msg,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Resize {
+                    bearer_id: 17,
+                    generation: 4,
+                    timeslot_bitmap: 0b0110,
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn bearer_resize_recovers_member_from_matching_radio_context() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        sndcp.bearers.get_mut(&17).unwrap().members.clear();
+        let mut queue = MessageQueue::new();
+
+        assert!(sndcp.start_bearer_resize(&mut queue, 17, 4, 0b0110, 0));
+
+        let resize = sndcp.bearers[&17].resize.as_ref().unwrap();
+        assert_eq!(resize.reporters.len(), 1);
+        assert!(resize.commit_at.is_none());
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                &message.msg,
+                SapMsgInner::TmaUnitdataReq(request)
+                    if request.main_address.ssi == 77_468
+                        && request.chan_alloc.as_ref().is_some_and(|allocation| allocation.timeslots == [false, true, true, false])
+            )
+        }));
+    }
+
+    #[test]
+    fn failed_multislot_expansion_restores_aach_and_allocator() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        sndcp.bearers.get_mut(&17).unwrap().timeslot_bitmap = 0b0110;
+        sndcp.contexts.get_mut(&77_468).unwrap().timeslot_bitmap = 0b0110;
+        sndcp
+            .config
+            .state_write()
+            .timeslot_alloc
+            .release(TimeslotOwner::PacketData, 4)
+            .unwrap();
+        let mut queue = MessageQueue::new();
+
+        sndcp.process_bearer_expansions(&mut queue);
+
+        let reporter = sndcp.bearers[&17].resize.as_ref().unwrap().reporters[0].clone();
+        assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        reporter.mark_discarded();
+        sndcp.process_bearer_resizes(&mut queue);
+
+        assert!(sndcp.bearers[&17].resize.is_none());
+        assert_eq!(sndcp.bearers[&17].timeslot_bitmap, 0b0110);
+        assert_eq!(sndcp.contexts[&77_468].timeslot_bitmap, 0b0110);
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(4));
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                message.msg,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Resize {
+                    bearer_id: 17,
+                    generation: 4,
+                    timeslot_bitmap: 0b0110,
+                })
+            )
+        }));
     }
 
     #[test]

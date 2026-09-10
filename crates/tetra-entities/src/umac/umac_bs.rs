@@ -2410,9 +2410,37 @@ impl UmacBs {
                     self.channel_scheduler
                         .dl_enqueue_associated_best_effort_tma(channel.timeslot, key, pdu, sdu, aie_request);
                 } else if self.channel_scheduler.packet_bearer_is_active(channel.timeslot) {
-                    tracing::debug!(?channel, "routing SNDCP signalling through assigned packet channel");
-                    self.channel_scheduler
-                        .dl_enqueue_tma_on_timeslot(channel.timeslot, pdu, sdu, prim.tx_reporter, aie_request);
+                    let mut packet_data_slots = [false; 4];
+                    if let Some(routes) = self
+                        .config
+                        .state_read()
+                        .subscriber_packet_delivery_routes
+                        .get(&prim.main_address.ssi)
+                    {
+                        for route in routes.iter().filter(|route| route.call_id == channel.call_id) {
+                            if (2..=4).contains(&route.timeslot) && self.channel_scheduler.packet_bearer_is_active(route.timeslot) {
+                                packet_data_slots[route.timeslot as usize - 1] = true;
+                            }
+                        }
+                    }
+                    // Keep a valid single-slot route during the brief state
+                    // propagation window in which LLC already knows the
+                    // associated bearer but the shared route set is not yet
+                    // complete.
+                    packet_data_slots[channel.timeslot as usize - 1] = true;
+                    tracing::debug!(
+                        ?channel,
+                        ?packet_data_slots,
+                        "routing SNDCP signalling through assigned packet channel"
+                    );
+                    self.channel_scheduler.dl_enqueue_packet_tma_on_timeslot(
+                        channel.timeslot,
+                        pdu,
+                        sdu,
+                        prim.tx_reporter,
+                        aie_request,
+                        packet_data_slots,
+                    );
                 } else {
                     let hangtime = self.channel_scheduler.is_hangtime(channel.timeslot);
                     let ul_active = self.channel_scheduler.circuit_is_active(Direction::Ul, channel.timeslot);

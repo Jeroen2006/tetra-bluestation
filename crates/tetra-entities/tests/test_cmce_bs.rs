@@ -1,8 +1,9 @@
 mod common;
 
-use tetra_config::bluestation::StackMode;
+use tetra_config::bluestation::{StackMode, SubscriberDeliveryRoute};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxState, debug};
+use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
@@ -180,6 +181,66 @@ fn test_group_setup_joins_existing_circuit() {
         }),
         "expected an individually addressed D-CONNECT for the joining terminal"
     );
+}
+
+#[test]
+fn test_group_setup_from_pdch_returns_call_signalling_on_pdch() {
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let packet_route = SubscriberDeliveryRoute {
+        call_id: 1846,
+        timeslot: 4,
+        usage: 47,
+    };
+    test.config
+        .state_write()
+        .subscriber_packet_delivery_routes
+        .insert(TEST_ISSI, vec![packet_route]);
+
+    test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let messages = test.dump_sinks();
+
+    let mut proceeding_seen = false;
+    let mut connect_seen = false;
+    for message in messages {
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = message.msg else {
+            continue;
+        };
+        if prim.main_address.ssi != TEST_ISSI || prim.main_address.ssi_type != SsiType::Issi {
+            continue;
+        }
+        let Some(pdu_type) = prim.sdu.peek_bits(5) else {
+            continue;
+        };
+        let associated = prim
+            .associated_channel
+            .expect("call setup response must remain on the originating PDCH");
+        assert_eq!(associated.call_id, packet_route.call_id);
+        assert_eq!(associated.timeslot, packet_route.timeslot);
+        assert_eq!(associated.usage, packet_route.usage);
+        if pdu_type == CmcePduTypeDl::DCallProceeding.into_raw() {
+            proceeding_seen = true;
+            assert!(prim.chan_alloc.is_none());
+        } else if pdu_type == CmcePduTypeDl::DConnect.into_raw() {
+            connect_seen = true;
+            let allocation = prim.chan_alloc.expect("D-CONNECT must carry the new voice allocation");
+            assert!(allocation.timeslots.iter().any(|assigned| *assigned));
+            assert_ne!(
+                allocation.timeslots[packet_route.timeslot as usize - 1],
+                true,
+                "the test voice circuit must not replace the PDCH source route before D-CONNECT is received"
+            );
+        }
+    }
+    assert!(proceeding_seen, "D-CALL-PROCEEDING was not emitted for the PDCH setup");
+    assert!(connect_seen, "D-CONNECT was not emitted for the PDCH setup");
 }
 
 /// Test that late-entry D-SETUP re-sends are throttled when the previous

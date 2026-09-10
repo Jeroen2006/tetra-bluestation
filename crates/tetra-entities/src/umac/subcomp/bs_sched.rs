@@ -59,6 +59,13 @@ pub const NUM_TIMESLOTS: usize = 4;
 /// through 13.
 const MAX_BASIC_SLOT_GRANT_DELAY: usize = 13;
 
+/// Capacity values that have an exact Basic slot granting encoding.
+const EXACT_BASIC_SLOT_GRANT_CAPACITIES: [usize; 14] = [1, 2, 3, 4, 5, 6, 8, 10, 13, 17, 24, 34, 51, 68];
+
+/// With two assigned PDCH slots, keep each uplink allocation short enough to
+/// leave useful receive opportunities for a frequency half-duplex terminal.
+const PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS: usize = 4;
+
 /// Select the SYSINFO variant for an actual BNCH transmission.
 ///
 /// EN 300 392-2 table 9.33 maps the mandatory frame-18 BNCH across all four
@@ -125,6 +132,9 @@ pub struct BsChannelScheduler {
     dltx_next_slot_queue: Vec<DlSchedElem>,
     /// Four queues for scheduled downlink traffic, one per timeslot
     dltx_queues: [Vec<DlSchedElem>; 4],
+    /// Downlink held for one frame because the addressed half-duplex terminal
+    /// owns a physically overlapping packet-data uplink opportunity.
+    dltx_half_duplex_queues: [Vec<DlSchedElem>; 4],
     /// Associated-control messages. These are consumed only in FN18 on an
     /// assigned channel and therefore never steal a normal speech frame.
     assoc_dltx_queues: [Vec<DlSchedElem>; 4],
@@ -180,7 +190,7 @@ pub enum DlSchedElem {
     Grant(TetraAddress, BasicSlotgrant),
 
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
-    Resource(MacResource, BitBuffer, Option<TxReporter>, AieRequest),
+    Resource(MacResource, BitBuffer, Option<TxReporter>, AieRequest, Option<[bool; 4]>),
 
     /// A capacity request received on an active assigned channel. The grant
     /// and its corresponding future FN18 reservation must be built together,
@@ -188,7 +198,7 @@ pub enum DlSchedElem {
     AssociatedGrantRequest(TetraAddress, ReservationRequirement, usize),
 
     /// A FragBuf containing remaining non-transmitted information after a MAC-RESOURCE start has been transmitted
-    FragBuf(BsFragger),
+    FragBuf(BsFragger, Option<[bool; 4]>),
 
     /// Pre-built STCH block for FACCH/stealing a half-slot from the traffic channel.
     /// Contains a 124-bit MAC-RESOURCE control block, for example a short
@@ -199,8 +209,8 @@ pub enum DlSchedElem {
 impl DlSchedElem {
     fn is_cancelled(&self) -> bool {
         match self {
-            Self::Resource(_, _, Some(reporter), _) | Self::Stealing(_, Some(reporter), ..) => reporter.is_discarded(),
-            Self::FragBuf(fragger) => fragger.is_cancelled(),
+            Self::Resource(_, _, Some(reporter), _, _) | Self::Stealing(_, Some(reporter), ..) => reporter.is_discarded(),
+            Self::FragBuf(fragger, _) => fragger.is_cancelled(),
             _ => false,
         }
     }
@@ -208,7 +218,7 @@ impl DlSchedElem {
     fn is_original_advanced_data(&self) -> bool {
         matches!(
             self,
-            Self::Resource(_, sdu, _, _)
+            Self::Resource(_, sdu, _, _, _)
                 if sdu.peek_bits(4) == Some(LlcPduType::AlDataAlFinal.into_raw())
         )
     }
@@ -238,6 +248,7 @@ impl BsChannelScheduler {
             precomps,
             dltx_next_slot_queue: Vec::new(),
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            dltx_half_duplex_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             assoc_dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             assoc_best_effort_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             ulsched: EMPTY_SCHED,
@@ -350,7 +361,7 @@ impl BsChannelScheduler {
         let queued = std::mem::take(&mut self.assoc_dltx_queues[idx]);
         let moved = queued.len();
         for mut elem in queued {
-            if let DlSchedElem::FragBuf(fragger) = &mut elem {
+            if let DlSchedElem::FragBuf(fragger, _) = &mut elem {
                 fragger.allow_ungranted_final_response();
             }
             self.dltx_queues[idx].push(elem);
@@ -669,6 +680,7 @@ impl BsChannelScheduler {
     /// Fully wipe the schedule
     pub fn purge_schedule(&mut self) {
         self.dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        self.dltx_half_duplex_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         self.assoc_dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         self.ulsched = EMPTY_SCHED;
         self.associated_ulsched.clear();
@@ -702,6 +714,22 @@ impl BsChannelScheduler {
         (2..=4)
             .filter(|candidate| self.packet_bearers[*candidate as usize - 1] == Some(bearer))
             .collect()
+    }
+
+    /// Count full uplink slots already reserved for this terminal after the
+    /// reservation request. A packet-data MS reports the total remaining
+    /// need in each following MAC-DATA capacity request; treating every
+    /// request as additional capacity grows the schedule faster than the MS
+    /// can consume it and removes its half-duplex downlink opportunities.
+    fn pending_packet_data_full_slot_grants_after(&self, after: TdmaTime, pdch_slots: &[u8], ssi: u32) -> usize {
+        (1..MACSCHED_NUM_FRAMES * 4)
+            .map(|distance| after.add_timeslots(distance as i32))
+            .filter(|candidate| pdch_slots.contains(&candidate.t) && !candidate.is_mandatory_clch())
+            .filter(|candidate| {
+                let elem = &self.ulsched[candidate.t as usize - 1][self.ul_ts_to_sched_index(candidate)];
+                elem.ul1 == Some(ssi) && elem.ul2 == Some(ssi)
+            })
+            .count()
     }
 
     /// Finds a grant opportunity for uplink transmission.
@@ -824,7 +852,117 @@ impl BsChannelScheduler {
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
     /// If successful, returns a BasicSlotgrant with the granting delay and capacity allocation.
     pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
+        if self.packet_bearer_is_active(timeslot) {
+            let request_time = self.cur_dltime.forward_to_timeslot(timeslot).add_timeslots(-4);
+            return self.ul_process_packet_data_cap_req_at(request_time, addr, res_req);
+        }
         self.ul_process_cap_req_after(timeslot, addr, res_req, 0)
+    }
+
+    /// Grant capacity on an assigned packet-data channel without duplicating
+    /// slots that were announced by earlier, still outstanding grants.
+    /// EN 300 392-2 permits granting fewer slots than requested; selecting the
+    /// largest exactly encodable shortfall keeps traffic moving when the full
+    /// request does not fit inside the 4-bit granting-delay horizon.
+    fn ul_process_packet_data_cap_req_at(
+        &mut self,
+        request_time: TdmaTime,
+        addr: TetraAddress,
+        res_req: &ReservationRequirement,
+    ) -> Option<BasicSlotgrant> {
+        let pdch_slots = self.basic_grant_timeslots(request_time.t);
+        let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
+        let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        let pending_cap = if is_halfslot {
+            0
+        } else {
+            self.pending_packet_data_full_slot_grants_after(request_time, &pdch_slots, addr.ssi)
+        };
+        if self.has_pending_packet_data_downlink_for_issi(addr.ssi) {
+            tracing::debug!(
+                address = ?addr,
+                request = %request_time,
+                requested_cap,
+                pending_cap,
+                "withholding further packet-data uplink capacity until queued downlink is delivered"
+            );
+            return None;
+        }
+        let additional_cap = requested_cap.saturating_sub(pending_cap);
+        if !is_halfslot && additional_cap == 0 {
+            tracing::debug!(
+                address = ?addr,
+                request = %request_time,
+                requested_cap,
+                pending_cap,
+                "existing packet-data uplink grants satisfy capacity request"
+            );
+            return None;
+        }
+
+        let maximum_grant = if pdch_slots.len() == 2 {
+            additional_cap.min(PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS)
+        } else {
+            additional_cap
+        };
+        let candidate_capacities: Vec<usize> = if is_halfslot {
+            vec![1]
+        } else {
+            EXACT_BASIC_SLOT_GRANT_CAPACITIES
+                .iter()
+                .rev()
+                .copied()
+                .filter(|capacity| *capacity <= maximum_grant)
+                .collect()
+        };
+
+        for granted_cap in candidate_capacities {
+            let Some((skips, grant_timestamps)) = self.ul_find_grant_opportunity_after(request_time.t, granted_cap, is_halfslot, 0) else {
+                continue;
+            };
+            if skips > MAX_BASIC_SLOT_GRANT_DELAY {
+                continue;
+            }
+            let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
+            let capacity_allocation = if is_halfslot {
+                match subslot {
+                    1 => BasicSlotgrantCapAlloc::FirstSubslotGranted,
+                    2 => BasicSlotgrantCapAlloc::SecondSubslotGranted,
+                    _ => unreachable!("subslot must be 1 or 2"),
+                }
+            } else {
+                BasicSlotgrantCapAlloc::from_req_slotcount(granted_cap)
+            };
+            let granting_delay = if skips == 0 {
+                BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
+            } else {
+                BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
+            };
+            tracing::debug!(
+                address = ?addr,
+                request = %request_time,
+                requested_cap,
+                pending_cap,
+                additional_cap,
+                granted_cap,
+                skips,
+                "reserved packet-data uplink capacity"
+            );
+            return Some(BasicSlotgrant {
+                capacity_allocation,
+                granting_delay,
+            });
+        }
+
+        tracing::debug!(
+            address = ?addr,
+            request = %request_time,
+            requested_cap,
+            pending_cap,
+            additional_cap,
+            "no encodable packet-data uplink shortfall grant is currently available"
+        );
+        None
     }
 
     fn ul_process_cap_req_after(
@@ -1074,6 +1212,160 @@ impl BsChannelScheduler {
         }
     }
 
+    fn packet_data_elem_issi(elem: &DlSchedElem) -> Option<u32> {
+        match elem {
+            DlSchedElem::Resource(pdu, _, _, aie_request, Some(_)) => Self::aie_individual_issi(*aie_request)
+                .or_else(|| pdu.addr.filter(|addr| addr.ssi_type == SsiType::Issi).map(|addr| addr.ssi)),
+            DlSchedElem::FragBuf(fragger, packet_data_slots) if packet_data_slots.is_some() => fragger.individual_issi(),
+            _ => None,
+        }
+    }
+
+    fn aie_individual_issi(aie_request: AieRequest) -> Option<u32> {
+        match aie_request {
+            AieRequest::Clear {
+                subject: AieSubject::Individual { issi },
+                ..
+            }
+            | AieRequest::Sc2 {
+                subject: AieSubject::Individual { issi },
+                ..
+            }
+            | AieRequest::Sc3 {
+                subject: AieSubject::Individual { issi },
+                ..
+            } => Some(issi),
+            _ => None,
+        }
+    }
+
+    /// Whether packet-data or service signalling for this terminal is already
+    /// waiting for a downlink opportunity on its assigned PDCH.  A frequency
+    /// simplex MS cannot receive that work while it has reserved uplink
+    /// capacity.  Continuing to extend the uplink allocation can therefore
+    /// starve the opposite direction indefinitely under bidirectional load.
+    fn has_pending_packet_data_downlink_for_issi(&self, issi: u32) -> bool {
+        self.dltx_queues
+            .iter()
+            .chain(self.dltx_half_duplex_queues.iter())
+            .flat_map(|queue| queue.iter())
+            .chain(self.dltx_next_slot_queue.iter())
+            .any(|elem| !elem.is_cancelled() && Self::packet_data_elem_issi(elem) == Some(issi))
+    }
+
+    fn advanced_link_segment_identity(sdu: &BitBuffer) -> Option<(bool, bool, u8, u8)> {
+        if sdu.get_len_remaining() < 17 || sdu.peek_bits_startoffset(0, 4) != Some(LlcPduType::AlDataAlFinal.into_raw()) {
+            return None;
+        }
+        Some((
+            sdu.peek_bits_startoffset(4, 1)? != 0,
+            sdu.peek_bits_startoffset(5, 1)? != 0,
+            sdu.peek_bits_startoffset(6, 3)? as u8,
+            sdu.peek_bits_startoffset(9, 8)? as u8,
+        ))
+    }
+
+    fn sched_elem_advanced_link_sequence(elem: &DlSchedElem) -> Option<(u32, u8, u8)> {
+        match elem {
+            DlSchedElem::Resource(_, sdu, _, aie_request, Some(_)) => {
+                let (_, _, ns, ss) = Self::advanced_link_segment_identity(sdu)?;
+                let issi = Self::aie_individual_issi(*aie_request)?;
+                Some((issi, ns, ss))
+            }
+            _ => None,
+        }
+    }
+
+    fn has_earlier_pending_advanced_link_segment(&self, issi: u32, ns: u8, ss: u8) -> bool {
+        self.dltx_queues
+            .iter()
+            .chain(self.dltx_half_duplex_queues.iter())
+            .flat_map(|queue| queue.iter())
+            .chain(self.dltx_next_slot_queue.iter())
+            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
+            .any(|(pending_issi, pending_ns, pending_ss)| pending_issi == issi && pending_ns == ns && pending_ss < ss)
+    }
+
+    fn dl_defer_packet_data_resource_to_next_pdch(
+        &mut self,
+        current_ts: u8,
+        elem: DlSchedElem,
+        packet_data_slots: [bool; 4],
+        reason: &'static str,
+    ) {
+        let target_ts = self
+            .next_packet_data_control_after(current_ts, packet_data_slots)
+            .unwrap_or(current_ts);
+        if target_ts == current_ts {
+            self.dltx_next_slot_queue.push(elem);
+        } else {
+            self.dltx_queues[target_ts as usize - 1].push(elem);
+        }
+        tracing::debug!(
+            current_ts,
+            target_ts,
+            reason,
+            "deferred packet-data resource to the next assigned PDCH opportunity"
+        );
+    }
+
+    /// A frequency half-duplex MS cannot receive an assigned-PDCH downlink
+    /// while it transmits in the physically overlapping uplink slot. Uplink
+    /// TDMA is offset by two timeslots; keep one switching slot on either side
+    /// and retry the affected downlink in the next frame. Pure MAC grants and
+    /// random-access acknowledgements stay eligible so reserved access can
+    /// continue progressing.
+    fn dl_defer_packet_data_for_concurrent_uplink(&mut self, ts: TdmaTime) -> usize {
+        if !self.packet_bearer_is_active(ts.t) {
+            return 0;
+        }
+
+        let mut guarded_owners = [None; 6];
+        for (guard_index, guard_ts) in [ts.add_timeslots(-3), ts.add_timeslots(-2), ts.add_timeslots(-1)]
+            .into_iter()
+            .enumerate()
+        {
+            let uplink = &self.ulsched[guard_ts.t as usize - 1][self.ul_ts_to_sched_index(&guard_ts)];
+            guarded_owners[guard_index * 2] = uplink.ul1;
+            guarded_owners[guard_index * 2 + 1] = uplink.ul2;
+        }
+        if guarded_owners.iter().all(Option::is_none) {
+            return 0;
+        }
+
+        let queue = &mut self.dltx_queues[ts.t as usize - 1];
+        let mut deferred = Vec::new();
+        let mut index = 0;
+        while index < queue.len() {
+            let should_defer = Self::packet_data_elem_issi(&queue[index]).is_some_and(|issi| guarded_owners.contains(&Some(issi)));
+            if should_defer {
+                deferred.push(queue.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+
+        let count = deferred.len();
+        if count > 0 {
+            tracing::debug!(
+                dltime = %ts,
+                count,
+                "deferred assigned packet-data downlink around half-duplex uplink"
+            );
+            self.dltx_half_duplex_queues[ts.t as usize - 1].extend(deferred);
+        }
+        count
+    }
+
+    fn requeue_half_duplex_deferred_before_newer_items(&mut self, slot: usize) {
+        if self.dltx_half_duplex_queues[slot].is_empty() {
+            return;
+        }
+        let mut older = std::mem::take(&mut self.dltx_half_duplex_queues[slot]);
+        older.append(&mut self.dltx_queues[slot]);
+        self.dltx_queues[slot] = older;
+    }
+
     ////////// DOWNLINK SCHEDULING /////////
 
     /// Registers that we should transmit a MAC-RESOURCE or similar with a grant, somewhere this tick
@@ -1120,11 +1412,11 @@ impl BsChannelScheduler {
             if next_ts > 0 {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
-                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), aie_request);
+                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), aie_request, None);
                 self.dltx_queues[ts as usize - 1].push(elem);
             } else {
                 // This is the last ts on which we need to transmit this message
-                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request);
+                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, None);
                 self.dltx_queues[ts as usize - 1].push(elem);
                 break;
             }
@@ -1144,7 +1436,27 @@ impl BsChannelScheduler {
         aie_request: AieRequest,
     ) {
         assert!((1..=4).contains(&ts), "invalid downlink timeslot");
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, None));
+    }
+
+    /// Queue packet data on one member of the MS's assigned multislot bearer.
+    /// The complete slot bitmap remains attached to the resource so a MAC
+    /// fragment can continue on the next physical PDCH opportunity.
+    pub fn dl_enqueue_packet_tma_on_timeslot(
+        &mut self,
+        ts: u8,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        aie_request: AieRequest,
+        packet_data_slots: [bool; 4],
+    ) {
+        assert!((2..=4).contains(&ts), "packet data must use an assigned PDCH timeslot");
+        assert!(
+            packet_data_slots[ts as usize - 1],
+            "packet-data target must be part of the MS allocation"
+        );
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, Some(packet_data_slots)));
     }
 
     pub fn dl_enqueue_associated_tma(
@@ -1164,7 +1476,7 @@ impl BsChannelScheduler {
             queued_before = queue.len(),
             "queued associated FN18 control resource"
         );
-        queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+        queue.push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, None));
     }
 
     /// Queue an expendable associated repeat. At most one copy per key waits
@@ -1185,7 +1497,7 @@ impl BsChannelScheduler {
             queued_before = queue.len(),
             "queued best-effort associated repeat"
         );
-        queue.push((key, DlSchedElem::Resource(pdu, sdu, None, aie_request)));
+        queue.push((key, DlSchedElem::Resource(pdu, sdu, None, aie_request, None)));
     }
 
     /// Deliver a capacity grant through the target channel's FN18 control
@@ -1203,6 +1515,7 @@ impl BsChannelScheduler {
             BitBuffer::new(0),
             None,
             AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+            None,
         ));
     }
 
@@ -1325,7 +1638,7 @@ impl BsChannelScheduler {
                 .or_else(|| {
                     queue
                         .iter()
-                        .position(|item| matches!(item, DlSchedElem::Resource(_, _, Some(reporter), _) if reporter.expects_ack()))
+                        .position(|item| matches!(item, DlSchedElem::Resource(_, _, Some(reporter), _, _) if reporter.expects_ack()))
                 })
                 .or_else(|| {
                     queue
@@ -1336,7 +1649,7 @@ impl BsChannelScheduler {
         };
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
-            DlSchedElem::Resource(mut pdu, sdu, reporter, aie_request) => {
+            DlSchedElem::Resource(mut pdu, sdu, reporter, aie_request, packet_data_slots) => {
                 let acknowledged_addr = reporter.as_ref().is_some_and(TxReporter::expects_ack).then_some(pdu.addr).flatten();
                 // TTR 001-01 14.1.14 permits a current-channel grant in either
                 // MAC-RESOURCE or MAC-END.  Grant in MAC-RESOURCE only when
@@ -1353,7 +1666,8 @@ impl BsChannelScheduler {
                     && let Some(addr) = acknowledged_addr
                 {
                     let Some(grant) = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr) else {
-                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::Resource(pdu, sdu, reporter, aie_request));
+                        self.assoc_dltx_queues[ts.t as usize - 1]
+                            .insert(0, DlSchedElem::Resource(pdu, sdu, reporter, aie_request, packet_data_slots));
                         return None;
                     };
                     tracing::info!(
@@ -1398,20 +1712,20 @@ impl BsChannelScheduler {
                         if acknowledged_addr.is_some() && fragger.has_started() {
                             fragger.require_final_slot_grant();
                         }
-                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger, packet_data_slots));
                     }
                 }
             }
-            DlSchedElem::FragBuf(mut fragger) => {
+            DlSchedElem::FragBuf(mut fragger, packet_data_slots) => {
                 if fragger.expects_ack() && fragger.can_finish_with_slot_grant(buf.get_len_remaining()) {
                     let Some(issi) = fragger.individual_issi() else {
                         tracing::warn!(dltime = %ts, "associated acknowledged fragment has no individual address for its MAC-END grant");
-                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger, packet_data_slots));
                         return None;
                     };
                     let addr = TetraAddress::issi(issi);
                     let Some(grant) = self.ul_prepare_associated_basic_link_ack_grant_at(ts, addr) else {
-                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger, packet_data_slots));
                         return None;
                     };
                     tracing::info!(
@@ -1432,7 +1746,7 @@ impl BsChannelScheduler {
                     if written_before == 0 && buf.get_len_written() == 0 {
                         tracing::warn!(dltime = %ts, "dropping associated MAC fragment that cannot make progress in an empty SCH/F");
                     } else {
-                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
+                        self.assoc_dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger, packet_data_slots));
                     }
                 }
             }
@@ -1458,7 +1772,7 @@ impl BsChannelScheduler {
                 let request = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
                 let mut fragger = BsFragger::new_with_aie(pdu, BitBuffer::new(0), None, request);
                 if !fragger.get_next_chunk(&mut buf) {
-                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger));
+                    self.assoc_dltx_queues[ts.t as usize - 1].push(DlSchedElem::FragBuf(fragger, None));
                 }
 
                 // On SACCH the BS may grant only one reserved slot at a time
@@ -1512,7 +1826,7 @@ impl BsChannelScheduler {
         let (key, item) = self.assoc_best_effort_queues[ts.t as usize - 1].remove(0);
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
-            DlSchedElem::Resource(pdu, sdu, _, aie_request) => {
+            DlSchedElem::Resource(pdu, sdu, _, aie_request, packet_data_slots) => {
                 let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
                     Ok(pdu) => pdu,
                     Err(error) => {
@@ -1531,11 +1845,11 @@ impl BsChannelScheduler {
                     if written_before == 0 && buf.get_len_written() == 0 {
                         tracing::debug!(dltime = %ts, key, "dropping best-effort associated repeat that cannot make progress");
                     } else {
-                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger)));
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger, packet_data_slots)));
                     }
                 }
             }
-            DlSchedElem::FragBuf(mut fragger) => {
+            DlSchedElem::FragBuf(mut fragger, packet_data_slots) => {
                 let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
@@ -1546,7 +1860,7 @@ impl BsChannelScheduler {
                     if written_before == 0 && buf.get_len_written() == 0 {
                         tracing::debug!(dltime = %ts, key, "dropping best-effort associated fragment that cannot make progress");
                     } else {
-                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger)));
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger, packet_data_slots)));
                     }
                 }
             }
@@ -1571,7 +1885,7 @@ impl BsChannelScheduler {
     fn cancel_interrupted_best_effort_fragment(&mut self, timeslot: u8) {
         let queue = &mut self.assoc_best_effort_queues[timeslot as usize - 1];
         let before = queue.len();
-        queue.retain(|(_, item)| !matches!(item, DlSchedElem::FragBuf(_)));
+        queue.retain(|(_, item)| !matches!(item, DlSchedElem::FragBuf(..)));
         if queue.len() != before {
             tracing::debug!(
                 dltime = %self.cur_dltime,
@@ -1640,10 +1954,27 @@ impl BsChannelScheduler {
         (1..=4).contains(&ts).then(|| self.traffic_aie[ts as usize - 1]).flatten()
     }
 
-    fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
-        tracing::debug!("dl_enqueue_tma_frag_next_frame: enqueueing {:?}", fragger);
-        let elem = DlSchedElem::FragBuf(fragger);
-        self.dltx_next_slot_queue.push(elem);
+    fn next_packet_data_control_after(&self, current_ts: u8, allowed_slots: [bool; 4]) -> Option<u8> {
+        if !(2..=4).contains(&current_ts) {
+            return None;
+        }
+        (current_ts + 1..=4)
+            .chain(2..current_ts)
+            .find(|ts| allowed_slots[*ts as usize - 1] && self.packet_bearer_is_active(*ts))
+    }
+
+    fn dl_enqueue_tma_frag_continuation(&mut self, current_ts: u8, fragger: BsFragger, packet_data_slots: Option<[bool; 4]>) {
+        let elem = DlSchedElem::FragBuf(fragger, packet_data_slots);
+        let target_ts = packet_data_slots
+            .and_then(|slots| self.next_packet_data_control_after(current_ts, slots))
+            .unwrap_or(current_ts);
+        if target_ts == current_ts {
+            tracing::debug!(target_ts, "queueing MAC fragment on the same timeslot next frame");
+            self.dltx_next_slot_queue.push(elem);
+        } else {
+            tracing::debug!(current_ts, target_ts, "striping packet-data MAC fragment to the next assigned PDCH");
+            self.dltx_queues[target_ts as usize - 1].push(elem);
+        }
     }
 
     pub fn dl_schedule_tmb(&mut self, _traffic: BitBuffer, _ts: &TdmaTime) {
@@ -1740,7 +2071,7 @@ impl BsChannelScheduler {
 
         for index in 0..queue.len() {
             let elem = &mut queue[index];
-            if let DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request) = elem {
+            if let DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request, _) = elem {
                 if let Some(pdu_ssi) = pdu.addr {
                     if pdu_ssi.ssi == addr.ssi {
                         // Found a resource for this address
@@ -1817,14 +2148,14 @@ impl BsChannelScheduler {
                 );
 
                 match elem {
-                    DlSchedElem::Resource(_, _, tx_reporter, _) => {
+                    DlSchedElem::Resource(_, _, tx_reporter, _, _) => {
                         // Report as discarded manually
                         if let Some(tx_reporter) = tx_reporter {
                             tx_reporter.mark_discarded();
                         }
                     }
 
-                    DlSchedElem::FragBuf(_) => {
+                    DlSchedElem::FragBuf(..) => {
                         // Fragger self-marks any unsent fragments as discarded when dropped, so we don't need to do anything here.
                     }
 
@@ -1862,7 +2193,7 @@ impl BsChannelScheduler {
                 "discarding associated control after circuit removal"
             );
 
-            if let DlSchedElem::Resource(_, _, Some(tx_reporter), _) = &elem
+            if let DlSchedElem::Resource(_, _, Some(tx_reporter), _, _) = &elem
                 && tx_reporter.get_state() == tetra_core::TxState::Pending
             {
                 tx_reporter.mark_discarded();
@@ -1906,7 +2237,7 @@ impl BsChannelScheduler {
             };
             let mac_resource = self.dl_get_scheduled_resource_for_ssi(ts, addr);
             match mac_resource {
-                Some(DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request)) => {
+                Some(DlSchedElem::Resource(pdu, _sdu, _repeat, _aie_request, _)) => {
                     // Integrate grant into the resource
                     match &elem {
                         DlSchedElem::Grant(_, grant) => {
@@ -1952,7 +2283,7 @@ impl BsChannelScheduler {
                     };
 
                     // Push new resource into the queue. These do not need a tx_reporter
-                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, aie_request);
+                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, aie_request, None);
                     self.dltx_queues[ts.t as usize - 1].push(dlsched_res);
                 }
                 _ => panic!(),
@@ -1973,10 +2304,26 @@ impl BsChannelScheduler {
                             unimplemented_log!("finalize_ts_for_tick: Broadcast scheduling not implemented");
                         }
 
-                        DlSchedElem::Resource(mut pdu, sdu, tx_reporter, aie_request) => {
+                        DlSchedElem::Resource(mut pdu, sdu, tx_reporter, aie_request, packet_data_slots) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
-                            if sdu.peek_bits(4) == Some(LlcPduType::AlDataAlFinal.into_raw()) && buf.get_len_written() != 0 {
+                            let al_identity = Self::advanced_link_segment_identity(&sdu);
+                            let al_sequence = packet_data_slots
+                                .and(al_identity)
+                                .and_then(|(_, _, ns, ss)| Self::aie_individual_issi(aie_request).map(|issi| (issi, ns, ss)));
+                            if let Some((issi, ns, ss)) = al_sequence
+                                && self.has_earlier_pending_advanced_link_segment(issi, ns, ss)
+                            {
+                                self.dl_defer_packet_data_resource_to_next_pdch(
+                                    ts.t,
+                                    DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, packet_data_slots),
+                                    packet_data_slots.expect("AL resource has packet-data slots"),
+                                    "lower AL S(S) is still pending",
+                                );
+                                buf_opt = (buf.get_len_written() > 0).then_some(buf);
+                                continue;
+                            }
+                            if al_identity.is_some() && buf.get_len_written() != 0 {
                                 // TIP 6.5 sizes a normal original-link segment
                                 // for a complete SCH/F MAC-RESOURCE.  Starting
                                 // it in the tail of an associated block forces
@@ -1984,8 +2331,17 @@ impl BsChannelScheduler {
                                 // the radio retransmission unit.  Finish the
                                 // higher-priority block and start this packet
                                 // data segment in the next slot instead.
-                                self.dltx_next_slot_queue
-                                    .push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+                                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, packet_data_slots);
+                                if let Some(slots) = packet_data_slots {
+                                    self.dl_defer_packet_data_resource_to_next_pdch(
+                                        ts.t,
+                                        elem,
+                                        slots,
+                                        "fresh SCH/F required for AL segment",
+                                    );
+                                } else {
+                                    self.dltx_next_slot_queue.push(elem);
+                                }
                                 buf_opt = Some(buf);
                                 break;
                             }
@@ -2035,8 +2391,13 @@ impl BsChannelScheduler {
                                 let Some(grant) =
                                     self.ul_process_cap_req_after(ts.t, addr, &ReservationRequirement::Req1Slot, minimum_delay)
                                 else {
-                                    self.dltx_next_slot_queue
-                                        .push(DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request));
+                                    self.dltx_next_slot_queue.push(DlSchedElem::Resource(
+                                        pdu,
+                                        sdu,
+                                        tx_reporter,
+                                        aie_request,
+                                        packet_data_slots,
+                                    ));
                                     buf_opt = Some(buf);
                                     break;
                                 };
@@ -2080,13 +2441,13 @@ impl BsChannelScheduler {
                                     if facch_ack_addr.is_some() && fragger.has_started() {
                                         fragger.require_final_slot_grant();
                                     }
-                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    self.dl_enqueue_tma_frag_continuation(ts.t, fragger, packet_data_slots);
                                 }
                             }
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::FragBuf(mut fragger) => {
+                        DlSchedElem::FragBuf(mut fragger, packet_data_slots) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             if self.is_hangtime(ts.t)
@@ -2096,13 +2457,13 @@ impl BsChannelScheduler {
                             {
                                 let Some(issi) = fragger.individual_issi() else {
                                     tracing::warn!(dltime = %ts, "FACCH acknowledged fragment has no individual address for its MAC-END grant");
-                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    self.dl_enqueue_tma_frag_continuation(ts.t, fragger, packet_data_slots);
                                     buf_opt = Some(buf);
                                     break;
                                 };
                                 let addr = TetraAddress::issi(issi);
                                 let Some(grant) = self.ul_process_cap_req(ts.t, addr, &ReservationRequirement::Req1Slot) else {
-                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    self.dl_enqueue_tma_frag_continuation(ts.t, fragger, packet_data_slots);
                                     buf_opt = Some(buf);
                                     break;
                                 };
@@ -2124,7 +2485,7 @@ impl BsChannelScheduler {
                                 if written_before == 0 && buf.get_len_written() == 0 {
                                     tracing::warn!(dltime = %ts, "dropping MAC fragment that cannot make progress in an empty SCH/F");
                                 } else {
-                                    self.dl_enqueue_tma_frag_next_frame(fragger);
+                                    self.dl_enqueue_tma_frag_continuation(ts.t, fragger, packet_data_slots);
                                 }
                             }
                             buf_opt = Some(buf);
@@ -2266,7 +2627,7 @@ impl BsChannelScheduler {
         }
 
         // Return FragBufs next
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::FragBuf(_))) {
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::FragBuf(..))) {
             return Some(q.remove(i));
         }
 
@@ -2276,7 +2637,7 @@ impl BsChannelScheduler {
         // low-priority IP traffic.
         if let Some(i) = q
             .iter()
-            .position(|e| matches!(e, DlSchedElem::Resource(_, _, _, _)) && !e.is_original_advanced_data())
+            .position(|e| matches!(e, DlSchedElem::Resource(..)) && !e.is_original_advanced_data())
         {
             return Some(q.remove(i));
         }
@@ -2485,6 +2846,8 @@ impl BsChannelScheduler {
             }
         } else {
             // Signalling mode (either no circuit, or hangtime on an allocated timeslot)
+            self.dl_defer_packet_data_for_concurrent_uplink(ts);
+
             // Integrate all grants and random access acks into resources (either existing or new)
             self.dl_integrate_sched_elems_for_timeslot(ts);
 
@@ -2627,6 +2990,10 @@ impl BsChannelScheduler {
         // Keep an FN18 grant long enough for the delayed UL receive path to
         // consume it, then discard it before a later multiframe can reuse it.
         self.associated_ulsched.retain(|(reservation_ts, _)| reservation_ts.age(ts) <= 16);
+
+        // Retry half-duplex packet-data work in this physical timeslot's next
+        // TDMA frame, ahead of data that arrived while the MS was transmitting.
+        self.requeue_half_duplex_deferred_before_newer_items(ts.t as usize - 1);
 
         // tracing::warn!("end finalize");
         // self.dump_ul_schedule_full(true);
@@ -2853,6 +3220,24 @@ impl BsChannelScheduler {
                         }
                     }
                     _ => panic!(), // never happens
+                }
+            }
+            (1..=17, 2..=4) if self.packet_bearer_is_active(ts.t) => {
+                // A pi/4-DQPSK PDCH is an assigned signalling channel.  In
+                // frames 1..17 an otherwise idle packet slot must therefore
+                // remain SCH/F; transmitting BSCH + MLE-SYNC here makes an MS
+                // lose the assigned channel immediately after accepting the
+                // Replace allocation.  Frame 18 deliberately falls through
+                // to BSCH below for monitoring and linearisation (TTR 001-05
+                // section 6.10.1).
+                let mut buf = BitBuffer::new(SCH_F_CAP);
+                MacResource::null_pdu().to_bitbuf(&mut buf);
+                TmvUnitdataReq {
+                    logical_channel: LogicalChannel::SchF,
+                    mac_block: buf,
+                    scrambling_code: self.scrambling_code,
+                    air_interface_encryption: None,
+                    cipher_region: None,
                 }
             }
             (1..=17, 2..=4) | (18, _) => {
@@ -3545,6 +3930,100 @@ mod tests {
     }
 
     #[test]
+    fn two_slot_packet_grant_adds_only_unreserved_shortfall() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let addr = TetraAddress::issi(77_479);
+        let request_time = sched.cur_dltime.forward_to_timeslot(2).add_timeslots(-4);
+
+        let first = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .expect("initial two-slot grant");
+        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+
+        let second = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .expect("only the remaining shortfall should be granted");
+        assert_eq!(second.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+
+        let third = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .expect("final exactly encodable shortfall");
+        assert_eq!(third.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
+        assert!(
+            sched
+                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+                .is_none(),
+            "ten already reserved slots must satisfy the repeated total request"
+        );
+    }
+
+    #[test]
+    fn queued_packet_downlink_stops_uplink_grant_extension() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let addr = TetraAddress::issi(77_479);
+        let request_time = sched.cur_dltime.forward_to_timeslot(2).add_timeslots(-4);
+
+        let first = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .expect("initial uplink grant");
+        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        resource.addr = None;
+        resource.event_label = Some(9);
+        sched.dltx_queues[1].push(DlSchedElem::Resource(
+            resource,
+            BitBuffer::from_bitstr("10010000"),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+            Some([false, true, true, false]),
+        ));
+
+        assert!(
+            sched
+                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+                .is_none(),
+            "queued downlink must get a receive window before the uplink allocation is extended"
+        );
+
+        sched.dltx_queues[1].clear();
+        let resumed = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .expect("uplink grants resume after queued downlink drains");
+        assert_eq!(resumed.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+    }
+
+    #[test]
+    fn packet_downlink_waits_for_physically_overlapping_uplink() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let addr = TetraAddress::issi(77_479);
+        let downlink = TdmaTime { t: 2, f: 5, m: 1, h: 0 };
+        sched.ul_reserve_grant(addr.ssi, vec![downlink.add_timeslots(-2)], false);
+
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        resource.addr = None;
+        resource.event_label = Some(9);
+        sched.dltx_queues[1].push(DlSchedElem::Resource(
+            resource,
+            BitBuffer::from_bitstr("10010000"),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+            Some([false, true, true, false]),
+        ));
+
+        assert_eq!(sched.dl_defer_packet_data_for_concurrent_uplink(downlink), 1);
+        assert!(sched.dltx_queues[1].is_empty());
+        assert_eq!(sched.dltx_half_duplex_queues[1].len(), 1);
+
+        sched.requeue_half_duplex_deferred_before_newer_items(1);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert!(sched.dltx_half_duplex_queues[1].is_empty());
+    }
+
+    #[test]
     fn anticipated_advanced_ack_grant_waits_one_multislot_frame() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b1110));
@@ -4094,7 +4573,7 @@ mod tests {
         assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
         assert!(matches!(
             sched.assoc_dltx_queues[timeslot as usize - 1].first(),
-            Some(DlSchedElem::FragBuf(_))
+            Some(DlSchedElem::FragBuf(..))
         ));
 
         // Even newly queued acknowledged data must not interrupt an active
@@ -4222,7 +4701,7 @@ mod tests {
         assert!(sched.assoc_dltx_queues[timeslot as usize - 1].is_empty());
         assert!(matches!(
             sched.dltx_queues[timeslot as usize - 1].first(),
-            Some(DlSchedElem::FragBuf(_))
+            Some(DlSchedElem::FragBuf(..))
         ));
 
         let facch_time = TdmaTime {
@@ -4361,7 +4840,7 @@ mod tests {
         assert!(
             sched.dltx_queues[timeslot as usize - 1]
                 .iter()
-                .any(|elem| matches!(elem, DlSchedElem::FragBuf(fragger) if !fragger.has_started())),
+                .any(|elem| matches!(elem, DlSchedElem::FragBuf(fragger, _) if !fragger.has_started())),
             "the untouched individual resource must remain queued"
         );
 
@@ -4410,9 +4889,75 @@ mod tests {
             "the AL segment must remain intact for an empty next SCH/F block"
         );
         assert!(
-            !matches!(sched.dltx_queues[timeslot as usize - 1][0], DlSchedElem::FragBuf(_)),
+            !matches!(sched.dltx_queues[timeslot as usize - 1][0], DlSchedElem::FragBuf(..)),
             "the AL segment must not start a MAC fragment chain in residual capacity"
         );
+    }
+
+    #[test]
+    fn packet_fragment_continues_on_next_assigned_pdch() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let slots = [false, true, true, false];
+        let addr = TetraAddress::issi(77_468);
+        let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        sched.dl_enqueue_packet_tma_on_timeslot(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            BitBuffer::from_bitstr(&"0".repeat(SCH_F_CAP * 2)),
+            None,
+            aie,
+            slots,
+        );
+
+        let time = TdmaTime { h: 0, m: 1, f: 1, t: 2 };
+        assert!(sched.dl_build_block_from_signalling_schedule(time).is_some());
+        assert!(sched.dltx_queues[1].is_empty());
+        assert!(matches!(
+            sched.dltx_queues[2].first(),
+            Some(DlSchedElem::FragBuf(_, Some(found))) if *found == slots
+        ));
+    }
+
+    #[test]
+    fn later_al_segment_waits_for_lower_sequence_on_other_pdch() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let slots = [false, true, true, false];
+        let addr = TetraAddress::issi(77_468);
+        let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        let segment = |ss: u8| BitBuffer::from_bitstr(&format!("100100000{:08b}{}", ss, "0".repeat(32)));
+        sched.dl_enqueue_packet_tma_on_timeslot(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            segment(0),
+            None,
+            aie,
+            slots,
+        );
+        sched.dl_enqueue_packet_tma_on_timeslot(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            segment(1),
+            None,
+            aie,
+            slots,
+        );
+
+        assert_eq!(
+            BsChannelScheduler::sched_elem_advanced_link_sequence(&sched.dltx_queues[1][0]),
+            Some((addr.ssi, 0, 0))
+        );
+        assert!(sched.has_earlier_pending_advanced_link_segment(addr.ssi, 0, 1));
+        let current = TdmaTime { h: 0, m: 1, f: 1, t: 3 };
+        assert!(sched.dl_build_block_from_signalling_schedule(current).is_none());
+        assert!(sched.dltx_queues[2].is_empty());
+        let sequence: Vec<u8> = sched.dltx_queues[1]
+            .iter()
+            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
+            .map(|(_, _, ss)| ss)
+            .collect();
+        assert_eq!(sequence, vec![0, 1]);
     }
 
     #[test]
@@ -4468,7 +5013,7 @@ mod tests {
         assert!(sched.dltx_queues[timeslot as usize - 1].is_empty());
         assert!(matches!(
             sched.assoc_dltx_queues[timeslot as usize - 1].first(),
-            Some(DlSchedElem::FragBuf(_))
+            Some(DlSchedElem::FragBuf(..))
         ));
 
         let sacch_time = (2..=18)
@@ -4734,7 +5279,7 @@ mod tests {
         assert!(first_slot.blk1.is_some());
         assert!(matches!(
             sched.assoc_best_effort_queues[2].first(),
-            Some((10, DlSchedElem::FragBuf(_)))
+            Some((10, DlSchedElem::FragBuf(..)))
         ));
 
         let sds_addr = TetraAddress::new(77_468, SsiType::Issi);
@@ -5148,6 +5693,29 @@ mod tests {
         assert!(sched.close_packet_bearer(17, 3));
         assert!(!sched.packet_bearer_is_active(3));
         assert!(!sched.packet_bearer_is_active(4));
+    }
+
+    #[test]
+    fn idle_packet_slot_stays_schf_until_frame_18() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+
+        let packet_frame = sched.generate_default_blks(TdmaTime { t: 2, f: 5, m: 1, h: 0 });
+        assert_eq!(packet_frame.logical_channel, LogicalChannel::SchF);
+        let mut packet_bits = packet_frame.mac_block;
+        packet_bits.seek(0);
+        assert!(
+            MacResource::from_bitbuf(&mut packet_bits)
+                .expect("valid idle PDCH MAC block")
+                .is_null_pdu()
+        );
+
+        let monitor_frame = sched.generate_default_blks(TdmaTime { t: 2, f: 18, m: 1, h: 0 });
+        assert_eq!(monitor_frame.logical_channel, LogicalChannel::Bsch);
+
+        assert!(sched.close_packet_bearer(17, 1));
+        let released_frame = sched.generate_default_blks(TdmaTime { t: 2, f: 5, m: 1, h: 0 });
+        assert_eq!(released_frame.logical_channel, LogicalChannel::Bsch);
     }
 
     #[test]

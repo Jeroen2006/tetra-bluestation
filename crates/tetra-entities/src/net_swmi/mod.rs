@@ -324,7 +324,23 @@ pub fn channel() -> (
     )
 }
 
+fn capacity_policy_cache_path() -> std::path::PathBuf {
+    std::env::var_os("TETRA_CAPACITY_POLICY_CACHE")
+        .map(Into::into)
+        .unwrap_or_else(|| ".cache/swmi-capacity-policy.json".into())
+}
+
 pub fn start(config: SharedConfig, endpoint: SwmiWorkerEndpoint) -> Option<thread::JoinHandle<()>> {
+    if let Ok(bytes) = std::fs::read(capacity_policy_cache_path()) {
+        if let Ok(policy) = serde_json::from_slice::<tetra_swmi_protocol::CapacityPolicy>(&bytes) {
+            if policy.validate() {
+                let _ = endpoint
+                    .cmce_incoming
+                    .send(SwmiMessage::Capacity(tetra_swmi_protocol::CapacityMessage::Policy(policy)));
+            }
+        }
+    }
+
     let swmi = config.config().swmi.clone()?;
     let profile = LocalRadioProfile::from_config(&config);
     let transport = match build_websocket_transport(&swmi) {
@@ -803,6 +819,23 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 tracing::warn!("SwMI MLE endpoint closed; dropping neighbour snapshot");
                             }
                         }
+                        Ok(message @ SwmiMessage::Capacity(tetra_swmi_protocol::CapacityMessage::Policy(policy))) => {
+                            if policy.validate() {
+                                let path = capacity_policy_cache_path();
+                                let saved = (|| -> std::io::Result<()> {
+                                    if let Some(parent) = path.parent() {
+                                        std::fs::create_dir_all(parent)?;
+                                    }
+                                    let temp = path.with_extension("tmp");
+                                    std::fs::write(&temp, serde_json::to_vec(&policy).expect("capacity policy JSON"))?;
+                                    std::fs::rename(temp, &path)
+                                })();
+                                if let Err(error) = saved {
+                                    tracing::warn!(%error,"cannot cache capacity policy");
+                                }
+                                let _ = self.endpoint.cmce_incoming.send(message);
+                            }
+                        }
                         Ok(
                             message @ (SwmiMessage::GroupCallStart { .. }
                             | SwmiMessage::GroupCallPriorityChanged { .. }
@@ -811,6 +844,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             | SwmiMessage::FloorReleased { .. }
                             | SwmiMessage::CallDisconnect { .. }
                             | SwmiMessage::CallRelease { .. }
+                            | SwmiMessage::Capacity(_)
                             | SwmiMessage::CallReject { .. }
                             | SwmiMessage::PrivateCallProceeding { .. }
                             | SwmiMessage::PrivateCallOffer { .. }

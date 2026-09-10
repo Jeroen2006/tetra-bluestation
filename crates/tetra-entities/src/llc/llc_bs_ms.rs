@@ -46,13 +46,22 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
-// TTR 001-05 section 6.5 defines 214 payload bits for an original advanced-
-// link downlink segment carried by a pi/4-DQPSK MAC-RESOURCE with event-label
-// addressing and provision for an eventual 8-bit slot grant.  Keeping every
-// non-final segment at that size lets AL-FINAL-AR carry the anticipated
-// AL-ACK grant without creating a MAC fragment or changing segment size on a
-// retransmission.
-const AL_SEGMENT_PAYLOAD_BITS: usize = 214;
+// TTR 001-05 section 6.5 permits up to 214 payload bits with event-label
+// addressing and provision for a slot grant. Smaller equal-sized segments
+// remain valid. The production reference stack and the tested MS are stable
+// with a uniform 180/172/164-bit chain, selected so AL-FINAL-AR retains the
+// complete 32-bit FCS tail. This also leaves margin for whole-octet MAC length
+// rounding and an anticipated acknowledgement grant.
+const AL_NON_FINAL_SEGMENT_CANDIDATES: [usize; 3] = [180, 172, 164];
+const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
+// TIP packet data is the only service using this original advanced link. Keep
+// its downlink stop-and-wait even when the MS negotiates a larger N.272 window;
+// interleaving several long TL-SDUs made recovery of missing segments unstable.
+const PACKET_DATA_AL_TLSDU_WINDOW_SIZE: usize = 1;
+// T.252 expiry repeats the acknowledgement request; it does not consume the
+// negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
+// peer that has left the channel cannot hold the link forever.
+const MAX_AL_ACK_REQUEST_REPEATS: u8 = 5;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -172,6 +181,7 @@ struct AdvancedTxSdu {
     reporter: TxReporter,
     attempt_reporter: Option<TxReporter>,
     sent_at: Option<TdmaTime>,
+    ack_request_repetitions: u8,
     retransmissions: u8,
     segment_retransmissions: Vec<u8>,
     pending_segments: Option<Vec<usize>>,
@@ -269,14 +279,20 @@ impl Llc {
         // call listener can remain in the CC routing table while the MS has
         // already returned to MCCH for location updating, so never inherit a
         // traffic route until D-LOCATION UPDATE ACCEPT is link-acknowledged.
-        if state.subscribers.is_registration_pending(issi) || state.subscribers.direct_response_window_active(issi, dltime) {
+        if state.subscribers.is_registration_pending(issi) {
             return Vec::new();
         }
+        let direct_response_window = state.subscribers.direct_response_window_active(issi, dltime);
+        // A TIP MS uses MAC-ACCESS for each uplink burst on its assigned
+        // PDCH. That refreshes the short direct-response window continuously,
+        // but the MS remains on the PDCH and cannot receive an unsolicited
+        // SDS on MCCH. During such a window suppress only a possibly stale
+        // circuit route; an active packet route is still authoritative.
         let mut routes = state
             .subscriber_delivery_routes
             .get(&issi)
+            .filter(|_| !direct_response_window)
             .into_iter()
-            .chain(state.subscriber_packet_delivery_routes.get(&issi))
             .flat_map(|routes| routes.iter())
             .filter(|route| (2..=4).contains(&route.timeslot))
             .map(|route| tetra_saps::tma::AssociatedChannel {
@@ -286,9 +302,33 @@ impl Llc {
                 best_effort_key: None,
             })
             .collect::<Vec<_>>();
-        // A subscriber can briefly be present in both CMCE and SNDCP state
-        // while packet capacity is draining. One physical timeslot needs only
-        // one concurrent copy; UMAC validates its live owner before enqueue.
+        // Every timeslot in an SNDCP context belongs to one multislot packet
+        // bearer. The MS monitors that bearer as a unit, so one basic-link
+        // copy on its primary PDCH is sufficient. Treating TS2..TS4 as three
+        // possible terminal locations needlessly transmits the same SDS three
+        // times and can displace in-flight advanced-link IP segments.
+        if let Some(packet_route) = state
+            .subscriber_packet_delivery_routes
+            .get(&issi)
+            .into_iter()
+            .flat_map(|routes| routes.iter())
+            .find(|route| (2..=4).contains(&route.timeslot))
+            .map(|route| tetra_saps::tma::AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+                best_effort_key: None,
+            })
+        {
+            // During a voice/packet transition both routing tables can still
+            // name the same physical slot. Prefer the packet route there;
+            // UMAC validates any remaining distinct circuit routes against
+            // their current owner immediately before enqueueing.
+            routes.retain(|route| route.timeslot != packet_route.timeslot);
+            routes.insert(0, packet_route);
+        }
+
+        // Scan-list call routes remain separate possible terminal locations.
         let mut seen_timeslots = HashSet::new();
         routes.retain(|route| seen_timeslots.insert(route.timeslot));
         routes
@@ -745,6 +785,18 @@ impl Llc {
         ));
     }
 
+    fn advanced_non_final_segment_size(framed_len_bits: usize) -> usize {
+        for segment_bits in AL_NON_FINAL_SEGMENT_CANDIDATES {
+            let non_final_segments = framed_len_bits.saturating_sub(AL_FINAL_FRAMED_SEGMENT_BITS).div_ceil(segment_bits);
+            let final_segment_bits = framed_len_bits - non_final_segments * segment_bits;
+            if final_segment_bits >= 32 {
+                return segment_bits;
+            }
+        }
+
+        unreachable!("a 164-bit non-final segment always leaves at least 32 final bits")
+    }
+
     fn advanced_segments(mut tl_sdu: BitBuffer) -> Vec<BitBuffer> {
         let mut protected = BitBuffer::new_autoexpand(tl_sdu.get_len_remaining() + 32);
         let length = tl_sdu.get_len_remaining();
@@ -753,9 +805,15 @@ impl Llc {
         protected.write_bits(checksum.into(), 32);
         protected.seek(0);
 
+        let non_final_segment_bits = Self::advanced_non_final_segment_size(protected.get_len_remaining());
         let mut segments = Vec::new();
         while protected.get_len_remaining() > 0 {
-            let length = protected.get_len_remaining().min(AL_SEGMENT_PAYLOAD_BITS);
+            let remaining = protected.get_len_remaining();
+            let length = if remaining <= AL_FINAL_FRAMED_SEGMENT_BITS {
+                remaining
+            } else {
+                non_final_segment_bits
+            };
             let mut segment = BitBuffer::new_autoexpand(length);
             segment.copy_bits(&mut protected, length);
             segment.seek(0);
@@ -811,6 +869,7 @@ impl Llc {
             reporter,
             attempt_reporter: None,
             sent_at: None,
+            ack_request_repetitions: 0,
             retransmissions: 0,
             pending_segments: None,
         });
@@ -1115,6 +1174,15 @@ impl Llc {
         };
         link.receiver_ready = ack.receiver_ready;
         for block in ack.blocks {
+            tracing::debug!(
+                issi = prim.main_address.ssi,
+                receiver_ready = ack.receiver_ready,
+                nr = block.nr,
+                acknowledgement_length = block.acknowledgement_length,
+                first_missing_segment = block.first_missing_segment,
+                acknowledgement_bitmap = ?block.acknowledgement_bitmap,
+                "received advanced-link acknowledgement block"
+            );
             let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
                 continue;
             };
@@ -1142,6 +1210,9 @@ impl Llc {
             }
 
             let sdu = &mut link.tx[position];
+            // Receipt of any acknowledgement block proves that the peer saw
+            // the AR. Subsequent recovery is governed by N.273/N.274.
+            sdu.ack_request_repetitions = 0;
             if block.acknowledgement_length == 63 {
                 sdu.retransmissions = sdu.retransmissions.saturating_add(1);
                 sdu.pending_segments = None;
@@ -1286,6 +1357,22 @@ impl Llc {
     fn submit_advanced_link_messages(&mut self, queue: &mut MessageQueue) -> bool {
         let now = self.dltime;
         let mut activity = false;
+        // A queued TL-SDU can outlive a PDCH resize. Resolve the routes at
+        // submission time so segments and selective retransmissions never
+        // target a timeslot that voice has taken from packet data.
+        let active_routes = self
+            .advanced_links
+            .iter()
+            .map(|(&issi, link)| {
+                (
+                    issi,
+                    Self::packet_routes(&self.config, issi)
+                        .into_iter()
+                        .take(link.slots as usize)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         for (issi, link) in &mut self.advanced_links {
             let mut remove = Vec::new();
             for (index, sdu) in link.tx.iter_mut().enumerate() {
@@ -1306,7 +1393,25 @@ impl Llc {
                 }
                 let timed_out = sdu.sent_at.is_some_and(|sent| now.diff(sent) >= T252_ACK_WAITING_TIMER as i32);
                 if timed_out {
-                    if sdu.retransmissions >= link.max_sdu_retransmissions {
+                    if sdu.ack_request_repetitions < MAX_AL_ACK_REQUEST_REPEATS {
+                        sdu.ack_request_repetitions += 1;
+                        if sdu.reporter.get_state() == TxState::Transmitted {
+                            sdu.reporter.reset();
+                        }
+                        sdu.attempt_reporter = None;
+                        sdu.sent_at = None;
+                        // TS 100 392-2 section 22.3.3.2.3 and TTR 001-05
+                        // figure 34: repeat an already transmitted segment
+                        // with AR after T.252. This is independent of N.273.
+                        sdu.pending_segments = Some(vec![sdu.segments.len().saturating_sub(1)]);
+                        tracing::info!(
+                            issi = *issi,
+                            ns = sdu.ns,
+                            attempt = sdu.ack_request_repetitions,
+                            maximum = MAX_AL_ACK_REQUEST_REPEATS,
+                            "repeating advanced-link acknowledgement request after T.252"
+                        );
+                    } else if sdu.retransmissions >= link.max_sdu_retransmissions {
                         if sdu.reporter.get_state() == TxState::Pending {
                             sdu.reporter.mark_transmitted();
                         }
@@ -1321,6 +1426,7 @@ impl Llc {
                         }
                         sdu.attempt_reporter = None;
                         sdu.sent_at = None;
+                        sdu.ack_request_repetitions = 0;
                         sdu.pending_segments = None;
                     }
                 }
@@ -1332,12 +1438,16 @@ impl Llc {
             if !link.receiver_ready {
                 continue;
             }
+            let routes = &active_routes[issi];
+            if routes.is_empty() {
+                continue;
+            }
             let in_flight = link
                 .tx
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            let mut available = link.window_size as usize - in_flight.min(link.window_size as usize);
+            let mut available = PACKET_DATA_AL_TLSDU_WINDOW_SIZE - in_flight.min(PACKET_DATA_AL_TLSDU_WINDOW_SIZE);
             for sdu in link
                 .tx
                 .iter_mut()
@@ -1358,7 +1468,7 @@ impl Llc {
                 // actual AL acknowledgement and timeout processing below.
                 let attempt_reporter = TxReporter::new();
                 for (selected_index, segment_index) in selected.iter().copied().enumerate() {
-                    let mut pdu = BitBuffer::new_autoexpand(AL_SEGMENT_PAYLOAD_BITS + 24);
+                    let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
                     let last_selected = selected_index + 1 == selected.len();
                     let final_segment = segment_index + 1 == sdu.segments.len();
                     let header = AlDataHeader {
@@ -1379,11 +1489,7 @@ impl Llc {
                         TetraAddress::issi(*issi),
                         sdu.endpoint_id,
                         pdu,
-                        if sdu.routes.is_empty() {
-                            None
-                        } else {
-                            Some(sdu.routes[segment_index % sdu.routes.len()])
-                        },
+                        Some(routes[segment_index % routes.len()]),
                         last_selected.then(|| sdu.chan_alloc.clone()).flatten(),
                         sdu.aie_request,
                         last_selected.then(|| attempt_reporter.clone()),
@@ -1970,9 +2076,13 @@ impl Llc {
         while let Some(ack) = self.scheduled_out_acks.pop_front() {
             tracing::debug!("auto-ack for ssi: {}, n: {}, ts: {}", ack.addr.ssi, ack.nr, ack.ts);
 
-            // Send BL-ACK via FACCH (stealing) on the traffic timeslot if the original
-            // message arrived on a traffic channel (TS2-4), otherwise via MCCH (TS1).
-            let steal = matches!(ack.ts, 2..=4);
+            // An assigned PDCH is an SCH/F signalling channel, even though it
+            // uses TS2..4. Sending its BL-ACK as FACCH leaves the ACK queued
+            // forever when no voice circuit exists, so the MS repeats the
+            // uplink SDS and blocks packet traffic. Preserve the live packet
+            // route and reserve stealing for an actual traffic channel.
+            let packet_route = Self::packet_route(&self.config, ack.addr.ssi, ack.ts);
+            let steal = matches!(ack.ts, 2..=4) && packet_route.is_none();
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
                 has_fcs: false,
@@ -2015,7 +2125,7 @@ impl Llc {
                     stealing_repeats_flag: None, // TODO FIXME
                     data_category: None,         // TODO FIXME
                     chan_alloc,
-                    associated_channel: None,
+                    associated_channel: packet_route,
                     tx_reporter: None, // By definition, no higher layer entity is interested
                 }),
             };
@@ -2198,7 +2308,7 @@ mod tests {
     fn receive_advanced_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, ns: u8, payload: BitBuffer) {
         let segments = Llc::advanced_segments(payload);
         for (index, mut segment) in segments.iter().cloned().enumerate() {
-            let mut pdu = BitBuffer::new_autoexpand(AL_SEGMENT_PAYLOAD_BITS + 24);
+            let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
             AlDataHeader {
                 final_segment: index + 1 == segments.len(),
                 acknowledgement_requested: index + 1 == segments.len(),
@@ -2495,6 +2605,7 @@ mod tests {
                 reporter,
                 attempt_reporter: None,
                 sent_at: None,
+                ack_request_repetitions: 0,
                 retransmissions: 0,
                 segment_retransmissions: vec![0],
                 pending_segments: None,
@@ -2573,7 +2684,7 @@ mod tests {
         let SapMsgInner::TmaUnitdataReq(second) = second.msg else {
             panic!("expected final TMA segment")
         };
-        assert_eq!(first.pdu.get_len_remaining(), 17 + AL_SEGMENT_PAYLOAD_BITS);
+        assert_eq!(first.pdu.get_len_remaining(), 17 + 180);
         assert_eq!(
             first.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
             Some((32, 2, 55))
@@ -2602,7 +2713,198 @@ mod tests {
     }
 
     #[test]
-    fn advanced_downlink_processes_every_ack_block_in_the_window() {
+    fn advanced_downlink_uses_uniform_segments_with_a_complete_fcs_tail() {
+        // A 64-byte IPv4 packet plus the 19 SNDCP/MLE bits used on this path
+        // leaves only 23 bits after three 180-bit segments. Use 172-bit
+        // non-final segments so AL-FINAL contains the complete 32-bit FCS.
+        let short = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(64 * 8 + 19)));
+        assert_eq!(
+            short.iter().map(BitBuffer::get_len_remaining).collect::<Vec<_>>(),
+            vec![172, 172, 172, 47]
+        );
+
+        let long = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(512 * 8 + 19)));
+        let non_final = &long[..long.len() - 1];
+        assert!(!non_final.is_empty());
+        assert!(
+            non_final
+                .iter()
+                .all(|segment| segment.get_len_remaining() == non_final[0].get_len_remaining())
+        );
+        assert!(long.last().unwrap().get_len_remaining() >= 32);
+    }
+
+    #[test]
+    fn packet_advanced_link_submits_only_one_tlsdu_at_a_time() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        for payload in ["0".repeat(240), "1".repeat(240)] {
+            let reporter = TxReporter::new();
+            llc.rx_tla_tldata_req_bl(
+                &mut queue,
+                SapMsg::new(
+                    Sap::TlaSap,
+                    TetraEntity::Mle,
+                    TetraEntity::Llc,
+                    SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                        main_address: TetraAddress::issi(77_468),
+                        link_id: 0,
+                        endpoint_id: 7,
+                        tl_sdu: BitBuffer::from_bitstr(&payload),
+                        stealing_permission: false,
+                        subscriber_class: 0,
+                        fcs_flag: true,
+                        packet_data_flag: true,
+                        air_interface_encryption: None,
+                        stealing_repeats_flag: None,
+                        data_class_info: None,
+                        req_handle: 0,
+                        graceful_degradation: None,
+                        chan_alloc: None,
+                        associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                        tx_reporter: Some(reporter),
+                    }),
+                ),
+            );
+        }
+
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let queued_ns = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                    return None;
+                };
+                AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok().map(|header| header.ns)
+            })
+            .collect::<Vec<_>>();
+        assert!(!queued_ns.is_empty());
+        assert!(queued_ns.iter().all(|ns| *ns == 0));
+        assert!(llc.advanced_links[&77_468].tx[1].attempt_reporter.is_none());
+    }
+
+    #[test]
+    fn queued_advanced_downlink_uses_the_current_pdch_width() {
+        let config = test_config();
+        let mut llc = Llc::new(config.clone());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                    tx_reporter: Some(TxReporter::new()),
+                }),
+            ),
+        );
+
+        // Voice takes TS4 after this TL-SDU entered LLC but before its
+        // segments are submitted. None of those segments may retain TS4.
+        config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .get_mut(&77_468)
+            .unwrap()
+            .retain(|route| route.timeslot != 4);
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let routes = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &message.msg else {
+                    return None;
+                };
+                request.associated_channel.map(|route| route.timeslot)
+            })
+            .collect::<Vec<_>>();
+        assert!(routes.len() >= 4);
+        assert!(routes.iter().all(|timeslot| matches!(timeslot, 2 | 3)));
+    }
+
+    #[test]
+    fn t252_repeats_only_the_ack_requesting_final_segment() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        // The test MS negotiates this value in the live TIP session. N.273=0
+        // must still permit T.252 acknowledgement-request repetition.
+        llc.advanced_links.get_mut(&77_468).unwrap().max_sdu_retransmissions = 0;
+        while queue.pop_front().is_some() {}
+        let reporter = TxReporter::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                    tx_reporter: Some(reporter),
+                }),
+            ),
+        );
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+        llc.advanced_links[&77_468].tx[0]
+            .attempt_reporter
+            .as_ref()
+            .unwrap()
+            .mark_transmitted();
+        llc.submit_advanced_link_messages(&mut queue);
+        while queue.pop_front().is_some() {}
+
+        llc.dltime = llc.dltime.add_timeslots(T252_ACK_WAITING_TIMER as i32);
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        assert_eq!(queue.iter_mut().count(), 1);
+        let SapMsgInner::TmaUnitdataReq(mut repeated) = queue.pop_front().unwrap().msg else {
+            panic!("expected repeated AL-FINAL-AR")
+        };
+        let header = AlDataHeader::from_bitbuf(&mut repeated.pdu).unwrap();
+        let final_index = llc.advanced_links[&77_468].tx[0].segments.len() - 1;
+        assert!(header.final_segment);
+        assert!(header.acknowledgement_requested);
+        assert_eq!(usize::from(header.segment), final_index);
+        assert_eq!(llc.advanced_links[&77_468].tx[0].ack_request_repetitions, 1);
+    }
+
+    #[test]
+    fn advanced_downlink_ignores_ack_blocks_for_unsent_tlsdus() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
@@ -2664,8 +2966,29 @@ mod tests {
         ack.seek(0);
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
 
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 1);
+        assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
+        assert_eq!(reporters[1].get_state(), TxState::Pending);
+
+        while queue.pop_front().is_some() {}
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        assert!(queue.iter_mut().count() > 0);
+        let mut ack = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![AlAckBlock {
+                nr: 1,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert!(llc.advanced_links[&77_468].tx.is_empty());
-        assert!(reporters.iter().all(|reporter| reporter.get_state() == TxState::Acknowledged));
+        assert_eq!(reporters[1].get_state(), TxState::Acknowledged);
     }
 
     #[test]
@@ -2838,6 +3161,31 @@ mod tests {
     }
 
     #[test]
+    fn packet_data_bl_ack_uses_assigned_schf_instead_of_facch() {
+        let mut llc = Llc::new(test_config());
+        let addr = TetraAddress::issi(77_468);
+        let received = TdmaTime { h: 0, m: 1, f: 4, t: 3 };
+        let aie = AieRequest::sc2(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData);
+        llc.schedule_outgoing_ack(received, addr, 1, aie);
+
+        let mut queue = MessageQueue::new();
+        assert!(llc.submit_ack_replies_to_umac(&mut queue));
+        let SapMsgInner::TmaUnitdataReq(request) = queue.pop_front().expect("BL-ACK must be queued").msg else {
+            panic!("expected a TMA request")
+        };
+        assert!(!request.stealing_permission, "an assigned PDCH is not a traffic channel");
+        assert!(
+            request.chan_alloc.is_none(),
+            "the existing packet bearer does not need a replacement allocation"
+        );
+        assert_eq!(
+            request.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
+            Some((32, 3, 55))
+        );
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
     fn combined_bl_adata_never_mixes_clear_and_sc2_ack_status() {
         let mut llc = Llc::new(test_config());
         let addr = TetraAddress::issi(1234);
@@ -2873,7 +3221,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_routes_combine_call_and_all_packet_slots_without_duplicates() {
+    fn delivery_routes_treat_multislot_packet_context_as_one_bearer() {
         let config = test_config();
         let issi = 77_479;
         let mut state = config.state_write();
@@ -2881,7 +3229,7 @@ mod tests {
             issi,
             vec![tetra_config::bluestation::SubscriberDeliveryRoute {
                 call_id: 7,
-                timeslot: 2,
+                timeslot: 4,
                 usage: 10,
             }],
         );
@@ -2908,7 +3256,13 @@ mod tests {
         drop(state);
 
         let routes = Llc::delivery_routes(&config, issi, TdmaTime::default());
-        assert_eq!(routes.iter().map(|route| route.timeslot).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (route.call_id, route.timeslot, route.usage))
+                .collect::<Vec<_>>(),
+            vec![(11, 2, 52), (7, 4, 10)]
+        );
     }
 
     #[test]
@@ -2916,14 +3270,21 @@ mod tests {
         let config = test_config();
         let issi = 77_468;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
-        config.state_write().subscriber_delivery_routes.insert(
-            issi,
-            vec![tetra_config::bluestation::SubscriberDeliveryRoute {
-                call_id: 7,
-                timeslot: 2,
-                usage: 10,
-            }],
-        );
+        {
+            let mut state = config.state_write();
+            // This test exercises one circuit route plus the MCCH fallback.
+            // test_config installs a three-slot PDCH for other routing tests,
+            // so remove that unrelated route from this scenario.
+            state.subscriber_packet_delivery_routes.remove(&issi);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 7,
+                    timeslot: 2,
+                    usage: 10,
+                }],
+            );
+        }
 
         let mut llc = Llc::new(config.clone());
         llc.dltime = start;
@@ -3084,26 +3445,30 @@ mod tests {
         let config = test_config();
         let issi = 77_468;
         let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
-        config.state_write().subscriber_delivery_routes.insert(
-            issi,
-            vec![
-                tetra_config::bluestation::SubscriberDeliveryRoute {
-                    call_id: 9,
-                    timeslot: 4,
-                    usage: 12,
-                },
-                tetra_config::bluestation::SubscriberDeliveryRoute {
-                    call_id: 8,
-                    timeslot: 3,
-                    usage: 11,
-                },
-                tetra_config::bluestation::SubscriberDeliveryRoute {
-                    call_id: 7,
-                    timeslot: 2,
-                    usage: 10,
-                },
-            ],
-        );
+        {
+            let mut state = config.state_write();
+            state.subscriber_packet_delivery_routes.remove(&issi);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![
+                    tetra_config::bluestation::SubscriberDeliveryRoute {
+                        call_id: 9,
+                        timeslot: 4,
+                        usage: 12,
+                    },
+                    tetra_config::bluestation::SubscriberDeliveryRoute {
+                        call_id: 8,
+                        timeslot: 3,
+                        usage: 11,
+                    },
+                    tetra_config::bluestation::SubscriberDeliveryRoute {
+                        call_id: 7,
+                        timeslot: 2,
+                        usage: 10,
+                    },
+                ],
+            );
+        }
 
         let mut llc = Llc::new(config.clone());
         llc.dltime = start;
@@ -3265,7 +3630,28 @@ mod tests {
     }
 
     #[test]
-    fn direct_mac_access_response_stays_on_mcch() {
+    fn direct_mac_access_response_ignores_stale_call_route() {
+        let config = test_config();
+        let issi = 0x12_34_56;
+        let now = TdmaTime::default();
+        {
+            let mut state = config.state_write();
+            state.subscribers.mark_direct_response_window(issi, now);
+            state.subscriber_delivery_routes.insert(
+                issi,
+                vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                    call_id: 7,
+                    timeslot: 2,
+                    usage: 10,
+                }],
+            );
+        }
+
+        assert!(Llc::delivery_routes(&config, issi, now).is_empty());
+    }
+
+    #[test]
+    fn direct_response_window_preserves_assigned_packet_routes() {
         let config = test_config();
         let issi = 0x12_34_56;
         let now = TdmaTime::default();
@@ -3290,7 +3676,11 @@ mod tests {
             );
         }
 
-        assert!(Llc::delivery_routes(&config, issi, now).is_empty());
+        let routes = Llc::delivery_routes(&config, issi, now);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].call_id, 11);
+        assert_eq!(routes[0].timeslot, 3);
+        assert_eq!(routes[0].usage, 52);
     }
 
     #[test]
