@@ -243,9 +243,8 @@ struct PendingRegistrationDelivery {
     command_id: Option<u64>,
     issi: u32,
     authentication_downlink: bool,
-    /// Accepted groups whose GCK association was included in the location
-    /// update accept. Repeat these as bounded figure-20 amendments only after
-    /// BL-ACK proves that registration completed on the air interface.
+    /// Groups whose GCK association was included in this location update
+    /// accept, retained only for delivery diagnostics.
     security_groups: Vec<u32>,
     tx_reporter: TxReporter,
 }
@@ -466,19 +465,12 @@ impl MmBs {
         groups
     }
 
-    /// Registration may carry associations for GSSIs other than the selected
-    /// group (TTR 001-11 clause 6.2.8.2). Merge the complete authoritative
-    /// local scan/attachment state into D-LOCATION UPDATE ACCEPT so roaming
-    /// does not unnecessarily depend on a second Figure-20 transaction.
-    fn registration_group_security_gssis(&mut self, issi: u32, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
-        let mut groups = gssis.into_iter().collect::<Vec<_>>();
-        groups.extend(
-            self.client_mgr
-                .get_client_by_issi(issi)
-                .into_iter()
-                .flat_map(|client| client.groups.keys().copied()),
-        );
-        self.normalized_group_security_gssis(groups)
+    /// Include the associations requested by this registration. Existing
+    /// scan groups restored from the SwMI do not need another air-interface
+    /// attachment or association exchange (TTR 001-01 6.4/8.3 and TTR 001-11
+    /// 6.2.8.2). Their presence must not enlarge the registration accept.
+    fn registration_group_security_gssis(&self, _issi: u32, gssis: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        self.normalized_group_security_gssis(gssis)
     }
 
     fn group_security_information(&self, gssis: impl IntoIterator<Item = u32>) -> Option<Vec<GroupIdentitySecurityRelatedInformation>> {
@@ -503,7 +495,20 @@ impl MmBs {
                 })
             })
             .collect::<Vec<_>>();
-        (!associations.is_empty()).then_some(vec![GroupIdentitySecurityRelatedInformation { associations }])
+        let mut elements: Vec<GroupIdentitySecurityRelatedInformation> = Vec::new();
+        for association in associations {
+            if let Some(element) = elements
+                .iter_mut()
+                .find(|e| e.associations[0].selection == association.selection && e.associations.len() < 30)
+            {
+                element.associations.push(association);
+            } else {
+                elements.push(GroupIdentitySecurityRelatedInformation {
+                    associations: vec![association],
+                });
+            }
+        }
+        (!elements.is_empty()).then_some(elements)
     }
 
     /// Select an explicit downlink policy while the MM transaction still
@@ -755,36 +760,21 @@ impl MmBs {
                 self.config.state_write().subscribers.mark_active(issi);
                 self.group_security_not_before
                     .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
-                // SubscriberStateSync can restore the terminal's roaming
-                // scan/attachment list while D-LOCATION UPDATE ACCEPT is
-                // still awaiting its BL-ACK.  Those groups were not present
-                // in the original location-update transaction, but they do
-                // need the same post-registration GSSI -> GCKN amendment
-                // before a restored or late-entry group call is usable.
-                let included_security_groups = pending.security_groups.iter().copied().collect::<HashSet<_>>();
-                let mut current_security_groups = pending.security_groups;
-                current_security_groups.extend(
-                    self.client_mgr
-                        .get_client_by_issi(issi)
-                        .into_iter()
-                        .flat_map(|client| client.groups.keys().copied()),
-                );
-                let current_security_groups = self.normalized_group_security_gssis(current_security_groups);
-                let post_registration_groups = current_security_groups
-                    .iter()
-                    .filter(|gssi| !included_security_groups.contains(gssi))
-                    .copied()
-                    .collect::<Vec<_>>();
-                let association_count = current_security_groups.len();
-                let late_association_count = post_registration_groups.len();
-                self.send_group_security_association_amendments(queue, issi, 0, post_registration_groups);
+                // TTR 001-01 6.4/8.3: ordinary roaming retains existing
+                // attachments (lifetime 01). Restoring them at this BS is
+                // not a new attachment at the MS. TTR 001-11 6.2.8.2 does
+                // not require resending unchanged stored GCK associations.
+                // Actual attachment requests and key-provisioning results
+                // retain their separate association-signalling paths.
+                let association_count = pending.security_groups.len();
+                let restored_group_count = self.client_mgr.get_client_by_issi(issi).map_or(0, |client| client.groups.len());
                 self.send_current_gck_version_to_terminal(queue, issi, 0);
                 tracing::info!(
                     command_id = ?pending.command_id,
                     issi = pending.issi,
                     authentication_downlink = pending.authentication_downlink,
                     association_count,
-                    late_association_count,
+                    restored_group_count,
                     "location update accepted and link-acknowledged on air interface"
                 );
             } else {
@@ -3511,9 +3501,7 @@ impl MmBs {
         // requested, then use the infrastructure-initiated MM recovery from
         // TS 100 392-2 clause 16.4.3 to make the MS register and report its
         // groups again.
-        let registration_recovery_required = results
-            .iter()
-            .any(|result| !result.accepted && result.cause == 2);
+        let registration_recovery_required = results.iter().any(|result| !result.accepted && result.cause == 2);
 
         let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending, results);
@@ -3670,17 +3658,9 @@ impl MmBs {
             });
         }
 
-        // Normally SubscriberStateSync precedes the registration BL-ACK and
-        // update_registration_delivery_statuses sends the complete Figure-20
-        // association set. If a delayed sync arrives after the terminal is
-        // already active, amend only genuinely new GCK groups here. This also
-        // closes the roaming race without rewriting unchanged associations.
-        let active = self.config.state_read().subscribers.is_active(issi);
-        let added_security_groups = self.group_security_information(added.iter().copied()).is_some();
-        if active && added_security_groups {
-            self.send_group_security_association_amendments(queue, issi, 0, added.iter().copied());
-            self.send_current_gck_version_to_terminal(queue, issi, 0);
-        }
+        // A group new to this BS is not necessarily new to the MS. This
+        // authoritative snapshot restores network state only (TTR 001-01
+        // 6.4), even when it arrives after the registration BL-ACK.
         let restored_count = desired_groups.len();
         tracing::info!(
             issi,
@@ -6422,11 +6402,11 @@ mod tests {
     }
 
     #[test]
-    fn registration_accept_embeds_all_known_sc3g_scan_associations() {
+    fn registration_accept_only_embeds_requested_sc3g_associations() {
         let issi = 77_492;
-        let expected_groups = vec![1202, 1203, 1204];
-        let mut mm = test_sc3g_mm(issi, &expected_groups);
-        let security_groups = mm.registration_group_security_gssis(issi, Vec::new());
+        let expected_groups = vec![1202];
+        let mm = test_sc3g_mm(issi, &[1202, 1203, 1204]);
+        let security_groups = mm.registration_group_security_gssis(issi, [1202]);
         let mut queue = MessageQueue::new();
 
         mm.send_d_location_update_accept_with_handover(
@@ -6451,7 +6431,7 @@ mod tests {
         let pdu = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid D-LOCATION UPDATE ACCEPT");
         let associations = pdu
             .group_identity_security_related_information
-            .expect("registration must embed the restored scan associations")[0]
+            .expect("registration must embed the requested association")[0]
             .associations
             .iter()
             .map(|association| association.gssi)
@@ -6504,6 +6484,27 @@ mod tests {
             let proprietary = accept.proprietary.expect("RUA request must be present");
             assert_eq!(proprietary.data & 0b111, expected);
         }
+    }
+
+    #[test]
+    fn roaming_scan_groups_are_retained_without_unsolicited_association_amendments() {
+        let issi = 77_492;
+        let groups = [1202, 1203, 1204, 1205, 1206, 1207];
+        let mut mm = test_sc3g_mm(issi, &groups);
+        let reporter = TxReporter::new();
+        let mut queue = MessageQueue::new();
+        mm.track_registration_delivery(Some(41), issi, false, vec![1202], reporter.clone());
+        reporter.mark_transmitted();
+        mm.update_registration_delivery_statuses(&mut queue);
+        assert!(!mm.queued_group_security_associations.contains_key(&issi));
+        reporter.mark_acknowledged();
+        mm.update_registration_delivery_statuses(&mut queue);
+        assert!(!mm.queued_group_security_associations.contains_key(&issi));
+        assert_eq!(mm.client_mgr.get_client_by_issi(issi).unwrap().groups.len(), 6);
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
+        mm.current_time = mm.current_time.add_timeslots(super::GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS);
+        mm.update_group_security_association_statuses(&mut queue);
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
     }
 
     #[test]
@@ -6808,7 +6809,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_roaming_state_sync_amends_new_gck_group_after_registration_ack() {
+    fn delayed_roaming_state_sync_restores_group_internally_after_registration_ack() {
         let issi = 430_904;
         let gssi = 1202;
         let config = test_config();
@@ -6848,18 +6849,17 @@ mod tests {
             TerminalSecurityClass::Sc3,
         );
 
-        let association = queue
-            .iter_mut()
-            .find_map(|message| match &mut message.msg {
-                SapMsgInner::LmmMleUnitdataReq(request) => DAttachDetachGroupIdentity::from_bitbuf(&mut request.sdu).ok(),
-                _ => None,
-            })
-            .expect("active target cell must amend a delayed GCK association");
-        let security = association
-            .group_identity_security_related_information
-            .expect("delayed roaming amendment must carry security information");
-        assert_eq!(security[0].associations[0].gssi, gssi);
-        assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(2));
+        assert_eq!(mm.client_mgr.client_group_class_of_usage(issi, gssi), Some(4));
+        assert!(queue.iter_mut().any(|message| matches!(&message.msg,
+            SapMsgInner::MmSubscriberUpdate(update) if update.groups.contains(&gssi))));
+        assert!(
+            queue
+                .iter_mut()
+                .all(|message| !matches!(&message.msg, SapMsgInner::LmmMleUnitdataReq(_))),
+            "restoring a snapshot must not send an air-interface PDU"
+        );
+        assert!(!mm.queued_group_security_associations.contains_key(&issi));
+        assert!(!mm.pending_group_security_associations.contains_key(&issi));
     }
 
     #[test]
@@ -6887,7 +6887,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_link_ack_defers_late_roaming_association_past_collision_guard() {
+    fn registration_guard_still_defers_explicit_security_amendments() {
         let issi = 77_468;
         let gssi = 91;
         let config = test_config();
@@ -6932,6 +6932,14 @@ mod tests {
             queue.pop_front().is_none(),
             "Figure-20 must not collide with terminal-side registration MM"
         );
+        assert!(
+            !mm.queued_group_security_associations.contains_key(&issi),
+            "restored group needs no amendment"
+        );
+        // An actual provisioning/association change remains a separate
+        // transaction and must still respect the registration guard.
+        mm.send_group_security_association_amendments(&mut queue, issi, 0, [gssi]);
+        assert!(queue.pop_front().is_none());
 
         mm.current_time = mm.current_time.add_timeslots(super::GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS);
         mm.update_group_security_association_statuses(&mut queue);
