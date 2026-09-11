@@ -29,10 +29,12 @@ use crate::{MessageQueue, TetraEntityTrait, net_swmi::SwmiPacketEndpoint};
 
 const DEFAULT_NSAPI: u8 = 1;
 const PACKET_USAGE_BASE: u8 = 48;
-// A successful acknowledged SN-END OF DATA already proves that the MS was
-// told to leave the PDCH. Do not add a fixed multi-frame delay afterwards;
-// the force deadline remains the bounded fallback for a missing terminal.
-const DRAIN_GRACE_TIMESLOTS: i32 = 0;
+// TxReporter is completed while the MAC block is prepared ahead of RF. Keep
+// the old PDCH alive until that preparation horizon has passed, so the
+// QuitAndGo allocation or the BL-ACK for an MS-originated immediate service
+// change cannot be removed together with the bearer that still carries it.
+const PDCH_RELEASE_RF_GUARD_TIMESLOTS: i32 = 8;
+const DRAIN_GRACE_TIMESLOTS: i32 = PDCH_RELEASE_RF_GUARD_TIMESLOTS;
 // TxReporter becomes Transmitted when the MAC block is built ahead of RF.
 // Retain the old PDCH for a short guard after that point so the channel
 // allocation reaches air before voice reuses the removed physical slot.
@@ -113,7 +115,11 @@ struct PendingStandby {
     issi: u32,
     session_id: u64,
     session_generation: u64,
-    reporter: TxReporter,
+    /// Present for a network-originated SN-END OF DATA. An MS-originated
+    /// immediate service change needs only enough time for LLC's BL-ACK to
+    /// reach RF.
+    reporter: Option<TxReporter>,
+    release_at: Option<TdmaTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -473,6 +479,21 @@ impl Sndcp {
                 bitmap & 0b1000 != 0,
             ],
             alloc_type,
+            cell_change_flag: false,
+            ul_dl_assigned: UlDlAssignment::Both,
+        }
+    }
+
+    /// TTR 001-05 sections 6.7 and 7.6 require the READY-to-STANDBY response
+    /// to use `Quit current channel and go to specified channel`. Bitmap 0000
+    /// selects the MCCH/common SCCH and the usage marker is absent for this
+    /// allocation type.
+    fn quit_to_common_channel() -> CmceChanAllocReq {
+        CmceChanAllocReq {
+            usage: None,
+            carrier: None,
+            timeslots: [false; 4],
+            alloc_type: ChanAllocType::QuitAndGo,
             cell_change_flag: false,
             ul_dl_assigned: UlDlAssignment::Both,
         }
@@ -1236,15 +1257,15 @@ impl Sndcp {
             .unwrap_or_default();
         for issi in member_ids {
             if let Some(context) = self.contexts.get(&issi).cloned() {
-                let reporter = TxReporter::new();
+                let reporter = TxReporter::new_unacked();
                 if self.queue_downlink_with_reporter(
                     queue,
                     &context,
                     SndcpDownlink::EndOfData {
                         immediate_service_change: true,
                     },
-                    Layer2Service::Acknowledged,
-                    Some(Self::channel_allocation(0, 0, ChanAllocType::QuitAndGo)),
+                    Layer2Service::Unacknowledged,
+                    Some(Self::quit_to_common_channel()),
                     Some(reporter.clone()),
                 ) && let Some(bearer) = self.bearers.get_mut(&id)
                 {
@@ -1478,6 +1499,11 @@ impl Sndcp {
                     && context.timeslot_bitmap == timeslot_bitmap
                     && context.event_label == Some(event_label);
                 if accepted {
+                    // A new access decision supersedes a READY-to-STANDBY
+                    // release that may still be inside its RF guard. Do not
+                    // detach the freshly resumed bearer when that old guard
+                    // expires.
+                    self.pending_standby.retain(|pending| pending.issi != issi);
                     context.session_id = Some(session_id);
                     context.session_generation = Some(session_generation);
                     if response != PacketAccessResponse::None {
@@ -1653,8 +1679,19 @@ impl Sndcp {
                     return;
                 };
                 if immediate_service_change {
+                    // TTR 001-12 sections 6.7.4 and 6.8.4 require the MS to
+                    // wait for the basic-link ACK before leaving the PDCH.
+                    // LLC generates that ACK automatically, but it is still
+                    // queued behind this indication. Preserve the bearer for
+                    // one RF preparation horizon before detaching it.
                     self.pending_standby.retain(|pending| pending.issi != issi);
-                    self.detach_packet_bearer(queue, issi);
+                    self.pending_standby.push(PendingStandby {
+                        issi,
+                        session_id,
+                        session_generation,
+                        reporter: None,
+                        release_at: Some(self.dltime.add_timeslots(PDCH_RELEASE_RF_GUARD_TIMESLOTS)),
+                    });
                     return;
                 }
                 if self.pending_standby.iter().any(|pending| {
@@ -1662,22 +1699,27 @@ impl Sndcp {
                 }) {
                     return;
                 }
-                let reporter = TxReporter::new();
+                // SN-END OF DATA is SNDCP control over the unacknowledged
+                // basic link. The channel allocation itself moves the MS to
+                // common control; no advanced-link teardown is part of this
+                // procedure (TTR 001-05 section 6.7).
+                let reporter = TxReporter::new_unacked();
                 if self.queue_downlink_with_reporter(
                     queue,
                     &context,
                     SndcpDownlink::EndOfData {
                         immediate_service_change: false,
                     },
-                    Layer2Service::Acknowledged,
-                    Some(Self::channel_allocation(0, 0, ChanAllocType::QuitAndGo)),
+                    Layer2Service::Unacknowledged,
+                    Some(Self::quit_to_common_channel()),
                     Some(reporter.clone()),
                 ) {
                     self.pending_standby.push(PendingStandby {
                         issi,
                         session_id,
                         session_generation,
-                        reporter,
+                        reporter: Some(reporter),
+                        release_at: None,
                     });
                 } else {
                     self.detach_packet_bearer(queue, issi);
@@ -1910,7 +1952,46 @@ impl Sndcp {
         let mut completed = Vec::new();
         let mut index = 0;
         while index < self.pending_standby.len() {
-            if self.pending_standby[index].reporter.is_in_final_state() {
+            let retry = self.pending_standby[index]
+                .reporter
+                .as_ref()
+                .is_some_and(TxReporter::is_discarded)
+                .then(|| {
+                    let pending = &self.pending_standby[index];
+                    (pending.issi, pending.session_id, pending.session_generation)
+                });
+            if let Some((issi, session_id, session_generation)) = retry {
+                let context = self
+                    .contexts
+                    .get(&issi)
+                    .cloned()
+                    .filter(|context| context.session() == Some((session_id, session_generation)));
+                if let Some(context) = context {
+                    let reporter = TxReporter::new_unacked();
+                    if self.queue_downlink_with_reporter(
+                        queue,
+                        &context,
+                        SndcpDownlink::EndOfData {
+                            immediate_service_change: false,
+                        },
+                        Layer2Service::Unacknowledged,
+                        Some(Self::quit_to_common_channel()),
+                        Some(reporter.clone()),
+                    ) {
+                        self.pending_standby[index].reporter = Some(reporter);
+                        self.pending_standby[index].release_at = None;
+                        tracing::debug!(issi, "retrying discarded SN-END OF DATA on retained PDCH");
+                        index += 1;
+                        continue;
+                    }
+                }
+            }
+            let pending = &mut self.pending_standby[index];
+            if pending.release_at.is_none() && pending.reporter.as_ref().is_some_and(TxReporter::is_transmitted) {
+                pending.release_at = Some(self.dltime.add_timeslots(PDCH_RELEASE_RF_GUARD_TIMESLOTS));
+            }
+            let due = pending.release_at.is_some_and(|release_at| release_at.age(self.dltime) >= 0);
+            if due || retry.is_some() {
                 completed.push(self.pending_standby.remove(index));
             } else {
                 index += 1;
@@ -2257,6 +2338,13 @@ mod tests {
             },
         );
         sndcp.pending_commands.insert(9, 77_468);
+        sndcp.pending_standby.push(PendingStandby {
+            issi: 77_468,
+            session_id: 8,
+            session_generation: 2,
+            reporter: None,
+            release_at: Some(sndcp.dltime.add_timeslots(PDCH_RELEASE_RF_GUARD_TIMESLOTS)),
+        });
         let mut queue = MessageQueue::new();
 
         sndcp.handle_swmi(
@@ -2280,6 +2368,10 @@ mod tests {
         };
         assert!(request.chan_alloc.is_none());
         assert_eq!(request.associated_channel.as_ref().map(|route| route.timeslot), Some(2));
+        assert!(
+            sndcp.pending_standby.is_empty(),
+            "resumed access must cancel the old standby release guard"
+        );
         assert!(queue.pop_front().is_none(), "existing bearer must not be attached twice");
     }
 
@@ -2336,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn end_of_data_response_releases_bearer_after_link_ack() {
+    fn end_of_data_response_uses_basic_link_and_releases_after_rf_guard() {
         let mut sndcp = test_sndcp();
         insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
         sndcp.contexts.insert(
@@ -2374,7 +2466,11 @@ mod tests {
             panic!("expected SN-END OF DATA response")
         };
         assert!(!SnEndOfData::from_bitbuf(&mut response.sdu).unwrap().immediate_service_change);
-        assert!(response.chan_alloc.is_some());
+        assert_eq!(response.layer2service, Layer2Service::Unacknowledged);
+        let allocation = response.chan_alloc.expect("READY expiry must return the MS to common control");
+        assert_eq!(allocation.alloc_type, ChanAllocType::QuitAndGo);
+        assert_eq!(allocation.usage, None);
+        assert_eq!(allocation.timeslots, [false; 4]);
         assert_eq!(
             response.associated_channel,
             Some(AssociatedChannel {
@@ -2387,8 +2483,17 @@ mod tests {
         assert!(sndcp.bearers.contains_key(&17));
         assert_eq!(sndcp.pending_standby.len(), 1);
 
-        sndcp.pending_standby[0].reporter.mark_transmitted();
-        sndcp.pending_standby[0].reporter.mark_acknowledged();
+        sndcp.pending_standby[0]
+            .reporter
+            .as_ref()
+            .expect("network response has a reporter")
+            .mark_transmitted();
+        sndcp.process_standby_reports(&mut queue);
+        assert!(sndcp.bearers.contains_key(&17), "MAC preparation is earlier than RF transmission");
+        sndcp.dltime = sndcp.dltime.add_timeslots(PDCH_RELEASE_RF_GUARD_TIMESLOTS - 1);
+        sndcp.process_standby_reports(&mut queue);
+        assert!(sndcp.bearers.contains_key(&17));
+        sndcp.dltime = sndcp.dltime.add_timeslots(1);
         sndcp.process_standby_reports(&mut queue);
 
         assert!(!sndcp.bearers.contains_key(&17));
@@ -2396,6 +2501,103 @@ mod tests {
         let context = sndcp.contexts.get(&77_468).unwrap();
         assert_eq!(context.session(), Some((8, 1)));
         assert_eq!(context.bearer_id, None);
+    }
+
+    #[test]
+    fn immediate_end_of_data_keeps_pdch_until_automatic_bl_ack_can_reach_rf() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        sndcp.insert_context(RadioContext {
+            issi: 77_468,
+            endpoint_id: 7,
+            link_id: 8,
+            nsapi: 1,
+            snei: Some(8),
+            session_id: Some(8),
+            session_generation: Some(1),
+            bearer_id: Some(17),
+            bearer_generation: Some(4),
+            timeslot_bitmap: 0b0010,
+            event_label: Some(23),
+            chap_identifier: None,
+            dynamic_address: true,
+        });
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::EndOfData {
+                command_id: 52,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 1,
+                immediate_service_change: true,
+            },
+        );
+
+        assert!(
+            queue.pop_front().is_none(),
+            "LLC already generated the required BL-ACK for the uplink"
+        );
+        assert!(sndcp.bearers.contains_key(&17));
+        assert!(sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
+        sndcp.dltime = sndcp.dltime.add_timeslots(PDCH_RELEASE_RF_GUARD_TIMESLOTS - 1);
+        sndcp.process_standby_reports(&mut queue);
+        assert!(sndcp.bearers.contains_key(&17));
+        sndcp.dltime = sndcp.dltime.add_timeslots(1);
+        sndcp.process_standby_reports(&mut queue);
+
+        assert!(!sndcp.bearers.contains_key(&17));
+        assert!(!sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
+    }
+
+    #[test]
+    fn discarded_end_of_data_is_retried_without_releasing_pdch() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        sndcp.insert_context(RadioContext {
+            issi: 77_468,
+            endpoint_id: 7,
+            link_id: 8,
+            nsapi: 1,
+            snei: Some(8),
+            session_id: Some(8),
+            session_generation: Some(1),
+            bearer_id: Some(17),
+            bearer_generation: Some(4),
+            timeslot_bitmap: 0b0010,
+            event_label: Some(23),
+            chap_identifier: None,
+            dynamic_address: true,
+        });
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::EndOfData {
+                command_id: 52,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 1,
+                immediate_service_change: false,
+            },
+        );
+        let original = sndcp.pending_standby[0].reporter.as_ref().unwrap().clone();
+        original.mark_discarded();
+        while queue.pop_front().is_some() {}
+
+        sndcp.process_standby_reports(&mut queue);
+
+        assert!(sndcp.bearers.contains_key(&17));
+        assert!(sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
+        assert_eq!(sndcp.pending_standby.len(), 1);
+        assert_eq!(sndcp.pending_standby[0].reporter.as_ref().unwrap().get_state(), TxState::Pending);
+        let SapMsgInner::LtpdMleUnitdataReq(mut retried) = queue.pop_front().expect("SN-END OF DATA retry").msg else {
+            panic!("retry must use the SNDCP basic link")
+        };
+        assert_eq!(retried.layer2service, Layer2Service::Unacknowledged);
+        assert!(!SnEndOfData::from_bitbuf(&mut retried.sdu).unwrap().immediate_service_change);
+        assert_eq!(retried.chan_alloc.unwrap().alloc_type, ChanAllocType::QuitAndGo);
     }
 
     #[test]

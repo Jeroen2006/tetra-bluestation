@@ -5,7 +5,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric};
 use tetra_pdus::cmce::enums::type3_elem_id::CmceType3ElemId;
 use tetra_pdus::cmce::pdus::{d_facility::DFacility, u_facility::UFacility};
-use tetra_saps::{SapMsg, SapMsgInner, lcmc::LcmcMleUnitdataReq};
+use tetra_saps::{SapMsg, SapMsgInner, lcmc::LcmcMleUnitdataReq, tma::AssociatedChannel};
 use tetra_swmi_protocol::{DgnaObservedGroup, SwmiMessage};
 
 /// Clause 12 Supplementary Services CMCE sub-entity.
@@ -182,7 +182,7 @@ impl SsBsSubentity {
         state.subscribers.is_active(issi) && !state.subscribers.is_registration_pending(issi)
     }
 
-    pub fn route_re_deliver(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn route_re_deliver(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
             return;
         };
@@ -219,12 +219,35 @@ impl SsBsSubentity {
             }
             return;
         }
+        if let Some((ss_type, operation)) = decode_ss_header(&facility.ss_pdu, facility.ss_pdu_bits)
+            && ss_type != SS_DGNA as u8
+        {
+            // EN 300 392-9's generic response is 6-bit SS type followed by
+            // PDU type 00000. The supplied terminal emits SS-CF (000100)
+            // action 10011 while refreshing its service profile. This stack
+            // does not implement call forwarding, so answer explicitly
+            // instead of misclassifying it as DGNA and leaving the MS to
+            // retry until its local service timer expires.
+            if operation > SS_LAST_GENERIC_PDU_TYPE {
+                let (response, response_bits) = encode_ss_not_supported(ss_type);
+                self.queue_facility(queue, issi, response, response_bits);
+                tracing::info!(
+                    issi,
+                    ss_type,
+                    operation,
+                    "responding that requested supplementary service is not supported"
+                );
+            } else {
+                tracing::debug!(issi, ss_type, operation, "received generic supplementary-service result");
+            }
+            return;
+        }
         let Some(decoded) = decode_dgna(&facility.ss_pdu, facility.ss_pdu_bits) else {
             tracing::warn!(
                 issi,
                 ss_pdu_bits = facility.ss_pdu_bits,
                 ss_pdu = ?facility.ss_pdu,
-                "unsupported SS-DGNA PDU in U-FACILITY"
+                "unsupported SS-DGNA action in U-FACILITY"
             );
             // The tested MS explicitly responds to INTERROGATE MS GROUPS with
             // a short, vendor-specific SS-DGNA rejection PDU rather than the
@@ -329,6 +352,19 @@ impl SsBsSubentity {
             return;
         }
         sdu.seek(0);
+        let associated_channel = self
+            .config
+            .state_read()
+            .subscriber_packet_delivery_routes
+            .get(&issi)
+            .and_then(|routes| routes.first())
+            .copied()
+            .map(|route| AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+                best_effort_key: None,
+            });
         queue.push_back(SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -344,7 +380,7 @@ impl SsBsSubentity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
-                associated_channel: None,
+                associated_channel,
                 main_address: TetraAddress::new(issi, SsiType::Issi),
                 aie_override: None,
                 tx_reporter: None,
@@ -365,6 +401,7 @@ impl SsBsSubentity {
 
 const SS_DGNA: u64 = 0b010110;
 const SS_CALL_WAITING: u64 = 0b001011;
+const SS_LAST_GENERIC_PDU_TYPE: u8 = 0b00100;
 const CW_ACTIVATE: u8 = 0b00101;
 const CW_ACTIVATE_ACK: u8 = 0b00110;
 const CW_DEACTIVATE: u8 = 0b00111;
@@ -398,6 +435,21 @@ struct DecodedDgna {
 struct DecodedCallWaiting {
     operation: u8,
     waiting_calls: u8,
+}
+
+fn decode_ss_header(raw: &[u8], bits: u16) -> Option<(u8, u8)> {
+    if raw.len() < usize::from(bits).div_ceil(8) || bits < 11 {
+        return None;
+    }
+    let mut buffer = BitBuffer::from_vec(raw.to_vec());
+    Some((buffer.read_bits(6)? as u8, buffer.read_bits(5)? as u8))
+}
+
+fn encode_ss_not_supported(ss_type: u8) -> (Vec<u8>, u16) {
+    let mut buffer = BitBuffer::new_autoexpand(11);
+    buffer.write_bits(u64::from(ss_type & 0x3f), 6);
+    buffer.write_bits(0, 5);
+    bitbuffer_bytes(buffer).expect("fixed generic SS response must encode")
 }
 
 fn decode_call_waiting(raw: &[u8], bits: u16) -> Option<DecodedCallWaiting> {
@@ -715,6 +767,18 @@ mod tests {
                 "type-1-only SS-CW PDU must reject a trailing bit"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_call_forwarding_request_gets_generic_ss_response() {
+        let request = [0x12, 0x64, 0x00, 0x00];
+        assert_eq!(decode_ss_header(&request, 31), Some((0b000100, 0b10011)));
+
+        let (response, bits) = encode_ss_not_supported(0b000100);
+        assert_eq!(bits, 11);
+        let mut encoded = BitBuffer::from_vec(response);
+        assert_eq!(encoded.read_bits(6), Some(0b000100));
+        assert_eq!(encoded.read_bits(5), Some(0));
     }
 
     #[test]

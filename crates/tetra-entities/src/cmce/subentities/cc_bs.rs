@@ -1056,6 +1056,52 @@ impl CcBsSubentity {
         result
     }
 
+    /// Packet-data bearers on which locally affiliated members of `gssi`
+    /// are currently listening. TTR 001-12 sections 6.7.4 and 6.8.4 require
+    /// incoming call setup to be presented on the PDCH before the MS can end
+    /// packet data and move to a traffic or common-control channel.
+    fn packet_group_listener_channels_for(&self, gssi: u32) -> Vec<AssociatedChannel> {
+        let listeners = self
+            .subscriber_groups
+            .iter()
+            .filter_map(|(&issi, groups)| {
+                (groups.contains(&gssi) && self.group_is_receivable(issi, gssi) && !self.private_call_is_connected_for(issi))
+                    .then_some(issi)
+            })
+            .collect::<Vec<_>>();
+        let state = self.config.state_read();
+        let mut result = Vec::new();
+        for issi in listeners {
+            let Some(route) = state.subscriber_packet_delivery_routes.get(&issi).and_then(|routes| routes.first()) else {
+                continue;
+            };
+            if result.iter().any(|existing: &AssociatedChannel| {
+                existing.call_id == route.call_id && existing.timeslot == route.timeslot && existing.usage == route.usage
+            }) {
+                continue;
+            }
+            result.push(AssociatedChannel {
+                call_id: route.call_id,
+                timeslot: route.timeslot,
+                usage: route.usage,
+                best_effort_key: None,
+            });
+        }
+        result
+    }
+
+    fn initial_group_setup_listener_channels_for(&self, gssi: u32) -> Vec<AssociatedChannel> {
+        let mut result = self.pgs_listener_channels_for(gssi);
+        for channel in self.packet_group_listener_channels_for(gssi) {
+            if !result.iter().any(|existing| {
+                existing.call_id == channel.call_id && existing.timeslot == channel.timeslot && existing.usage == channel.usage
+            }) {
+                result.push(channel);
+            }
+        }
+        result
+    }
+
     /// Active group bearers on which members of another scanned group may
     /// currently be listening. These are used only for expendable periodic
     /// late-entry repeats. The destination call's own bearer is excluded: its
@@ -1853,7 +1899,7 @@ impl CcBsSubentity {
         // PGS announcement follows the regular MCCH D-SETUP.  It is sent on
         // the old likely group channel(s), where UMAC uses FN18 while traffic
         // is active and ordinary frames during hangtime.
-        for source_channel in self.pgs_listener_channels_for(dest_gssi) {
+        for source_channel in self.initial_group_setup_listener_channels_for(dest_gssi) {
             let (sdu, allocation) = Self::build_d_setup_prim(d_setup_ref, circuit.usage, circuit.ts, UlDlAssignment::Both);
             queue.push_back(Self::build_sapmsg_associated(
                 sdu,
@@ -2299,7 +2345,20 @@ impl CcBsSubentity {
             return false;
         }
 
-        let other_channels = self.other_group_call_channels(call_id);
+        let mut other_channels = self.other_group_call_channels(call_id);
+        if let Some(gssi) = self.active_calls.get(&call_id).map(|call| call.dest_gssi) {
+            for mut channel in self.packet_group_listener_channels_for(gssi) {
+                // Periodic copies are recovery hints and yield to SDS, call
+                // control and packet payload. UMAC coalesces them per target
+                // call through this best-effort key.
+                channel.best_effort_key = Some(call_id);
+                if !other_channels.iter().any(|existing| {
+                    existing.call_id == channel.call_id && existing.timeslot == channel.timeslot && existing.usage == channel.usage
+                }) {
+                    other_channels.push(channel);
+                }
+            }
+        }
         let Some((pdu, dest_addr, receipt)) = self.cached_setups.get_mut(&call_id) else {
             tracing::error!(call_id, "no cached D-SETUP");
             return false;
@@ -4117,7 +4176,7 @@ impl CcBsSubentity {
             // MCCH remains the safe baseline.  In parallel, advertise the new
             // higher-priority group on the old, tracked group channel(s), so an
             // MS currently listening there sees the D-SETUP without DL stealing.
-            for source_channel in self.pgs_listener_channels_for(gssi) {
+            for source_channel in self.initial_group_setup_listener_channels_for(gssi) {
                 let (sdu, allocation) = Self::build_d_setup_prim(pdu, circuit.usage, circuit.ts, UlDlAssignment::Both);
                 queue.push_back(Self::build_sapmsg_associated(
                     sdu,
@@ -4571,13 +4630,26 @@ impl CcBsSubentity {
         let mut sdu = BitBuffer::new_autoexpand(80);
         pdu.to_bitbuf(&mut sdu).expect("serialize private D-SETUP");
         sdu.seek(0);
-        queue.push_back(Self::build_sapmsg(
-            sdu,
-            None,
-            TetraAddress::new(call.callee_itsi, SsiType::Issi),
-            Layer2Service::Acknowledged,
-            None,
-        ));
+        let destination = TetraAddress::new(call.callee_itsi, SsiType::Issi);
+        if let Some(channel) = self.packet_listener_channel(call.callee_itsi) {
+            tracing::info!(
+                call_id,
+                callee_itsi = call.callee_itsi,
+                packet_bearer_id = channel.call_id,
+                packet_timeslot = channel.timeslot,
+                "routing private D-SETUP on called terminal's PDCH"
+            );
+            queue.push_back(Self::build_sapmsg_associated(
+                sdu,
+                None,
+                destination,
+                Layer2Service::Acknowledged,
+                None,
+                channel,
+            ));
+        } else {
+            queue.push_back(Self::build_sapmsg(sdu, None, destination, Layer2Service::Acknowledged, None));
+        }
     }
 
     fn rx_private_u_alert(&mut self, mut message: SapMsg) {
@@ -5687,7 +5759,7 @@ impl CcBsSubentity {
         let (setup_sdu, setup_chan_alloc) = Self::build_d_setup_prim(d_setup_ref, usage, ts, UlDlAssignment::Both);
         let setup_msg = Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), dest_addr, Layer2Service::Unacknowledged, None);
         queue.push_back(setup_msg);
-        for source_channel in self.pgs_listener_channels_for(dest_gssi) {
+        for source_channel in self.initial_group_setup_listener_channels_for(dest_gssi) {
             let (sdu, allocation) = Self::build_d_setup_prim(d_setup_ref, usage, ts, UlDlAssignment::Both);
             queue.push_back(Self::build_sapmsg_associated(
                 sdu,
@@ -6400,6 +6472,135 @@ mod tests {
             "a call must never receive its own D-SETUP repeat"
         );
         assert_eq!(associated[0].best_effort_key, Some(8));
+    }
+
+    #[test]
+    fn group_setup_is_sent_on_affiliated_members_active_pdch() {
+        let gssi = 91;
+        let issi = 77_479;
+        let packet_route = SubscriberDeliveryRoute {
+            call_id: 70,
+            timeslot: 3,
+            usage: 54,
+        };
+        let mut cc = test_cc_with_group(gssi);
+        cc.subscriber_groups.insert(issi, HashSet::from([gssi]));
+        cc.subscriber_group_cou.insert((issi, gssi), 4); // selected
+        cc.config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .insert(issi, vec![packet_route]);
+        let mut queue = MessageQueue::new();
+
+        cc.start_remote_swmi_call(&mut queue, 9, 430_892, gssi, 1, 430_892, None, false, true);
+
+        let mut found = false;
+        while let Some(message) = queue.pop_front() {
+            let SapMsgInner::LcmcMleUnitdataReq(mut request) = message.msg else {
+                continue;
+            };
+            if request
+                .associated_channel
+                .map(|channel| (channel.call_id, channel.timeslot, channel.usage))
+                != Some((packet_route.call_id, packet_route.timeslot, packet_route.usage))
+            {
+                continue;
+            }
+            let setup = DSetup::from_bitbuf(&mut request.sdu).expect("associated PDCH message must be D-SETUP");
+            assert_eq!(setup.call_identifier, 9);
+            assert_eq!(request.main_address.ssi, gssi);
+            assert_eq!(request.main_address.ssi_type, SsiType::Gssi);
+            assert!(request.chan_alloc.is_some(), "group setup on PDCH must allocate the voice channel");
+            found = true;
+        }
+        assert!(found, "affiliated packet-data listener must receive group D-SETUP on its PDCH");
+    }
+
+    #[test]
+    fn periodic_group_setup_recovery_also_uses_active_pdch_at_low_priority() {
+        let gssi = 91;
+        let issi = 77_479;
+        let packet_route = SubscriberDeliveryRoute {
+            call_id: 70,
+            timeslot: 3,
+            usage: 54,
+        };
+        let mut cc = test_cc_with_group(gssi);
+        cc.subscriber_groups.insert(issi, HashSet::from([gssi]));
+        cc.subscriber_group_cou.insert((issi, gssi), 4);
+        cc.config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .insert(issi, vec![packet_route]);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, 9, 430_892, gssi, 1, 430_892, None, false, true);
+        while queue.pop_front().is_some() {}
+        let target = cc.active_calls.get(&9).expect("target call").clone();
+
+        assert!(cc.send_cached_group_d_setup(&mut queue, 9, target.usage, target.ts, true));
+
+        assert!(queue.iter_mut().any(|message| {
+            matches!(
+                &message.msg,
+                SapMsgInner::LcmcMleUnitdataReq(request)
+                    if request.associated_channel.is_some_and(|channel|
+                        channel.call_id == packet_route.call_id
+                            && channel.timeslot == packet_route.timeslot
+                            && channel.usage == packet_route.usage
+                            && channel.best_effort_key == Some(9))
+            )
+        }));
+    }
+
+    #[test]
+    fn private_setup_is_sent_on_called_terminals_active_pdch_without_allocation() {
+        let callee = 77_479;
+        let packet_route = SubscriberDeliveryRoute {
+            call_id: 70,
+            timeslot: 3,
+            usage: 54,
+        };
+        let mut cc = test_cc_with_group(91);
+        cc.config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .insert(callee, vec![packet_route]);
+        let mut queue = MessageQueue::new();
+
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::PrivateCallOffer {
+                call_id: 33,
+                caller_itsi: 77_468,
+                callee_itsi: u64::from(callee),
+                hook: true,
+                duplex: false,
+                request_to_transmit: true,
+                priority: 2,
+            },
+        );
+
+        let SapMsgInner::LcmcMleUnitdataReq(mut request) = queue.pop_front().expect("private D-SETUP queued").msg else {
+            panic!("private D-SETUP must be routed to MLE")
+        };
+        assert_eq!(request.main_address.ssi, callee);
+        assert_eq!(request.main_address.ssi_type, SsiType::Issi);
+        assert_eq!(
+            request
+                .associated_channel
+                .map(|channel| (channel.call_id, channel.timeslot, channel.usage)),
+            Some((packet_route.call_id, packet_route.timeslot, packet_route.usage))
+        );
+        assert!(
+            request.chan_alloc.is_none(),
+            "private setup on PDCH must first return the MS to MCCH"
+        );
+        assert_eq!(
+            DSetup::from_bitbuf(&mut request.sdu)
+                .expect("parse private D-SETUP")
+                .call_identifier,
+            33
+        );
     }
 
     #[test]
