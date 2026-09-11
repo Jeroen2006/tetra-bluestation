@@ -719,10 +719,14 @@ impl Llc {
         // The last retry can be discarded or still queued after an earlier
         // attempt reached the air.  TxReporter requires Transmitted -> Lost,
         // so normalize the per-attempt state before completing the overall
-        // basic-link transaction.
-        if !reporter.is_transmitted() {
-            reporter.reset();
-            reporter.mark_transmitted();
+        // acknowledged transaction.
+        match reporter.get_state() {
+            TxState::Acknowledged | TxState::Lost => return,
+            TxState::Pending | TxState::Discarded => {
+                reporter.reset();
+                reporter.mark_transmitted();
+            }
+            TxState::Transmitted => {}
         }
         reporter.mark_lost();
     }
@@ -1160,12 +1164,62 @@ impl Llc {
         }
     }
 
-    fn handle_al_ack(&mut self, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
+    fn close_failed_advanced_link(&mut self, queue: &mut MessageQueue, issi: u32, failed_ns: u8, reason: &'static str) {
+        let Some(mut link) = self.advanced_links.remove(&issi) else {
+            return;
+        };
+        let aie_request = link
+            .tx
+            .iter()
+            .find(|sdu| sdu.ns == failed_ns)
+            .or_else(|| link.tx.front())
+            .map(|sdu| sdu.aie_request)
+            .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        let pending = link.tx.len();
+        for sdu in link.tx.drain(..) {
+            Self::mark_reporter_lost(&sdu.reporter);
+        }
+
+        // TS 100 392-2 22.3.3.2.4 requires a failed TL-SDU to be
+        // abandoned and reported to the service user. The service user must
+        // then stop using the ambiguous N(S)/N(R) state and reset or
+        // disconnect the advanced link. TxReporter is the local TL-REPORT
+        // equivalent in this stack, so finish every outstanding request and
+        // perform the normal 22.3.3.3 close handshake here.
+        let mut pdu = BitBuffer::new_autoexpand(16);
+        AlDisconnect {
+            acknowledged: true,
+            link_number: link.link_number,
+            report: 1,
+        }
+        .to_bitbuf(&mut pdu);
+        pdu.seek(0);
+        Self::queue_advanced_pdu(
+            queue,
+            TetraAddress::issi(issi),
+            link.endpoint_id,
+            pdu,
+            Self::packet_route(&self.config, issi, self.dltime.t),
+            None,
+            aie_request,
+            None,
+        );
+        tracing::warn!(
+            issi,
+            ns = failed_ns,
+            pending_tlsdus = pending,
+            reason,
+            "advanced-link transfer failed; closing link so the peer can restart with clean sequence state"
+        );
+    }
+
+    fn handle_al_ack(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
         let Ok(ack) = AlAck::from_bitbuf(&mut pdu) else {
             tracing::warn!(issi = prim.main_address.ssi, "invalid AL-ACK/RNR");
             return;
         };
-        let Some(link) = self.advanced_links.get_mut(&prim.main_address.ssi) else {
+        let issi = prim.main_address.ssi;
+        let Some(link) = self.advanced_links.get_mut(&issi) else {
             return;
         };
         link.receiver_ready = ack.receiver_ready;
@@ -1179,63 +1233,77 @@ impl Llc {
                 acknowledgement_bitmap = ?block.acknowledgement_bitmap,
                 "received advanced-link acknowledgement block"
             );
-            let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
-                continue;
-            };
-            let was_sent = {
-                let sdu = &link.tx[position];
-                sdu.attempt_reporter.is_some() || sdu.sent_at.is_some() || sdu.reporter.get_state() != TxState::Pending
-            };
-            // A TIP acknowledgement covers the whole N.272 receive window,
-            // which can include a TL-SDU that this transmitter has queued but
-            // has not put on air yet.  Such a block carries no information for
-            // the local sending state.
-            if !was_sent {
-                continue;
-            }
-            if block.acknowledgement_length == 0 {
-                if let Some(sdu) = link.tx.remove(position) {
-                    if sdu.reporter.get_state() == TxState::Pending {
-                        sdu.reporter.mark_transmitted();
-                    }
-                    if sdu.reporter.get_state() == TxState::Transmitted {
-                        sdu.reporter.mark_acknowledged();
-                    }
+            let failed_ns = {
+                let Some(link) = self.advanced_links.get_mut(&issi) else {
+                    break;
+                };
+                let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
+                    continue;
+                };
+                let was_sent = {
+                    let sdu = &link.tx[position];
+                    sdu.attempt_reporter.is_some() || sdu.sent_at.is_some() || sdu.reporter.get_state() != TxState::Pending
+                };
+                // A TIP acknowledgement covers the whole N.272 receive window,
+                // which can include a TL-SDU that this transmitter has queued but
+                // has not put on air yet.  Such a block carries no information for
+                // the local sending state.
+                if !was_sent {
+                    continue;
                 }
-                continue;
-            }
+                if block.acknowledgement_length == 0 {
+                    if let Some(sdu) = link.tx.remove(position) {
+                        if sdu.reporter.get_state() == TxState::Pending {
+                            sdu.reporter.mark_transmitted();
+                        }
+                        if sdu.reporter.get_state() == TxState::Transmitted {
+                            sdu.reporter.mark_acknowledged();
+                        }
+                    }
+                    continue;
+                }
 
-            let sdu = &mut link.tx[position];
-            // Receipt of any acknowledgement block proves that the peer saw
-            // the AR. Subsequent recovery is governed by N.273/N.274.
-            sdu.ack_request_repetitions = 0;
-            if block.acknowledgement_length == 63 {
-                sdu.retransmissions = sdu.retransmissions.saturating_add(1);
-                sdu.pending_segments = None;
-            } else if let Some(first) = block.first_missing_segment {
-                let mut missing = vec![first as usize];
-                for (offset, received) in block.acknowledgement_bitmap.iter().copied().enumerate() {
-                    if !received {
-                        missing.push(first as usize + offset + 1);
-                    }
-                }
-                missing.retain(|segment| *segment < sdu.segments.len());
-                let segment_limit_exceeded = missing.iter().any(|segment| {
-                    sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
-                    sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
-                });
-                if segment_limit_exceeded {
+                let sdu = &mut link.tx[position];
+                // Receipt of any acknowledgement block proves that the peer saw
+                // the AR. Subsequent recovery is governed by N.273/N.274.
+                sdu.ack_request_repetitions = 0;
+                if block.acknowledgement_length == 63 {
                     sdu.retransmissions = sdu.retransmissions.saturating_add(1);
                     sdu.pending_segments = None;
-                } else if !missing.is_empty() {
-                    sdu.pending_segments = Some(missing);
+                } else if let Some(first) = block.first_missing_segment {
+                    let mut missing = vec![first as usize];
+                    for (offset, received) in block.acknowledgement_bitmap.iter().copied().enumerate() {
+                        if !received {
+                            missing.push(first as usize + offset + 1);
+                        }
+                    }
+                    missing.retain(|segment| *segment < sdu.segments.len());
+                    let segment_limit_exceeded = missing.iter().any(|segment| {
+                        sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
+                        sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
+                    });
+                    if segment_limit_exceeded {
+                        sdu.retransmissions = sdu.retransmissions.saturating_add(1);
+                        sdu.pending_segments = None;
+                    } else if !missing.is_empty() {
+                        sdu.pending_segments = Some(missing);
+                    }
                 }
+                if sdu.retransmissions > link.max_sdu_retransmissions {
+                    Some(sdu.ns)
+                } else {
+                    if sdu.reporter.get_state() == TxState::Transmitted {
+                        sdu.reporter.reset();
+                    }
+                    sdu.sent_at = None;
+                    sdu.attempt_reporter = None;
+                    None
+                }
+            };
+            if let Some(failed_ns) = failed_ns {
+                self.close_failed_advanced_link(queue, issi, failed_ns, "N.273/N.274 retry limit exceeded");
+                break;
             }
-            if sdu.reporter.get_state() == TxState::Transmitted {
-                sdu.reporter.reset();
-            }
-            sdu.sent_at = None;
-            sdu.attempt_reporter = None;
         }
     }
 
@@ -1298,7 +1366,17 @@ impl Llc {
         if request.link_number != 0 {
             return;
         }
-        self.advanced_links.remove(&prim.main_address.ssi);
+        if let Some(mut link) = self.advanced_links.remove(&prim.main_address.ssi) {
+            for sdu in link.tx.drain(..) {
+                Self::mark_reporter_lost(&sdu.reporter);
+            }
+        }
+        // Success acknowledges a Close that this LLC initiated and must not
+        // itself be answered. Only an incoming Close requires Success; this
+        // also applies in IDLE after the local state was already discarded.
+        if request.report != 1 {
+            return;
+        }
         let mut response_pdu = BitBuffer::new_autoexpand(16);
         AlDisconnect {
             acknowledged: true,
@@ -1337,7 +1415,7 @@ impl Llc {
         match pdu_type {
             LlcPduType::AlSetup => self.handle_al_setup(queue, prim, pdu),
             LlcPduType::AlDataAlFinal => self.handle_al_data(queue, prim, pdu),
-            LlcPduType::AlAckAlRnr => self.handle_al_ack(prim, pdu),
+            LlcPduType::AlAckAlRnr => self.handle_al_ack(queue, prim, pdu),
             LlcPduType::AlReconnect => self.handle_al_reconnect(queue, prim, pdu),
             LlcPduType::AlDisc => self.handle_al_disconnect(queue, prim, pdu),
             LlcPduType::AlAlUdataAlUfinal => {
@@ -1353,6 +1431,7 @@ impl Llc {
     fn submit_advanced_link_messages(&mut self, queue: &mut MessageQueue) -> bool {
         let now = self.dltime;
         let mut activity = false;
+        let mut failed_links = Vec::new();
         // A queued TL-SDU can outlive a PDCH resize. Resolve the routes at
         // submission time so segments and selective retransmissions never
         // target a timeslot that voice has taken from packet data.
@@ -1370,8 +1449,8 @@ impl Llc {
             })
             .collect::<HashMap<_, _>>();
         for (issi, link) in &mut self.advanced_links {
-            let mut remove = Vec::new();
-            for (index, sdu) in link.tx.iter_mut().enumerate() {
+            let mut failed_ns = None;
+            for sdu in &mut link.tx {
                 if let Some(attempt) = &sdu.attempt_reporter {
                     match attempt.get_state() {
                         TxState::Transmitted | TxState::Acknowledged => {
@@ -1408,13 +1487,8 @@ impl Llc {
                             "repeating advanced-link acknowledgement request after T.252"
                         );
                     } else if sdu.retransmissions >= link.max_sdu_retransmissions {
-                        if sdu.reporter.get_state() == TxState::Pending {
-                            sdu.reporter.mark_transmitted();
-                        }
-                        if sdu.reporter.get_state() == TxState::Transmitted {
-                            sdu.reporter.mark_lost();
-                        }
-                        remove.push(index);
+                        failed_ns = Some(sdu.ns);
+                        break;
                     } else {
                         sdu.retransmissions += 1;
                         if sdu.reporter.get_state() == TxState::Transmitted {
@@ -1427,8 +1501,9 @@ impl Llc {
                     }
                 }
             }
-            for index in remove.into_iter().rev() {
-                link.tx.remove(index);
+            if let Some(failed_ns) = failed_ns {
+                failed_links.push((*issi, failed_ns));
+                continue;
             }
 
             if !link.receiver_ready {
@@ -1502,6 +1577,10 @@ impl Llc {
                 available -= 1;
                 activity = true;
             }
+        }
+        for (issi, failed_ns) in failed_links {
+            self.close_failed_advanced_link(queue, issi, failed_ns, "T.252 acknowledgement recovery exhausted");
+            activity = true;
         }
         activity
     }
@@ -2858,6 +2937,84 @@ mod tests {
         assert!(!queued_ns.is_empty());
         assert!(queued_ns.iter().all(|ns| *ns == 0));
         assert!(llc.advanced_links[&77_468].tx[1].attempt_reporter.is_none());
+    }
+
+    #[test]
+    fn advanced_retry_exhaustion_fails_window_and_restarts_sequence_after_new_setup() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        {
+            let link = llc.advanced_links.get_mut(&77_468).unwrap();
+            link.window_size = 3;
+            link.max_sdu_retransmissions = 0;
+            link.max_segment_retransmissions = 0;
+        }
+        while queue.pop_front().is_some() {}
+
+        let reporters = ["0", "1", "0"].map(|bit| queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(240)));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+
+        let mut ack = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 1,
+                first_missing_segment: Some(0),
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+
+        assert!(!llc.advanced_links.contains_key(&77_468));
+        assert!(reporters.iter().all(|reporter| reporter.get_state() == TxState::Lost));
+        let SapMsgInner::TmaUnitdataReq(mut close) = queue.pop_front().expect("AL-DISC close").msg else {
+            panic!("expected TMA request")
+        };
+        let close = AlDisconnect::from_bitbuf(&mut close.pdu).unwrap();
+        assert_eq!(close.report, 1);
+        assert!(queue.pop_front().is_none());
+
+        // The peer can establish a fresh link after Close. Both sequence
+        // directions start at zero, so an abandoned N(S) cannot leave a
+        // permanent hole in the new receive window.
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"1".repeat(240));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let SapMsgInner::TmaUnitdataReq(mut first) = queue.pop_front().expect("fresh AL-DATA").msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(AlDataHeader::from_bitbuf(&mut first.pdu).unwrap().ns, 0);
+    }
+
+    #[test]
+    fn al_disconnect_success_is_not_echoed() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        let mut success = BitBuffer::new_autoexpand(16);
+        AlDisconnect {
+            acknowledged: true,
+            link_number: 0,
+            report: 0,
+        }
+        .to_bitbuf(&mut success);
+        success.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, success));
+
+        assert!(!llc.advanced_links.contains_key(&77_468));
+        assert!(
+            queue.pop_front().is_none(),
+            "AL-DISC Success must complete rather than restart the handshake"
+        );
     }
 
     #[test]
