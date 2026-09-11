@@ -1529,7 +1529,25 @@ impl Sndcp {
                         }
                     }
                 }
-                let context = context.clone();
+                let detach_for_standby = accepted && response == PacketAccessResponse::None && context.bearer_id.is_some();
+                let mut context = context.clone();
+                if detach_for_standby {
+                    // After radio downlink failure, SN-RECONNECT with "no
+                    // data to send" arrives on the CCCH (TTR 001-05 6.17).
+                    // A null AccessResult deliberately has no air PDU, but it
+                    // must detach the stale PDCH association so signalling and
+                    // the next packet transfer start from the common channel.
+                    self.detach_packet_bearer(queue, issi);
+                    if let Some(updated) = self.contexts.get(&issi) {
+                        context = updated.clone();
+                    }
+                    tracing::info!(
+                        issi,
+                        session_id,
+                        session_generation,
+                        "packet terminal returned to standby after reconnect without data"
+                    );
+                }
                 self.publish_delivery_routes(&context);
                 // A repeated READY-state access on the same bearer is answered
                 // on that PDCH. Repeating the Replace allocation forces LLC
@@ -2373,6 +2391,80 @@ mod tests {
             "resumed access must cancel the old standby release guard"
         );
         assert!(queue.pop_front().is_none(), "existing bearer must not be attached twice");
+    }
+
+    #[test]
+    fn null_access_response_detaches_terminal_that_returned_to_ccch() {
+        let mut sndcp = test_sndcp();
+        insert_bearer(&mut sndcp, 4, HashSet::from([77_468]), Vec::new());
+        sndcp.bearers.get_mut(&17).unwrap().draining = false;
+        sndcp.contexts.insert(
+            77_468,
+            RadioContext {
+                issi: 77_468,
+                endpoint_id: 7,
+                link_id: 8,
+                nsapi: 1,
+                snei: Some(8),
+                session_id: Some(8),
+                session_generation: Some(2),
+                bearer_id: Some(17),
+                bearer_generation: Some(4),
+                timeslot_bitmap: 0b0010,
+                event_label: Some(23),
+                chap_identifier: None,
+                dynamic_address: true,
+            },
+        );
+        let context = sndcp.contexts[&77_468].clone();
+        sndcp.publish_delivery_routes(&context);
+        sndcp.pending_commands.insert(9, 77_468);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::AccessResult {
+                command_id: 9,
+                itsi: 77_468,
+                session_id: 8,
+                session_generation: 2,
+                accepted: true,
+                cause: None,
+                response: PacketAccessResponse::None,
+                bearer_id: 0,
+                timeslot_bitmap: 0,
+                event_label: 0,
+            },
+        );
+
+        let context = &sndcp.contexts[&77_468];
+        assert_eq!(context.bearer_id, None);
+        assert_eq!(context.timeslot_bitmap, 0);
+        assert!(!sndcp.bearers.contains_key(&17));
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(2));
+        assert!(!sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
+        let mut saw_detach = false;
+        let mut saw_close = false;
+        while let Some(message) = queue.pop_front() {
+            match message.msg {
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Detach {
+                    bearer_id: 17,
+                    generation: 4,
+                    event_label: 23,
+                }) => saw_detach = true,
+                SapMsgInner::PacketBearerControl(PacketBearerControl::Close {
+                    bearer_id: 17,
+                    generation: 4,
+                    forced: false,
+                }) => saw_close = true,
+                SapMsgInner::LtpdMleUnitdataReq(_) => {
+                    panic!("null access response must not transmit an SNDCP PDU")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_detach);
+        assert!(saw_close);
     }
 
     #[test]
