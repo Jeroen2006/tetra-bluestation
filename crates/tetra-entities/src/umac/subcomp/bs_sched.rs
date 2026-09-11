@@ -2308,21 +2308,6 @@ impl BsChannelScheduler {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             let al_identity = Self::advanced_link_segment_identity(&sdu);
-                            let al_sequence = packet_data_slots
-                                .and(al_identity)
-                                .and_then(|(_, _, ns, ss)| Self::aie_individual_issi(aie_request).map(|issi| (issi, ns, ss)));
-                            if let Some((issi, ns, ss)) = al_sequence
-                                && self.has_earlier_pending_advanced_link_segment(issi, ns, ss)
-                            {
-                                self.dl_defer_packet_data_resource_to_next_pdch(
-                                    ts.t,
-                                    DlSchedElem::Resource(pdu, sdu, tx_reporter, aie_request, packet_data_slots),
-                                    packet_data_slots.expect("AL resource has packet-data slots"),
-                                    "lower AL S(S) is still pending",
-                                );
-                                buf_opt = (buf.get_len_written() > 0).then_some(buf);
-                                continue;
-                            }
                             if al_identity.is_some() && buf.get_len_written() != 0 {
                                 // TIP 6.5 sizes a normal original-link segment
                                 // for a complete SCH/F MAC-RESOURCE.  Starting
@@ -2642,8 +2627,25 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
-        // Return advanced-link Resources last.
-        if let Some(i) = q.iter().position(DlSchedElem::is_original_advanced_data) {
+        // Return advanced-link Resources last. A complete TL-SDU is striped
+        // over all assigned PDCH slots, so the next physical slot can contain
+        // a later S(S) while its predecessor is waiting on another slot. Pick
+        // an eligible segment directly instead of removing and requeueing all
+        // later segments on every radio opportunity. The latter is quadratic
+        // for a large IP packet and can itself disturb the timing task.
+        let eligible_advanced = self.dltx_queues[slot].iter().enumerate().find_map(|(index, elem)| {
+            if !elem.is_original_advanced_data() {
+                return None;
+            }
+            let Some((issi, ns, ss)) = Self::sched_elem_advanced_link_sequence(elem) else {
+                // Control and test paths can carry an advanced PDU without
+                // the packet-route metadata used for cross-slot ordering.
+                return Some(index);
+            };
+            (!self.has_earlier_pending_advanced_link_segment(issi, ns, ss)).then_some(index)
+        });
+        if let Some(i) = eligible_advanced {
+            let q = &mut self.dltx_queues[slot];
             return Some(q.remove(i));
         }
 
@@ -4951,13 +4953,47 @@ mod tests {
         assert!(sched.has_earlier_pending_advanced_link_segment(addr.ssi, 0, 1));
         let current = TdmaTime { h: 0, m: 1, f: 1, t: 3 };
         assert!(sched.dl_build_block_from_signalling_schedule(current).is_none());
-        assert!(sched.dltx_queues[2].is_empty());
-        let sequence: Vec<u8> = sched.dltx_queues[1]
+        let sequence_ts2: Vec<u8> = sched.dltx_queues[1]
             .iter()
             .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
             .map(|(_, _, ss)| ss)
             .collect();
-        assert_eq!(sequence, vec![0, 1]);
+        let sequence_ts3: Vec<u8> = sched.dltx_queues[2]
+            .iter()
+            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
+            .map(|(_, _, ss)| ss)
+            .collect();
+        assert_eq!(sequence_ts2, vec![0]);
+        assert_eq!(sequence_ts3, vec![1]);
+    }
+
+    #[test]
+    fn blocked_al_segment_does_not_hide_another_links_ready_segment() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0110));
+        let slots = [false, true, true, false];
+        let first = TetraAddress::issi(77_468);
+        let second = TetraAddress::issi(77_479);
+        let segment = |ss: u8| BitBuffer::from_bitstr(&format!("100100000{:08b}{}", ss, "0".repeat(32)));
+        for (timeslot, addr, ss) in [(2, first, 0), (3, first, 1), (3, second, 0)] {
+            sched.dl_enqueue_packet_tma_on_timeslot(
+                timeslot,
+                BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+                segment(ss),
+                None,
+                AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+                slots,
+            );
+        }
+
+        let current = TdmaTime { h: 0, m: 1, f: 1, t: 3 };
+        assert!(sched.dl_build_block_from_signalling_schedule(current).is_some());
+        let remaining: Vec<(u32, u8)> = sched.dltx_queues[2]
+            .iter()
+            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
+            .map(|(issi, _, ss)| (issi, ss))
+            .collect();
+        assert_eq!(remaining, vec![(first.ssi, 1)]);
     }
 
     #[test]
