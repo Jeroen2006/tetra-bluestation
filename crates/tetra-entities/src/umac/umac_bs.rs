@@ -1174,7 +1174,11 @@ impl UmacBs {
             if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
-            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req) {
+            } else if let Some(grant) = if is_frag_start {
+                self.channel_scheduler.ul_process_fragment_cap_req(msg_dltime.t, addr, res_req)
+            } else {
+                self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req)
+            } {
                 self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 // None also means an earlier grant already covers this
@@ -1458,7 +1462,11 @@ impl UmacBs {
                 // reservation aligned when BSCH/BNCH defers the queue.
                 self.channel_scheduler
                     .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
-            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req) {
+            } else if let Some(grant) = if pdu.is_frag_start() {
+                self.channel_scheduler.ul_process_fragment_cap_req(msg_dltime.t, addr, res_req)
+            } else {
+                self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req)
+            } {
                 self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);

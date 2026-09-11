@@ -854,7 +854,27 @@ impl BsChannelScheduler {
     pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
         if self.packet_bearer_is_active(timeslot) {
             let request_time = self.cur_dltime.forward_to_timeslot(timeslot).add_timeslots(-4);
-            return self.ul_process_packet_data_cap_req_at(request_time, addr, res_req);
+            return self.ul_process_packet_data_cap_req_at(request_time, addr, res_req, false);
+        }
+        self.ul_process_cap_req_after(timeslot, addr, res_req, 0)
+    }
+
+    /// Process a reservation that continues an uplink MAC fragment chain.
+    ///
+    /// A fragmented acknowledgement can be the response that releases an
+    /// advanced-link downlink window. It must therefore be allowed to finish
+    /// even while data for this MS remains queued on the downlink; withholding
+    /// that grant creates a half-duplex deadlock and makes the MS retry the
+    /// first fragment after T.202.
+    pub fn ul_process_fragment_cap_req(
+        &mut self,
+        timeslot: u8,
+        addr: TetraAddress,
+        res_req: &ReservationRequirement,
+    ) -> Option<BasicSlotgrant> {
+        if self.packet_bearer_is_active(timeslot) {
+            let request_time = self.cur_dltime.forward_to_timeslot(timeslot).add_timeslots(-4);
+            return self.ul_process_packet_data_cap_req_at(request_time, addr, res_req, true);
         }
         self.ul_process_cap_req_after(timeslot, addr, res_req, 0)
     }
@@ -869,6 +889,7 @@ impl BsChannelScheduler {
         request_time: TdmaTime,
         addr: TetraAddress,
         res_req: &ReservationRequirement,
+        continues_fragment: bool,
     ) -> Option<BasicSlotgrant> {
         let pdch_slots = self.basic_grant_timeslots(request_time.t);
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
@@ -878,7 +899,7 @@ impl BsChannelScheduler {
         } else {
             self.pending_packet_data_full_slot_grants_after(request_time, &pdch_slots, addr.ssi)
         };
-        if self.has_pending_packet_data_downlink_for_issi(addr.ssi) {
+        if !continues_fragment && self.has_pending_packet_data_downlink_for_issi(addr.ssi) {
             tracing::debug!(
                 address = ?addr,
                 request = %request_time,
@@ -3939,22 +3960,22 @@ mod tests {
         let request_time = sched.cur_dltime.forward_to_timeslot(2).add_timeslots(-4);
 
         let first = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("initial two-slot grant");
         assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
 
         let second = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("only the remaining shortfall should be granted");
         assert_eq!(second.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
 
         let third = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("final exactly encodable shortfall");
         assert_eq!(third.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
         assert!(
             sched
-                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
                 .is_none(),
             "ten already reserved slots must satisfy the repeated total request"
         );
@@ -3968,7 +3989,7 @@ mod tests {
         let request_time = sched.cur_dltime.forward_to_timeslot(2).add_timeslots(-4);
 
         let first = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("initial uplink grant");
         assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
 
@@ -3985,16 +4006,45 @@ mod tests {
 
         assert!(
             sched
-                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
                 .is_none(),
             "queued downlink must get a receive window before the uplink allocation is extended"
         );
 
         sched.dltx_queues[1].clear();
         let resumed = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots)
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("uplink grants resume after queued downlink drains");
         assert_eq!(resumed.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+    }
+
+    #[test]
+    fn fragmented_packet_uplink_can_finish_while_downlink_is_queued() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let addr = TetraAddress::issi(77_480);
+
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        resource.addr = None;
+        resource.event_label = Some(33);
+        sched.dltx_queues[1].push(DlSchedElem::Resource(
+            resource,
+            BitBuffer::from_bitstr("10010000"),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+            Some([false, true, true, true]),
+        ));
+
+        assert!(
+            sched.ul_process_cap_req(2, addr, &ReservationRequirement::Req2Slots).is_none(),
+            "ordinary uplink extension must still yield to queued downlink"
+        );
+
+        let grant = sched
+            .ul_process_fragment_cap_req(2, addr, &ReservationRequirement::Req2Slots)
+            .expect("an in-progress MAC fragment chain must receive continuation capacity");
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity);
     }
 
     #[test]
