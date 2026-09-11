@@ -1177,7 +1177,10 @@ impl UmacBs {
             } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req) {
                 self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
-                tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
+                // None also means an earlier grant already covers this
+                // request, or that a downlink transfer temporarily has the
+                // half-duplex turn. The scheduler logs the exact reason.
+                tracing::debug!("rx_mac_data: No new grant for reservation request {:?}", res_req);
             }
         };
 
