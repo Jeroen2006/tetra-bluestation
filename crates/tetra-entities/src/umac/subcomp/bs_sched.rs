@@ -771,7 +771,7 @@ impl BsChannelScheduler {
                 continue;
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 "ul_find_grant_opportunity: considering candidate ul_ts {}, have {:?}",
                 candidate_t,
                 grant_timeslots
