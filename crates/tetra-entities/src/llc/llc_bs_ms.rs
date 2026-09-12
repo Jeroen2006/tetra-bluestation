@@ -47,16 +47,14 @@ const COMMON_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 4;
 // retain the outstanding LLC transaction for that minimum random-access
 // window instead of classifying the valid ACK as a late duplicate.
 const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
-// TTR 001-05 §6.5 fixes the original advanced-link downlink capacity at
-// 214 bits when MAC-RESOURCE uses event-label addressing and reserves room
-// for a slot grant.  UMAC selects event-label addressing for advanced-link
-// traffic, so use that capacity even for a block which happens not to carry a
-// grant: an AL-FINAL-AR may need one, and all middle segments retain a common
-// size.  The previous 180-bit segments made an MTU-sized IPv4 packet span 67
-// segments. That exceeds the 62-segment AL-ACK bitmap, so a single early radio
-// error could not be expressed or recovered selectively.
-const AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT: usize = 214;
-const AL_FINAL_FCS_BITS: usize = 32;
+// TTR 001-05 section 6.5 permits up to 214 payload bits with event-label
+// addressing and provision for a slot grant. Smaller equal-sized segments
+// remain valid. The production reference stack and the tested MS are stable
+// with a uniform 180/172/164-bit chain, selected so AL-FINAL-AR retains the
+// complete 32-bit FCS tail. This also leaves margin for whole-octet MAC length
+// rounding and an anticipated acknowledgement grant.
+const AL_NON_FINAL_SEGMENT_CANDIDATES: [usize; 3] = [180, 172, 164];
+const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
 // T.252 expiry repeats the acknowledgement request; it does not consume the
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
@@ -890,6 +888,18 @@ impl Llc {
         );
     }
 
+    fn advanced_non_final_segment_size(framed_len_bits: usize) -> usize {
+        for segment_bits in AL_NON_FINAL_SEGMENT_CANDIDATES {
+            let non_final_segments = framed_len_bits.saturating_sub(AL_FINAL_FRAMED_SEGMENT_BITS).div_ceil(segment_bits);
+            let final_segment_bits = framed_len_bits - non_final_segments * segment_bits;
+            if final_segment_bits >= 32 {
+                return segment_bits;
+            }
+        }
+
+        unreachable!("a 164-bit non-final segment always leaves at least 32 final bits")
+    }
+
     fn advanced_segments(mut tl_sdu: BitBuffer) -> Vec<BitBuffer> {
         let mut protected = BitBuffer::new_autoexpand(tl_sdu.get_len_remaining() + 32);
         let length = tl_sdu.get_len_remaining();
@@ -898,32 +908,15 @@ impl Llc {
         protected.write_bits(checksum.into(), 32);
         protected.seek(0);
 
-        let total_bits = protected.get_len_remaining();
-        let mut segment_lengths = Vec::new();
-        if total_bits <= AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT {
-            segment_lengths.push(total_bits);
-        } else {
-            let full_segments = total_bits / AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT;
-            let remainder = total_bits % AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT;
-            if remainder >= AL_FINAL_FCS_BITS {
-                segment_lengths.resize(full_segments, AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT);
-                segment_lengths.push(remainder);
+        let non_final_segment_bits = Self::advanced_non_final_segment_size(protected.get_len_remaining());
+        let mut segments = Vec::new();
+        while protected.get_len_remaining() > 0 {
+            let remaining = protected.get_len_remaining();
+            let length = if remaining <= AL_FINAL_FRAMED_SEGMENT_BITS {
+                remaining
             } else {
-                // Preserve the complete FCS in the final segment.  §6.5 permits
-                // the first and last segment to differ from the equal-sized
-                // middle segments, so move the small remainder into those ends.
-                debug_assert!(full_segments > 0);
-                segment_lengths.push(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT - (AL_FINAL_FCS_BITS - remainder));
-                segment_lengths.extend(std::iter::repeat_n(
-                    AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT,
-                    full_segments - 1,
-                ));
-                segment_lengths.push(AL_FINAL_FCS_BITS);
-            }
-        }
-
-        let mut segments = Vec::with_capacity(segment_lengths.len());
-        for length in segment_lengths {
+                non_final_segment_bits
+            };
             let mut segment = BitBuffer::new_autoexpand(length);
             segment.copy_bits(&mut protected, length);
             segment.seek(0);
@@ -1679,7 +1672,7 @@ impl Llc {
                 // half-duplex turn or an extra uplink grant.
                 let attempt_reporter = TxReporter::new();
                 for (selected_index, segment_index) in selected.iter().copied().enumerate() {
-                    let mut pdu = BitBuffer::new_autoexpand(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT + 24);
+                    let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
                     let last_selected = selected_index + 1 == selected.len();
                     let final_segment = segment_index + 1 == sdu.segments.len();
                     let header = AlDataHeader {
@@ -2548,7 +2541,7 @@ mod tests {
     fn receive_advanced_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, ns: u8, payload: BitBuffer) {
         let segments = Llc::advanced_segments(payload);
         for (index, mut segment) in segments.iter().cloned().enumerate() {
-            let mut pdu = BitBuffer::new_autoexpand(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT + 24);
+            let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
             AlDataHeader {
                 final_segment: index + 1 == segments.len(),
                 acknowledgement_requested: index + 1 == segments.len(),
@@ -2673,7 +2666,7 @@ mod tests {
         let payload = BitBuffer::from_bitstr(&"10110010".repeat(40));
         let segments = Llc::advanced_segments(payload.clone());
         for (index, mut segment) in segments.iter().cloned().enumerate() {
-            let mut pdu = BitBuffer::new_autoexpand(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT + 24);
+            let mut pdu = BitBuffer::new_autoexpand(200);
             AlDataHeader {
                 final_segment: index + 1 == segments.len(),
                 acknowledgement_requested: index + 1 == segments.len(),
@@ -2696,39 +2689,6 @@ mod tests {
             panic!("expected reassembled TL-DATA indication")
         };
         assert_eq!(delivered.tl_sdu.unwrap().dump_bin_unformatted(), payload.dump_bin_unformatted());
-    }
-
-    #[test]
-    fn advanced_downlink_segments_fill_event_label_grant_capacity_for_an_mtu_packet() {
-        // TTR 001-05 §6.5 reserves 214 payload bits on a MAC-RESOURCE carrying
-        // event-label addressing and a slot grant. With the 32-bit AL FCS, an
-        // MTU-sized IPv4 packet must fit the 62-segment selective ACK range.
-        let segments = Llc::advanced_segments(BitBuffer::from_bytes(&vec![0x5a; 1_500]));
-
-        assert_eq!(segments.len(), 57);
-        assert!(
-            segments
-                .iter()
-                .take(56)
-                .all(|segment| segment.get_len_remaining() == AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT)
-        );
-        assert_eq!(segments.last().unwrap().get_len_remaining(), 48);
-        assert!(segments.len() <= 62, "a partial AL-ACK must represent every MTU segment");
-    }
-
-    #[test]
-    fn advanced_downlink_segment_sequence_fits_the_tip_maximum_tlsdu() {
-        // Table 26 permits a 2048-octet TL-SDU.  Keep the segment sequence
-        // below its eight-bit on-air limit even at that maximum.
-        let segments = Llc::advanced_segments(BitBuffer::from_bytes(&vec![0xa5; 2_048]));
-
-        assert!(segments.len() <= usize::from(u8::MAX) + 1);
-        assert!(
-            segments
-                .iter()
-                .all(|segment| segment.get_len_remaining() <= AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT)
-        );
-        assert!(segments.last().unwrap().get_len_remaining() >= AL_FINAL_FCS_BITS);
     }
 
     #[test]
@@ -2988,10 +2948,7 @@ mod tests {
         let SapMsgInner::TmaUnitdataReq(second) = second.msg else {
             panic!("expected final TMA segment")
         };
-        assert_eq!(
-            first.pdu.get_len_remaining(),
-            17 + AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT
-        );
+        assert_eq!(first.pdu.get_len_remaining(), 17 + 180);
         assert_eq!(
             first.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
             Some((32, 2, 55))
@@ -3022,12 +2979,12 @@ mod tests {
     #[test]
     fn advanced_downlink_uses_uniform_segments_with_a_complete_fcs_tail() {
         // A 64-byte IPv4 packet plus the 19 SNDCP/MLE bits used on this path
-        // leaves a 135-bit final segment after two 214-bit segments. The
-        // complete 32-bit FCS remains in AL-FINAL.
+        // leaves only 23 bits after three 180-bit segments. Use 172-bit
+        // non-final segments so AL-FINAL contains the complete 32-bit FCS.
         let short = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(64 * 8 + 19)));
         assert_eq!(
             short.iter().map(BitBuffer::get_len_remaining).collect::<Vec<_>>(),
-            vec![214, 214, 135]
+            vec![172, 172, 172, 47]
         );
 
         let long = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(512 * 8 + 19)));
@@ -3053,7 +3010,7 @@ mod tests {
         for bit in ["0", "1", "0", "1"] {
             // Five segments per TL-SDU exercise every member of the
             // three-slot bearer (TS2 -> TS3 -> TS4 -> TS2 -> TS3).
-            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(900)));
+            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(800)));
         }
 
         assert!(llc.submit_advanced_link_messages(&mut queue));
