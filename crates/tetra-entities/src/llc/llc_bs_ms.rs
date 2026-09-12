@@ -55,10 +55,6 @@ const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
 // rounding and an anticipated acknowledgement grant.
 const AL_NON_FINAL_SEGMENT_CANDIDATES: [usize; 3] = [180, 172, 164];
 const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
-// TIP packet data is the only service using this original advanced link. Keep
-// its downlink stop-and-wait even when the MS negotiates a larger N.272 window;
-// interleaving several long TL-SDUs made recovery of missing segments unstable.
-const PACKET_DATA_AL_TLSDU_WINDOW_SIZE: usize = 1;
 // T.252 expiry repeats the acknowledgement request; it does not consume the
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
@@ -1630,7 +1626,13 @@ impl Llc {
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            let mut available = PACKET_DATA_AL_TLSDU_WINDOW_SIZE - in_flight.min(PACKET_DATA_AL_TLSDU_WINDOW_SIZE);
+            // N.272 is negotiated by AL-SETUP for exactly this purpose: up
+            // to that many TL-SDUs may be outstanding before the sender has
+            // to wait for acknowledgements.  TIP normal downlink permits
+            // later TL-SDUs in that window after a missing-segment recovery.
+            // Each TL-SDU nevertheless remains on one PDCH, chosen below.
+            let window_size = usize::from(link.window_size.clamp(1, 3));
+            let mut available = window_size.saturating_sub(in_flight.min(window_size));
             for sdu in link
                 .tx
                 .iter_mut()
@@ -2991,43 +2993,94 @@ mod tests {
     }
 
     #[test]
-    fn packet_advanced_link_submits_only_one_tlsdu_at_a_time() {
+    fn packet_advanced_link_uses_negotiated_tlsdu_window() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
+        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 3;
         while queue.pop_front().is_some() {}
 
-        for payload in ["0".repeat(240), "1".repeat(240)] {
-            let reporter = TxReporter::new();
-            llc.rx_tla_tldata_req_bl(
-                &mut queue,
-                SapMsg::new(
-                    Sap::TlaSap,
-                    TetraEntity::Mle,
-                    TetraEntity::Llc,
-                    SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                        main_address: TetraAddress::issi(77_468),
-                        link_id: 0,
-                        endpoint_id: 7,
-                        tl_sdu: BitBuffer::from_bitstr(&payload),
-                        stealing_permission: false,
-                        subscriber_class: 0,
-                        fcs_flag: true,
-                        packet_data_flag: true,
-                        air_interface_encryption: None,
-                        stealing_repeats_flag: None,
-                        data_class_info: None,
-                        req_handle: 0,
-                        graceful_degradation: None,
-                        chan_alloc: None,
-                        associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
-                        tx_reporter: Some(reporter),
-                    }),
-                ),
-            );
+        let mut reporters = Vec::new();
+        for bit in ["0", "1", "0", "1"] {
+            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(240)));
         }
 
         assert!(llc.submit_advanced_link_messages(&mut queue));
+        let mut queued_ns = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                    return None;
+                };
+                AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok().map(|header| header.ns)
+            })
+            .collect::<Vec<_>>();
+        queued_ns.sort_unstable();
+        queued_ns.dedup();
+        assert_eq!(queued_ns, vec![0, 1, 2]);
+        let routes = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                    return None;
+                };
+                request.associated_channel.map(|route| route.timeslot)
+            })
+            .collect::<Vec<_>>();
+        assert!(routes.iter().all(|timeslot| *timeslot == 2));
+        assert!(
+            llc.advanced_links[&77_468]
+                .tx
+                .iter()
+                .take(3)
+                .all(|sdu| sdu.attempt_reporter.is_some())
+        );
+        assert!(llc.advanced_links[&77_468].tx[3].attempt_reporter.is_none());
+
+        let mut ack = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+
+        while queue.pop_front().is_some() {}
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let queued_ns = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                    return None;
+                };
+                AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok().map(|header| header.ns)
+            })
+            .collect::<Vec<_>>();
+        assert!(!queued_ns.is_empty());
+        assert!(queued_ns.iter().all(|ns| *ns == 3));
+        assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
+        assert!(reporters[1..].iter().all(|reporter| reporter.get_state() == TxState::Pending));
+    }
+
+    #[test]
+    fn packet_advanced_link_window_one_remains_stop_and_wait() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 1;
+        while queue.pop_front().is_some() {}
+
+        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"0".repeat(240));
+        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"1".repeat(240));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+
         let queued_ns = queue
             .iter_mut()
             .filter_map(|message| {
@@ -3280,9 +3333,12 @@ mod tests {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
+        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 3;
         while queue.pop_front().is_some() {}
         let mut reporters = Vec::new();
-        for bit in ["0", "1"] {
+        // The negotiated N.272 window is three in this test profile, so
+        // N(S)=3 is the first TL-SDU that has not yet reached UMAC.
+        for bit in ["0", "1", "0", "1"] {
             let reporter = TxReporter::new();
             reporters.push(reporter.clone());
             llc.rx_tla_tldata_req_bl(
@@ -3313,7 +3369,7 @@ mod tests {
             );
         }
         llc.submit_advanced_link_messages(&mut queue);
-        assert_eq!(llc.advanced_links[&77_468].tx.len(), 2);
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 4);
 
         let mut ack = BitBuffer::new_autoexpand(32);
         AlAck {
@@ -3326,7 +3382,7 @@ mod tests {
                     acknowledgement_bitmap: Vec::new(),
                 },
                 AlAckBlock {
-                    nr: 1,
+                    nr: 3,
                     acknowledgement_length: 0,
                     first_missing_segment: None,
                     acknowledgement_bitmap: Vec::new(),
@@ -3338,9 +3394,9 @@ mod tests {
         ack.seek(0);
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
 
-        assert_eq!(llc.advanced_links[&77_468].tx.len(), 1);
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 3);
         assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
-        assert_eq!(reporters[1].get_state(), TxState::Pending);
+        assert_eq!(reporters[3].get_state(), TxState::Pending);
 
         while queue.pop_front().is_some() {}
         assert!(llc.submit_advanced_link_messages(&mut queue));
@@ -3349,7 +3405,7 @@ mod tests {
         AlAck {
             receiver_ready: true,
             blocks: vec![AlAckBlock {
-                nr: 1,
+                nr: 3,
                 acknowledgement_length: 0,
                 first_missing_segment: None,
                 acknowledgement_bitmap: Vec::new(),
@@ -3359,8 +3415,8 @@ mod tests {
         .unwrap();
         ack.seek(0);
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
-        assert!(llc.advanced_links[&77_468].tx.is_empty());
-        assert_eq!(reporters[1].get_state(), TxState::Acknowledged);
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 2);
+        assert_eq!(reporters[3].get_state(), TxState::Acknowledged);
     }
 
     #[test]
