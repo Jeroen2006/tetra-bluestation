@@ -171,7 +171,6 @@ impl AdvancedRxSdu {
 struct AdvancedTxSdu {
     ns: u8,
     segments: Vec<BitBuffer>,
-    routes: Vec<tetra_saps::tma::AssociatedChannel>,
     chan_alloc: Option<CmceChanAllocReq>,
     endpoint_id: u32,
     aie_request: AieRequest,
@@ -928,7 +927,7 @@ impl Llc {
         let Some(slots) = self.advanced_links.get(&issi).map(|link| link.slots) else {
             return false;
         };
-        let mut routes = Self::packet_routes(&self.config, issi)
+        let routes = Self::packet_routes(&self.config, issi)
             .into_iter()
             .take(slots as usize)
             .collect::<Vec<_>>();
@@ -950,10 +949,6 @@ impl Llc {
         }
         let reporter = prim.tx_reporter.unwrap_or_else(TxReporter::new);
         let segments = Self::advanced_segments(prim.tl_sdu);
-        if let Some(primary) = prim.associated_channel {
-            routes.retain(|route| route.timeslot != primary.timeslot);
-            routes.insert(0, primary);
-        }
         let ns = link.next_tx_ns;
         link.next_tx_ns = (link.next_tx_ns + 1) & 0x07;
         link.endpoint_id = prim.endpoint_id;
@@ -961,7 +956,6 @@ impl Llc {
             ns,
             segment_retransmissions: vec![0; segments.len()],
             segments,
-            routes,
             chan_alloc: prim.chan_alloc,
             endpoint_id: prim.endpoint_id,
             aie_request: prim
@@ -1630,7 +1624,6 @@ impl Llc {
             // to that many TL-SDUs may be outstanding before the sender has
             // to wait for acknowledgements.  TIP normal downlink permits
             // later TL-SDUs in that window after a missing-segment recovery.
-            // Each TL-SDU nevertheless remains on one PDCH, chosen below.
             let window_size = usize::from(link.window_size.clamp(1, 3));
             let mut available = window_size.saturating_sub(in_flight.min(window_size));
             for sdu in link
@@ -1669,32 +1662,18 @@ impl Llc {
                     let length = payload.get_len_remaining();
                     pdu.copy_bits(&mut payload, length);
                     pdu.seek(0);
-                    // Keep every segment of one original-link TL-SDU on the
-                    // same PDCH.  The terminal acknowledges segments as one
-                    // reassembly unit, while a PDCH allocation or retune can
-                    // take effect between individual slots.  Striping segment
-                    // 0, 1, ... across TS2..TS4 let a terminal receive the
-                    // final segment before it was monitoring the preceding
-                    // routes, which then drove it into repeated AR recovery.
+                    // TIP 6.10 defines every member of a multislot PDCH as
+                    // equivalent. Spread the successive S(S) values of one
+                    // TL-SDU across the *current* bearer so a large packet
+                    // makes use of every assigned slot. These routes are
+                    // resolved immediately before submission: a resize may
+                    // have removed a slot since SNDCP queued the TL-SDU.
                     //
-                    // Select a PDCH once per TL-SDU, using N(S) to share a
-                    // negotiated multislot bearer across its live slots.  The
-                    // selected original route must still exist after a resize;
-                    // otherwise choose one surviving route with the same stable
-                    // N(S)-based ordering.  This preserves complete-segment
-                    // reassembly while allowing the N.272 window to use TS2..4.
-                    let route = sdu
-                        .routes
-                        .get(sdu.ns as usize % sdu.routes.len().max(1))
-                        .filter(|preferred| {
-                            routes.iter().any(|active| {
-                                active.call_id == preferred.call_id
-                                    && active.timeslot == preferred.timeslot
-                                    && active.usage == preferred.usage
-                            })
-                        })
-                        .copied()
-                        .or_else(|| routes.get(sdu.ns as usize % routes.len()).copied());
+                    // UMAC enforces the complementary rule: an S(S) is not
+                    // transmitted before any lower S(S) for the same N(S),
+                    // even when the preceding segment was deferred for a
+                    // half-duplex uplink turn or a full SCH/F block.
+                    let route = Some(routes[segment_index % routes.len()]);
                     Self::queue_advanced_pdu(
                         queue,
                         TetraAddress::issi(*issi),
@@ -2857,7 +2836,6 @@ mod tests {
             link.tx.push_back(AdvancedTxSdu {
                 ns: 2,
                 segments: vec![BitBuffer::from_bitstr("0101")],
-                routes: Vec::new(),
                 chan_alloc: None,
                 endpoint_id: 7,
                 aie_request: AieRequest::clear(AieSubject::Individual { issi: 77_468 }, AieScope::MacData),
@@ -2950,7 +2928,7 @@ mod tests {
         );
         assert_eq!(
             second.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
-            Some((32, 2, 55))
+            Some((32, 3, 55))
         );
 
         let mut ack = BitBuffer::new_autoexpand(16);
@@ -3003,7 +2981,9 @@ mod tests {
 
         let mut reporters = Vec::new();
         for bit in ["0", "1", "0", "1"] {
-            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(240)));
+            // Five segments per TL-SDU exercise every member of the
+            // three-slot bearer (TS2 -> TS3 -> TS4 -> TS2 -> TS3).
+            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(800)));
         }
 
         assert!(llc.submit_advanced_link_messages(&mut queue));
@@ -3025,18 +3005,18 @@ mod tests {
                 let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
                     return None;
                 };
-                let ns = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?.ns;
-                request.associated_channel.map(|route| (ns, route.timeslot))
+                let header = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?;
+                request.associated_channel.map(|route| (header.ns, header.segment, route.timeslot))
             })
             .collect::<Vec<_>>();
-        for (ns, timeslot) in [(0, 2), (1, 3), (2, 4)] {
+        for ns in [0, 1, 2] {
             let segments = routes
                 .iter()
-                .filter(|(received_ns, _)| *received_ns == ns)
-                .map(|(_, received_timeslot)| *received_timeslot)
+                .filter(|(received_ns, _, _)| *received_ns == ns)
+                .map(|(_, segment, received_timeslot)| (*segment, *received_timeslot))
                 .collect::<Vec<_>>();
-            assert!(!segments.is_empty());
-            assert!(segments.iter().all(|received_timeslot| *received_timeslot == timeslot));
+            assert!(segments.len() >= 5);
+            assert!(segments.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 3)));
         }
         assert!(
             llc.advanced_links[&77_468]
@@ -3106,7 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_advanced_downlink_keeps_all_segments_on_one_live_pdch() {
+    fn queued_advanced_downlink_spreads_segments_over_live_pdchs_after_resize() {
         let config = test_config();
         let mut llc = Llc::new(config.clone());
         let mut queue = MessageQueue::new();
@@ -3141,8 +3121,8 @@ mod tests {
         );
 
         // Voice takes TS4 after this TL-SDU entered LLC but before its
-        // segments are submitted.  TS2 remains live, so every segment must
-        // retain the original route instead of being striped across TS2/TS3.
+        // segments are submitted. TS2 and TS3 remain equivalent members of
+        // the packet bearer, so the segments must use only those live slots.
         config
             .state_write()
             .subscriber_packet_delivery_routes
@@ -3156,15 +3136,16 @@ mod tests {
                 let SapMsgInner::TmaUnitdataReq(request) = &message.msg else {
                     return None;
                 };
-                request.associated_channel.map(|route| route.timeslot)
+                let header = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?;
+                request.associated_channel.map(|route| (header.segment, route.timeslot))
             })
             .collect::<Vec<_>>();
         assert!(routes.len() >= 4);
-        assert!(routes.iter().all(|timeslot| *timeslot == 2));
+        assert!(routes.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 2)));
     }
 
     #[test]
-    fn queued_advanced_downlink_moves_the_whole_tlsdu_to_one_live_pdch_after_resize() {
+    fn queued_advanced_downlink_spreads_over_surviving_pdchs_after_resize() {
         let config = test_config();
         let mut llc = Llc::new(config.clone());
         let mut queue = MessageQueue::new();
@@ -3173,10 +3154,9 @@ mod tests {
 
         let reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(400));
 
-        // TS2 was the preferred packet route when SNDCP queued the TL-SDU,
+        // TS2 was part of the packet bearer when SNDCP queued the TL-SDU,
         // but a resize assigned it to voice before LLC could submit the
-        // segments.  TS3 is now the first still-valid route for this same
-        // bearer.  The chain must move as a whole, never segment by segment.
+        // segments. TS3 and TS4 remain equivalent live bearer members.
         config
             .state_write()
             .subscriber_packet_delivery_routes
@@ -3190,11 +3170,12 @@ mod tests {
                 let SapMsgInner::TmaUnitdataReq(request) = &message.msg else {
                     return None;
                 };
-                request.associated_channel.map(|route| route.timeslot)
+                let header = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?;
+                request.associated_channel.map(|route| (header.segment, route.timeslot))
             })
             .collect::<Vec<_>>();
         assert!(routes.len() >= 4);
-        assert!(routes.iter().all(|timeslot| *timeslot == 3));
+        assert!(routes.iter().all(|(segment, timeslot)| *timeslot == 3 + (*segment % 2)));
         assert_eq!(reporter.get_state(), TxState::Pending);
     }
 

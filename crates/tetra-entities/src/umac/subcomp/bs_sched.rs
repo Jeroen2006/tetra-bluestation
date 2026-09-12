@@ -4972,10 +4972,10 @@ mod tests {
     }
 
     #[test]
-    fn later_al_segment_waits_for_lower_sequence_on_other_pdch() {
+    fn multislot_al_segments_wait_for_their_predecessor_and_then_use_each_pdch() {
         let mut sched = get_testing_slotter();
-        assert!(sched.open_packet_bearer(17, 1, 0b0110));
-        let slots = [false, true, true, false];
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let slots = [false, true, true, true];
         let addr = TetraAddress::issi(77_468);
         let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
         let segment = |ss: u8| BitBuffer::from_bitstr(&format!("100100000{:08b}{}", ss, "0".repeat(32)));
@@ -4995,26 +4995,47 @@ mod tests {
             aie,
             slots,
         );
+        sched.dl_enqueue_packet_tma_on_timeslot(
+            4,
+            BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+            segment(2),
+            None,
+            aie,
+            slots,
+        );
 
         assert_eq!(
             BsChannelScheduler::sched_elem_advanced_link_sequence(&sched.dltx_queues[1][0]),
             Some((addr.ssi, 0, 0))
         );
         assert!(sched.has_earlier_pending_advanced_link_segment(addr.ssi, 0, 1));
-        let current = TdmaTime { h: 0, m: 1, f: 1, t: 3 };
-        assert!(sched.dl_build_block_from_signalling_schedule(current).is_none());
-        let sequence_ts2: Vec<u8> = sched.dltx_queues[1]
-            .iter()
-            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
-            .map(|(_, _, ss)| ss)
-            .collect();
-        let sequence_ts3: Vec<u8> = sched.dltx_queues[2]
-            .iter()
-            .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
-            .map(|(_, _, ss)| ss)
-            .collect();
-        assert_eq!(sequence_ts2, vec![0]);
-        assert_eq!(sequence_ts3, vec![1]);
+        // TS3 must not bypass S(S)=0 while TS2 still owns it.
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 3 })
+                .is_none()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 2 })
+                .is_some()
+        );
+        assert!(sched.dltx_queues[1].is_empty());
+
+        // Once S(S)=0 has left TS2, the next physical slots deliver S(S)=1
+        // and S(S)=2 without waiting for another TDMA frame.
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 3 })
+                .is_some()
+        );
+        assert!(sched.dltx_queues[2].is_empty());
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 4 })
+                .is_some()
+        );
+        assert!(sched.dltx_queues[3].is_empty());
     }
 
     #[test]
