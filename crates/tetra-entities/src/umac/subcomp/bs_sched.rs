@@ -66,6 +66,14 @@ const EXACT_BASIC_SLOT_GRANT_CAPACITIES: [usize; 14] = [1, 2, 3, 4, 5, 6, 8, 10,
 /// leave useful receive opportunities for a frequency half-duplex terminal.
 const PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS: usize = 4;
 
+/// When downlink work is waiting for a frequency half-duplex packet-data MS,
+/// grant exactly one new uplink opportunity at a time.  TTR 001-05 §6.10.2
+/// requires the SwMI to keep both signalling directions moving.  Refusing
+/// every new grant here can strand TCP acknowledgements until the downlink
+/// queue drains, while an unrestricted multi-slot grant can strand downlink
+/// for an entire uplink burst.
+const PACKET_DATA_BIDIRECTIONAL_MAX_GRANT_SLOTS: usize = 1;
+
 /// Select the SYSINFO variant for an actual BNCH transmission.
 ///
 /// EN 300 392-2 table 9.33 maps the mandatory frame-18 BNCH across all four
@@ -899,16 +907,6 @@ impl BsChannelScheduler {
         } else {
             self.pending_packet_data_full_slot_grants_after(request_time, &pdch_slots, addr.ssi)
         };
-        if !continues_fragment && self.has_pending_packet_data_downlink_for_issi(addr.ssi) {
-            tracing::debug!(
-                address = ?addr,
-                request = %request_time,
-                requested_cap,
-                pending_cap,
-                "withholding further packet-data uplink capacity until queued downlink is delivered"
-            );
-            return None;
-        }
         let additional_cap = requested_cap.saturating_sub(pending_cap);
         if !is_halfslot && additional_cap == 0 {
             tracing::debug!(
@@ -921,7 +919,22 @@ impl BsChannelScheduler {
             return None;
         }
 
-        let maximum_grant = if pdch_slots.len() == 2 {
+        let downlink_waiting = !continues_fragment && self.has_pending_packet_data_downlink_for_issi(addr.ssi);
+        let maximum_grant = if downlink_waiting {
+            let limited = additional_cap.min(PACKET_DATA_BIDIRECTIONAL_MAX_GRANT_SLOTS);
+            if additional_cap > limited {
+                tracing::debug!(
+                    address = ?addr,
+                    request = %request_time,
+                    requested_cap,
+                    pending_cap,
+                    additional_cap,
+                    granted_cap = limited,
+                    "limiting packet-data uplink grant to preserve a downlink receive opportunity"
+                );
+            }
+            limited
+        } else if pdch_slots.len() == 2 {
             additional_cap.min(PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS)
         } else {
             additional_cap
@@ -3994,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_packet_downlink_stops_uplink_grant_extension() {
+    fn queued_packet_downlink_interleaves_one_uplink_slot() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b0110));
         let addr = TetraAddress::issi(77_479);
@@ -4016,12 +4029,10 @@ mod tests {
             Some([false, true, true, false]),
         ));
 
-        assert!(
-            sched
-                .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-                .is_none(),
-            "queued downlink must get a receive window before the uplink allocation is extended"
-        );
+        let interleaved = sched
+            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
+            .expect("queued downlink must still leave one uplink turnaround slot");
+        assert_eq!(interleaved.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
 
         sched.dltx_queues[1].clear();
         let resumed = sched
@@ -4047,16 +4058,16 @@ mod tests {
             Some([false, true, true, true]),
         ));
 
-        assert!(
-            sched.ul_process_cap_req(2, addr, &ReservationRequirement::Req2Slots).is_none(),
-            "ordinary uplink extension must still yield to queued downlink"
-        );
+        let turnaround = sched
+            .ul_process_cap_req(2, addr, &ReservationRequirement::Req3Slots)
+            .expect("ordinary uplink must retain one turnaround slot while downlink is queued");
+        assert_eq!(turnaround.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
 
         let grant = sched
-            .ul_process_fragment_cap_req(2, addr, &ReservationRequirement::Req2Slots)
+            .ul_process_fragment_cap_req(2, addr, &ReservationRequirement::Req3Slots)
             .expect("an in-progress MAC fragment chain must receive continuation capacity");
         assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
-        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
     }
 
     #[test]
