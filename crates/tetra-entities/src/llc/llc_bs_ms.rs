@@ -1677,15 +1677,16 @@ impl Llc {
                     // final segment before it was monitoring the preceding
                     // routes, which then drove it into repeated AR recovery.
                     //
-                    // Prefer the route captured from the originating SNDCP
-                    // transaction when it is still live.  If a resize or
-                    // pre-emption removed it, select a live route once for the
-                    // whole TL-SDU.  A later TL-SDU can use a different PDCH
-                    // after this one is acknowledged.
+                    // Select a PDCH once per TL-SDU, using N(S) to share a
+                    // negotiated multislot bearer across its live slots.  The
+                    // selected original route must still exist after a resize;
+                    // otherwise choose one surviving route with the same stable
+                    // N(S)-based ordering.  This preserves complete-segment
+                    // reassembly while allowing the N.272 window to use TS2..4.
                     let route = sdu
                         .routes
-                        .iter()
-                        .find(|preferred| {
+                        .get(sdu.ns as usize % sdu.routes.len().max(1))
+                        .filter(|preferred| {
                             routes.iter().any(|active| {
                                 active.call_id == preferred.call_id
                                     && active.timeslot == preferred.timeslot
@@ -3024,10 +3025,19 @@ mod tests {
                 let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
                     return None;
                 };
-                request.associated_channel.map(|route| route.timeslot)
+                let ns = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?.ns;
+                request.associated_channel.map(|route| (ns, route.timeslot))
             })
             .collect::<Vec<_>>();
-        assert!(routes.iter().all(|timeslot| *timeslot == 2));
+        for (ns, timeslot) in [(0, 2), (1, 3), (2, 4)] {
+            let segments = routes
+                .iter()
+                .filter(|(received_ns, _)| *received_ns == ns)
+                .map(|(_, received_timeslot)| *received_timeslot)
+                .collect::<Vec<_>>();
+            assert!(!segments.is_empty());
+            assert!(segments.iter().all(|received_timeslot| *received_timeslot == timeslot));
+        }
         assert!(
             llc.advanced_links[&77_468]
                 .tx
