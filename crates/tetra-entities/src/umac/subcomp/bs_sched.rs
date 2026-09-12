@@ -5051,6 +5051,52 @@ mod tests {
     }
 
     #[test]
+    fn multislot_al_batch_finishes_an_older_ns_before_a_newer_ns() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let slots = [false, true, true, true];
+        let addr = TetraAddress::issi(77_468);
+        let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        let segment = |ns: u8, ss: u8| BitBuffer::from_bitstr(&format!("100100{ns:03b}{ss:08b}{}", "0".repeat(32)));
+
+        for (timeslot, ns, ss) in [(2, 0, 0), (3, 0, 1), (4, 1, 0)] {
+            sched.dl_enqueue_packet_tma_on_timeslot(
+                timeslot,
+                BsChannelScheduler::dl_make_minimal_resource(&addr, None, false),
+                segment(ns, ss),
+                None,
+                aie,
+                slots,
+            );
+        }
+
+        // The later N(S) must not start while the older TL-SDU remains in
+        // the queue on another PDCH. The only reserved uplink turn follows
+        // the full N.272 batch, not each individual TL-SDU.
+        assert!(sched.has_earlier_pending_advanced_link_segment(addr.ssi, 1, 0));
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 4 })
+                .is_none()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 2 })
+                .is_some()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 3 })
+                .is_some()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { h: 0, m: 1, f: 1, t: 4 })
+                .is_some()
+        );
+    }
+
+    #[test]
     fn blocked_al_segment_does_not_hide_another_links_ready_segment() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b0110));
