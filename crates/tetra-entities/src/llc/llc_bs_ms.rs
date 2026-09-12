@@ -59,6 +59,14 @@ const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
 const MAX_AL_ACK_REQUEST_REPEATS: u8 = 5;
+// N.272 tells an original advanced-link peer how many TL-SDUs it is prepared
+// to acknowledge; it is an upper bound, not a requirement to fill the window.
+// Keep one TL-SDU in flight while it is striped over a multislot PDCH. A
+// frequency-simplex, non-fast-switching MS must reserve a complete slot for
+// every receive/transmit transition (TTR 001-05 §6.3), and three interleaved
+// long TL-SDUs made those turns overlap in live operation. One outstanding
+// TL-SDU retains multislot throughput without creating that ambiguity.
+const ORIGINAL_ADVANCED_LINK_MAX_IN_FLIGHT_TLSDUS: usize = 1;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -1620,11 +1628,12 @@ impl Llc {
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            // N.272 is negotiated by AL-SETUP for exactly this purpose: up
-            // to that many TL-SDUs may be outstanding before the sender has
-            // to wait for acknowledgements.  TIP normal downlink permits
-            // later TL-SDUs in that window after a missing-segment recovery.
-            let window_size = usize::from(link.window_size.clamp(1, 3));
+            // N.272 is the peer's maximum acknowledgement window. The local
+            // sender deliberately uses one TL-SDU at a time: its successive
+            // segments can still use every PDCH member, while the terminal's
+            // mandatory half-duplex direction changes remain attributable to
+            // one acknowledgement transaction.
+            let window_size = usize::from(link.window_size.clamp(1, 3)).min(ORIGINAL_ADVANCED_LINK_MAX_IN_FLIGHT_TLSDUS);
             let mut available = window_size.saturating_sub(in_flight.min(window_size));
             for sdu in link
                 .tx
@@ -2972,7 +2981,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_advanced_link_uses_negotiated_tlsdu_window() {
+    fn packet_advanced_link_stripes_one_tlsdu_before_waiting_for_ack() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
@@ -2998,7 +3007,7 @@ mod tests {
             .collect::<Vec<_>>();
         queued_ns.sort_unstable();
         queued_ns.dedup();
-        assert_eq!(queued_ns, vec![0, 1, 2]);
+        assert_eq!(queued_ns, vec![0]);
         let routes = queue
             .iter_mut()
             .filter_map(|message| {
@@ -3009,23 +3018,27 @@ mod tests {
                 request.associated_channel.map(|route| (header.ns, header.segment, route.timeslot))
             })
             .collect::<Vec<_>>();
-        for ns in [0, 1, 2] {
-            let segments = routes
-                .iter()
-                .filter(|(received_ns, _, _)| *received_ns == ns)
-                .map(|(_, segment, received_timeslot)| (*segment, *received_timeslot))
-                .collect::<Vec<_>>();
-            assert!(segments.len() >= 5);
-            assert!(segments.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 3)));
-        }
+        let segments = routes
+            .iter()
+            .filter(|(received_ns, _, _)| *received_ns == 0)
+            .map(|(_, segment, received_timeslot)| (*segment, *received_timeslot))
+            .collect::<Vec<_>>();
+        assert!(segments.len() >= 5);
+        assert!(segments.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 3)));
         assert!(
             llc.advanced_links[&77_468]
                 .tx
                 .iter()
-                .take(3)
+                .take(1)
                 .all(|sdu| sdu.attempt_reporter.is_some())
         );
-        assert!(llc.advanced_links[&77_468].tx[3].attempt_reporter.is_none());
+        assert!(
+            llc.advanced_links[&77_468]
+                .tx
+                .iter()
+                .skip(1)
+                .all(|sdu| sdu.attempt_reporter.is_none())
+        );
 
         let mut ack = BitBuffer::new_autoexpand(16);
         AlAck {
@@ -3054,7 +3067,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!queued_ns.is_empty());
-        assert!(queued_ns.iter().all(|ns| *ns == 3));
+        assert!(queued_ns.iter().all(|ns| *ns == 1));
         assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
         assert!(reporters[1..].iter().all(|reporter| reporter.get_state() == TxState::Pending));
     }
