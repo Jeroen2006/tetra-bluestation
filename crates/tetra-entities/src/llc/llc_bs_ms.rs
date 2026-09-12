@@ -59,15 +59,6 @@ const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
 const MAX_AL_ACK_REQUEST_REPEATS: u8 = 5;
-// N.272 tells an original advanced-link peer how many TL-SDUs it is prepared
-// to acknowledge; it is an upper bound, not a requirement to fill the window.
-// Keep one TL-SDU in flight while it is striped over a multislot PDCH. A
-// frequency-simplex, non-fast-switching MS must reserve a complete slot for
-// every receive/transmit transition (TTR 001-05 §6.3), and three interleaved
-// long TL-SDUs made those turns overlap in live operation. One outstanding
-// TL-SDU retains multislot throughput without creating that ambiguity.
-const ORIGINAL_ADVANCED_LINK_MAX_IN_FLIGHT_TLSDUS: usize = 1;
-
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
 pub struct ExpectedInAck {
@@ -184,6 +175,10 @@ struct AdvancedTxSdu {
     aie_request: AieRequest,
     reporter: TxReporter,
     attempt_reporter: Option<TxReporter>,
+    /// True only for the transmitted segment which asked the peer for the
+    /// current window acknowledgement. T.252 applies to that request, not to
+    /// every TL-SDU which is awaiting the same acknowledgement.
+    acknowledgement_requested: bool,
     sent_at: Option<TdmaTime>,
     ack_request_repetitions: u8,
     retransmissions: u8,
@@ -971,6 +966,7 @@ impl Llc {
                 .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
             reporter,
             attempt_reporter: None,
+            acknowledgement_requested: false,
             sent_at: None,
             ack_request_repetitions: 0,
             retransmissions: 0,
@@ -1342,6 +1338,7 @@ impl Llc {
             // Receipt of any acknowledgement block proves that the peer saw
             // the AR. Subsequent recovery is governed by N.273/N.274.
             sdu.ack_request_repetitions = 0;
+            sdu.acknowledgement_requested = false;
             if block.acknowledgement_length == 63 {
                 sdu.retransmissions = sdu.retransmissions.saturating_add(1);
                 sdu.pending_segments = None;
@@ -1567,10 +1564,13 @@ impl Llc {
                             if sdu.reporter.get_state() == TxState::Pending {
                                 sdu.reporter.mark_transmitted();
                             }
-                            sdu.sent_at.get_or_insert(now);
+                            if sdu.acknowledgement_requested {
+                                sdu.sent_at.get_or_insert(now);
+                            }
                         }
                         TxState::Discarded | TxState::Lost => {
                             sdu.attempt_reporter = None;
+                            sdu.acknowledgement_requested = false;
                             sdu.sent_at = None;
                         }
                         TxState::Pending => {}
@@ -1584,6 +1584,7 @@ impl Llc {
                             sdu.reporter.reset();
                         }
                         sdu.attempt_reporter = None;
+                        sdu.acknowledgement_requested = false;
                         sdu.sent_at = None;
                         // TS 100 392-2 section 22.3.3.2.3 and TTR 001-05
                         // figure 34: repeat an already transmitted segment
@@ -1605,6 +1606,7 @@ impl Llc {
                             sdu.reporter.reset();
                         }
                         sdu.attempt_reporter = None;
+                        sdu.acknowledgement_requested = false;
                         sdu.sent_at = None;
                         sdu.ack_request_repetitions = 0;
                         sdu.pending_segments = None;
@@ -1623,36 +1625,51 @@ impl Llc {
             if routes.is_empty() {
                 continue;
             }
+            // On a frequency-simplex MS the downlink batch must finish before
+            // the one reserved uplink acknowledgement opportunity.  Do not
+            // create a second independent AR while that turn is still
+            // pending.  TTR 001-05 §7.12.2 and TS 100 392-2 §22.3.3.2.3 then
+            // allow the sender to fill the negotiated N.272 window and ask
+            // for a single acknowledgement on its final segment.
+            if link.tx.iter().any(|sdu| sdu.acknowledgement_requested) {
+                continue;
+            }
             let in_flight = link
                 .tx
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            // N.272 is the peer's maximum acknowledgement window. The local
-            // sender deliberately uses one TL-SDU at a time: its successive
-            // segments can still use every PDCH member, while the terminal's
-            // mandatory half-duplex direction changes remain attributable to
-            // one acknowledgement transaction.
-            let window_size = usize::from(link.window_size.clamp(1, 3)).min(ORIGINAL_ADVANCED_LINK_MAX_IN_FLIGHT_TLSDUS);
-            let mut available = window_size.saturating_sub(in_flight.min(window_size));
-            for sdu in link
+            let window_size = usize::from(link.window_size.clamp(1, 3));
+            let available = window_size.saturating_sub(in_flight.min(window_size));
+            let selected_sdus = link
                 .tx
                 .iter_mut()
-                .filter(|sdu| sdu.attempt_reporter.is_none() && sdu.sent_at.is_none())
-            {
-                if available == 0 || sdu.retransmissions > link.max_sdu_retransmissions {
-                    break;
-                }
+                .enumerate()
+                .filter_map(|(index, sdu)| {
+                    (sdu.attempt_reporter.is_none()
+                        && sdu.sent_at.is_none()
+                        && !sdu.acknowledgement_requested
+                        && sdu.retransmissions <= link.max_sdu_retransmissions)
+                        .then_some(index)
+                })
+                .take(available)
+                .collect::<Vec<_>>();
+            let Some(&acknowledgement_sdu) = selected_sdus.last() else {
+                continue;
+            };
+            for sdu_index in selected_sdus {
+                let sdu = &mut link.tx[sdu_index];
+                let request_acknowledgement = sdu_index == acknowledgement_sdu;
                 let selected = sdu
                     .pending_segments
                     .clone()
                     .filter(|segments| !segments.is_empty())
                     .unwrap_or_else(|| (0..sdu.segments.len()).collect());
-                // AL-FINAL-AR needs an anticipated uplink slot for the MS's
-                // AL-ACK (TTR 001-05 figure 41).  Keep this per-attempt
-                // reporter in the acknowledged state machine so UMAC can add
-                // that grant to the final MAC-RESOURCE.  LLC still owns the
-                // actual AL acknowledgement and timeout processing below.
+                // The final selected segment of the batch carries the only
+                // AR.  Earlier TL-SDUs keep their per-attempt reporters so
+                // their delivery is accounted for when that one AL-ACK covers
+                // the whole N.272 window, but they do not force a premature
+                // half-duplex turn or an extra uplink grant.
                 let attempt_reporter = TxReporter::new();
                 for (selected_index, segment_index) in selected.iter().copied().enumerate() {
                     let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
@@ -1660,7 +1677,7 @@ impl Llc {
                     let final_segment = segment_index + 1 == sdu.segments.len();
                     let header = AlDataHeader {
                         final_segment,
-                        acknowledgement_requested: last_selected,
+                        acknowledgement_requested: request_acknowledgement && last_selected,
                         ns: sdu.ns,
                         segment: segment_index as u8,
                     };
@@ -1695,8 +1712,8 @@ impl Llc {
                     );
                 }
                 sdu.attempt_reporter = Some(attempt_reporter);
+                sdu.acknowledgement_requested = request_acknowledgement;
                 sdu.pending_segments = None;
-                available -= 1;
                 activity = true;
             }
         }
@@ -2850,6 +2867,7 @@ mod tests {
                 aie_request: AieRequest::clear(AieSubject::Individual { issi: 77_468 }, AieScope::MacData),
                 reporter,
                 attempt_reporter: None,
+                acknowledgement_requested: false,
                 sent_at: None,
                 ack_request_repetitions: 0,
                 retransmissions: 0,
@@ -2981,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_advanced_link_stripes_one_tlsdu_before_waiting_for_ack() {
+    fn packet_advanced_link_batches_negotiated_window_before_waiting_for_ack() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
@@ -3007,7 +3025,7 @@ mod tests {
             .collect::<Vec<_>>();
         queued_ns.sort_unstable();
         queued_ns.dedup();
-        assert_eq!(queued_ns, vec![0]);
+        assert_eq!(queued_ns, vec![0, 1, 2]);
         let routes = queue
             .iter_mut()
             .filter_map(|message| {
@@ -3018,37 +3036,54 @@ mod tests {
                 request.associated_channel.map(|route| (header.ns, header.segment, route.timeslot))
             })
             .collect::<Vec<_>>();
-        let segments = routes
-            .iter()
-            .filter(|(received_ns, _, _)| *received_ns == 0)
-            .map(|(_, segment, received_timeslot)| (*segment, *received_timeslot))
+        for ns in [0, 1, 2] {
+            let segments = routes
+                .iter()
+                .filter(|(received_ns, _, _)| *received_ns == ns)
+                .map(|(_, segment, received_timeslot)| (*segment, *received_timeslot))
+                .collect::<Vec<_>>();
+            assert!(segments.len() >= 5);
+            assert!(segments.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 3)));
+        }
+        let acknowledgement_requests = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                    return None;
+                };
+                let header = AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok()?;
+                header.acknowledgement_requested.then_some(header.ns)
+            })
             .collect::<Vec<_>>();
-        assert!(segments.len() >= 5);
-        assert!(segments.iter().all(|(segment, timeslot)| *timeslot == 2 + (*segment % 3)));
+        assert_eq!(acknowledgement_requests, vec![2]);
         assert!(
             llc.advanced_links[&77_468]
                 .tx
                 .iter()
-                .take(1)
+                .take(3)
                 .all(|sdu| sdu.attempt_reporter.is_some())
         );
         assert!(
             llc.advanced_links[&77_468]
                 .tx
                 .iter()
-                .skip(1)
-                .all(|sdu| sdu.attempt_reporter.is_none())
+                .take(2)
+                .all(|sdu| !sdu.acknowledgement_requested)
         );
+        assert!(llc.advanced_links[&77_468].tx[2].acknowledgement_requested);
+        assert!(llc.advanced_links[&77_468].tx[3].attempt_reporter.is_none());
 
         let mut ack = BitBuffer::new_autoexpand(16);
         AlAck {
             receiver_ready: true,
-            blocks: vec![AlAckBlock {
-                nr: 0,
-                acknowledgement_length: 0,
-                first_missing_segment: None,
-                acknowledgement_bitmap: Vec::new(),
-            }],
+            blocks: (0..3)
+                .map(|nr| AlAckBlock {
+                    nr,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                })
+                .collect(),
         }
         .to_bitbuf(&mut ack)
         .unwrap();
@@ -3067,9 +3102,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!queued_ns.is_empty());
-        assert!(queued_ns.iter().all(|ns| *ns == 1));
-        assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
-        assert!(reporters[1..].iter().all(|reporter| reporter.get_state() == TxState::Pending));
+        assert!(queued_ns.iter().all(|ns| *ns == 3));
+        assert!(reporters[..3].iter().all(|reporter| reporter.get_state() == TxState::Acknowledged));
+        assert_eq!(reporters[3].get_state(), TxState::Pending);
     }
 
     #[test]
@@ -3403,6 +3438,24 @@ mod tests {
         assert_eq!(reporters[3].get_state(), TxState::Pending);
 
         while queue.pop_front().is_some() {}
+        assert!(
+            !llc.submit_advanced_link_messages(&mut queue),
+            "an AR for the current N.272 window must complete before a new window begins"
+        );
+        let mut ack = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![AlAckBlock {
+                nr: 2,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert!(llc.submit_advanced_link_messages(&mut queue));
         assert!(queue.iter_mut().count() > 0);
         let mut ack = BitBuffer::new_autoexpand(16);
@@ -3419,7 +3472,7 @@ mod tests {
         .unwrap();
         ack.seek(0);
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
-        assert_eq!(llc.advanced_links[&77_468].tx.len(), 2);
+        assert_eq!(llc.advanced_links[&77_468].tx.len(), 1);
         assert_eq!(reporters[3].get_state(), TxState::Acknowledged);
     }
 

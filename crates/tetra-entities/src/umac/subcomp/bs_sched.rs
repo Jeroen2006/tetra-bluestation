@@ -1304,7 +1304,19 @@ impl BsChannelScheduler {
             .flat_map(|queue| queue.iter())
             .chain(self.dltx_next_slot_queue.iter())
             .filter_map(BsChannelScheduler::sched_elem_advanced_link_sequence)
-            .any(|(pending_issi, pending_ns, pending_ss)| pending_issi == issi && pending_ns == ns && pending_ss < ss)
+            .any(|(pending_issi, pending_ns, pending_ss)| {
+                if pending_issi != issi {
+                    return false;
+                }
+                if pending_ns == ns {
+                    return pending_ss < ss;
+                }
+                // A window has at most three original-link TL-SDUs.  Keep its
+                // complete older TL-SDU on air before a newer one starts: the
+                // only AR then follows the full downlink batch, avoiding a
+                // half-duplex downlink/uplink turn between every TL-SDU.
+                (1..=3).contains(&(ns.wrapping_sub(pending_ns) & 0x07))
+            })
     }
 
     fn dl_defer_packet_data_resource_to_next_pdch(
