@@ -13,9 +13,10 @@ use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::components::fcs;
-use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
+use tetra_pdus::llc::consts::consts::{N252_BL_MAX_TLSDU_RETRANSMITS_ACKED, N262_AL_MAX_CONNECTION_SETUP_RETRIES};
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::consts::timers::T252_ACK_WAITING_TIMER;
+use tetra_pdus::llc::consts::timers::T261_SETUP_WAITING_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::al::{AlAck, AlAckBlock, AlDataHeader, AlDisconnect, AlReconnect, AlSetup};
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
@@ -54,6 +55,10 @@ const ASSIGNED_CHANNEL_FINAL_ACK_GRACE_TIMESLOTS: u32 = 5 * 18 * 4;
 // rounding and an anticipated acknowledgement grant.
 const AL_NON_FINAL_SEGMENT_CANDIDATES: [usize; 3] = [180, 172, 164];
 const AL_FINAL_FRAMED_SEGMENT_BITS: usize = 196;
+// TIP packet data is the only service using this original advanced link. Keep
+// its downlink stop-and-wait even when the MS negotiates a larger N.272 window;
+// interleaving several long TL-SDUs made recovery of missing segments unstable.
+const PACKET_DATA_AL_TLSDU_WINDOW_SIZE: usize = 1;
 // T.252 expiry repeats the acknowledgement request; it does not consume the
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
@@ -188,6 +193,7 @@ struct AdvancedLink {
     link_number: u8,
     maximum_sdu: u8,
     slots: u8,
+    throughput: u8,
     window_size: u8,
     max_sdu_retransmissions: u8,
     max_segment_retransmissions: u8,
@@ -198,6 +204,16 @@ struct AdvancedLink {
     receiver_ready: bool,
     rx_sdus: BTreeMap<u8, AdvancedRxSdu>,
     tx: VecDeque<AdvancedTxSdu>,
+    reset: Option<AdvancedLinkReset>,
+}
+
+#[derive(Debug, Clone)]
+struct AdvancedLinkReset {
+    setup: AlSetup,
+    aie_request: AieRequest,
+    attempt_reporter: TxReporter,
+    sent_at: Option<TdmaTime>,
+    retries: u32,
 }
 
 impl AdvancedLink {
@@ -785,6 +801,95 @@ impl Llc {
         ));
     }
 
+    fn queue_advanced_link_reset_attempt(
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        endpoint_id: u32,
+        setup: AlSetup,
+        route: Option<tetra_saps::tma::AssociatedChannel>,
+        aie_request: AieRequest,
+        reporter: TxReporter,
+    ) {
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        if setup.to_bitbuf(&mut pdu).is_err() {
+            Self::mark_reporter_lost(&reporter);
+            return;
+        }
+        pdu.seek(0);
+        Self::queue_advanced_pdu(queue, address, endpoint_id, pdu, route, None, aie_request, Some(reporter));
+    }
+
+    /// Reset an acknowledged original link without releasing the SNDCP/PDP
+    /// context. TS 100 392-2 22.3.3.2.4 requires the service user to stop
+    /// using a link after N.273 exhaustion. Clause 22.3.3.1.1 defines
+    /// AL-SETUP(Reset) as the in-place recovery procedure and requires both
+    /// sequence directions and the old data buffers to be reset.
+    fn begin_advanced_link_reset(&mut self, queue: &mut MessageQueue, issi: u32, failed_ns: u8, reason: &'static str) {
+        let route = Self::packet_routes(&self.config, issi).first().cloned();
+        let Some(link) = self.advanced_links.get_mut(&issi) else {
+            return;
+        };
+        if link.reset.is_some() {
+            return;
+        }
+
+        let aie_request = link
+            .tx
+            .iter()
+            .find(|sdu| sdu.ns == failed_ns)
+            .or_else(|| link.tx.front())
+            .map(|sdu| sdu.aie_request)
+            .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
+        let abandoned = link.tx.len();
+        for sdu in link.tx.drain(..) {
+            Self::mark_reporter_lost(&sdu.reporter);
+        }
+        link.next_tx_ns = 0;
+        link.next_rx_ns = 0;
+        link.rx_sdus.clear();
+        link.receiver_ready = false;
+
+        let setup = AlSetup {
+            acknowledged: true,
+            link_number: link.link_number,
+            maximum_sdu: link.maximum_sdu,
+            connection_width: link.slots > 1,
+            asymmetric: false,
+            uplink_slots: (link.slots > 1).then_some(link.slots),
+            downlink_slots: None,
+            throughput: link.throughput,
+            window_size: link.window_size,
+            sdu_retransmissions: link.max_sdu_retransmissions,
+            segment_retransmissions: link.max_segment_retransmissions,
+            report: 3,
+        };
+        let endpoint_id = link.endpoint_id;
+        let attempt_reporter = TxReporter::new();
+        link.reset = Some(AdvancedLinkReset {
+            setup,
+            aie_request,
+            attempt_reporter: attempt_reporter.clone(),
+            sent_at: None,
+            retries: 0,
+        });
+        tracing::warn!(
+            issi,
+            ns = failed_ns,
+            abandoned_tlsdus = abandoned,
+            reason,
+            "advanced-link transfer failed; starting in-place AL-SETUP reset"
+        );
+        Self::queue_advanced_link_reset_attempt(
+            queue,
+            TetraAddress::issi(issi),
+            endpoint_id,
+            setup,
+            route,
+            aie_request,
+            attempt_reporter,
+        );
+    }
+
     fn advanced_non_final_segment_size(framed_len_bits: usize) -> usize {
         for segment_bits in AL_NON_FINAL_SEGMENT_CANDIDATES {
             let non_final_segments = framed_len_bits.saturating_sub(AL_FINAL_FRAMED_SEGMENT_BITS).div_ceil(segment_bits);
@@ -957,6 +1062,7 @@ impl Llc {
             link_number: 0,
             maximum_sdu,
             slots,
+            throughput: request.throughput,
             window_size,
             max_sdu_retransmissions: request.sdu_retransmissions,
             max_segment_retransmissions: request.segment_retransmissions,
@@ -966,6 +1072,7 @@ impl Llc {
             receiver_ready: true,
             rx_sdus: BTreeMap::new(),
             tx: VecDeque::new(),
+            reset: None,
         };
         if successful_response {
             if let Some(link) = self.advanced_links.get_mut(&prim.main_address.ssi) {
@@ -973,14 +1080,28 @@ impl Llc {
                 // that this Success confirms.
                 link.maximum_sdu = maximum_sdu;
                 link.slots = slots;
+                link.throughput = request.throughput;
                 link.window_size = window_size;
                 link.max_sdu_retransmissions = request.sdu_retransmissions;
                 link.max_segment_retransmissions = request.segment_retransmissions;
                 link.endpoint_id = prim.endpoint_id;
+                if link.reset.take().is_some() {
+                    // begin_advanced_link_reset already cleared both sequence
+                    // directions and the old buffers. Success makes the link
+                    // available again; data queued while waiting starts at
+                    // the new N(S)=0 boundary.
+                    link.receiver_ready = true;
+                    tracing::info!(issi = prim.main_address.ssi, "in-place advanced-link reset accepted by terminal");
+                }
             } else {
                 self.advanced_links.insert(prim.main_address.ssi, negotiated_link);
             }
         } else {
+            if let Some(mut old) = self.advanced_links.remove(&prim.main_address.ssi) {
+                for sdu in old.tx.drain(..) {
+                    Self::mark_reporter_lost(&sdu.reporter);
+                }
+            }
             self.advanced_links.insert(prim.main_address.ssi, negotiated_link);
         }
         if !successful_response {
@@ -1041,6 +1162,10 @@ impl Llc {
             tracing::warn!(issi, "AL-DATA received without an established advanced link");
             return;
         };
+        if link.reset.is_some() {
+            tracing::debug!(issi, "discarding AL-DATA while acknowledged advanced link is resetting");
+            return;
+        }
         let distance = header.ns.wrapping_sub(link.next_rx_ns) & 0x07;
         if distance >= link.window_size {
             // An acknowledgement may be lost even though the complete SDU
@@ -1164,55 +1289,6 @@ impl Llc {
         }
     }
 
-    fn close_failed_advanced_link(&mut self, queue: &mut MessageQueue, issi: u32, failed_ns: u8, reason: &'static str) {
-        let Some(mut link) = self.advanced_links.remove(&issi) else {
-            return;
-        };
-        let aie_request = link
-            .tx
-            .iter()
-            .find(|sdu| sdu.ns == failed_ns)
-            .or_else(|| link.tx.front())
-            .map(|sdu| sdu.aie_request)
-            .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
-        let pending = link.tx.len();
-        for sdu in link.tx.drain(..) {
-            Self::mark_reporter_lost(&sdu.reporter);
-        }
-
-        // TS 100 392-2 22.3.3.2.4 requires a failed TL-SDU to be
-        // abandoned and reported to the service user. The service user must
-        // then stop using the ambiguous N(S)/N(R) state and reset or
-        // disconnect the advanced link. TxReporter is the local TL-REPORT
-        // equivalent in this stack, so finish every outstanding request and
-        // perform the normal 22.3.3.3 close handshake here.
-        let mut pdu = BitBuffer::new_autoexpand(16);
-        AlDisconnect {
-            acknowledged: true,
-            link_number: link.link_number,
-            report: 1,
-        }
-        .to_bitbuf(&mut pdu);
-        pdu.seek(0);
-        Self::queue_advanced_pdu(
-            queue,
-            TetraAddress::issi(issi),
-            link.endpoint_id,
-            pdu,
-            Self::packet_route(&self.config, issi, self.dltime.t),
-            None,
-            aie_request,
-            None,
-        );
-        tracing::warn!(
-            issi,
-            ns = failed_ns,
-            pending_tlsdus = pending,
-            reason,
-            "advanced-link transfer failed; closing link so the peer can restart with clean sequence state"
-        );
-    }
-
     fn handle_al_ack(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
         let Ok(ack) = AlAck::from_bitbuf(&mut pdu) else {
             tracing::warn!(issi = prim.main_address.ssi, "invalid AL-ACK/RNR");
@@ -1222,7 +1298,12 @@ impl Llc {
         let Some(link) = self.advanced_links.get_mut(&issi) else {
             return;
         };
+        if link.reset.is_some() {
+            tracing::debug!(issi, "ignoring stale AL-ACK while acknowledged advanced link is resetting");
+            return;
+        }
         link.receiver_ready = ack.receiver_ready;
+        let mut failed_ns = None;
         for block in ack.blocks {
             tracing::debug!(
                 issi = prim.main_address.ssi,
@@ -1233,77 +1314,70 @@ impl Llc {
                 acknowledgement_bitmap = ?block.acknowledgement_bitmap,
                 "received advanced-link acknowledgement block"
             );
-            let failed_ns = {
-                let Some(link) = self.advanced_links.get_mut(&issi) else {
-                    break;
-                };
-                let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
-                    continue;
-                };
-                let was_sent = {
-                    let sdu = &link.tx[position];
-                    sdu.attempt_reporter.is_some() || sdu.sent_at.is_some() || sdu.reporter.get_state() != TxState::Pending
-                };
-                // A TIP acknowledgement covers the whole N.272 receive window,
-                // which can include a TL-SDU that this transmitter has queued but
-                // has not put on air yet.  Such a block carries no information for
-                // the local sending state.
-                if !was_sent {
-                    continue;
-                }
-                if block.acknowledgement_length == 0 {
-                    if let Some(sdu) = link.tx.remove(position) {
-                        if sdu.reporter.get_state() == TxState::Pending {
-                            sdu.reporter.mark_transmitted();
-                        }
-                        if sdu.reporter.get_state() == TxState::Transmitted {
-                            sdu.reporter.mark_acknowledged();
-                        }
+            let Some(position) = link.tx.iter().position(|sdu| sdu.ns == block.nr) else {
+                continue;
+            };
+            let was_sent = {
+                let sdu = &link.tx[position];
+                sdu.attempt_reporter.is_some() || sdu.sent_at.is_some() || sdu.reporter.get_state() != TxState::Pending
+            };
+            // A TIP acknowledgement covers the whole N.272 receive window,
+            // which can include a TL-SDU that this transmitter has queued but
+            // has not put on air yet.  Such a block carries no information for
+            // the local sending state.
+            if !was_sent {
+                continue;
+            }
+            if block.acknowledgement_length == 0 {
+                if let Some(sdu) = link.tx.remove(position) {
+                    if sdu.reporter.get_state() == TxState::Pending {
+                        sdu.reporter.mark_transmitted();
                     }
-                    continue;
+                    if sdu.reporter.get_state() == TxState::Transmitted {
+                        sdu.reporter.mark_acknowledged();
+                    }
                 }
+                continue;
+            }
 
-                let sdu = &mut link.tx[position];
-                // Receipt of any acknowledgement block proves that the peer saw
-                // the AR. Subsequent recovery is governed by N.273/N.274.
-                sdu.ack_request_repetitions = 0;
-                if block.acknowledgement_length == 63 {
+            let sdu = &mut link.tx[position];
+            // Receipt of any acknowledgement block proves that the peer saw
+            // the AR. Subsequent recovery is governed by N.273/N.274.
+            sdu.ack_request_repetitions = 0;
+            if block.acknowledgement_length == 63 {
+                sdu.retransmissions = sdu.retransmissions.saturating_add(1);
+                sdu.pending_segments = None;
+            } else if let Some(first) = block.first_missing_segment {
+                let mut missing = vec![first as usize];
+                for (offset, received) in block.acknowledgement_bitmap.iter().copied().enumerate() {
+                    if !received {
+                        missing.push(first as usize + offset + 1);
+                    }
+                }
+                missing.retain(|segment| *segment < sdu.segments.len());
+                let segment_limit_exceeded = missing.iter().any(|segment| {
+                    sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
+                    sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
+                });
+                if segment_limit_exceeded {
                     sdu.retransmissions = sdu.retransmissions.saturating_add(1);
                     sdu.pending_segments = None;
-                } else if let Some(first) = block.first_missing_segment {
-                    let mut missing = vec![first as usize];
-                    for (offset, received) in block.acknowledgement_bitmap.iter().copied().enumerate() {
-                        if !received {
-                            missing.push(first as usize + offset + 1);
-                        }
-                    }
-                    missing.retain(|segment| *segment < sdu.segments.len());
-                    let segment_limit_exceeded = missing.iter().any(|segment| {
-                        sdu.segment_retransmissions[*segment] = sdu.segment_retransmissions[*segment].saturating_add(1);
-                        sdu.segment_retransmissions[*segment] > link.max_segment_retransmissions
-                    });
-                    if segment_limit_exceeded {
-                        sdu.retransmissions = sdu.retransmissions.saturating_add(1);
-                        sdu.pending_segments = None;
-                    } else if !missing.is_empty() {
-                        sdu.pending_segments = Some(missing);
-                    }
+                } else if !missing.is_empty() {
+                    sdu.pending_segments = Some(missing);
                 }
-                if sdu.retransmissions > link.max_sdu_retransmissions {
-                    Some(sdu.ns)
-                } else {
-                    if sdu.reporter.get_state() == TxState::Transmitted {
-                        sdu.reporter.reset();
-                    }
-                    sdu.sent_at = None;
-                    sdu.attempt_reporter = None;
-                    None
-                }
-            };
-            if let Some(failed_ns) = failed_ns {
-                self.close_failed_advanced_link(queue, issi, failed_ns, "N.273/N.274 retry limit exceeded");
+            }
+            if sdu.reporter.get_state() == TxState::Transmitted {
+                sdu.reporter.reset();
+            }
+            sdu.sent_at = None;
+            sdu.attempt_reporter = None;
+            if sdu.retransmissions > link.max_sdu_retransmissions {
+                failed_ns = Some(sdu.ns);
                 break;
             }
+        }
+        if let Some(failed_ns) = failed_ns {
+            self.begin_advanced_link_reset(queue, issi, failed_ns, "N.273/N.274 retry limit exceeded");
         }
     }
 
@@ -1371,9 +1445,8 @@ impl Llc {
                 Self::mark_reporter_lost(&sdu.reporter);
             }
         }
-        // Success acknowledges a Close that this LLC initiated and must not
-        // itself be answered. Only an incoming Close requires Success; this
-        // also applies in IDLE after the local state was already discarded.
+        // Success confirms a Close previously sent by this side. Only an
+        // incoming Close is answered; echoing Success starts an AL-DISC loop.
         if request.report != 1 {
             return;
         }
@@ -1432,6 +1505,7 @@ impl Llc {
         let now = self.dltime;
         let mut activity = false;
         let mut failed_links = Vec::new();
+        let mut setup_failures = Vec::new();
         // A queued TL-SDU can outlive a PDCH resize. Resolve the routes at
         // submission time so segments and selective retransmissions never
         // target a timeslot that voice has taken from packet data.
@@ -1449,8 +1523,46 @@ impl Llc {
             })
             .collect::<HashMap<_, _>>();
         for (issi, link) in &mut self.advanced_links {
+            if let Some(reset) = link.reset.as_mut() {
+                let retry = match reset.attempt_reporter.get_state() {
+                    TxState::Transmitted | TxState::Acknowledged => {
+                        let sent_at = *reset.sent_at.get_or_insert(now);
+                        now.diff(sent_at) >= T261_SETUP_WAITING_TIMER as i32
+                    }
+                    TxState::Discarded | TxState::Lost => true,
+                    TxState::Pending => false,
+                };
+                if retry {
+                    if reset.retries < N262_AL_MAX_CONNECTION_SETUP_RETRIES {
+                        reset.retries += 1;
+                        reset.sent_at = None;
+                        let reporter = TxReporter::new();
+                        reset.attempt_reporter = reporter.clone();
+                        tracing::info!(
+                            issi = *issi,
+                            attempt = reset.retries,
+                            maximum = N262_AL_MAX_CONNECTION_SETUP_RETRIES,
+                            "repeating in-place AL-SETUP reset after T.261"
+                        );
+                        Self::queue_advanced_link_reset_attempt(
+                            queue,
+                            TetraAddress::issi(*issi),
+                            link.endpoint_id,
+                            reset.setup,
+                            active_routes[issi].first().cloned(),
+                            reset.aie_request,
+                            reporter,
+                        );
+                        activity = true;
+                    } else {
+                        setup_failures.push(*issi);
+                    }
+                }
+                continue;
+            }
+
             let mut failed_ns = None;
-            for sdu in &mut link.tx {
+            for sdu in link.tx.iter_mut() {
                 if let Some(attempt) = &sdu.attempt_reporter {
                     match attempt.get_state() {
                         TxState::Transmitted | TxState::Acknowledged => {
@@ -1518,13 +1630,7 @@ impl Llc {
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            // N.272 is negotiated by AL-SETUP for exactly this purpose: up
-            // to that many TL-SDUs may be outstanding before the sender has
-            // to wait for acknowledgements. Keeping an additional local
-            // window of one here turned an original advanced link into
-            // stop-and-wait even when the MS had accepted a larger window.
-            let window_size = usize::from(link.window_size.clamp(1, 3));
-            let mut available = window_size.saturating_sub(in_flight.min(window_size));
+            let mut available = PACKET_DATA_AL_TLSDU_WINDOW_SIZE - in_flight.min(PACKET_DATA_AL_TLSDU_WINDOW_SIZE);
             for sdu in link
                 .tx
                 .iter_mut()
@@ -1561,12 +1667,37 @@ impl Llc {
                     let length = payload.get_len_remaining();
                     pdu.copy_bits(&mut payload, length);
                     pdu.seek(0);
+                    // Keep every segment of one original-link TL-SDU on the
+                    // same PDCH.  The terminal acknowledges segments as one
+                    // reassembly unit, while a PDCH allocation or retune can
+                    // take effect between individual slots.  Striping segment
+                    // 0, 1, ... across TS2..TS4 let a terminal receive the
+                    // final segment before it was monitoring the preceding
+                    // routes, which then drove it into repeated AR recovery.
+                    //
+                    // Prefer the route captured from the originating SNDCP
+                    // transaction when it is still live.  If a resize or
+                    // pre-emption removed it, select a live route once for the
+                    // whole TL-SDU.  A later TL-SDU can use a different PDCH
+                    // after this one is acknowledged.
+                    let route = sdu
+                        .routes
+                        .iter()
+                        .find(|preferred| {
+                            routes.iter().any(|active| {
+                                active.call_id == preferred.call_id
+                                    && active.timeslot == preferred.timeslot
+                                    && active.usage == preferred.usage
+                            })
+                        })
+                        .copied()
+                        .or_else(|| routes.get(sdu.ns as usize % routes.len()).copied());
                     Self::queue_advanced_pdu(
                         queue,
                         TetraAddress::issi(*issi),
                         sdu.endpoint_id,
                         pdu,
-                        Some(routes[segment_index % routes.len()]),
+                        route,
                         last_selected.then(|| sdu.chan_alloc.clone()).flatten(),
                         sdu.aie_request,
                         last_selected.then(|| attempt_reporter.clone()),
@@ -1579,7 +1710,20 @@ impl Llc {
             }
         }
         for (issi, failed_ns) in failed_links {
-            self.close_failed_advanced_link(queue, issi, failed_ns, "T.252 acknowledgement recovery exhausted");
+            self.begin_advanced_link_reset(queue, issi, failed_ns, "T.252 acknowledgement recovery exhausted");
+            activity = true;
+        }
+        for issi in setup_failures {
+            if let Some(mut link) = self.advanced_links.remove(&issi) {
+                for sdu in link.tx.drain(..) {
+                    Self::mark_reporter_lost(&sdu.reporter);
+                }
+            }
+            tracing::warn!(
+                issi,
+                retries = N262_AL_MAX_CONNECTION_SETUP_RETRIES,
+                "in-place advanced-link reset failed after T.261 retries; leaving link idle"
+            );
             activity = true;
         }
         activity
@@ -2386,6 +2530,25 @@ mod tests {
         llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
     }
 
+    fn receive_advanced_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, ns: u8, payload: BitBuffer) {
+        let segments = Llc::advanced_segments(payload);
+        for (index, mut segment) in segments.iter().cloned().enumerate() {
+            let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
+            AlDataHeader {
+                final_segment: index + 1 == segments.len(),
+                acknowledgement_requested: index + 1 == segments.len(),
+                ns,
+                segment: index as u8,
+            }
+            .to_bitbuf(&mut pdu)
+            .unwrap();
+            let length = segment.get_len_remaining();
+            pdu.copy_bits(&mut segment, length);
+            pdu.seek(0);
+            llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
+        }
+    }
+
     fn queue_advanced_downlink(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, payload: &str) -> TxReporter {
         let reporter = TxReporter::new();
         llc.rx_tla_tldata_req_bl(
@@ -2415,25 +2578,6 @@ mod tests {
             ),
         );
         reporter
-    }
-
-    fn receive_advanced_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, ns: u8, payload: BitBuffer) {
-        let segments = Llc::advanced_segments(payload);
-        for (index, mut segment) in segments.iter().cloned().enumerate() {
-            let mut pdu = BitBuffer::new_autoexpand(AL_NON_FINAL_SEGMENT_CANDIDATES[0] + 24);
-            AlDataHeader {
-                final_segment: index + 1 == segments.len(),
-                acknowledgement_requested: index + 1 == segments.len(),
-                ns,
-                segment: index as u8,
-            }
-            .to_bitbuf(&mut pdu)
-            .unwrap();
-            let length = segment.get_len_remaining();
-            pdu.copy_bits(&mut segment, length);
-            pdu.seek(0);
-            llc.rx_tma_unitdata_ind(queue, advanced_indication(issi, pdu));
-        }
     }
 
     #[test]
@@ -2803,7 +2947,7 @@ mod tests {
         );
         assert_eq!(
             second.associated_channel.map(|route| (route.call_id, route.timeslot, route.usage)),
-            Some((32, 3, 55))
+            Some((32, 2, 55))
         );
 
         let mut ack = BitBuffer::new_autoexpand(16);
@@ -2847,84 +2991,43 @@ mod tests {
     }
 
     #[test]
-    fn packet_advanced_link_uses_negotiated_tlsdu_window() {
+    fn packet_advanced_link_submits_only_one_tlsdu_at_a_time() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
-        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 3;
         while queue.pop_front().is_some() {}
 
-        let mut reporters = Vec::new();
-        for bit in ["0", "1", "0", "1"] {
-            reporters.push(queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(240)));
+        for payload in ["0".repeat(240), "1".repeat(240)] {
+            let reporter = TxReporter::new();
+            llc.rx_tla_tldata_req_bl(
+                &mut queue,
+                SapMsg::new(
+                    Sap::TlaSap,
+                    TetraEntity::Mle,
+                    TetraEntity::Llc,
+                    SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                        main_address: TetraAddress::issi(77_468),
+                        link_id: 0,
+                        endpoint_id: 7,
+                        tl_sdu: BitBuffer::from_bitstr(&payload),
+                        stealing_permission: false,
+                        subscriber_class: 0,
+                        fcs_flag: true,
+                        packet_data_flag: true,
+                        air_interface_encryption: None,
+                        stealing_repeats_flag: None,
+                        data_class_info: None,
+                        req_handle: 0,
+                        graceful_degradation: None,
+                        chan_alloc: None,
+                        associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                        tx_reporter: Some(reporter),
+                    }),
+                ),
+            );
         }
 
         assert!(llc.submit_advanced_link_messages(&mut queue));
-        let mut queued_ns = queue
-            .iter_mut()
-            .filter_map(|message| {
-                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
-                    return None;
-                };
-                AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok().map(|header| header.ns)
-            })
-            .collect::<Vec<_>>();
-        queued_ns.sort_unstable();
-        queued_ns.dedup();
-        assert_eq!(queued_ns, vec![0, 1, 2]);
-        assert!(
-            llc.advanced_links[&77_468]
-                .tx
-                .iter()
-                .take(3)
-                .all(|sdu| sdu.attempt_reporter.is_some())
-        );
-        assert!(llc.advanced_links[&77_468].tx[3].attempt_reporter.is_none());
-
-        let mut ack = BitBuffer::new_autoexpand(16);
-        AlAck {
-            receiver_ready: true,
-            blocks: vec![AlAckBlock {
-                nr: 0,
-                acknowledgement_length: 0,
-                first_missing_segment: None,
-                acknowledgement_bitmap: Vec::new(),
-            }],
-        }
-        .to_bitbuf(&mut ack)
-        .unwrap();
-        ack.seek(0);
-        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
-
-        while queue.pop_front().is_some() {}
-        assert!(llc.submit_advanced_link_messages(&mut queue));
-        let queued_ns = queue
-            .iter_mut()
-            .filter_map(|message| {
-                let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
-                    return None;
-                };
-                AlDataHeader::from_bitbuf(&mut request.pdu.clone()).ok().map(|header| header.ns)
-            })
-            .collect::<Vec<_>>();
-        assert!(!queued_ns.is_empty());
-        assert!(queued_ns.iter().all(|ns| *ns == 3));
-        assert_eq!(reporters[0].get_state(), TxState::Acknowledged);
-        assert!(reporters[1..].iter().all(|reporter| reporter.get_state() == TxState::Pending));
-    }
-
-    #[test]
-    fn packet_advanced_link_window_one_remains_stop_and_wait() {
-        let mut llc = Llc::new(test_config());
-        let mut queue = MessageQueue::new();
-        establish_advanced_link(&mut llc, &mut queue, 77_468);
-        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 1;
-        while queue.pop_front().is_some() {}
-
-        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"0".repeat(240));
-        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"1".repeat(240));
-        assert!(llc.submit_advanced_link_messages(&mut queue));
-
         let queued_ns = queue
             .iter_mut()
             .filter_map(|message| {
@@ -2940,113 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_retry_exhaustion_fails_window_and_restarts_sequence_after_new_setup() {
-        let mut llc = Llc::new(test_config());
-        let mut queue = MessageQueue::new();
-        establish_advanced_link(&mut llc, &mut queue, 77_468);
-        {
-            let link = llc.advanced_links.get_mut(&77_468).unwrap();
-            link.window_size = 3;
-            link.max_sdu_retransmissions = 0;
-            link.max_segment_retransmissions = 0;
-        }
-        while queue.pop_front().is_some() {}
-
-        let reporters = ["0", "1", "0"].map(|bit| queue_advanced_downlink(&mut llc, &mut queue, 77_468, &bit.repeat(240)));
-        assert!(llc.submit_advanced_link_messages(&mut queue));
-        while queue.pop_front().is_some() {}
-
-        let mut ack = BitBuffer::new_autoexpand(16);
-        AlAck {
-            receiver_ready: true,
-            blocks: vec![AlAckBlock {
-                nr: 0,
-                acknowledgement_length: 1,
-                first_missing_segment: Some(0),
-                acknowledgement_bitmap: Vec::new(),
-            }],
-        }
-        .to_bitbuf(&mut ack)
-        .unwrap();
-        ack.seek(0);
-        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
-
-        assert!(!llc.advanced_links.contains_key(&77_468));
-        assert!(reporters.iter().all(|reporter| reporter.get_state() == TxState::Lost));
-        let SapMsgInner::TmaUnitdataReq(mut close) = queue.pop_front().expect("AL-DISC close").msg else {
-            panic!("expected TMA request")
-        };
-        let close = AlDisconnect::from_bitbuf(&mut close.pdu).unwrap();
-        assert_eq!(close.report, 1);
-        assert!(queue.pop_front().is_none());
-
-        // The peer can establish a fresh link after Close. Both sequence
-        // directions start at zero, so an abandoned N(S) cannot leave a
-        // permanent hole in the new receive window.
-        establish_advanced_link(&mut llc, &mut queue, 77_468);
-        while queue.pop_front().is_some() {}
-        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"1".repeat(240));
-        assert!(llc.submit_advanced_link_messages(&mut queue));
-        let SapMsgInner::TmaUnitdataReq(mut first) = queue.pop_front().expect("fresh AL-DATA").msg else {
-            panic!("expected TMA request")
-        };
-        assert_eq!(AlDataHeader::from_bitbuf(&mut first.pdu).unwrap().ns, 0);
-    }
-
-    #[test]
-    fn al_disconnect_success_is_not_echoed() {
-        let mut llc = Llc::new(test_config());
-        let mut queue = MessageQueue::new();
-        establish_advanced_link(&mut llc, &mut queue, 77_468);
-        while queue.pop_front().is_some() {}
-
-        let mut success = BitBuffer::new_autoexpand(16);
-        AlDisconnect {
-            acknowledged: true,
-            link_number: 0,
-            report: 0,
-        }
-        .to_bitbuf(&mut success);
-        success.seek(0);
-        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, success));
-
-        assert!(!llc.advanced_links.contains_key(&77_468));
-        assert!(
-            queue.pop_front().is_none(),
-            "AL-DISC Success must complete rather than restart the handshake"
-        );
-    }
-
-    #[test]
-    fn packet_advanced_link_rnr_stops_new_tlsdus() {
-        let mut llc = Llc::new(test_config());
-        let mut queue = MessageQueue::new();
-        establish_advanced_link(&mut llc, &mut queue, 77_468);
-        while queue.pop_front().is_some() {}
-
-        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"0".repeat(240));
-        let mut rnr = BitBuffer::new_autoexpand(16);
-        AlAck {
-            receiver_ready: false,
-            blocks: vec![AlAckBlock {
-                nr: 0,
-                acknowledgement_length: 1,
-                first_missing_segment: Some(0),
-                acknowledgement_bitmap: Vec::new(),
-            }],
-        }
-        .to_bitbuf(&mut rnr)
-        .unwrap();
-        rnr.seek(0);
-        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, rnr));
-
-        assert!(!llc.submit_advanced_link_messages(&mut queue));
-        assert!(queue.iter_mut().next().is_none());
-        assert!(llc.advanced_links[&77_468].tx[0].attempt_reporter.is_none());
-    }
-
-    #[test]
-    fn queued_advanced_downlink_uses_the_current_pdch_width() {
+    fn queued_advanced_downlink_keeps_all_segments_on_one_live_pdch() {
         let config = test_config();
         let mut llc = Llc::new(config.clone());
         let mut queue = MessageQueue::new();
@@ -3081,7 +3078,8 @@ mod tests {
         );
 
         // Voice takes TS4 after this TL-SDU entered LLC but before its
-        // segments are submitted. None of those segments may retain TS4.
+        // segments are submitted.  TS2 remains live, so every segment must
+        // retain the original route instead of being striped across TS2/TS3.
         config
             .state_write()
             .subscriber_packet_delivery_routes
@@ -3099,7 +3097,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(routes.len() >= 4);
-        assert!(routes.iter().all(|timeslot| matches!(timeslot, 2 | 3)));
+        assert!(routes.iter().all(|timeslot| *timeslot == 2));
+    }
+
+    #[test]
+    fn queued_advanced_downlink_moves_the_whole_tlsdu_to_one_live_pdch_after_resize() {
+        let config = test_config();
+        let mut llc = Llc::new(config.clone());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        let reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(400));
+
+        // TS2 was the preferred packet route when SNDCP queued the TL-SDU,
+        // but a resize assigned it to voice before LLC could submit the
+        // segments.  TS3 is now the first still-valid route for this same
+        // bearer.  The chain must move as a whole, never segment by segment.
+        config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .get_mut(&77_468)
+            .unwrap()
+            .retain(|route| route.timeslot != 2);
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let routes = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &message.msg else {
+                    return None;
+                };
+                request.associated_channel.map(|route| route.timeslot)
+            })
+            .collect::<Vec<_>>();
+        assert!(routes.len() >= 4);
+        assert!(routes.iter().all(|timeslot| *timeslot == 3));
+        assert_eq!(reporter.get_state(), TxState::Pending);
     }
 
     #[test]
@@ -3163,11 +3196,90 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_ack_recovery_resets_link_in_place_and_waits_for_success() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        llc.advanced_links.get_mut(&77_468).unwrap().max_sdu_retransmissions = 0;
+
+        let reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(400));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+        llc.advanced_links[&77_468].tx[0]
+            .attempt_reporter
+            .as_ref()
+            .unwrap()
+            .mark_transmitted();
+        llc.submit_advanced_link_messages(&mut queue);
+        {
+            let pending = &mut llc.advanced_links.get_mut(&77_468).unwrap().tx[0];
+            pending.ack_request_repetitions = MAX_AL_ACK_REQUEST_REPEATS;
+        }
+        llc.dltime = llc.dltime.add_timeslots(T252_ACK_WAITING_TIMER as i32);
+
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        assert_eq!(reporter.get_state(), TxState::Lost);
+        let link = &llc.advanced_links[&77_468];
+        assert!(link.reset.is_some());
+        assert!(link.tx.is_empty());
+        assert_eq!((link.next_tx_ns, link.next_rx_ns), (0, 0));
+        let SapMsgInner::TmaUnitdataReq(mut reset) = queue.pop_front().expect("AL-SETUP reset").msg else {
+            panic!("expected TMA request")
+        };
+        let reset = AlSetup::from_bitbuf(&mut reset.pdu).unwrap();
+        assert_eq!(reset.report, 3);
+        assert!(queue.pop_front().is_none());
+
+        let queued_after_reset = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"01".repeat(128));
+        assert!(!llc.submit_advanced_link_messages(&mut queue));
+        assert!(queue.pop_front().is_none(), "new data must wait for AL-SETUP Success");
+        assert_eq!(queued_after_reset.get_state(), TxState::Pending);
+
+        let mut success = BitBuffer::new_autoexpand(32);
+        AlSetup { report: 0, ..reset }.to_bitbuf(&mut success).unwrap();
+        success.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, success));
+        let link = &llc.advanced_links[&77_468];
+        assert!(link.reset.is_none());
+        assert!(link.receiver_ready);
+        assert!(
+            queue.pop_front().is_none(),
+            "AL-SETUP Success must complete without another response"
+        );
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let SapMsgInner::TmaUnitdataReq(mut first) = queue.pop_front().expect("first post-reset AL-DATA").msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(AlDataHeader::from_bitbuf(&mut first.pdu).unwrap().ns, 0);
+    }
+
+    #[test]
+    fn al_disconnect_success_is_not_echoed() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+
+        let mut success = BitBuffer::new_autoexpand(16);
+        AlDisconnect {
+            acknowledged: true,
+            link_number: 0,
+            report: 0,
+        }
+        .to_bitbuf(&mut success);
+        success.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, success));
+
+        assert!(!llc.advanced_links.contains_key(&77_468));
+        assert!(queue.pop_front().is_none(), "AL-DISC Success must complete without a response");
+    }
+
+    #[test]
     fn advanced_downlink_ignores_ack_blocks_for_unsent_tlsdus() {
         let mut llc = Llc::new(test_config());
         let mut queue = MessageQueue::new();
         establish_advanced_link(&mut llc, &mut queue, 77_468);
-        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 1;
         while queue.pop_front().is_some() {}
         let mut reporters = Vec::new();
         for bit in ["0", "1"] {
