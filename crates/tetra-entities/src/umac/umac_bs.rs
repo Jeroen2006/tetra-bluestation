@@ -16,6 +16,7 @@ use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 use tetra_pdus::umac::enums::mac_pdu_type::MacPduType;
+use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
 use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
@@ -1001,6 +1002,40 @@ impl UmacBs {
         }
     }
 
+    fn handle_uplink_capacity_request(
+        &mut self,
+        ul_time: TdmaTime,
+        addr: TetraAddress,
+        res_req: ReservationRequirement,
+        continues_fragment: bool,
+    ) {
+        if self
+            .channel_scheduler
+            .queue_packet_data_capacity_request(ul_time, addr, res_req, continues_fragment)
+        {
+            return;
+        }
+
+        let active_traffic_channel = self.channel_scheduler.circuit_is_active(Direction::Dl, ul_time.t)
+            && !self.channel_scheduler.is_hangtime(ul_time.t)
+            && (2..=4).contains(&ul_time.t);
+        if active_traffic_channel {
+            self.channel_scheduler.dl_enqueue_associated_grant_request(ul_time.t, addr, res_req);
+            return;
+        }
+
+        let grant = if continues_fragment {
+            self.channel_scheduler.ul_process_fragment_cap_req(ul_time.t, addr, &res_req)
+        } else {
+            self.channel_scheduler.ul_process_cap_req(ul_time.t, addr, &res_req)
+        };
+        if let Some(grant) = grant {
+            self.channel_scheduler.dl_enqueue_grant(ul_time.t, addr, grant);
+        } else {
+            tracing::debug!(?addr, %ul_time, ?res_req, "no grant available for uplink capacity request");
+        }
+    }
+
     fn rx_mac_data(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_mac_data");
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
@@ -1093,6 +1128,9 @@ impl UmacBs {
             let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
             let rf_observation = prim.rf_observation.take();
             self.observe_control_rf(decoded_issi, prim.ul_time, prim.block_num, rf_observation, true);
+            if self.channel_scheduler.packet_bearer_is_active(prim.ul_time.t) && addr.ssi_type == SsiType::Issi {
+                self.channel_scheduler.clear_pending_packet_data_capacity(addr.ssi, prim.ul_time);
+            }
             // TODO not sure if there is scenarios in which we want to pass a null pdu to the LLC
             // tracing::warn!("rx_mac_data: Null PDU not passed to LLC");
             return;
@@ -1165,28 +1203,11 @@ impl UmacBs {
         let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
         let rf_observation = prim.rf_observation.take();
         self.observe_control_rf(decoded_issi, msg_dltime, prim.block_num, rf_observation, true);
-        if let Some(res_req) = &pdu.reservation_req {
-            // During a call, queue only the request. The associated FN18 may
-            // be deferred by mandatory BSCH/BNCH; building the grant now
-            // would reserve a different target FN18 than the one the MS sees.
-            let active_assigned_channel =
-                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
-            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
-                self.channel_scheduler
-                    .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
-            } else if let Some(grant) = if is_frag_start {
-                self.channel_scheduler.ul_process_fragment_cap_req(msg_dltime.t, addr, res_req)
-            } else {
-                self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req)
-            } {
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
-            } else {
-                // None also means an earlier grant already covers this
-                // request, or that a downlink transfer temporarily has the
-                // half-duplex turn. The scheduler logs the exact reason.
-                tracing::debug!("rx_mac_data: No new grant for reservation request {:?}", res_req);
-            }
-        };
+        if let Some(res_req) = pdu.reservation_req {
+            self.handle_uplink_capacity_request(msg_dltime, addr, res_req, is_frag_start);
+        } else if self.channel_scheduler.packet_bearer_is_active(msg_dltime.t) && addr.ssi_type == SsiType::Issi {
+            self.channel_scheduler.clear_pending_packet_data_capacity(addr.ssi, msg_dltime);
+        }
 
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
         if is_frag_start {
@@ -1320,6 +1341,9 @@ impl UmacBs {
             let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
             let rf_observation = prim.rf_observation.take();
             self.observe_control_rf(decoded_issi, prim.ul_time, prim.block_num, rf_observation, true);
+            if self.channel_scheduler.packet_bearer_is_active(prim.ul_time.t) && addr.ssi_type == SsiType::Issi {
+                self.channel_scheduler.clear_pending_packet_data_capacity(addr.ssi, prim.ul_time);
+            }
             // tracing::warn!("rx_mac_access: Null PDU not passed to LLC");
             return;
         }
@@ -1454,24 +1478,14 @@ impl UmacBs {
         }
 
         // Handle reservation if present
-        if let (Some(issi), Some(res_req)) = (issi, &pdu.reservation_req) {
+        if let (Some(issi), Some(res_req)) = (issi, pdu.reservation_req) {
             let addr = TetraAddress::issi(issi);
-            if in_active_over && (2..=4).contains(&msg_dltime.t) {
-                // Defer both grant construction and reservation until the
-                // actual associated FN18 is transmitted. This keeps the BS
-                // reservation aligned when BSCH/BNCH defers the queue.
-                self.channel_scheduler
-                    .dl_enqueue_associated_grant_request(msg_dltime.t, addr, *res_req);
-            } else if let Some(grant) = if pdu.is_frag_start() {
-                self.channel_scheduler.ul_process_fragment_cap_req(msg_dltime.t, addr, res_req)
-            } else {
-                self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req)
-            } {
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
-            } else {
-                tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
-            }
-        };
+            self.handle_uplink_capacity_request(msg_dltime, addr, res_req, pdu.is_frag_start());
+        } else if let Some(issi) = issi
+            && self.channel_scheduler.packet_bearer_is_active(msg_dltime.t)
+        {
+            self.channel_scheduler.clear_pending_packet_data_capacity(issi, msg_dltime);
+        }
 
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
         if pdu.is_frag_start() {
@@ -1706,18 +1720,12 @@ impl UmacBs {
         };
 
         // Handle reservation if present
-        if let Some(res_req) = &pdu.reservation_req {
-            let active_assigned_channel =
-                self.channel_scheduler.assigned_channel_is_active(msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
-            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
-                self.channel_scheduler
-                    .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
-            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req) {
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
-            } else {
-                tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
-            }
-        };
+        if let Some(res_req) = pdu.reservation_req {
+            self.handle_uplink_capacity_request(msg_dltime, defragbuf.addr, res_req, false);
+        } else if self.channel_scheduler.packet_bearer_is_active(msg_dltime.t) && defragbuf.addr.ssi_type == SsiType::Issi {
+            self.channel_scheduler
+                .clear_pending_packet_data_capacity(defragbuf.addr.ssi, msg_dltime);
+        }
 
         // Pass completed block to LLC
         tracing::debug!("rx_mac_end_ul: sdu: {:?}", defragbuf.buffer.dump_bin());
@@ -1854,18 +1862,12 @@ impl UmacBs {
         };
 
         // Handle reservation if present
-        if let Some(res_req) = &pdu.reservation_req {
-            let active_assigned_channel =
-                self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) && !self.channel_scheduler.is_hangtime(msg_dltime.t);
-            if active_assigned_channel && (2..=4).contains(&msg_dltime.t) {
-                self.channel_scheduler
-                    .dl_enqueue_associated_grant_request(msg_dltime.t, defragbuf.addr, *res_req);
-            } else if let Some(grant) = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req) {
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
-            } else {
-                tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
-            }
-        };
+        if let Some(res_req) = pdu.reservation_req {
+            self.handle_uplink_capacity_request(msg_dltime, defragbuf.addr, res_req, false);
+        } else if self.channel_scheduler.packet_bearer_is_active(msg_dltime.t) && defragbuf.addr.ssi_type == SsiType::Issi {
+            self.channel_scheduler
+                .clear_pending_packet_data_capacity(defragbuf.addr.ssi, msg_dltime);
+        }
 
         // Pass completed block to LLC
         tracing::debug!("rx_mac_end_hu: sdu: {:?}", defragbuf.buffer.dump_bin());
@@ -3091,18 +3093,23 @@ impl UmacBs {
                 bearer_id,
                 generation,
                 timeslot_bitmap,
-            }
-            | PacketBearerControl::Resize {
-                bearer_id,
-                generation,
-                timeslot_bitmap,
             } => {
-                self.channel_scheduler.close_packet_bearer(bearer_id, generation);
                 if !self.channel_scheduler.open_packet_bearer(bearer_id, generation, timeslot_bitmap) {
                     tracing::warn!(bearer_id, generation, "ignoring stale packet bearer activation");
                     return;
                 }
                 tracing::info!(bearer_id, generation, timeslot_bitmap, "packet bearer active");
+            }
+            PacketBearerControl::Resize {
+                bearer_id,
+                generation,
+                timeslot_bitmap,
+            } => {
+                if !self.channel_scheduler.open_packet_bearer(bearer_id, generation, timeslot_bitmap) {
+                    tracing::warn!(bearer_id, generation, "ignoring stale packet bearer resize");
+                    return;
+                }
+                tracing::info!(bearer_id, generation, timeslot_bitmap, "packet bearer resized");
             }
             PacketBearerControl::Attach {
                 bearer_id,
@@ -3124,10 +3131,16 @@ impl UmacBs {
                 event_label,
             } => {
                 if self.channel_scheduler.packet_bearers_match(bearer_id, generation) {
+                    if let Some(addr) = self.event_label_store.get_addr_by_label(event_label)
+                        && addr.ssi_type == SsiType::Issi
+                    {
+                        self.channel_scheduler.detach_packet_data_terminal(addr.ssi);
+                    }
                     self.event_label_store.remove(event_label);
                 }
             }
             PacketBearerControl::Drain { bearer_id, generation } => {
+                self.channel_scheduler.set_packet_bearer_draining(bearer_id, generation);
                 tracing::info!(bearer_id, generation, "packet bearer draining; new packet grants disabled");
             }
             PacketBearerControl::Close {

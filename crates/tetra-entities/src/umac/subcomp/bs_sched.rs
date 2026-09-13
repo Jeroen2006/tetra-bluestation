@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie};
 use tetra_core::{
@@ -62,17 +62,33 @@ const MAX_BASIC_SLOT_GRANT_DELAY: usize = 13;
 /// Capacity values that have an exact Basic slot granting encoding.
 const EXACT_BASIC_SLOT_GRANT_CAPACITIES: [usize; 14] = [1, 2, 3, 4, 5, 6, 8, 10, 13, 17, 24, 34, 51, 68];
 
-/// With two assigned PDCH slots, keep each uplink allocation short enough to
-/// leave useful receive opportunities for a frequency half-duplex terminal.
-const PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS: usize = 4;
+/// Keep an ordinary packet-data uplink turn within six TDMA frames.  This
+/// leaves regular receive opportunities for a frequency-simplex terminal
+/// without reducing a three-slot PDCH to one-slot grants.
+const PACKET_DATA_UPLINK_TURN_TIMESLOTS: i32 = 6 * 4;
 
-/// When downlink work is waiting for a frequency half-duplex packet-data MS,
-/// grant exactly one new uplink opportunity at a time.  TTR 001-05 §6.10.2
-/// requires the SwMI to keep both signalling directions moving.  Refusing
-/// every new grant here can strand TCP acknowledgements until the downlink
-/// queue drains, while an unrestricted multi-slot grant can strand downlink
-/// for an entire uplink burst.
-const PACKET_DATA_BIDIRECTIONAL_MAX_GRANT_SLOTS: usize = 1;
+/// After the mandatory one-slot switching guard, leave one complete TDMA
+/// frame in which the terminal can receive acknowledgements and service
+/// signalling before announcing another uplink turn.
+const PACKET_DATA_RECEIVE_TURN_TIMESLOTS: i32 = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPacketDataGrant {
+    addr: TetraAddress,
+    bearer: (u64, u64),
+    request_time: TdmaTime,
+    remaining_slots: usize,
+    is_halfslot: bool,
+    continues_fragment: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PacketDataGrantWindow {
+    bearer: (u64, u64),
+    first_uplink: TdmaTime,
+    last_uplink: TdmaTime,
+    next_grant_downlink: TdmaTime,
+}
 
 /// Select the SYSINFO variant for an actual BNCH transmission.
 ///
@@ -180,6 +196,17 @@ pub struct BsChannelScheduler {
     /// Highest generation observed for each bearer id. Tombstones remain
     /// after close so a delayed Open cannot resurrect an older bearer.
     packet_bearer_generations: HashMap<u64, u64>,
+    /// Latest unsatisfied total-capacity report per terminal.  Repeated MAC
+    /// reservation requirements replace rather than add to this value.
+    pending_packet_data_grants: HashMap<u32, PendingPacketDataGrant>,
+    /// Complete basic-grant interval per terminal, including gaps caused by
+    /// non-PDCH timeslots or CLCH.  A frequency-simplex terminal cannot
+    /// receive addressed signalling inside this interval.
+    packet_data_grant_windows: HashMap<u32, PacketDataGrantWindow>,
+    /// Bearers in drain keep carrying their final downlink control, but no
+    /// longer receive new ordinary packet-data uplink grants.
+    draining_packet_bearers: HashSet<(u64, u64)>,
+    packet_grant_round_robin_after: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -269,6 +296,10 @@ impl BsChannelScheduler {
             traffic_aie: [None; 4],
             packet_bearers: [None; 4],
             packet_bearer_generations: HashMap::new(),
+            pending_packet_data_grants: HashMap::new(),
+            packet_data_grant_windows: HashMap::new(),
+            draining_packet_bearers: HashSet::new(),
+            packet_grant_round_robin_after: None,
         }
     }
 
@@ -281,6 +312,9 @@ impl BsChannelScheduler {
             return false;
         }
         self.packet_bearer_generations.insert(bearer_id, generation);
+        self.draining_packet_bearers.retain(|(id, _)| *id != bearer_id);
+        self.pending_packet_data_grants
+            .retain(|_, request| request.bearer.0 != bearer_id || request.bearer.1 == generation);
         for slot in &mut self.packet_bearers {
             if slot.is_some_and(|(id, _)| id == bearer_id) {
                 *slot = None;
@@ -303,7 +337,22 @@ impl BsChannelScheduler {
                 *slot = None;
             }
         }
+        self.pending_packet_data_grants
+            .retain(|_, request| request.bearer != (bearer_id, generation));
+        self.draining_packet_bearers.remove(&(bearer_id, generation));
         true
+    }
+
+    pub fn set_packet_bearer_draining(&mut self, bearer_id: u64, generation: u64) {
+        if self.packet_bearers_match(bearer_id, generation) {
+            self.draining_packet_bearers.insert((bearer_id, generation));
+            self.pending_packet_data_grants
+                .retain(|_, request| request.bearer != (bearer_id, generation));
+        }
+    }
+
+    pub fn detach_packet_data_terminal(&mut self, issi: u32) {
+        self.pending_packet_data_grants.remove(&issi);
     }
 
     pub fn packet_bearer_is_active(&self, timeslot: u8) -> bool {
@@ -692,6 +741,9 @@ impl BsChannelScheduler {
         self.assoc_dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         self.ulsched = EMPTY_SCHED;
         self.associated_ulsched.clear();
+        self.pending_packet_data_grants.clear();
+        self.packet_data_grant_windows.clear();
+        self.packet_grant_round_robin_after = None;
     }
 
     /// Sets the current downlink time to the given TdmaTime
@@ -724,6 +776,33 @@ impl BsChannelScheduler {
             .collect()
     }
 
+    fn packet_bearer_for_timeslot(&self, timeslot: u8) -> Option<(u64, u64)> {
+        self.packet_bearers.get(timeslot as usize - 1).copied().flatten()
+    }
+
+    fn packet_data_request_slots(res_req: ReservationRequirement) -> (usize, bool) {
+        match res_req {
+            ReservationRequirement::Req1Subslot => (1, true),
+            ReservationRequirement::Req1Slot => (1, false),
+            ReservationRequirement::Req2Slots => (2, false),
+            ReservationRequirement::Req3Slots => (3, false),
+            ReservationRequirement::Req4Slots => (4, false),
+            ReservationRequirement::Req5Slots => (5, false),
+            ReservationRequirement::Req6Slots => (6, false),
+            ReservationRequirement::Req8Slots => (8, false),
+            ReservationRequirement::Req10Slots => (10, false),
+            ReservationRequirement::Req13Slots => (13, false),
+            ReservationRequirement::Req17Slots => (17, false),
+            ReservationRequirement::Req24Slots => (24, false),
+            ReservationRequirement::Req34Slots => (34, false),
+            ReservationRequirement::Req51Slots => (51, false),
+            ReservationRequirement::Req68Slots => (68, false),
+            // The all-ones encoding is a lower bound, not a request for an
+            // arbitrary sentinel quantity.
+            ReservationRequirement::ReqOver68 => (69, false),
+        }
+    }
+
     /// Count full uplink slots already reserved for this terminal after the
     /// reservation request. A packet-data MS reports the total remaining
     /// need in each following MAC-DATA capacity request; treating every
@@ -738,6 +817,257 @@ impl BsChannelScheduler {
                 elem.ul1 == Some(ssi) && elem.ul2 == Some(ssi)
             })
             .count()
+    }
+
+    fn record_packet_data_grant_window(&mut self, ssi: u32, bearer: (u64, u64), first_uplink: TdmaTime, last_uplink: TdmaTime) {
+        // Uplink timing is represented two logical timeslots before the
+        // physically overlapping downlink timing.  Consequently the three
+        // forbidden DL positions around an UL slot are UL+1, UL+2 and UL+3.
+        // The first free DL position is last+4; reserve a complete frame from
+        // there before another ordinary grant may be sent.
+        let next_grant_downlink = last_uplink.add_timeslots(4 + PACKET_DATA_RECEIVE_TURN_TIMESLOTS);
+        let window = PacketDataGrantWindow {
+            bearer,
+            first_uplink,
+            last_uplink,
+            next_grant_downlink,
+        };
+        self.packet_data_grant_windows.insert(ssi, window);
+        tracing::debug!(
+            issi = ssi,
+            bearer_id = bearer.0,
+            generation = bearer.1,
+            first_uplink = %first_uplink,
+            last_uplink = %last_uplink,
+            next_grant_downlink = %next_grant_downlink,
+            "recorded frequency-simplex packet-data grant interval"
+        );
+    }
+
+    fn packet_data_downlink_is_blocked(&self, issi: u32, downlink: TdmaTime) -> bool {
+        self.packet_data_grant_windows.get(&issi).is_some_and(|window| {
+            let blocked_from = window.first_uplink.add_timeslots(1);
+            let blocked_through = window.last_uplink.add_timeslots(3);
+            downlink.diff(blocked_from) >= 0 && blocked_through.diff(downlink) >= 0
+        })
+    }
+
+    /// Store the latest total remaining need reported by a packet-data MS.
+    /// The report includes future slots that have already been granted, so
+    /// only the shortfall is retained for the next uplink turn.
+    pub fn queue_packet_data_capacity_request(
+        &mut self,
+        request_time: TdmaTime,
+        addr: TetraAddress,
+        res_req: ReservationRequirement,
+        continues_fragment: bool,
+    ) -> bool {
+        let Some(bearer) = self.packet_bearer_for_timeslot(request_time.t) else {
+            return false;
+        };
+        if self.draining_packet_bearers.contains(&bearer) {
+            tracing::debug!(?addr, %request_time, bearer_id = bearer.0, "ignoring new packet-data grant while bearer drains");
+            return true;
+        }
+
+        let (requested_slots, is_halfslot) = Self::packet_data_request_slots(res_req);
+        let pdch_slots = self.basic_grant_timeslots(request_time.t);
+        let already_granted = if is_halfslot {
+            0
+        } else {
+            self.pending_packet_data_full_slot_grants_after(request_time, &pdch_slots, addr.ssi)
+        };
+        let shortfall = requested_slots.saturating_sub(already_granted);
+        if shortfall == 0 {
+            self.pending_packet_data_grants.remove(&addr.ssi);
+            tracing::debug!(
+                ?addr,
+                %request_time,
+                requested_slots,
+                already_granted,
+                "current packet-data grant covers latest reservation requirement"
+            );
+            return true;
+        }
+
+        self.pending_packet_data_grants.insert(
+            addr.ssi,
+            PendingPacketDataGrant {
+                addr,
+                bearer,
+                request_time,
+                remaining_slots: shortfall,
+                is_halfslot,
+                continues_fragment,
+            },
+        );
+        tracing::debug!(
+            ?addr,
+            %request_time,
+            requested_slots,
+            already_granted,
+            shortfall,
+            continues_fragment,
+            "queued packet-data capacity shortfall"
+        );
+        true
+    }
+
+    /// An uplink MAC block without a reservation requirement releases any
+    /// unannounced remainder.  Announced slots stay reserved until their
+    /// natural end because the BS cannot withdraw capacity already granted.
+    pub fn clear_pending_packet_data_capacity(&mut self, issi: u32, uplink: TdmaTime) {
+        if self.pending_packet_data_grants.remove(&issi).is_some() {
+            tracing::debug!(issi, %uplink, "cleared unannounced packet-data capacity after final uplink PDU");
+        }
+    }
+
+    fn packet_data_grant_ready_at(&self, request: PendingPacketDataGrant, downlink: TdmaTime) -> bool {
+        self.packet_data_grant_windows
+            .get(&request.addr.ssi)
+            .is_none_or(|window| window.bearer != request.bearer || downlink.diff(window.next_grant_downlink) >= 0)
+    }
+
+    fn packet_data_random_access_ack_allows_slot(&self, issi: u32, timeslot: u8) -> bool {
+        let mut any_ack = false;
+        let mut ack_on_this_slot = false;
+        for (slot, queue) in self.dltx_queues.iter().enumerate() {
+            if queue
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::RandomAccessAck(addr, _) if addr.ssi_type == SsiType::Issi && addr.ssi == issi))
+            {
+                any_ack = true;
+                ack_on_this_slot |= slot == timeslot as usize - 1;
+            }
+        }
+        !any_ack || ack_on_this_slot
+    }
+
+    fn expire_packet_data_grant_windows(&mut self, now: TdmaTime) {
+        let pending = &self.pending_packet_data_grants;
+        self.packet_data_grant_windows
+            .retain(|issi, window| pending.contains_key(issi) || window.next_grant_downlink.diff(now) >= 0);
+    }
+
+    fn reserve_packet_data_turn(&mut self, grant_downlink: TdmaTime, request: PendingPacketDataGrant) -> Option<(BasicSlotgrant, usize)> {
+        let pdch_slots = self.basic_grant_timeslots(grant_downlink.t);
+        let turn_capacity = match pdch_slots.len() {
+            0 => return None,
+            1 => 6,
+            2 => 10,
+            _ => 17,
+        };
+        let maximum = request.remaining_slots.min(turn_capacity);
+        let candidate_capacities: Vec<usize> = if request.is_halfslot {
+            vec![1]
+        } else {
+            EXACT_BASIC_SLOT_GRANT_CAPACITIES
+                .iter()
+                .rev()
+                .copied()
+                .filter(|capacity| *capacity <= maximum)
+                .collect()
+        };
+
+        for granted_slots in candidate_capacities {
+            let Some((skips, grant_timestamps)) =
+                self.ul_find_grant_opportunity_from(grant_downlink, grant_downlink.t, granted_slots, request.is_halfslot, 0)
+            else {
+                continue;
+            };
+            if skips > MAX_BASIC_SLOT_GRANT_DELAY
+                || grant_timestamps
+                    .last()
+                    .is_some_and(|last| last.diff(grant_downlink) >= PACKET_DATA_UPLINK_TURN_TIMESLOTS)
+            {
+                continue;
+            }
+
+            let subslot = self.ul_reserve_grant(request.addr.ssi, grant_timestamps, request.is_halfslot);
+            let capacity_allocation = if request.is_halfslot {
+                match subslot {
+                    1 => BasicSlotgrantCapAlloc::FirstSubslotGranted,
+                    2 => BasicSlotgrantCapAlloc::SecondSubslotGranted,
+                    _ => unreachable!("subslot grant must reserve one half"),
+                }
+            } else {
+                BasicSlotgrantCapAlloc::from_req_slotcount(granted_slots)
+            };
+            let granting_delay = if skips == 0 {
+                BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
+            } else {
+                BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
+            };
+            return Some((
+                BasicSlotgrant {
+                    capacity_allocation,
+                    granting_delay,
+                },
+                granted_slots,
+            ));
+        }
+        None
+    }
+
+    /// At most one queued packet-data request is turned into an on-air grant
+    /// in a physical downlink slot.  Fragment continuations are considered
+    /// first; equal-priority terminals rotate by ISSI.
+    fn schedule_ready_packet_data_grant(&mut self, downlink: TdmaTime) {
+        if downlink.f == 18 {
+            return;
+        }
+        let Some(bearer) = self.packet_bearer_for_timeslot(downlink.t) else {
+            return;
+        };
+        if self.draining_packet_bearers.contains(&bearer) {
+            return;
+        }
+
+        let mut candidates = self
+            .pending_packet_data_grants
+            .values()
+            .copied()
+            .filter(|request| {
+                request.bearer == bearer
+                    && self.packet_data_grant_ready_at(*request, downlink)
+                    && self.packet_data_random_access_ack_allows_slot(request.addr.ssi, downlink.t)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|request| (!request.continues_fragment, request.addr.ssi));
+        if candidates.is_empty() {
+            return;
+        }
+
+        let priority = candidates[0].continues_fragment;
+        let same_priority = candidates
+            .iter()
+            .copied()
+            .filter(|request| request.continues_fragment == priority)
+            .collect::<Vec<_>>();
+        let request = self
+            .packet_grant_round_robin_after
+            .and_then(|after| same_priority.iter().copied().find(|request| request.addr.ssi > after))
+            .unwrap_or(same_priority[0]);
+
+        let Some((grant, granted_slots)) = self.reserve_packet_data_turn(downlink, request) else {
+            return;
+        };
+        if request.is_halfslot || granted_slots >= request.remaining_slots {
+            self.pending_packet_data_grants.remove(&request.addr.ssi);
+        } else if let Some(pending) = self.pending_packet_data_grants.get_mut(&request.addr.ssi) {
+            pending.remaining_slots -= granted_slots;
+        }
+        self.packet_grant_round_robin_after = Some(request.addr.ssi);
+        tracing::info!(
+            address = ?request.addr,
+            request = %request.request_time,
+            grant_downlink = %downlink,
+            requested_shortfall = request.remaining_slots,
+            granted_slots,
+            grant = ?grant,
+            "scheduled next frequency-simplex packet-data uplink turn"
+        );
+        self.dl_enqueue_grant(downlink.t, request.addr, grant);
     }
 
     /// Finds a grant opportunity for uplink transmission.
@@ -761,6 +1091,17 @@ impl BsChannelScheduler {
         minimum_delay: usize,
     ) -> Option<(usize, Vec<TdmaTime>)> {
         let first_opportunity = self.cur_dltime.forward_to_timeslot(t);
+        self.ul_find_grant_opportunity_from(first_opportunity, t, num_slots, is_halfslot, minimum_delay)
+    }
+
+    fn ul_find_grant_opportunity_from(
+        &self,
+        first_opportunity: TdmaTime,
+        t: u8,
+        num_slots: usize,
+        is_halfslot: bool,
+        minimum_delay: usize,
+    ) -> Option<(usize, Vec<TdmaTime>)> {
         let channel_timeslots = self.basic_grant_timeslots(t);
         let mut grant_timeslots = Vec::with_capacity(num_slots);
         let mut opportunities_skipped = 0;
@@ -785,13 +1126,20 @@ impl BsChannelScheduler {
                 grant_timeslots
             );
 
-            if candidate_t.is_mandatory_clch() {
-                // Not an opportunity; skip
+            if opportunities_skipped < minimum_delay {
+                opportunities_skipped += 1;
                 continue;
             }
 
-            if opportunities_skipped < minimum_delay {
-                opportunities_skipped += 1;
+            if candidate_t.is_mandatory_clch() {
+                // A predefined CLCH is included when counting granting-delay
+                // opportunities, but it is skipped while consuming granted
+                // full-slot capacity.  Before the grant starts it therefore
+                // advances the encoded delay; inside a grant it creates a
+                // permitted hole without ending the basic allocation.
+                if grant_timeslots.is_empty() {
+                    opportunities_skipped += 1;
+                }
                 continue;
             }
 
@@ -832,6 +1180,9 @@ impl BsChannelScheduler {
         assert!(!grant_timestamps.is_empty());
         assert!(!is_halfslot || grant_timestamps.len() == 1);
         // let ts = grant_timestamps[0].t as usize;
+        let first_uplink = grant_timestamps[0];
+        let last_uplink = *grant_timestamps.last().expect("non-empty grant");
+        let mut subslot = 0;
         for ts in grant_timestamps {
             let index = self.ul_ts_to_sched_index(&ts);
 
@@ -839,11 +1190,11 @@ impl BsChannelScheduler {
             if is_halfslot {
                 if elem.ul1.is_none() {
                     elem.ul1 = Some(ssi);
-                    return 1;
+                    subslot = 1;
                 } else {
                     assert!(elem.ul2.is_none(), "ul_reserve_grant: ul2 already set for ts {:?}, ssi {}", ts, ssi);
                     elem.ul2 = Some(ssi);
-                    return 2;
+                    subslot = 2;
                 }
             } else {
                 assert!(elem.ul1.is_none(), "ul_reserve_grant: ul1 already set for ts {:?}, ssi {}", ts, ssi);
@@ -853,8 +1204,11 @@ impl BsChannelScheduler {
             }
         }
 
-        // Full slots reserved
-        0
+        if let Some(bearer) = self.packet_bearer_for_timeslot(first_uplink.t) {
+            self.record_packet_data_grant_window(ssi, bearer, first_uplink, last_uplink);
+        }
+
+        subslot
     }
 
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
@@ -897,11 +1251,10 @@ impl BsChannelScheduler {
         request_time: TdmaTime,
         addr: TetraAddress,
         res_req: &ReservationRequirement,
-        continues_fragment: bool,
+        _continues_fragment: bool,
     ) -> Option<BasicSlotgrant> {
         let pdch_slots = self.basic_grant_timeslots(request_time.t);
-        let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
-        let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        let (requested_cap, is_halfslot) = Self::packet_data_request_slots(*res_req);
         let pending_cap = if is_halfslot {
             0
         } else {
@@ -919,26 +1272,13 @@ impl BsChannelScheduler {
             return None;
         }
 
-        let downlink_waiting = !continues_fragment && self.has_pending_packet_data_downlink_for_issi(addr.ssi);
-        let maximum_grant = if downlink_waiting {
-            let limited = additional_cap.min(PACKET_DATA_BIDIRECTIONAL_MAX_GRANT_SLOTS);
-            if additional_cap > limited {
-                tracing::debug!(
-                    address = ?addr,
-                    request = %request_time,
-                    requested_cap,
-                    pending_cap,
-                    additional_cap,
-                    granted_cap = limited,
-                    "limiting packet-data uplink grant to preserve a downlink receive opportunity"
-                );
-            }
-            limited
-        } else if pdch_slots.len() == 2 {
-            additional_cap.min(PACKET_DATA_REDUCED_PDCH_MAX_GRANT_SLOTS)
-        } else {
-            additional_cap
+        let turn_capacity = match pdch_slots.len() {
+            0 => return None,
+            1 => 6,
+            2 => 10,
+            _ => 17,
         };
+        let maximum_grant = additional_cap.min(turn_capacity);
         let candidate_capacities: Vec<usize> = if is_halfslot {
             vec![1]
         } else {
@@ -954,7 +1294,11 @@ impl BsChannelScheduler {
             let Some((skips, grant_timestamps)) = self.ul_find_grant_opportunity_after(request_time.t, granted_cap, is_halfslot, 0) else {
                 continue;
             };
-            if skips > MAX_BASIC_SLOT_GRANT_DELAY {
+            if skips > MAX_BASIC_SLOT_GRANT_DELAY
+                || grant_timestamps
+                    .last()
+                    .is_some_and(|last| last.diff(self.cur_dltime.forward_to_timeslot(request_time.t)) >= PACKET_DATA_UPLINK_TURN_TIMESLOTS)
+            {
                 continue;
             }
             let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
@@ -1248,9 +1592,14 @@ impl BsChannelScheduler {
 
     fn packet_data_elem_issi(elem: &DlSchedElem) -> Option<u32> {
         match elem {
-            DlSchedElem::Resource(pdu, _, _, aie_request, Some(_)) => Self::aie_individual_issi(*aie_request)
+            DlSchedElem::Grant(addr, _) | DlSchedElem::RandomAccessAck(addr, _) | DlSchedElem::AssociatedGrantRequest(addr, ..)
+                if addr.ssi_type == SsiType::Issi =>
+            {
+                Some(addr.ssi)
+            }
+            DlSchedElem::Resource(pdu, _, _, aie_request, _) => Self::aie_individual_issi(*aie_request)
                 .or_else(|| pdu.addr.filter(|addr| addr.ssi_type == SsiType::Issi).map(|addr| addr.ssi)),
-            DlSchedElem::FragBuf(fragger, packet_data_slots) if packet_data_slots.is_some() => fragger.individual_issi(),
+            DlSchedElem::FragBuf(fragger, _) => fragger.individual_issi(),
             _ => None,
         }
     }
@@ -1271,20 +1620,6 @@ impl BsChannelScheduler {
             } => Some(issi),
             _ => None,
         }
-    }
-
-    /// Whether packet-data or service signalling for this terminal is already
-    /// waiting for a downlink opportunity on its assigned PDCH.  A frequency
-    /// simplex MS cannot receive that work while it has reserved uplink
-    /// capacity.  Continuing to extend the uplink allocation can therefore
-    /// starve the opposite direction indefinitely under bidirectional load.
-    fn has_pending_packet_data_downlink_for_issi(&self, issi: u32) -> bool {
-        self.dltx_queues
-            .iter()
-            .chain(self.dltx_half_duplex_queues.iter())
-            .flat_map(|queue| queue.iter())
-            .chain(self.dltx_next_slot_queue.iter())
-            .any(|elem| !elem.is_cancelled() && Self::packet_data_elem_issi(elem) == Some(issi))
     }
 
     fn advanced_link_segment_identity(sdu: &BitBuffer) -> Option<(bool, bool, u8, u8)> {
@@ -1355,27 +1690,21 @@ impl BsChannelScheduler {
         );
     }
 
-    /// A frequency half-duplex MS cannot receive an assigned-PDCH downlink
-    /// while it transmits in the physically overlapping uplink slot. Uplink
-    /// TDMA is offset by two timeslots; keep one switching slot on either side
-    /// and retry the affected downlink in the next frame. Pure MAC grants and
-    /// random-access acknowledgements stay eligible so reserved access can
-    /// continue progressing.
+    /// Apply the complete forbidden interval from TTR 001-05 figure 1.  The
+    /// terminal may use only some granted slots, but it is not required to
+    /// monitor the downlink anywhere between the first and last slot.
     fn dl_defer_packet_data_for_concurrent_uplink(&mut self, ts: TdmaTime) -> usize {
         if !self.packet_bearer_is_active(ts.t) {
             return 0;
         }
 
-        let mut guarded_owners = [None; 6];
-        for (guard_index, guard_ts) in [ts.add_timeslots(-3), ts.add_timeslots(-2), ts.add_timeslots(-1)]
-            .into_iter()
-            .enumerate()
-        {
-            let uplink = &self.ulsched[guard_ts.t as usize - 1][self.ul_ts_to_sched_index(&guard_ts)];
-            guarded_owners[guard_index * 2] = uplink.ul1;
-            guarded_owners[guard_index * 2 + 1] = uplink.ul2;
-        }
-        if guarded_owners.iter().all(Option::is_none) {
+        let blocked_issis = self
+            .packet_data_grant_windows
+            .keys()
+            .copied()
+            .filter(|issi| self.packet_data_downlink_is_blocked(*issi, ts))
+            .collect::<HashSet<_>>();
+        if blocked_issis.is_empty() {
             return 0;
         }
 
@@ -1383,7 +1712,7 @@ impl BsChannelScheduler {
         let mut deferred = Vec::new();
         let mut index = 0;
         while index < queue.len() {
-            let should_defer = Self::packet_data_elem_issi(&queue[index]).is_some_and(|issi| guarded_owners.contains(&Some(issi)));
+            let should_defer = Self::packet_data_elem_issi(&queue[index]).is_some_and(|issi| blocked_issis.contains(&issi));
             if should_defer {
                 deferred.push(queue.remove(index));
             } else {
@@ -2657,6 +2986,16 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
+        // Packet-data grants are normally integrated into a MAC-RESOURCE
+        // before prioritization.  Emit that resource first so its reserved
+        // uplink slots cannot become an unannounced allocation.
+        if let Some(i) = q
+            .iter()
+            .position(|e| matches!(e, DlSchedElem::Resource(pdu, ..) if pdu.slot_granting_element.is_some()))
+        {
+            return Some(q.remove(i));
+        }
+
         // Return FragBufs next
         if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::FragBuf(..))) {
             return Some(q.remove(i));
@@ -2894,6 +3233,9 @@ impl BsChannelScheduler {
             }
         } else {
             // Signalling mode (either no circuit, or hangtime on an allocated timeslot)
+            // A retained reservation requirement becomes a grant only after
+            // the previous frequency-simplex uplink turn and receive window.
+            self.schedule_ready_packet_data_grant(ts);
             self.dl_defer_packet_data_for_concurrent_uplink(ts);
 
             // Integrate all grants and random access acks into resources (either existing or new)
@@ -3042,6 +3384,7 @@ impl BsChannelScheduler {
         // Retry half-duplex packet-data work in this physical timeslot's next
         // TDMA frame, ahead of data that arrived while the MS was transmitting.
         self.requeue_half_duplex_deferred_before_newer_items(ts.t as usize - 1);
+        self.expire_packet_data_grant_windows(ts);
 
         // tracing::warn!("end finalize");
         // self.dump_ul_schedule_full(true);
@@ -3978,7 +4321,7 @@ mod tests {
     }
 
     #[test]
-    fn two_slot_packet_grant_adds_only_unreserved_shortfall() {
+    fn two_slot_packet_grant_uses_one_bounded_turn_for_a_total_request() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b0110));
         let addr = TetraAddress::issi(77_479);
@@ -3987,96 +4330,125 @@ mod tests {
         let first = sched
             .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
             .expect("initial two-slot grant");
-        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
-
-        let second = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-            .expect("only the remaining shortfall should be granted");
-        assert_eq!(second.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
-
-        let third = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-            .expect("final exactly encodable shortfall");
-        assert_eq!(third.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
+        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant10Slots);
         assert!(
             sched
                 .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
                 .is_none(),
-            "ten already reserved slots must satisfy the repeated total request"
+            "a repeated total request must not add another ten slots"
         );
     }
 
     #[test]
-    fn queued_packet_downlink_interleaves_one_uplink_slot() {
-        let mut sched = get_testing_slotter();
-        assert!(sched.open_packet_bearer(17, 1, 0b0110));
-        let addr = TetraAddress::issi(77_479);
-        let request_time = sched.cur_dltime.forward_to_timeslot(2).add_timeslots(-4);
-
-        let first = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-            .expect("initial uplink grant");
-        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
-
-        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
-        resource.addr = None;
-        resource.event_label = Some(9);
-        sched.dltx_queues[1].push(DlSchedElem::Resource(
-            resource,
-            BitBuffer::from_bitstr("10010000"),
-            None,
-            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
-            Some([false, true, true, false]),
-        ));
-
-        let interleaved = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-            .expect("queued downlink must still leave one uplink turnaround slot");
-        assert_eq!(interleaved.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
-
-        sched.dltx_queues[1].clear();
-        let resumed = sched
-            .ul_process_packet_data_cap_req_at(request_time, addr, &ReservationRequirement::Req10Slots, false)
-            .expect("uplink grants resume after queued downlink drains");
-        assert_eq!(resumed.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
-    }
-
-    #[test]
-    fn fragmented_packet_uplink_can_finish_while_downlink_is_queued() {
+    fn packet_shortfall_is_granted_after_the_receive_turn_without_new_random_access() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b1110));
-        let addr = TetraAddress::issi(77_480);
+        let addr = TetraAddress::issi(77_479);
+        let grant_time = TdmaTime { t: 2, f: 3, m: 1, h: 0 };
+        assert!(sched.queue_packet_data_capacity_request(grant_time.add_timeslots(-4), addr, ReservationRequirement::Req34Slots, false));
 
-        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
-        resource.addr = None;
-        resource.event_label = Some(33);
-        sched.dltx_queues[1].push(DlSchedElem::Resource(
-            resource,
-            BitBuffer::from_bitstr("10010000"),
-            None,
-            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
-            Some([false, true, true, true]),
-        ));
+        sched.schedule_ready_packet_data_grant(grant_time);
+        let first = sched.dltx_queues[grant_time.t as usize - 1]
+            .iter()
+            .find_map(|elem| match elem {
+                DlSchedElem::Grant(_, grant) => Some(grant),
+                _ => None,
+            })
+            .expect("first retained request must produce a grant");
+        assert_eq!(first.capacity_allocation, BasicSlotgrantCapAlloc::Grant17Slots);
+        assert_eq!(sched.pending_packet_data_grants[&addr.ssi].remaining_slots, 17);
 
-        let turnaround = sched
-            .ul_process_cap_req(2, addr, &ReservationRequirement::Req3Slots)
-            .expect("ordinary uplink must retain one turnaround slot while downlink is queued");
-        assert_eq!(turnaround.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        let first_window = sched.packet_data_grant_windows[&addr.ssi];
+        sched.dltx_queues[grant_time.t as usize - 1].clear();
+        sched.schedule_ready_packet_data_grant(first_window.next_grant_downlink.add_timeslots(-1));
+        assert!(
+            sched.dltx_queues.iter().all(Vec::is_empty),
+            "no additional grant may be sent before the receive turn ends"
+        );
 
-        let grant = sched
-            .ul_process_fragment_cap_req(2, addr, &ReservationRequirement::Req3Slots)
-            .expect("an in-progress MAC fragment chain must receive continuation capacity");
-        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
-        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+        sched.schedule_ready_packet_data_grant(first_window.next_grant_downlink);
+        assert!(
+            sched.dltx_queues[first_window.next_grant_downlink.t as usize - 1].iter().any(
+                |elem| matches!(elem, DlSchedElem::Grant(_, grant) if grant.capacity_allocation == BasicSlotgrantCapAlloc::Grant17Slots)
+            ),
+            "the retained shortfall must progress without another MAC-ACCESS"
+        );
+        assert!(!sched.pending_packet_data_grants.contains_key(&addr.ssi));
     }
 
     #[test]
-    fn packet_downlink_waits_for_physically_overlapping_uplink() {
+    fn fragment_continuation_precedes_an_ordinary_packet_request() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let ordinary = TetraAddress::issi(77_479);
+        let fragment = TetraAddress::issi(77_480);
+        let grant_time = TdmaTime { t: 2, f: 3, m: 1, h: 0 };
+        assert!(sched.queue_packet_data_capacity_request(grant_time, ordinary, ReservationRequirement::Req3Slots, false));
+        assert!(sched.queue_packet_data_capacity_request(grant_time, fragment, ReservationRequirement::Req3Slots, true));
+
+        sched.schedule_ready_packet_data_grant(grant_time);
+        assert!(matches!(
+            sched.dltx_queues[grant_time.t as usize - 1].first(),
+            Some(DlSchedElem::Grant(addr, _)) if addr.ssi == fragment.ssi && addr.ssi_type == fragment.ssi_type
+        ));
+    }
+
+    #[test]
+    fn initial_packet_grant_waits_for_the_random_access_ack_timeslot() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b1110));
+        let addr = TetraAddress::issi(77_479);
+        let request_time = TdmaTime { t: 4, f: 3, m: 1, h: 0 };
+        sched.dl_enqueue_random_access_ack(
+            request_time.t,
+            addr,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
+        assert!(sched.queue_packet_data_capacity_request(request_time, addr, ReservationRequirement::Req6Slots, false));
+
+        sched.schedule_ready_packet_data_grant(request_time.forward_to_timeslot(2));
+        assert!(
+            !sched.dltx_queues[1].iter().any(|elem| matches!(elem, DlSchedElem::Grant(..))),
+            "the grant must not get separated from its pending random-access acknowledgement"
+        );
+        sched.schedule_ready_packet_data_grant(request_time);
+        assert!(sched.dltx_queues[3].iter().any(|elem| matches!(elem, DlSchedElem::Grant(..))));
+    }
+
+    #[test]
+    fn clch_counts_for_grant_delay_but_not_as_full_slot_capacity() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(17, 1, 0b0010));
+        let clch = TdmaTime { t: 2, f: 18, m: 5, h: 0 };
+        assert!(clch.is_mandatory_clch());
+
+        let (delay, slots) = sched
+            .ul_find_grant_opportunity_from(clch, 2, 1, false, 0)
+            .expect("the first usable slot after CLCH must be found");
+        assert_eq!(delay, 1, "CLCH is one granting-delay opportunity");
+        assert_eq!(slots, vec![clch.add_timeslots(4)]);
+        assert!(!slots[0].is_mandatory_clch());
+    }
+
+    #[test]
+    fn packet_downlink_waits_for_the_complete_basic_grant_interval() {
         let mut sched = get_testing_slotter();
         assert!(sched.open_packet_bearer(17, 1, 0b0110));
         let addr = TetraAddress::issi(77_479);
-        let downlink = TdmaTime { t: 2, f: 5, m: 1, h: 0 };
-        sched.ul_reserve_grant(addr.ssi, vec![downlink.add_timeslots(-2)], false);
+        let first_uplink = TdmaTime { t: 2, f: 4, m: 1, h: 0 };
+        let last_uplink = first_uplink.add_timeslots(4);
+        sched.ul_reserve_grant(addr.ssi, vec![first_uplink, first_uplink.add_timeslots(1), last_uplink], false);
+
+        for offset in 1..=7 {
+            assert!(
+                sched.packet_data_downlink_is_blocked(addr.ssi, first_uplink.add_timeslots(offset)),
+                "the complete grant, its internal gap and both switching guards must be blocked"
+            );
+        }
+        assert!(!sched.packet_data_downlink_is_blocked(addr.ssi, first_uplink));
+        assert!(!sched.packet_data_downlink_is_blocked(addr.ssi, first_uplink.add_timeslots(8)));
+
+        let downlink = first_uplink.add_timeslots(4);
 
         let mut resource = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
         resource.addr = None;
@@ -4088,13 +4460,18 @@ mod tests {
             AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
             Some([false, true, true, false]),
         ));
+        sched.dl_enqueue_random_access_ack(
+            downlink.t,
+            addr,
+            AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource),
+        );
 
-        assert_eq!(sched.dl_defer_packet_data_for_concurrent_uplink(downlink), 1);
+        assert_eq!(sched.dl_defer_packet_data_for_concurrent_uplink(downlink), 2);
         assert!(sched.dltx_queues[1].is_empty());
-        assert_eq!(sched.dltx_half_duplex_queues[1].len(), 1);
+        assert_eq!(sched.dltx_half_duplex_queues[1].len(), 2);
 
         sched.requeue_half_duplex_deferred_before_newer_items(1);
-        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[1].len(), 2);
         assert!(sched.dltx_half_duplex_queues[1].is_empty());
     }
 
