@@ -88,7 +88,7 @@ impl BsFragger {
             return resource_len_bits + fill_bits <= slot_cap_bits;
         }
         let macend_len_bits = MacEndDl::compute_hdr_len(None, self.chan_alloc.clone()) + 8 + self.sdu.get_len_remaining();
-        macend_len_bits.div_ceil(8) * 8 <= slot_cap_bits
+        macend_len_bits <= slot_cap_bits
     }
 
     pub fn set_completion_slot_grant(&mut self, grant: BasicSlotgrant) {
@@ -173,7 +173,11 @@ impl BsFragger {
         let slot_cap_bits = mac_block.get_len_remaining();
         let num_fill_bits = fillbits::addition::compute_required(hdr_len_bits + sdu_len_bits, slot_cap_bits);
         let total_len_bits = hdr_len_bits + sdu_len_bits + num_fill_bits;
-        let total_len_bytes = total_len_bits / 8;
+        // EN 300 392-2 23.4.2.3 requires the indicated PDU length to be
+        // rounded up.  A full SCH/F block is 268 bits, so its length is
+        // encoded as 34 octets and the receiver crops the indicated 272 bits
+        // to the physical block boundary.
+        let total_len_bytes = total_len_bits.div_ceil(8);
 
         // Check if we can fit all in a single MAC-RESOURCE
         if total_len_bits <= slot_cap_bits {
@@ -292,18 +296,18 @@ impl BsFragger {
         let reserved_slot_grant_bits = usize::from(self.final_slot_grant_required && self.final_slot_grant.is_none()) * 8;
         let macend_len_bits =
             MacEndDl::compute_hdr_len(self.final_slot_grant.clone(), self.chan_alloc.clone()) + reserved_slot_grant_bits + sdu_bits;
-        let macend_len_bytes = (macend_len_bits + 7) / 8;
         let slot_cap_bits = mac_block.get_len_remaining();
 
         // tracing::trace!("MAC-END would have length: {} bits, {} bytes, slot capacity: {} bits",
         //     macend_len_bits, macend_len_bytes, slot_cap);
-        if macend_len_bytes * 8 <= slot_cap_bits {
+        if macend_len_bits <= slot_cap_bits {
             if self.final_slot_grant_required && self.final_slot_grant.is_none() {
                 tracing::debug!("-> final MAC-END awaits an actual-time slot grant");
                 return false;
             }
             // Fits in single MAC-END
             let num_fill_bits = fillbits::addition::compute_required(macend_len_bits, slot_cap_bits);
+            let macend_len_bytes = (macend_len_bits + num_fill_bits).div_ceil(8);
             let mut pdu = MacEndDl {
                 fill_bits: num_fill_bits > 0,
                 pos_of_grant: 0,
@@ -437,6 +441,9 @@ mod tests {
         address::{SsiType, TetraAddress},
         debug,
     };
+    use tetra_pdus::umac::enums::{
+        basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc, basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay,
+    };
     use tetra_pdus::umac::pdus::mac_resource::MAC_RESOURCE_LENGTH_FRAG_START;
     use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
     use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
@@ -474,6 +481,38 @@ mod tests {
 
         assert!(done, "Should be done in single chunk");
         tracing::info!("MAC block: {}", mac_block.dump_bin());
+    }
+
+    #[test]
+    fn full_schf_resource_rounds_length_up_without_fragmenting() {
+        for (raw_bits, expected_written, expected_length, expected_fill) in [
+            (264, 264, 33, false),
+            (265, 268, 34, true),
+            (266, 268, 34, true),
+            (267, 268, 34, true),
+            (268, 268, 34, false),
+        ] {
+            let mut resource = get_default_resource();
+            resource.addr = None;
+            resource.event_label = Some(3);
+            resource.slot_granting_element = Some(BasicSlotgrant {
+                capacity_allocation: BasicSlotgrantCapAlloc::Grant1Slot,
+                granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+            });
+            assert_eq!(resource.compute_header_len(), 37);
+
+            let mut fragger = BsFragger::new(resource, BitBuffer::from_bitstr(&"1".repeat(raw_bits - 37)), None);
+            let mut block = BitBuffer::new(SCH_F_CAP);
+            assert!(fragger.get_next_chunk(&mut block), "{raw_bits}-bit PDU must fit in SCH/F");
+            assert_eq!(block.get_len_written(), expected_written);
+
+            block.seek(0);
+            let decoded = MacResource::from_bitbuf(&mut block).unwrap();
+            assert_eq!(decoded.length_ind, expected_length);
+            assert_eq!(decoded.fill_bits, expected_fill);
+            assert_eq!(decoded.event_label, Some(3));
+            assert!(decoded.slot_granting_element.is_some());
+        }
     }
 
     #[test]

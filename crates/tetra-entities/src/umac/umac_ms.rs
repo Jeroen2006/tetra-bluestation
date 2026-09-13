@@ -297,11 +297,11 @@ impl UmacMs {
         };
 
         if pdu_len_bits > prim.pdu.get_len() {
-            // TODO FIXME: I sometimes encounter len = 0b100010 = 32
-            // This does not fit, since it translates to 272 bits while it comes in a 268 bit slot
-            // We'll correct for that by simply cropping to the end... But this is strange
-            tracing::warn!(
-                "rx_mac_resource: Strange length_ind {} in MAC resource, truncating from {} to {}",
+            // EN 300 392-2 23.4.3.3 requires the indicated octet length to
+            // be cropped to the available MAC block.  This is the normal
+            // representation of a PDU which fills a 268-bit SCH/F block.
+            tracing::trace!(
+                "cropping MAC-RESOURCE length indication {} from {} to {} available bits",
                 pdu.length_ind,
                 pdu_len_bits,
                 prim.pdu.get_len()
@@ -467,6 +467,11 @@ impl UmacMs {
         // Compute len
         assert!(pdu.length_ind != 0); // Reserved
         let mut pdu_len_bits = pdu.length_ind as usize * 8;
+        if pdu_len_bits > prim.pdu.get_len() {
+            // As for MAC-RESOURCE, an octet-rounded length may extend up to
+            // seven bits beyond the physical block boundary.
+            pdu_len_bits = prim.pdu.get_len();
+        }
 
         // Strip fill bits. Maintain original end to allow for later parsing of a second mac block
         let num_fill_bits = {

@@ -175,10 +175,15 @@ impl AlAckBlock {
     }
 
     fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        let expected_bitmap_len = if (1..=62).contains(&self.acknowledgement_length) {
+            self.acknowledgement_length as usize - 1
+        } else {
+            0
+        };
         if self.nr > 7
             || self.acknowledgement_length > 63
             || ((1..=62).contains(&self.acknowledgement_length) != self.first_missing_segment.is_some())
-            || self.acknowledgement_bitmap.len() != self.acknowledgement_length.saturating_sub(1) as usize
+            || self.acknowledgement_bitmap.len() != expected_bitmap_len
         {
             return Err(PduParseErr::Inconsistency {
                 field: "al_ack",
@@ -369,6 +374,24 @@ mod tests {
             blocks: vec![AlAckBlock {
                 nr: 5,
                 acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        };
+        let mut bits = BitBuffer::new_autoexpand(16);
+        ack.to_bitbuf(&mut bits).unwrap();
+        assert_eq!(bits.get_len_written(), 14);
+        bits.seek(0);
+        assert_eq!(AlAck::from_bitbuf(&mut bits).unwrap(), ack);
+    }
+
+    #[test]
+    fn fcs_failure_ack_has_no_segment_fields() {
+        let ack = AlAck {
+            receiver_ready: true,
+            blocks: vec![AlAckBlock {
+                nr: 5,
+                acknowledgement_length: 63,
                 first_missing_segment: None,
                 acknowledgement_bitmap: Vec::new(),
             }],
