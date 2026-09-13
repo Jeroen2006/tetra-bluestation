@@ -841,11 +841,30 @@ impl Llc {
             .or_else(|| link.tx.front())
             .map(|sdu| sdu.aie_request)
             .unwrap_or_else(|| AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
-        let abandoned = link.tx.len();
-        for sdu in link.tx.drain(..) {
-            Self::mark_reporter_lost(&sdu.reporter);
+        let failed_position = link.tx.iter().position(|sdu| sdu.ns == failed_ns);
+        let mut retained = VecDeque::new();
+        let mut abandoned = 0;
+        for (position, mut sdu) in link.tx.drain(..).enumerate() {
+            let never_offered = Some(position) != failed_position
+                && sdu.attempt_reporter.is_none()
+                && sdu.sent_at.is_none()
+                && sdu.reporter.get_state() == TxState::Pending
+                && !sdu.acknowledgement_requested
+                && sdu.ack_request_repetitions == 0
+                && sdu.retransmissions == 0
+                && sdu.segment_retransmissions.iter().all(|repetitions| *repetitions == 0)
+                && sdu.pending_segments.is_none();
+            if never_offered {
+                sdu.ns = (retained.len() as u8) & 0x07;
+                retained.push_back(sdu);
+            } else {
+                Self::mark_reporter_lost(&sdu.reporter);
+                abandoned += 1;
+            }
         }
-        link.next_tx_ns = 0;
+        let retained_count = retained.len();
+        link.tx = retained;
+        link.next_tx_ns = (retained_count as u8) & 0x07;
         link.next_rx_ns = 0;
         link.rx_sdus.clear();
         link.receiver_ready = false;
@@ -877,6 +896,7 @@ impl Llc {
             issi,
             ns = failed_ns,
             abandoned_tlsdus = abandoned,
+            retained_tlsdus = retained_count,
             reason,
             "advanced-link transfer failed; starting in-place AL-SETUP reset"
         );
@@ -904,24 +924,15 @@ impl Llc {
         if total_bits <= AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT {
             segment_lengths.push(total_bits);
         } else {
-            let full_segments = total_bits / AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT;
-            let remainder = total_bits % AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT;
-            if remainder == 0 {
-                segment_lengths.resize(full_segments, AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT);
-            } else if remainder >= AL_FINAL_FCS_BITS {
-                segment_lengths.resize(full_segments, AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT);
-                segment_lengths.push(remainder);
-            } else {
-                // The first and last segment may differ on pi/4-DQPSK. Move
-                // enough bits from the first segment to leave the complete
-                // FCS in the final segment without adding another segment.
-                segment_lengths.push(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT - (AL_FINAL_FCS_BITS - remainder));
-                segment_lengths.extend(std::iter::repeat_n(
-                    AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT,
-                    full_segments - 1,
-                ));
-                segment_lengths.push(AL_FINAL_FCS_BITS);
-            }
+            let segment_count = total_bits.div_ceil(AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT);
+            // TIP 6.5 permits the first segment to differ, but equal-sized
+            // non-final downlink segments avoid receiver-specific ambiguity.
+            // Choose the largest uniform length that leaves at least the
+            // complete 32-bit FCS in AL-FINAL.
+            let non_final_length =
+                AL_DOWNLINK_SEGMENT_BITS_WITH_EVENT_LABEL_AND_GRANT.min((total_bits - AL_FINAL_FCS_BITS) / (segment_count - 1));
+            segment_lengths.resize(segment_count - 1, non_final_length);
+            segment_lengths.push(total_bits - non_final_length * (segment_count - 1));
         }
 
         let mut segments = Vec::with_capacity(segment_lengths.len());
@@ -2997,13 +3008,24 @@ mod tests {
             vec![214, 214, 135]
         );
 
-        // When fewer than 32 bits remain, shorten only the permitted first
-        // segment so the final segment still contains the complete FCS.
+        // When fewer than 32 bits would remain, every non-final segment must
+        // be shortened equally and the final segment must contain the FCS.
         let short_remainder = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(128 * 8 + 19)));
         assert_eq!(
             short_remainder.iter().map(BitBuffer::get_len_remaining).collect::<Vec<_>>(),
-            vec![187, 214, 214, 214, 214, 32]
+            vec![208, 208, 208, 208, 208, 35]
         );
+
+        for (tl_sdu_bits, non_final_bits, final_bits) in [(4259, 212, 51), (2779, 213, 42), (411, 205, 33)] {
+            let segments = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(tl_sdu_bits)));
+            assert!(
+                segments[..segments.len() - 1]
+                    .iter()
+                    .all(|segment| segment.get_len_remaining() == non_final_bits),
+                "all non-final segments must be uniform for a {tl_sdu_bits}-bit TL-SDU"
+            );
+            assert_eq!(segments.last().unwrap().get_len_remaining(), final_bits);
+        }
 
         let long = Llc::advanced_segments(BitBuffer::from_bitstr(&"0".repeat(512 * 8 + 19)));
         assert!(long[..long.len() - 1].iter().all(|segment| segment.get_len_remaining() == 214));
@@ -3342,27 +3364,30 @@ mod tests {
         while queue.pop_front().is_some() {}
         llc.advanced_links.get_mut(&77_468).unwrap().max_sdu_retransmissions = 0;
 
-        let reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(400));
+        let in_flight_reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(400));
+        let failed_reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"01".repeat(400));
+        let retained_reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"11".repeat(128));
         assert!(llc.submit_advanced_link_messages(&mut queue));
         while queue.pop_front().is_some() {}
-        llc.advanced_links[&77_468].tx[0]
-            .attempt_reporter
-            .as_ref()
-            .unwrap()
-            .mark_transmitted();
+        for sdu in llc.advanced_links[&77_468].tx.iter().take(2) {
+            sdu.attempt_reporter.as_ref().unwrap().mark_transmitted();
+        }
         llc.submit_advanced_link_messages(&mut queue);
         {
-            let pending = &mut llc.advanced_links.get_mut(&77_468).unwrap().tx[0];
+            let pending = &mut llc.advanced_links.get_mut(&77_468).unwrap().tx[1];
             pending.ack_request_repetitions = MAX_AL_ACK_REQUEST_REPEATS;
         }
         llc.dltime = llc.dltime.add_timeslots(T252_ACK_WAITING_TIMER as i32);
 
         assert!(llc.submit_advanced_link_messages(&mut queue));
-        assert_eq!(reporter.get_state(), TxState::Lost);
+        assert_eq!(in_flight_reporter.get_state(), TxState::Lost);
+        assert_eq!(failed_reporter.get_state(), TxState::Lost);
+        assert_eq!(retained_reporter.get_state(), TxState::Pending);
         let link = &llc.advanced_links[&77_468];
         assert!(link.reset.is_some());
-        assert!(link.tx.is_empty());
-        assert_eq!((link.next_tx_ns, link.next_rx_ns), (0, 0));
+        assert_eq!(link.tx.len(), 1);
+        assert_eq!(link.tx[0].ns, 0);
+        assert_eq!((link.next_tx_ns, link.next_rx_ns), (1, 0));
         let SapMsgInner::TmaUnitdataReq(mut reset) = queue.pop_front().expect("AL-SETUP reset").msg else {
             panic!("expected TMA request")
         };
@@ -3374,6 +3399,10 @@ mod tests {
         assert!(!llc.submit_advanced_link_messages(&mut queue));
         assert!(queue.pop_front().is_none(), "new data must wait for AL-SETUP Success");
         assert_eq!(queued_after_reset.get_state(), TxState::Pending);
+        assert_eq!(
+            llc.advanced_links[&77_468].tx.iter().map(|sdu| sdu.ns).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         let mut success = BitBuffer::new_autoexpand(32);
         AlSetup { report: 0, ..reset }.to_bitbuf(&mut success).unwrap();
@@ -3391,6 +3420,12 @@ mod tests {
             panic!("expected TMA request")
         };
         assert_eq!(AlDataHeader::from_bitbuf(&mut first.pdu).unwrap().ns, 0);
+        assert!(queue.iter_mut().any(|message| {
+            let SapMsgInner::TmaUnitdataReq(request) = &mut message.msg else {
+                return false;
+            };
+            AlDataHeader::from_bitbuf(&mut request.pdu).is_ok_and(|header| header.ns == 1)
+        }));
     }
 
     #[test]
