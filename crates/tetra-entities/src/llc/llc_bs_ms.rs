@@ -748,6 +748,15 @@ impl Llc {
         reporter.mark_lost();
     }
 
+    fn mark_advanced_sdu_acknowledged(sdu: &AdvancedTxSdu) {
+        if sdu.reporter.get_state() == TxState::Pending {
+            sdu.reporter.mark_transmitted();
+        }
+        if sdu.reporter.get_state() == TxState::Transmitted {
+            sdu.reporter.mark_acknowledged();
+        }
+    }
+
     fn packet_routes(config: &SharedConfig, issi: u32) -> Vec<tetra_saps::tma::AssociatedChannel> {
         config
             .state_read()
@@ -1322,6 +1331,37 @@ impl Llc {
         }
         link.receiver_ready = ack.receiver_ready;
         let mut failed_ns = None;
+        let complete_window_report = ack.blocks.len() == usize::from(link.window_size)
+            && ack.blocks.windows(2).all(|blocks| blocks[1].nr == (blocks[0].nr + 1) & 0x07);
+        if complete_window_report {
+            let receiver_base = ack.blocks[0].nr;
+            // The acknowledgement blocks start at the peer's current receive
+            // window. A previously missing base disappears from the next
+            // report once its selective retransmission has completed, so
+            // retire sent entries which the peer's window has passed.
+            loop {
+                let Some(front) = link.tx.front() else {
+                    break;
+                };
+                if front.ns == receiver_base {
+                    break;
+                }
+                let advance = receiver_base.wrapping_sub(front.ns) & 0x07;
+                let was_sent =
+                    front.attempt_reporter.is_some() || front.sent_at.is_some() || front.reporter.get_state() != TxState::Pending;
+                if advance == 0 || advance > link.window_size || !was_sent {
+                    break;
+                }
+                let sdu = link.tx.pop_front().expect("advanced-link send window has a front");
+                Self::mark_advanced_sdu_acknowledged(&sdu);
+                tracing::debug!(
+                    issi,
+                    ns = sdu.ns,
+                    receiver_base,
+                    "retired advanced-link TL-SDU passed by peer receive window"
+                );
+            }
+        }
         for block in ack.blocks {
             tracing::debug!(
                 issi = prim.main_address.ssi,
@@ -1348,12 +1388,7 @@ impl Llc {
             }
             if block.acknowledgement_length == 0 {
                 if let Some(sdu) = link.tx.remove(position) {
-                    if sdu.reporter.get_state() == TxState::Pending {
-                        sdu.reporter.mark_transmitted();
-                    }
-                    if sdu.reporter.get_state() == TxState::Transmitted {
-                        sdu.reporter.mark_acknowledged();
-                    }
+                    Self::mark_advanced_sdu_acknowledged(&sdu);
                 }
                 continue;
             }
@@ -1663,14 +1698,28 @@ impl Llc {
                 .iter()
                 .filter(|sdu| sdu.attempt_reporter.is_some() || sdu.sent_at.is_some())
                 .count();
-            let window_size = usize::from(link.window_size.clamp(1, 3));
-            let available = window_size.saturating_sub(in_flight.min(window_size));
+            let window_size = link.window_size.clamp(1, 3);
+            let Some(send_base) = link.tx.front().map(|sdu| sdu.ns) else {
+                continue;
+            };
+            let generation_end = link
+                .tx
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(index, sdu)| (sdu.ns == send_base).then_some(index))
+                .unwrap_or(link.tx.len());
+            let window_capacity = usize::from(window_size);
+            let available = window_capacity.saturating_sub(in_flight.min(window_capacity));
             let selected_sdus = link
                 .tx
                 .iter_mut()
                 .enumerate()
                 .filter_map(|(index, sdu)| {
-                    (sdu.attempt_reporter.is_none()
+                    let sequence_distance = sdu.ns.wrapping_sub(send_base) & 0x07;
+                    (index < generation_end
+                        && sequence_distance < window_size
+                        && sdu.attempt_reporter.is_none()
                         && sdu.sent_at.is_none()
                         && !sdu.acknowledgement_requested
                         && sdu.retransmissions <= link.max_sdu_retransmissions)
@@ -3556,6 +3605,126 @@ mod tests {
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert_eq!(llc.advanced_links[&77_468].tx.len(), 1);
         assert_eq!(reporters[3].get_state(), TxState::Acknowledged);
+    }
+
+    #[test]
+    fn advanced_downlink_does_not_slide_past_missing_window_base() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 3;
+        while queue.pop_front().is_some() {}
+
+        // Queue far enough ahead for the three-bit N(S) to wrap. Only the
+        // first N.272 window may be transmitted while its base remains
+        // incomplete, even if the other two members are acknowledged.
+        for index in 0..9 {
+            queue_advanced_downlink(&mut llc, &mut queue, 77_468, &format!("{:08b}", index));
+        }
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+
+        let mut ack = BitBuffer::new_autoexpand(32);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![
+                AlAckBlock {
+                    nr: 0,
+                    acknowledgement_length: 1,
+                    first_missing_segment: Some(0),
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 1,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 2,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+            ],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+
+        let link = &llc.advanced_links[&77_468];
+        assert_eq!(link.tx.front().unwrap().ns, 0);
+        assert_eq!(link.tx.back().unwrap().ns, 0, "the queued N(S) has wrapped");
+        let expected_payload = link.tx.front().unwrap().segments[0].to_bitstr();
+        while queue.pop_front().is_some() {}
+
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let retransmitted = queue
+            .iter_mut()
+            .filter_map(|message| {
+                let SapMsgInner::TmaUnitdataReq(request) = &message.msg else {
+                    return None;
+                };
+                let mut pdu = request.pdu.clone();
+                AlDataHeader::from_bitbuf(&mut pdu)
+                    .ok()
+                    .map(|header| (header.ns, pdu.to_bitstr().ends_with(&expected_payload)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retransmitted, vec![(0, true)]);
+    }
+
+    #[test]
+    fn advanced_ack_retires_tlsdu_passed_by_peer_window() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        llc.advanced_links.get_mut(&77_468).unwrap().window_size = 3;
+        while queue.pop_front().is_some() {}
+
+        let reporters = (0..4)
+            .map(|index| queue_advanced_downlink(&mut llc, &mut queue, 77_468, &format!("{:08b}", index)))
+            .collect::<Vec<_>>();
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+
+        // N(S)=0 was completed by a selective retry. The peer now starts its
+        // report at N(R)=1, rather than repeating a positive block for zero.
+        let mut ack = BitBuffer::new_autoexpand(32);
+        AlAck {
+            receiver_ready: true,
+            blocks: vec![
+                AlAckBlock {
+                    nr: 1,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 2,
+                    acknowledgement_length: 0,
+                    first_missing_segment: None,
+                    acknowledgement_bitmap: Vec::new(),
+                },
+                AlAckBlock {
+                    nr: 3,
+                    acknowledgement_length: 1,
+                    first_missing_segment: Some(0),
+                    acknowledgement_bitmap: Vec::new(),
+                },
+            ],
+        }
+        .to_bitbuf(&mut ack)
+        .unwrap();
+        ack.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
+
+        assert!(reporters[..3].iter().all(|reporter| reporter.get_state() == TxState::Acknowledged));
+        assert_eq!(reporters[3].get_state(), TxState::Pending);
+        let link = &llc.advanced_links[&77_468];
+        assert_eq!(link.tx.len(), 1);
+        assert_eq!(link.tx.front().unwrap().ns, 3);
     }
 
     #[test]
