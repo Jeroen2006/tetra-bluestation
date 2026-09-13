@@ -76,6 +76,11 @@ pub struct ExpectedInAck {
     /// delivery route still exist for the same PDP context.
     force_common_channel: bool,
 
+    /// Packet signalling has one authoritative location: its explicit PDCH
+    /// route, or the MCCH when no route is attached. Duplicating the same LLC
+    /// transaction on both can make half-duplex terminals process it twice.
+    packet_data: bool,
+
     /// Time this message was received from the MLE
     pub t_first: TdmaTime,
     /// Time this message was actually passed down to the Umac. If a previous message on the basic link is already
@@ -575,7 +580,8 @@ impl Llc {
             SapMsgInner::TmaUnitdataReq(req) => req.associated_channel.clone(),
             _ => None,
         };
-        let mut routes = if ack.force_common_channel {
+        let packet_associated_route = ack.packet_data && preferred_route.as_ref().is_some_and(|route| (2..=4).contains(&route.timeslot));
+        let mut routes = if ack.force_common_channel || ack.packet_data {
             Vec::new()
         } else {
             Self::delivery_routes(config, ack.addr.ssi, dltime)
@@ -622,10 +628,13 @@ impl Llc {
             queue.push_back(sapmsg);
         }
 
-        // Even a non-scanning MS can be on MCCH after missing D-SETUP or
-        // returning from a released call.  Queue MCCH in the same attempt;
-        // its independent reporter lets a traffic-channel ACK cancel this
-        // copy before a deferred EE monitoring occasion transmits it.
+        // Non-packet signalling may need fan-out because a scanning MS can be
+        // on a traffic bearer or MCCH. Packet signalling already carries its
+        // authoritative PDCH route; when that route is absent, MCCH is the
+        // sole destination for the current packet state.
+        if packet_associated_route {
+            return;
+        }
         let mut sapmsg = ack.retransmission_buf.clone();
         let reporter = TxReporter::new();
         let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg else {
@@ -1817,7 +1826,8 @@ impl Llc {
             panic!()
         };
 
-        let force_common_channel = prim.packet_data_flag
+        let packet_data = prim.packet_data_flag;
+        let force_common_channel = packet_data
             && prim
                 .chan_alloc
                 .as_ref()
@@ -1932,6 +1942,7 @@ impl Llc {
             ts: ack_timeslot,
             bl_type: Layer2Service::Acknowledged,
             force_common_channel,
+            packet_data,
             tx_reporter,
             attempt_reporters: Vec::new(),
             attempt_timeslots: Vec::new(),
@@ -4174,6 +4185,57 @@ mod tests {
             panic!("expected TMA retry")
         };
         assert!(retry_mcch.associated_channel.is_none());
+    }
+
+    #[test]
+    fn packet_basic_link_uses_only_its_associated_pdch() {
+        let config = test_config();
+        let issi = 77_468;
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let mut llc = Llc::new(config);
+        llc.dltime = start;
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                    main_address: TetraAddress::issi(issi),
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: BitBuffer::from_bitstr("1010"),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    packet_data_flag: true,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: Some(tetra_saps::tma::AssociatedChannel {
+                        call_id: 17,
+                        timeslot: 2,
+                        usage: 52,
+                        best_effort_key: None,
+                    }),
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        assert!(llc.submit_free_messages_to_umac(&mut queue));
+        let first = queue.pop_front().expect("PDCH attempt queued");
+        let SapMsgInner::TmaUnitdataReq(first) = first.msg else {
+            panic!("expected TMA request")
+        };
+        assert_eq!(first.associated_channel.map(|route| route.timeslot), Some(2));
+        assert!(queue.pop_front().is_none(), "packet signalling must not be duplicated on MCCH");
+        assert_eq!(llc.outbound_messages[0].attempt_reporters.len(), 1);
+        assert_eq!(llc.outbound_messages[0].attempt_timeslots, vec![2]);
     }
 
     #[test]

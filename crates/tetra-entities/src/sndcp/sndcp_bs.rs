@@ -575,6 +575,11 @@ impl Sndcp {
                 chap,
             } => {
                 let dynamic_address = matches!(&address, SndcpAddressRequest::Dynamic);
+                // A new PDP activation replaces any retained context for this
+                // ISSI. Detach it before overwriting the context, otherwise a
+                // terminal reset can leave an empty bearer holding all PDCH
+                // timeslots and every subsequent access reservation fails.
+                self.detach_packet_bearer(queue, issi);
                 let context = RadioContext {
                     issi,
                     endpoint_id: prim.endpoint_id,
@@ -2137,7 +2142,9 @@ impl TetraEntityTrait for Sndcp {
 mod tests {
     use super::*;
     use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
-    use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::SnActivatePdpContextAccept;
+    use tetra_pdus::sndcp::enums::address_type_identifier_in_demand::AddressTypeIdentifierInDemand;
+    use tetra_pdus::sndcp::enums::packet_data_ms_type::PacketDataMsType;
+    use tetra_pdus::sndcp::pdus::sn_activate_pdp_context::{SnActivatePdpContextAccept, SnActivatePdpContextDemand};
     use tetra_pdus::sndcp::pdus::sn_control::{SnDeactivatePdpContextAccept, SnDeactivatePdpContextDemand, SnEndOfData, SnReconnect};
     use tetra_pdus::sndcp::pdus::sn_transmit::SnDataTransmitRequest;
 
@@ -2327,6 +2334,42 @@ mod tests {
         assert_eq!(accept.ipv4_address, Some(u32::from_be_bytes([10, 45, 0, 164])));
         assert_eq!(accept.sndcp_network_endpoint_identifier, Some(4));
         assert!(accept.type34_elements.is_empty());
+    }
+
+    #[test]
+    fn repeated_activation_releases_the_previous_packet_bearer() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        let mut encoded = BitBuffer::new_autoexpand(128);
+        SnActivatePdpContextDemand {
+            sndcp_version: 1,
+            nsapi: 1,
+            address_type_identifier: AddressTypeIdentifierInDemand::Ipv4Dynamic,
+            ipv4_address: None,
+            primary_nsapi: None,
+            packet_data_ms_type: PacketDataMsType::TypeB,
+            pcomp_negotiation: 0,
+            vj_compression_state_slots: None,
+            ip_header_compression_state_slots_tcp: None,
+            ip_header_compression_state_slots_non_tcp: None,
+            maximum_interval_between_full_headers: None,
+            maximum_time_interval_between_full_headers: None,
+            largest_header_size: None,
+            access_point_name_index: None,
+            type34_elements: Vec::new(),
+        }
+        .to_bitbuf(&mut encoded)
+        .unwrap();
+        encoded.seek(0);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_uplink(&mut queue, uplink(encoded, 77_468));
+
+        assert!(!sndcp.bearers.contains_key(&17));
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(2));
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(3));
+        assert!(sndcp.config.state_read().timeslot_alloc.is_free(4));
+        assert!(!sndcp.config.state_read().subscriber_packet_delivery_routes.contains_key(&77_468));
     }
 
     #[test]
