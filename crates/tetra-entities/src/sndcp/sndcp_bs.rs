@@ -146,6 +146,12 @@ pub struct Sndcp {
     contexts: HashMap<u32, RadioContext>,
     pending_commands: HashMap<u64, u32>,
     pending_ms_deactivations: HashMap<u64, PendingMsDeactivation>,
+    // An MS can finish AL disconnection and send a PDP deactivation just as
+    // this BS has restarted.  The radio context is then gone locally while
+    // the SwMI still owns the PDP context.  Retain the terminal demand while
+    // SN-RECONNECT recovers the authoritative session identity, then forward
+    // the actual PDP-DEACTIVATE before acknowledging the MS.
+    pending_recovery_deactivations: HashMap<u64, PendingMsDeactivation>,
     pending_network_deactivations: HashMap<u32, PendingNetworkDeactivation>,
     bearers: HashMap<u64, Bearer>,
     pending_deliveries: Vec<PendingDelivery>,
@@ -163,6 +169,7 @@ impl Sndcp {
             contexts: HashMap::new(),
             pending_commands: HashMap::new(),
             pending_ms_deactivations: HashMap::new(),
+            pending_recovery_deactivations: HashMap::new(),
             pending_network_deactivations: HashMap::new(),
             bearers: HashMap::new(),
             pending_deliveries: Vec::new(),
@@ -673,7 +680,7 @@ impl Sndcp {
                 nsapi,
                 snei,
             } => {
-                let context = self.contexts.get(&issi).cloned().unwrap_or(RadioContext {
+                let context = self.contexts.get(&issi).cloned().unwrap_or_else(|| RadioContext {
                     issi,
                     endpoint_id: prim.endpoint_id,
                     link_id: prim.link_id,
@@ -688,6 +695,7 @@ impl Sndcp {
                     chap_identifier: None,
                     dynamic_address: true,
                 });
+                let missing_context = !self.contexts.contains_key(&issi);
                 let identifies_context =
                     deactivation_type == 0 || (nsapi == Some(context.nsapi) && snei.is_none_or(|value| context.snei == Some(value)));
                 if let Some((session_id, session_generation)) = context.session().filter(|_| identifies_context) {
@@ -711,6 +719,29 @@ impl Sndcp {
                         return;
                     }
                     self.pending_ms_deactivations.remove(&command_id);
+                }
+                // TTR 001-05 §7.13.2.1 requires the SwMI to process this
+                // demand after AL-DISC has completed.  A BS restart must not
+                // turn that into a terminal-only acknowledgement: recover the
+                // retained SwMI session by its SNEI and deactive it when the
+                // recovery result arrives.  This matches the same-cell
+                // SN-RECONNECT recovery path used after a lost radio context.
+                if missing_context && deactivation_type == 1 && snei.is_some() {
+                    self.insert_context(context.clone());
+                    if let Some(command_id) = self.request_access(issi, prim.endpoint_id, prim.link_id, None, true, false) {
+                        self.pending_recovery_deactivations.insert(
+                            command_id,
+                            PendingMsDeactivation {
+                                issi,
+                                deactivation_type,
+                                nsapi,
+                                snei,
+                            },
+                        );
+                        tracing::info!(issi, ?snei, "recovering retained SNDCP session before MS PDP deactivation");
+                        return;
+                    }
+                    self.remove_context(issi);
                 }
                 self.queue_downlink(
                     queue,
@@ -910,16 +941,16 @@ impl Sndcp {
         resource: Option<SndcpResourceRequest>,
         reconnect: bool,
         data_to_send: bool,
-    ) {
+    ) -> Option<u64> {
         let Some(context) = self.contexts.get_mut(&issi) else {
-            return;
+            return None;
         };
         context.endpoint_id = endpoint_id;
         context.link_id = link_id;
         let context = context.clone();
         let (session_id, session_generation) = context.session().unwrap_or((0, 0));
         if session_id == 0 && (!reconnect || context.snei.is_none()) {
-            return;
+            return None;
         }
         let command_id = self.next_command();
         self.pending_commands.insert(command_id, issi);
@@ -934,7 +965,8 @@ impl Sndcp {
             reconnect,
             snei: context.snei,
             resource: Self::resource(resource),
-        });
+        })
+        .then_some(command_id)
     }
 
     fn reserve_bearer(&mut self, queue: &mut MessageQueue, command_id: u64, id: u64, generation: u64, requested: u8) {
@@ -1486,6 +1518,7 @@ impl Sndcp {
                 if self.pending_commands.remove(&command_id) != Some(issi) {
                     return;
                 }
+                let pending_recovery_deactivation = self.pending_recovery_deactivations.remove(&command_id);
                 let Some(context) = self.contexts.get_mut(&issi) else {
                     return;
                 };
@@ -1529,8 +1562,50 @@ impl Sndcp {
                         }
                     }
                 }
-                let detach_for_standby = accepted && response == PacketAccessResponse::None && context.bearer_id.is_some();
                 let mut context = context.clone();
+                if let Some(pending) = pending_recovery_deactivation {
+                    if accepted {
+                        let command_id = self.next_command();
+                        self.pending_ms_deactivations.insert(command_id, pending.clone());
+                        if self.submit(PacketDataMessage::Deactivate {
+                            command_id,
+                            itsi: u64::from(issi),
+                            session_id,
+                            session_generation,
+                            network_initiated: false,
+                        }) {
+                            tracing::info!(
+                                issi,
+                                session_id,
+                                session_generation,
+                                "forwarded recovered MS PDP deactivation to SwMI"
+                            );
+                            return;
+                        }
+                        self.pending_ms_deactivations.remove(&command_id);
+                    }
+                    tracing::warn!(
+                        issi,
+                        session_id,
+                        session_generation,
+                        accepted,
+                        "could not forward recovered MS PDP deactivation; completing local release"
+                    );
+                    self.queue_downlink(
+                        queue,
+                        &context,
+                        SndcpDownlink::DeactivateAccept {
+                            deactivation_type: pending.deactivation_type,
+                            nsapi: pending.nsapi,
+                            snei: pending.snei,
+                        },
+                        Layer2Service::Acknowledged,
+                        None,
+                    );
+                    self.remove_context(issi);
+                    return;
+                }
+                let detach_for_standby = accepted && response == PacketAccessResponse::None && context.bearer_id.is_some();
                 if detach_for_standby {
                     // After radio downlink failure, SN-RECONNECT with "no
                     // data to send" arrives on the CCCH (TTR 001-05 6.17).
@@ -2075,6 +2150,16 @@ mod tests {
         Sndcp::new(SharedConfig::from_parts(config, None), None)
     }
 
+    fn test_sndcp_with_swmi() -> (Sndcp, crate::net_swmi::SwmiWorkerEndpoint) {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration");
+        let (worker, _, _, _, _, _, packet) = crate::net_swmi::channel();
+        (Sndcp::new(SharedConfig::from_parts(config, None), Some(packet)), worker)
+    }
+
     fn insert_bearer(sndcp: &mut Sndcp, generation: u64, members: HashSet<u32>, reporters: Vec<TxReporter>) {
         sndcp
             .config
@@ -2268,6 +2353,89 @@ mod tests {
         assert_eq!(accept.deactivation_type, 0);
         assert_eq!(accept.nsapi, None);
         assert!(!sndcp.contexts.contains_key(&77_468));
+    }
+
+    #[test]
+    fn unknown_ms_deactivation_recovers_then_releases_retained_swmi_session() {
+        let (mut sndcp, worker) = test_sndcp_with_swmi();
+        let mut encoded = BitBuffer::new_autoexpand(64);
+        SnDeactivatePdpContextDemand {
+            deactivation_type: 1,
+            nsapi: Some(1),
+            sndcp_network_endpoint_identifier: Some(84),
+        }
+        .to_bitbuf(&mut encoded)
+        .unwrap();
+        encoded.seek(0);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_uplink(&mut queue, uplink(encoded, 430_905));
+
+        assert!(queue.pop_front().is_none(), "MS must wait for SwMI PDP deactivation");
+        assert!(matches!(
+            worker.try_recv_outgoing(),
+            Some(SwmiMessage::PacketData(PacketDataMessage::Access {
+                command_id: 1,
+                itsi: 430_905,
+                session_id: 0,
+                session_generation: 0,
+                reconnect: true,
+                data_to_send: false,
+                snei: Some(84),
+                resource: None,
+                ..
+            }))
+        ));
+        assert!(sndcp.pending_recovery_deactivations.contains_key(&1));
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::AccessResult {
+                command_id: 1,
+                itsi: 430_905,
+                session_id: 84,
+                session_generation: 1,
+                accepted: true,
+                cause: None,
+                response: PacketAccessResponse::None,
+                bearer_id: 0,
+                timeslot_bitmap: 0,
+                event_label: 0,
+            },
+        );
+
+        assert!(queue.pop_front().is_none(), "recovery has no air-interface response");
+        assert!(matches!(
+            worker.try_recv_outgoing(),
+            Some(SwmiMessage::PacketData(PacketDataMessage::Deactivate {
+                command_id: 2,
+                itsi: 430_905,
+                session_id: 84,
+                session_generation: 1,
+                network_initiated: false,
+            }))
+        ));
+        assert!(sndcp.pending_ms_deactivations.contains_key(&2));
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::DeactivateResult {
+                command_id: 2,
+                itsi: 430_905,
+                session_id: 84,
+                session_generation: 1,
+                accepted: true,
+            },
+        );
+
+        let SapMsgInner::LtpdMleUnitdataReq(mut primitive) = queue.pop_front().expect("deactivation accept").msg else {
+            panic!("expected LTPD unitdata request");
+        };
+        let accept = SnDeactivatePdpContextAccept::from_bitbuf(&mut primitive.sdu).unwrap();
+        assert_eq!(accept.deactivation_type, 1);
+        assert_eq!(accept.nsapi, Some(1));
+        assert_eq!(accept.sndcp_network_endpoint_identifier, Some(84));
+        assert!(!sndcp.contexts.contains_key(&430_905));
     }
 
     #[test]

@@ -155,6 +155,13 @@ pub struct SwmiWorkerEndpoint {
     online: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+impl SwmiWorkerEndpoint {
+    pub(crate) fn try_recv_outgoing(&self) -> Option<SwmiMessage> {
+        self.outgoing.try_recv().ok()
+    }
+}
+
 /// MLE's non-blocking view of the centrally resolved neighbour directory.
 /// It is separate from MM/CMCE because the MLE owns D-NWRK-BROADCAST.
 pub struct SwmiMleEndpoint {
