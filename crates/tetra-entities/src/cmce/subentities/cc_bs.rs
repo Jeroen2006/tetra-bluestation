@@ -3006,6 +3006,11 @@ impl CcBsSubentity {
             SwmiMessage::FloorReleased { call_id, .. } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
                 self.pending_preemptive_floor_grants.remove(&call_id);
+                // A restored floor holder needed the D-SETUP suppression only
+                // while it retained Granted. Once the central floor is
+                // released, the cached setup is again consistent with the
+                // terminal's state and may resume normal late-entry recovery.
+                self.restore_prepared_calls.remove(&call_id);
                 if let Some(call) = self.pending_remote_swmi_calls.get_mut(&call_id) {
                     call.floor_itsi = 0;
                 }
@@ -5965,6 +5970,12 @@ impl CcBsSubentity {
             (call.dest_gssi, call.ts)
         };
 
+        // The restoring speaker has now been explicitly interrupted. It can
+        // no longer be harmed by the cached GrantedToOtherUser D-SETUP, so
+        // subsequent FloorGranted handling and periodic late entry may use
+        // the normal group advertisement again.
+        self.restore_prepared_calls.remove(&call_id);
+
         if self.subscriber_groups.contains_key(&previous_itsi) {
             self.send_d_tx_interrupt_individual_facch(queue, call_id, previous_itsi, next_itsi, ts);
         }
@@ -6757,6 +6768,31 @@ mod tests {
         assert!(
             cc.restore_prepared_calls.contains(&call_id),
             "speaker restore must suppress cached GrantedToOtherUser D-SETUP"
+        );
+    }
+
+    #[test]
+    fn restored_speaker_preemption_resumes_group_late_entry() {
+        let gssi = 91;
+        let restoring_itsi = 430_892;
+        let next_itsi = 430_905;
+        let call_id = 17;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+
+        cc.start_remote_swmi_call(&mut queue, call_id, restoring_itsi, gssi, 1, restoring_itsi, None, false, false);
+        while queue.pop_front().is_some() {}
+        assert!(cc.restore_prepared_calls.contains(&call_id));
+
+        assert!(cc.apply_floor_preemption(&mut queue, call_id, restoring_itsi, next_itsi));
+
+        assert!(
+            !cc.restore_prepared_calls.contains(&call_id),
+            "the group setup may resume once the restored speaker loses floor"
+        );
+        assert!(
+            !cc.active_calls.get(&call_id).expect("active call retained").tx_active,
+            "pre-emption must stop the old floor holder before the next grant"
         );
     }
 
