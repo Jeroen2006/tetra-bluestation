@@ -4034,14 +4034,11 @@ impl CcBsSubentity {
             .collect();
         for (call_id, restored_itsi, expected_floor_itsi) in ready {
             self.pending_restore_floor_indications.remove(&(call_id, restored_itsi));
-            let Some((floor_itsi, ts, usage, gssi)) = self.active_calls.get(&call_id).and_then(|call| {
-                (call.tx_active && call.source_issi == expected_floor_itsi).then_some((
-                    call.source_issi,
-                    call.ts,
-                    call.usage,
-                    call.dest_gssi,
-                ))
-            }) else {
+            let Some((floor_itsi, ts)) = self
+                .active_calls
+                .get(&call_id)
+                .and_then(|call| (call.tx_active && call.source_issi == expected_floor_itsi).then_some((call.source_issi, call.ts)))
+            else {
                 tracing::debug!(call_id, itsi = restored_itsi, "not sending stale post-restore D-TX GRANTED");
                 continue;
             };
@@ -4051,16 +4048,37 @@ impl CcBsSubentity {
                 // permission, so use a targeted FACCH indication here.
                 self.send_d_tx_grant_to_individual_facch(queue, call_id, restored_itsi, floor_itsi, ts, TransmissionGrant::Granted);
             } else {
-                // The restored MS is a listener.  Send the source identity to
-                // the GSSI on its associated SACCH/FN18, where every member
-                // on this target cell can consume the same floor indication.
-                self.send_d_tx_granted_group_fn18(queue, call_id, floor_itsi, gssi, ts, usage);
+                // TS 100 392-2 14.5.2.2.4 requires a restored listener to
+                // switch its U-plane on when it is told that another user
+                // owns the floor.  The group-addressed FN18 indication used
+                // here previously depended on the MS having already rebuilt
+                // its group receive context on the new TCH.  That leaves a
+                // visible but silent call if that first FN18 is missed. Send
+                // the current floor state directly over FACCH instead; the
+                // terminal has already accepted the D-CALL RESTORE channel
+                // allocation before this deferred indication is due.
+                self.send_d_tx_grant_to_individual_facch(
+                    queue,
+                    call_id,
+                    restored_itsi,
+                    floor_itsi,
+                    ts,
+                    TransmissionGrant::GrantedToOtherUser,
+                );
+
+                // The cached D-SETUP encodes GrantedToOtherUser, which now
+                // agrees with this restored listener.  It is safe to resume
+                // normal late-entry advertising for other group members. A
+                // restored floor holder deliberately remains suppressed until
+                // a later floor transition, because that same D-SETUP would
+                // otherwise revoke its granted transmit permission.
+                self.restore_prepared_calls.remove(&call_id);
             }
             tracing::info!(
                 call_id,
                 itsi = restored_itsi,
                 floor_itsi,
-                group_addressed = floor_itsi != restored_itsi,
+                group_addressed = false,
                 "sent post-restore D-TX GRANTED speaker indication"
             );
         }
@@ -6673,6 +6691,73 @@ mod tests {
                         && matches!(prim.main_address.ssi_type, SsiType::Gssi)
             )
         }));
+    }
+
+    #[test]
+    fn restored_group_listener_gets_individual_floor_grant() {
+        let gssi = 91;
+        let restoring_itsi = 430_892;
+        let floor_itsi = 430_905;
+        let call_id = 15;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+
+        // Recreate the target-cell state after the SwMI has reserved a call
+        // for a listener's U-RESTORE.  It must not broadcast D-SETUP before
+        // the individual restore completes.
+        cc.start_remote_swmi_call(&mut queue, call_id, floor_itsi, gssi, 1, floor_itsi, None, false, false);
+        while queue.pop_front().is_some() {}
+        assert!(cc.restore_prepared_calls.contains(&call_id));
+        cc.pending_restore_floor_indications
+            .insert((call_id, restoring_itsi), (floor_itsi, cc.dltime));
+
+        cc.process_pending_restore_floor_indications(&mut queue);
+
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut queue.pop_front().expect("targeted floor indication queued").msg else {
+            panic!("post-restore floor indication must be routed through MLE")
+        };
+        assert_eq!(prim.main_address.ssi, restoring_itsi);
+        assert!(matches!(prim.main_address.ssi_type, SsiType::Issi));
+        assert!(prim.stealing_permission, "post-restore listener grant uses FACCH");
+        let grant = DTxGranted::from_bitbuf(&mut prim.sdu).expect("parse targeted D-TX GRANTED");
+        assert_eq!(grant.call_identifier, call_id);
+        assert_eq!(grant.transmission_grant, TransmissionGrant::GrantedToOtherUser.into_raw() as u8);
+        assert_eq!(grant.transmitting_party_address_ssi, Some(u64::from(floor_itsi)));
+        assert!(
+            !cc.restore_prepared_calls.contains(&call_id),
+            "a restored listener may resume normal late-entry D-SETUP advertisements"
+        );
+    }
+
+    #[test]
+    fn restored_group_speaker_keeps_granted_state_without_group_d_setup() {
+        let gssi = 91;
+        let restoring_itsi = 430_892;
+        let call_id = 16;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+
+        // The active speaker may roam as well.  Its D-CALL RESTORE grants
+        // transmit permission, so a later cached group D-SETUP carrying
+        // GrantedToOtherUser would revoke that permission.
+        cc.start_remote_swmi_call(&mut queue, call_id, restoring_itsi, gssi, 1, restoring_itsi, None, false, false);
+        while queue.pop_front().is_some() {}
+        cc.pending_restore_floor_indications
+            .insert((call_id, restoring_itsi), (restoring_itsi, cc.dltime));
+
+        cc.process_pending_restore_floor_indications(&mut queue);
+
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut queue.pop_front().expect("speaker floor confirmation queued").msg else {
+            panic!("post-restore speaker confirmation must be routed through MLE")
+        };
+        assert_eq!(prim.main_address.ssi, restoring_itsi);
+        assert!(prim.stealing_permission, "post-restore speaker grant uses FACCH");
+        let grant = DTxGranted::from_bitbuf(&mut prim.sdu).expect("parse targeted speaker D-TX GRANTED");
+        assert_eq!(grant.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+        assert!(
+            cc.restore_prepared_calls.contains(&call_id),
+            "speaker restore must suppress cached GrantedToOtherUser D-SETUP"
+        );
     }
 
     #[test]
