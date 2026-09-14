@@ -2135,11 +2135,11 @@ impl CcBsSubentity {
             call_identifier: pdu.call_identifier,
             transmission_grant: transmission_grant.into_raw() as u8,
             transmission_request_permission,
-            // Service restoration is the first reliable downlink exchange on
-            // the target cell.  Restart T310 here: retaining the source-cell
-            // deadline can make the MS cancel a perfectly restored call while
-            // it is waiting for its first floor decision or D-INFO.
-            reset_call_time_out_timer_t310_: true,
+            // TTR 001-01 10.2.1 figures 34--37 require the restoration
+            // response to carry "no reset of call timeout timer T310".
+            // Restarting it turns a normal listener re-selection into a
+            // fresh call timer and has produced noticeably late recovery.
+            reset_call_time_out_timer_t310_: false,
             new_call_identifier: None,
             call_time_out: None,
             call_status: None,

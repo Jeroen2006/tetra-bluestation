@@ -298,24 +298,41 @@ impl MleBs {
         });
     }
 
-    fn send_mle_downlink(
-        &self,
-        queue: &mut MessageQueue,
+    fn build_mle_downlink(
         address: TetraAddress,
         mut pdu: BitBuffer,
         chan_alloc: Option<CmceChanAllocReq>,
         air_interface_encryption: Option<AieRequest>,
-    ) {
+        layer2service: Layer2Service,
+    ) -> SapMsg {
         let pdu_len = pdu.get_len_remaining();
         let mut tl_sdu = BitBuffer::new_autoexpand(3 + pdu_len);
         tl_sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
         tl_sdu.copy_bits(&mut pdu, pdu_len);
         tl_sdu.seek(0);
-        queue.push_back(SapMsg {
-            sap: Sap::TlaSap,
-            src: TetraEntity::Mle,
-            dest: TetraEntity::Llc,
-            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+        let msg = match layer2service {
+            // TTR 001-01 10.2.1 requires D-RESTORE-ACK to use BL-UDATA. It
+            // carries a channel allocation, so waiting for an LLC acknowledgement
+            // here leaves the MS on the MCCH longer than the restoration procedure
+            // permits.
+            Layer2Service::Unacknowledged => SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                main_address: address,
+                link_id: 0,
+                endpoint_id: 0,
+                tl_sdu,
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption,
+                packet_data_flag: false,
+                n_tlsdu_repeats: 0,
+                data_class_info: None,
+                req_handle: 0,
+                chan_alloc,
+                associated_channel: None,
+                tx_reporter: None,
+            }),
+            _ => SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
                 main_address: address,
                 link_id: 0,
                 endpoint_id: 0,
@@ -333,7 +350,31 @@ impl MleBs {
                 associated_channel: None,
                 tx_reporter: None,
             }),
-        });
+        };
+        SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Llc,
+            msg,
+        }
+    }
+
+    fn send_mle_downlink(
+        &self,
+        queue: &mut MessageQueue,
+        address: TetraAddress,
+        pdu: BitBuffer,
+        chan_alloc: Option<CmceChanAllocReq>,
+        air_interface_encryption: Option<AieRequest>,
+        layer2service: Layer2Service,
+    ) {
+        queue.push_back(Self::build_mle_downlink(
+            address,
+            pdu,
+            chan_alloc,
+            air_interface_encryption,
+            layer2service,
+        ));
     }
 
     fn send_new_cell(
@@ -354,7 +395,14 @@ impl MleBs {
         .is_ok()
         {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, chan_alloc, air_interface_encryption);
+            self.send_mle_downlink(
+                queue,
+                address,
+                bits,
+                chan_alloc,
+                air_interface_encryption,
+                Layer2Service::Acknowledged,
+            );
         }
     }
 
@@ -380,7 +428,7 @@ impl MleBs {
         let mut bits = BitBuffer::new_autoexpand(64);
         if (DPrepareFail { fail_cause, sdu }).to_bitbuf(&mut bits).is_ok() {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption);
+            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption, Layer2Service::Acknowledged);
         }
     }
 
@@ -394,7 +442,7 @@ impl MleBs {
         let mut bits = BitBuffer::new_autoexpand(16);
         if (DRestoreFail { fail_cause }).to_bitbuf(&mut bits).is_ok() {
             bits.seek(0);
-            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption);
+            self.send_mle_downlink(queue, address, bits, None, air_interface_encryption, Layer2Service::Acknowledged);
         }
     }
 
@@ -836,6 +884,7 @@ impl MleBs {
                         bits,
                         prim.chan_alloc.take(),
                         self.mle_reply_aie(prim.main_address, incoming_aie),
+                        Layer2Service::Unacknowledged,
                     );
                 }
             }
@@ -1142,6 +1191,17 @@ mod tests {
             mle_upper_layer_route(MleProtocolDiscriminator::Sndcp),
             Some((Sap::TlpdSap, TetraEntity::Sndcp))
         );
+    }
+
+    #[test]
+    fn restore_ack_uses_unacknowledged_basic_link_service() {
+        let mut cmce = BitBuffer::new_autoexpand(8);
+        cmce.write_bits(0b01110, 5); // D-CALL RESTORE
+        cmce.seek(0);
+
+        let message = MleBs::build_mle_downlink(TetraAddress::issi(77_492), cmce, None, None, Layer2Service::Unacknowledged);
+
+        assert!(matches!(message.msg, SapMsgInner::TlaTlUnitdataReqBl(_)));
     }
 
     #[test]
