@@ -72,6 +72,10 @@ pub struct UmacBs {
     /// is the generation token for the slot: teardown and floor/media events
     /// from an older call are ignored after the slot has been recycled.
     traffic_call_owner: [Option<u16>; 4],
+    /// First central downlink voice frame admitted to the RF scheduler for
+    /// each traffic-slot call generation.  One log entry per call makes the
+    /// media half of call restoration observable without per-frame logging.
+    first_central_downlink_voice: [Option<u16>; 4],
     /// The current floor holder is the only identity available to an
     /// unaddressed U-TX CEASED MAC-U-SIGNAL. Keep it at the UMAC/CMCE
     /// boundary instead of forwarding a synthetic SSI 0.
@@ -333,6 +337,7 @@ impl UmacBs {
             aie_provider,
             uplink_traffic_aie: [None; 4],
             traffic_call_owner: [None; 4],
+            first_central_downlink_voice: [None; 4],
             traffic_floor_holder: [None; 4],
             last_ul_voice: [None; 4],
             private_media_timeslots: HashSet::new(),
@@ -2534,6 +2539,19 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
+                    if (1..=4).contains(&ts)
+                        && src == TetraEntity::Swmi
+                        && let Some(call_id) = self.traffic_call_owner[ts as usize - 1]
+                        && self.first_central_downlink_voice[ts as usize - 1] != Some(call_id)
+                    {
+                        self.first_central_downlink_voice[ts as usize - 1] = Some(call_id);
+                        tracing::info!(
+                            call_id,
+                            ts,
+                            dltime = %self.dltime,
+                            "first central voice frame admitted to RF traffic scheduler"
+                        );
+                    }
                     self.channel_scheduler.dl_schedule_tmd(ts, prim.data);
                 } else {
                     tracing::warn!(
@@ -2718,6 +2736,7 @@ impl UmacBs {
             // private-call state into the next generation of this slot.
             self.set_traffic_aie(queue, ts, None, None);
             self.channel_scheduler.set_hangtime(ts, false);
+            self.first_central_downlink_voice[ts as usize - 1] = None;
             self.traffic_floor_holder[ts as usize - 1] = None;
             self.last_ul_voice[ts as usize - 1] = None;
             self.private_media_timeslots.remove(&ts);
@@ -2811,6 +2830,7 @@ impl UmacBs {
         self.set_traffic_aie(queue, ts, None, None);
         if (1..=4).contains(&ts) {
             self.traffic_call_owner[ts as usize - 1] = None;
+            self.first_central_downlink_voice[ts as usize - 1] = None;
             self.traffic_floor_holder[ts as usize - 1] = None;
             self.last_ul_voice[ts as usize - 1] = None;
             self.private_media_timeslots.remove(&ts);
@@ -2957,6 +2977,7 @@ impl UmacBs {
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.traffic_call_owner[ts as usize - 1] = None;
+                    self.first_central_downlink_voice[ts as usize - 1] = None;
                     self.traffic_floor_holder[ts as usize - 1] = None;
                     self.last_ul_voice[ts as usize - 1] = None;
                     self.duplex_private_media_timeslots.remove(&ts);
@@ -3065,6 +3086,7 @@ impl UmacBs {
                 }
                 self.set_traffic_aie(queue, ts, None, None);
                 self.traffic_call_owner[ts as usize - 1] = None;
+                self.first_central_downlink_voice[ts as usize - 1] = None;
                 self.private_media_timeslots.remove(&ts);
                 self.duplex_private_media_timeslots.remove(&ts);
                 if (1..=4).contains(&ts) {

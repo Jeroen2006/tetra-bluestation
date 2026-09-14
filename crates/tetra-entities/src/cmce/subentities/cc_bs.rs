@@ -176,12 +176,18 @@ const PRIVATE_CALL_SETUP_TIMEOUT: CallTimeoutSetupPhase = CallTimeoutSetupPhase:
 /// Give a normally responsive central SwMI one TDMA multiframe to decide a
 /// private floor request before telling the terminal that it is queued.
 const PRIVATE_FLOOR_RESPONSE_GRACE_TIMESLOTS: i32 = 18 * 4;
-/// D-CALL RESTORE itself enables the receive U-plane when it says
-/// `GrantedToOtherUser` (TTR 001-01, 10.2.1). The follow-up FACCH indication
-/// only names the current speaker, so hold it for two TDMA frames: long
-/// enough for the replace allocation to reach the MS without imposing a full
-/// multiframe of otherwise avoidable restored-call silence.
+/// A restoring MS that still has a pending transmit request needs the final
+/// floor-state indication after D-CALL RESTORE.  Listeners do not: D-CALL
+/// RESTORE's `GrantedToOtherUser` value itself enables their receive U-plane
+/// (TTR 001-01, 10.2.1).  Hold the required follow-up only long enough for
+/// the replace allocation to reach the MS.
 const RESTORE_FLOOR_INDICATION_DELAY_TIMESLOTS: i32 = 8;
+/// Keep group late-entry advertisements out of the short restoration window.
+/// The restored MS must not be made to process a redundant group D-SETUP
+/// immediately after the individually addressed D-RESTORE-ACK.  The active
+/// call is already allocated, and this low-priority recovery broadcast can
+/// safely resume after four TDMA multiframes.
+const RESTORE_LATE_ENTRY_HOLD_TIMESLOTS: i32 = 18 * 4;
 /// SS-TPI is carried in the Facility element of the associated CMCE PDU.
 const SS_TPI_AIR_INTERFACE_ENABLED: bool = true;
 
@@ -196,6 +202,10 @@ pub struct CcBsSubentity {
     /// D-SETUP remains necessary for D-RELEASE, but must not be emitted to
     /// the restoring floor holder as `GrantedToOtherUser`.
     restore_prepared_calls: HashSet<u16>,
+    /// Temporary hold after a listener's D-CALL RESTORE.  This is separate
+    /// from `restore_prepared_calls`, which remains necessary for a roaming
+    /// floor holder whose cached D-SETUP would revoke transmit permission.
+    restore_late_entry_holds: HashMap<u16, TdmaTime>,
     circuits: CircuitMgr,
     /// Active group calls: call_id -> call info
     active_calls: HashMap<u16, ActiveCall>,
@@ -484,6 +494,7 @@ impl CcBsSubentity {
             dltime: TdmaTime::default(),
             cached_setups: HashMap::new(),
             restore_prepared_calls: HashSet::new(),
+            restore_late_entry_holds: HashMap::new(),
             circuits: CircuitMgr::new(),
             active_calls: HashMap::new(),
             subscriber_groups: HashMap::new(),
@@ -2067,6 +2078,7 @@ impl CcBsSubentity {
                 .is_some_and(|groups| groups.contains(&call.dest_gssi))
         });
         let group_floor_itsi = group_call.and_then(|call| call.tx_active.then_some(call.source_issi));
+        let restoring_group_floor_holder = group_floor_itsi.is_some_and(|floor_itsi| floor_itsi == itsi);
         let private_call = self.private_calls.get(&pdu.call_identifier).filter(|call| {
             call.connected
                 && (call.caller_itsi == itsi || call.callee_itsi == itsi)
@@ -2184,7 +2196,13 @@ impl CcBsSubentity {
             Layer2Service::Acknowledged,
             None,
         ));
-        if let Some(floor_itsi) = group_floor_itsi {
+        // A listener has no outstanding transmit request.  Its D-CALL
+        // RESTORE already turned on the receive U-plane, so an immediate
+        // D-TX GRANTED is redundant call control and can arrive while the MS
+        // is still applying the replace allocation.  TS 100 392-2 only needs
+        // the later D-TX GRANTED response when the MS brought a pending
+        // transmit request across the cell change.
+        if let Some(floor_itsi) = group_floor_itsi.filter(|_| pdu.request_to_transmit_send_data && !restoring_group_floor_holder) {
             self.pending_restore_floor_indications.insert(
                 (pdu.call_identifier, itsi),
                 (floor_itsi, self.dltime.add_timeslots(RESTORE_FLOOR_INDICATION_DELAY_TIMESLOTS)),
@@ -2194,6 +2212,21 @@ impl CcBsSubentity {
                 call_id = pdu.call_identifier,
                 floor_itsi,
                 "queued post-restore D-TX GRANTED speaker indication"
+            );
+        }
+        if group_call.is_some() && !restoring_group_floor_holder {
+            // `start_remote_swmi_call` intentionally suppresses D-SETUP
+            // until the individual restoration completes.  Continue that
+            // suppression for the short settling period above, then let the
+            // normal low-priority late-entry cadence resume for other MSs.
+            self.restore_prepared_calls.remove(&pdu.call_identifier);
+            self.restore_late_entry_holds
+                .insert(pdu.call_identifier, self.dltime.add_timeslots(RESTORE_LATE_ENTRY_HOLD_TIMESLOTS));
+            tracing::info!(
+                itsi,
+                call_id = pdu.call_identifier,
+                hold_timeslots = RESTORE_LATE_ENTRY_HOLD_TIMESLOTS,
+                "holding group late-entry D-SETUP after listener restoration"
             );
         }
         // U-RESTORE positively confirms that this MS has reached the target
@@ -2338,8 +2371,13 @@ impl CcBsSubentity {
         // A call prepared for service restoration already has its target
         // circuit. Re-sending the cached group D-SETUP would overwrite a
         // restored speaker's `Granted` state with `GrantedToOtherUser`.
-        if self.restore_prepared_calls.contains(&call_id) {
-            tracing::debug!(call_id, "suppressing D-SETUP for restore-prepared call");
+        if self.restore_prepared_calls.contains(&call_id)
+            || self
+                .restore_late_entry_holds
+                .get(&call_id)
+                .is_some_and(|hold_until| hold_until.age(self.dltime) < 0)
+        {
+            tracing::debug!(call_id, "suppressing D-SETUP during call restoration");
             return false;
         }
         // P2P D-SETUP is individually addressed before RF resource
@@ -2434,6 +2472,7 @@ impl CcBsSubentity {
 
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime, sds: &mut SdsBsSubentity, ss: &mut SsBsSubentity) {
         self.dltime = dltime;
+        self.restore_late_entry_holds.retain(|_, hold_until| hold_until.age(dltime) < 0);
 
         // Central decisions are applied on the radio/router thread, never on
         // the WSS worker.  Drain all pending control actions before TDMA work.
@@ -2511,6 +2550,7 @@ impl CcBsSubentity {
                         // Clean up call state
                         self.cached_setups.remove(&call_id);
                         self.restore_prepared_calls.remove(&call_id);
+                        self.restore_late_entry_holds.remove(&call_id);
                         self.pending_restore_floor_indications
                             .retain(|(pending_call_id, _), _| *pending_call_id != call_id);
                         self.active_calls.remove(&call_id);
@@ -4223,6 +4263,7 @@ impl CcBsSubentity {
         self.cached_setups.insert(call_id, (d_setup, dest_addr, None));
         if announce_setup {
             self.restore_prepared_calls.remove(&call_id);
+            self.restore_late_entry_holds.remove(&call_id);
             let (pdu, _, _) = self.cached_setups.get(&call_id).expect("inserted above");
             let (sdu, allocation) = Self::build_d_setup_prim(pdu, circuit.usage, circuit.ts, UlDlAssignment::Both);
             queue.push_back(Self::build_sapmsg(
@@ -4375,6 +4416,7 @@ impl CcBsSubentity {
         );
         self.pending_preemptive_floor_grants.remove(&call_id);
         self.restore_prepared_calls.remove(&call_id);
+        self.restore_late_entry_holds.remove(&call_id);
         self.pending_restore_floor_indications
             .retain(|(pending_call_id, _), _| *pending_call_id != call_id);
         let Some(call) = self.active_calls.remove(&call_id) else {
@@ -6708,7 +6750,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_group_listener_gets_individual_floor_grant() {
+    fn restoring_pending_transmitter_gets_individual_floor_state() {
         let gssi = 91;
         let restoring_itsi = 430_892;
         let floor_itsi = 430_905;
@@ -6716,9 +6758,8 @@ mod tests {
         let mut cc = test_cc_with_group(gssi);
         let mut queue = MessageQueue::new();
 
-        // Recreate the target-cell state after the SwMI has reserved a call
-        // for a listener's U-RESTORE.  It must not broadcast D-SETUP before
-        // the individual restore completes.
+        // A roaming MS which carried a transmit request needs the D-TX
+        // GRANTED state after it has processed D-CALL RESTORE.
         cc.start_remote_swmi_call(&mut queue, call_id, floor_itsi, gssi, 1, floor_itsi, None, false, false);
         while queue.pop_front().is_some() {}
         assert!(cc.restore_prepared_calls.contains(&call_id));
@@ -6739,7 +6780,37 @@ mod tests {
         assert_eq!(grant.transmitting_party_address_ssi, Some(u64::from(floor_itsi)));
         assert!(
             !cc.restore_prepared_calls.contains(&call_id),
-            "a restored listener may resume normal late-entry D-SETUP advertisements"
+            "a pending transmitter may resume normal late-entry advertisements once its floor state is confirmed"
+        );
+    }
+
+    #[test]
+    fn restored_listener_defers_group_late_entry_advertisements() {
+        let gssi = 91;
+        let call_id = 17;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+
+        // The target circuit has been reserved for an individual D-RESTORE-
+        // ACK.  Once a listener's D-CALL RESTORE is accepted, the call no
+        // longer needs the speaker-only suppression, but periodic group
+        // D-SETUP must not immediately follow that response.
+        cc.start_remote_swmi_call(&mut queue, call_id, 430_905, gssi, 1, 430_905, None, false, false);
+        while queue.pop_front().is_some() {}
+        let call = cc.active_calls.get(&call_id).expect("restored call allocated").clone();
+        cc.restore_prepared_calls.remove(&call_id);
+        let hold_until = cc.dltime.add_timeslots(RESTORE_LATE_ENTRY_HOLD_TIMESLOTS);
+        cc.restore_late_entry_holds.insert(call_id, hold_until);
+
+        assert!(
+            !cc.send_cached_group_d_setup(&mut queue, call_id, call.usage, call.ts, true),
+            "a listener must not receive a redundant group D-SETUP in its restoration window"
+        );
+
+        cc.dltime = hold_until;
+        assert!(
+            cc.send_cached_group_d_setup(&mut queue, call_id, call.usage, call.ts, true),
+            "normal late entry resumes once the restoration hold ends"
         );
     }
 

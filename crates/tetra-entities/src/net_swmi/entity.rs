@@ -34,6 +34,11 @@ struct ActivePrivateVoice {
 pub struct SwmiMediaEntity {
     endpoint: SwmiMediaEndpoint,
     calls_by_ts: HashMap<u8, ActiveVoiceCall>,
+    /// First central downlink frame seen for the current call generation on a
+    /// timeslot.  This is deliberately operational telemetry rather than a
+    /// per-frame log: it makes a roaming recovery gap observable without
+    /// turning normal speech into log noise.
+    downlink_started_by_ts: HashMap<u8, u16>,
     private_by_ts: HashMap<u8, ActivePrivateVoice>,
 }
 
@@ -42,6 +47,7 @@ impl SwmiMediaEntity {
         Self {
             endpoint,
             calls_by_ts: HashMap::new(),
+            downlink_started_by_ts: HashMap::new(),
             private_by_ts: HashMap::new(),
         }
     }
@@ -127,6 +133,9 @@ impl SwmiMediaEntity {
             tracing::warn!(call_id, gssi, "SwMI voice frame has unsupported TMD length");
             return;
         };
+        if self.downlink_started_by_ts.insert(ts, call_id as u16) != Some(call_id as u16) {
+            tracing::info!(call_id, gssi, ts, "first central voice frame accepted for local traffic circuit");
+        }
         queue.push_back(SapMsg {
             sap: Sap::TmdSap,
             src: TetraEntity::Swmi,
@@ -217,6 +226,7 @@ impl TetraEntityTrait for SwmiMediaEntity {
                 dest_gssi,
                 ts,
             }) => {
+                self.downlink_started_by_ts.remove(&ts);
                 self.calls_by_ts.insert(
                     ts,
                     ActiveVoiceCall {
@@ -230,6 +240,7 @@ impl TetraEntityTrait for SwmiMediaEntity {
             | SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }) => {
                 if self.calls_by_ts.get(&ts).is_some_and(|call| call.call_id == call_id) {
                     self.calls_by_ts.remove(&ts);
+                    self.downlink_started_by_ts.remove(&ts);
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::PrivateMediaStart {
