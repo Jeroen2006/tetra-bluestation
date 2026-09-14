@@ -1740,7 +1740,7 @@ impl Sndcp {
                         nsapi: context.nsapi,
                         payload,
                     },
-                    Layer2Service::Acknowledged,
+                    Layer2Service::AdvancedAcknowledged,
                     None,
                     Some(reporter.clone()),
                 );
@@ -2251,6 +2251,30 @@ mod tests {
             chan_change_resp_req: false,
             chan_change_handle: None,
         }
+    }
+
+    #[test]
+    fn ipv4_downlink_requires_the_advanced_link() {
+        let mut sndcp = test_sndcp();
+        insert_active_multislot_bearer(&mut sndcp);
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::Ipv4 {
+                session_id: 8,
+                session_generation: 1,
+                packet_id: 42,
+                payload: vec![0x45; 20],
+            },
+        );
+
+        let SapMsgInner::LtpdMleUnitdataReq(request) = queue.pop_front().expect("IPv4 downlink").msg else {
+            panic!("expected LTPD unitdata request")
+        };
+        assert_eq!(request.layer2service, Layer2Service::AdvancedAcknowledged);
+        assert!(queue.pop_front().is_none());
+        assert_eq!(sndcp.pending_deliveries.len(), 1);
     }
 
     #[test]

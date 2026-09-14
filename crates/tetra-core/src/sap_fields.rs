@@ -24,6 +24,9 @@ pub enum Layer2Service {
     Todo,
     /// Use acknowledged BL-DATA (or BL-ADATA) service
     Acknowledged,
+    /// Require the acknowledged advanced-link service.  The request remains
+    /// pending until AL-SETUP has completed and is never sent as BL-DATA.
+    AdvancedAcknowledged,
     /// Use unacknowledged BL-UDATA service
     Unacknowledged,
 }

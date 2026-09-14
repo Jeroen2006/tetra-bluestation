@@ -82,9 +82,11 @@ pub struct TlConnectConf {
     setup_report: Todo,
 }
 
-/// advanced link only
-#[derive(Debug, Clone)]
-pub struct TlDataReqAl;
+/// TL-DATA request fields used by the acknowledged advanced-link primitive.
+///
+/// The enum variant carrying this alias keeps advanced-link-only requests
+/// separate from basic-link TL-DATA requests at the LLC boundary.
+pub type TlaTlDataReqAl = TlaTlDataReqBl;
 #[derive(Debug, Clone)]
 pub struct TlDataIndAl;
 #[derive(Debug, Clone)]
@@ -105,8 +107,7 @@ pub struct TlaTlDataReqBl {
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,
-    /// Selects the acknowledged advanced link after it has been established.
-    /// SNDCP control PDUs may still fall back to basic link before AL-SETUP.
+    /// Identifies packet-data signalling for MAC routing and allocation.
     pub packet_data_flag: bool,
     pub air_interface_encryption: Option<AieRequest>,
     pub stealing_repeats_flag: Option<bool>,

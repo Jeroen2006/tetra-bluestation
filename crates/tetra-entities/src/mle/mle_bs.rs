@@ -784,28 +784,34 @@ impl MleBs {
                 }),
             )
         } else {
+            let advanced_link_required = prim.layer2service == Layer2Service::AdvancedAcknowledged;
+            let request = TlaTlDataReqBl {
+                main_address: prim.main_address,
+                link_id: prim.link_id,
+                endpoint_id: prim.endpoint_id,
+                tl_sdu: pdu,
+                stealing_permission: prim.stealing_permission,
+                subscriber_class: 0,
+                fcs_flag: prim.fcs_flag,
+                packet_data_flag: true,
+                air_interface_encryption,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: prim.handle,
+                graceful_degradation: None,
+                chan_alloc: prim.chan_alloc.take(),
+                associated_channel: prim.associated_channel.take(),
+                tx_reporter: prim.tx_reporter.take(),
+            };
             SapMsg::new(
                 Sap::TlaSap,
                 TetraEntity::Mle,
                 TetraEntity::Llc,
-                SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                    main_address: prim.main_address,
-                    link_id: prim.link_id,
-                    endpoint_id: prim.endpoint_id,
-                    tl_sdu: pdu,
-                    stealing_permission: prim.stealing_permission,
-                    subscriber_class: 0,
-                    fcs_flag: prim.fcs_flag,
-                    packet_data_flag: true,
-                    air_interface_encryption,
-                    stealing_repeats_flag: None,
-                    data_class_info: None,
-                    req_handle: prim.handle,
-                    graceful_degradation: None,
-                    chan_alloc: prim.chan_alloc.take(),
-                    associated_channel: prim.associated_channel.take(),
-                    tx_reporter: prim.tx_reporter.take(),
-                }),
+                if advanced_link_required {
+                    SapMsgInner::TlaTlDataReqAl(request)
+                } else {
+                    SapMsgInner::TlaTlDataReqBl(request)
+                },
             )
         };
         queue.push_back(sapmsg);
@@ -1075,6 +1081,56 @@ impl TetraEntityTrait for MleBs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sndcp_advanced_data_routes_to_the_advanced_tla_primitive() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration");
+        let mut mle = MleBs::new(SharedConfig::from_parts(config, None), None, None);
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlpd_prim(
+            &mut queue,
+            SapMsg::new(
+                Sap::TlpdSap,
+                TetraEntity::Sndcp,
+                TetraEntity::Mle,
+                SapMsgInner::LtpdMleUnitdataReq(tetra_saps::ltpd::LtpdMleUnitdataReq {
+                    sdu: BitBuffer::from_bitstr("10101010"),
+                    handle: 11,
+                    layer2service: Layer2Service::AdvancedAcknowledged,
+                    unacked_bl_repetitions: 1,
+                    pdu_prio: 0,
+                    main_address: TetraAddress::issi(77_468),
+                    endpoint_id: 7,
+                    link_id: 0,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    channel_advice_flag: false,
+                    data_class_info: 0,
+                    data_prio: 0,
+                    mle_data_prio_flag: false,
+                    packet_data_flag: true,
+                    scheduled_data_status: 0,
+                    max_schedule_interval: 0,
+                    fcs_flag: true,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    aie_override: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        assert!(matches!(
+            queue.pop_front().map(|message| message.msg),
+            Some(SapMsgInner::TlaTlDataReqAl(_))
+        ));
+        assert!(queue.pop_front().is_none());
+    }
 
     #[test]
     fn acknowledged_mle_payloads_route_to_their_own_upper_layer() {

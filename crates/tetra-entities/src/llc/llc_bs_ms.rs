@@ -8,7 +8,7 @@ use tetra_core::{AieRequest, AieScope, AieSubject, BitBuffer, Layer2Service, Sap
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
+use tetra_saps::tla::{TlaTlDataIndBl, TlaTlDataReqAl, TlaTlUnitdataIndBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -58,6 +58,12 @@ const AL_FINAL_FCS_BITS: usize = 32;
 // negotiated N.273 whole-TL-SDU retransmission budget. Keep this bounded so a
 // peer that has left the channel cannot hold the link forever.
 const MAX_AL_ACK_REQUEST_REPEATS: u8 = 5;
+// An MS that requested a multislot PDCH establishes its advanced link after
+// the channel assignment.  Bound the wait by the standard setup timer and
+// retry count so an MS that never completes AL-SETUP cannot retain IP packets
+// indefinitely.
+const AL_SETUP_NEGOTIATION_TIMEOUT: u32 = T261_SETUP_WAITING_TIMER * (N262_AL_MAX_CONNECTION_SETUP_RETRIES + 1);
+const MAX_PENDING_ADVANCED_TLSDUS_PER_LINK: usize = 64;
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
 pub struct ExpectedInAck {
@@ -208,9 +214,19 @@ struct AdvancedLink {
     /// Lower boundary of the modulo-8 original advanced-link receive window.
     next_rx_ns: u8,
     receiver_ready: bool,
+    /// True after the AL-SETUP Success response has been sent or received.
+    /// A Service change proposal remains false until the peer confirms it.
+    ready: bool,
+    setup_started_at: Option<TdmaTime>,
     rx_sdus: BTreeMap<u8, AdvancedRxSdu>,
     tx: VecDeque<AdvancedTxSdu>,
     reset: Option<AdvancedLinkReset>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAdvancedData {
+    prim: TlaTlDataReqAl,
+    queued_at: TdmaTime,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +277,7 @@ pub struct Llc {
     /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
     advanced_links: HashMap<u32, AdvancedLink>,
+    pending_advanced_data: HashMap<u32, VecDeque<PendingAdvancedData>>,
 }
 
 impl Llc {
@@ -273,6 +290,7 @@ impl Llc {
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
             advanced_links: HashMap::new(),
+            pending_advanced_data: HashMap::new(),
         }
     }
 
@@ -886,6 +904,8 @@ impl Llc {
         link.next_rx_ns = 0;
         link.rx_sdus.clear();
         link.receiver_ready = false;
+        link.ready = false;
+        link.setup_started_at = None;
 
         let setup = AlSetup {
             acknowledged: true,
@@ -963,30 +983,13 @@ impl Llc {
         segments
     }
 
-    fn rx_tla_tldata_req_al(&mut self, prim: tetra_saps::tla::TlaTlDataReqBl) -> bool {
+    fn rx_tla_tldata_req_al(&mut self, prim: TlaTlDataReqAl) -> Result<(), TlaTlDataReqAl> {
         let issi = prim.main_address.ssi;
-        let Some(slots) = self.advanced_links.get(&issi).map(|link| link.slots) else {
-            return false;
-        };
-        let routes = Self::packet_routes(&self.config, issi)
-            .into_iter()
-            .take(slots as usize)
-            .collect::<Vec<_>>();
-        // TTR 001-05 sections 6.5 and 7.12 restrict advanced-link data
-        // transfer to an assigned PDCH.  The advanced link itself remains
-        // established while the MS is in STANDBY, so its mere presence is
-        // not proof that an AL-DATA PDU can currently be sent.  In
-        // particular, PDP activation/deactivation signalling on the CCCH
-        // must fall back to acknowledged basic link instead of disappearing
-        // into an unroutable advanced-link queue.
-        if routes.is_empty() && prim.associated_channel.is_none() {
-            return false;
-        }
         let Some(link) = self.advanced_links.get_mut(&issi) else {
-            return false;
+            return Err(prim);
         };
-        if link.link_number != 0 || link.tx.len() >= 64 {
-            return false;
+        if link.link_number != 0 || link.tx.len() >= MAX_PENDING_ADVANCED_TLSDUS_PER_LINK {
+            return Err(prim);
         }
         let reporter = prim.tx_reporter.unwrap_or_else(TxReporter::new);
         let segments = Self::advanced_segments(prim.tl_sdu);
@@ -1010,7 +1013,81 @@ impl Llc {
             retransmissions: 0,
             pending_segments: None,
         });
-        true
+        Ok(())
+    }
+
+    fn queue_pending_advanced_data(&mut self, prim: TlaTlDataReqAl) {
+        let issi = prim.main_address.ssi;
+        let linked = self.advanced_links.get(&issi).map_or(0, |link| link.tx.len());
+        let pending = self.pending_advanced_data.entry(issi).or_default();
+        if linked + pending.len() >= MAX_PENDING_ADVANCED_TLSDUS_PER_LINK {
+            if let Some(reporter) = &prim.tx_reporter {
+                Self::mark_reporter_lost(reporter);
+            }
+            tracing::warn!(
+                issi,
+                linked,
+                pending = pending.len(),
+                limit = MAX_PENDING_ADVANCED_TLSDUS_PER_LINK,
+                "advanced-link setup queue full; rejecting packet data"
+            );
+            return;
+        }
+        pending.push_back(PendingAdvancedData {
+            prim,
+            queued_at: self.dltime,
+        });
+        tracing::debug!(
+            issi,
+            queued = pending.len(),
+            "holding packet data until advanced-link setup completes"
+        );
+    }
+
+    /// Move setup-waiting packet data into the negotiated AL in original
+    /// arrival order.  Entries without any AL are failed after the bounded
+    /// setup interval; entries already attached to a Service change are
+    /// failed by that negotiation's timeout instead.
+    fn process_pending_advanced_data(&mut self) -> bool {
+        let now = self.dltime;
+        let mut activity = false;
+        let issis = self.pending_advanced_data.keys().copied().collect::<Vec<_>>();
+        for issi in issis {
+            let Some(mut pending) = self.pending_advanced_data.remove(&issi) else {
+                continue;
+            };
+            let mut retained = VecDeque::new();
+            while let Some(mut entry) = pending.pop_front() {
+                if now.diff(entry.queued_at) >= AL_SETUP_NEGOTIATION_TIMEOUT as i32 {
+                    if let Some(reporter) = &entry.prim.tx_reporter {
+                        Self::mark_reporter_lost(reporter);
+                    }
+                    tracing::warn!(issi, "advanced-link setup did not start before packet-data timeout");
+                    activity = true;
+                    continue;
+                }
+                match self.rx_tla_tldata_req_al(entry.prim) {
+                    Ok(()) => activity = true,
+                    Err(prim) => {
+                        entry.prim = prim;
+                        retained.push_back(entry);
+                        retained.append(&mut pending);
+                        break;
+                    }
+                }
+            }
+            if !retained.is_empty() {
+                self.pending_advanced_data.insert(issi, retained);
+            }
+        }
+        activity
+    }
+
+    fn rx_tla_tldata_req_al_message(&mut self, message: SapMsg) {
+        let SapMsgInner::TlaTlDataReqAl(prim) = message.msg else { panic!() };
+        if let Err(prim) = self.rx_tla_tldata_req_al(prim) {
+            self.queue_pending_advanced_data(prim);
+        }
     }
 
     fn send_al_ack(
@@ -1094,6 +1171,12 @@ impl Llc {
         let maximum_sdu = request.maximum_sdu.min(6);
         let window_size = request.window_size.clamp(1, 3);
         let successful_response = matches!(request.report, 0 | 4);
+        let changed = slots != requested_slots || maximum_sdu != request.maximum_sdu || window_size != request.window_size;
+        // A constrained Service definition is answered with Service change.
+        // The link only becomes usable when the MS confirms that proposal
+        // with Success.  Every other request is completed by our queued
+        // Success response (or is itself that Success response).
+        let awaiting_peer_success = request.report == 1 && changed;
         let negotiated_link = AdvancedLink {
             link_number: 0,
             maximum_sdu,
@@ -1106,6 +1189,8 @@ impl Llc {
             next_tx_ns: 0,
             next_rx_ns: 0,
             receiver_ready: true,
+            ready: !awaiting_peer_success,
+            setup_started_at: awaiting_peer_success.then_some(self.dltime),
             rx_sdus: BTreeMap::new(),
             tx: VecDeque::new(),
             reset: None,
@@ -1121,6 +1206,8 @@ impl Llc {
                 link.max_sdu_retransmissions = request.sdu_retransmissions;
                 link.max_segment_retransmissions = request.segment_retransmissions;
                 link.endpoint_id = prim.endpoint_id;
+                link.ready = true;
+                link.setup_started_at = None;
                 if link.reset.take().is_some() {
                     // begin_advanced_link_reset already cleared both sequence
                     // directions and the old buffers. Success makes the link
@@ -1141,7 +1228,6 @@ impl Llc {
             self.advanced_links.insert(prim.main_address.ssi, negotiated_link);
         }
         if !successful_response {
-            let changed = slots != requested_slots || maximum_sdu != request.maximum_sdu || window_size != request.window_size;
             let response = AlSetup {
                 acknowledged: true,
                 link_number: 0,
@@ -1174,14 +1260,25 @@ impl Llc {
                 Self::queue_advanced_pdu(queue, prim.main_address, prim.endpoint_id, response_pdu, route, None, aie, None);
             }
         }
-        tracing::info!(
-            issi = prim.main_address.ssi,
-            slots,
-            window_size,
-            maximum_sdu,
-            setup_report = request.report,
-            "established original acknowledged advanced link"
-        );
+        self.process_pending_advanced_data();
+        if awaiting_peer_success {
+            tracing::info!(
+                issi = prim.main_address.ssi,
+                slots,
+                window_size,
+                maximum_sdu,
+                "advanced-link service change proposed; awaiting terminal Success"
+            );
+        } else {
+            tracing::info!(
+                issi = prim.main_address.ssi,
+                slots,
+                window_size,
+                maximum_sdu,
+                setup_report = request.report,
+                "established original acknowledged advanced link"
+            );
+        }
     }
 
     fn handle_al_data(&mut self, queue: &mut MessageQueue, prim: &tetra_saps::tma::TmaUnitdataInd, mut pdu: BitBuffer) {
@@ -1508,6 +1605,13 @@ impl Llc {
                 Self::mark_reporter_lost(&sdu.reporter);
             }
         }
+        if let Some(mut pending) = self.pending_advanced_data.remove(&prim.main_address.ssi) {
+            for entry in pending.drain(..) {
+                if let Some(reporter) = &entry.prim.tx_reporter {
+                    Self::mark_reporter_lost(reporter);
+                }
+            }
+        }
         // Success confirms a Close previously sent by this side. Only an
         // incoming Close is answered; echoing Success starts an AL-DISC loop.
         if request.report != 1 {
@@ -1569,6 +1673,7 @@ impl Llc {
         let mut activity = false;
         let mut failed_links = Vec::new();
         let mut setup_failures = Vec::new();
+        let mut negotiation_failures = Vec::new();
         // A queued TL-SDU can outlive a PDCH resize. Resolve the routes at
         // submission time so segments and selective retransmissions never
         // target a timeslot that voice has taken from packet data.
@@ -1620,6 +1725,16 @@ impl Llc {
                     } else {
                         setup_failures.push(*issi);
                     }
+                }
+                continue;
+            }
+
+            if !link.ready {
+                if link
+                    .setup_started_at
+                    .is_some_and(|started| now.diff(started) >= AL_SETUP_NEGOTIATION_TIMEOUT as i32)
+                {
+                    negotiation_failures.push(*issi);
                 }
                 continue;
             }
@@ -1816,6 +1931,15 @@ impl Llc {
             );
             activity = true;
         }
+        for issi in negotiation_failures {
+            if let Some(mut link) = self.advanced_links.remove(&issi) {
+                for sdu in link.tx.drain(..) {
+                    Self::mark_reporter_lost(&sdu.reporter);
+                }
+            }
+            tracing::warn!(issi, "advanced-link Service change was not confirmed before setup timeout");
+            activity = true;
+        }
         activity
     }
 
@@ -1835,10 +1959,6 @@ impl Llc {
         // TTR 001-05 figures 13 and 15 carry the SN-DATA TRANSMIT RESPONSE
         // and its Replace allocation on CCCH.  An existing AL is retained in
         // STANDBY, but must not capture this new CCCH-to-PDCH assignment.
-        if prim.packet_data_flag && !force_common_channel && self.rx_tla_tldata_req_al(prim.clone()) {
-            return;
-        }
-
         if prim.stealing_permission {
             panic!("Can't send BL-DATA for STCH message");
         }
@@ -1962,6 +2082,9 @@ impl Llc {
     fn rx_tla_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_prim");
         match &message.msg {
+            SapMsgInner::TlaTlDataReqAl(_) => {
+                self.rx_tla_tldata_req_al_message(message);
+            }
             SapMsgInner::TlaTlDataReqBl(_) => {
                 self.rx_tla_tldata_req_bl(queue, message);
             }
@@ -2536,6 +2659,8 @@ impl TetraEntityTrait for Llc {
         // Step 4 / 4: Send any U-DATA messages
         had_activity |= self.submit_udata_msgs_to_umac(queue);
 
+        had_activity |= self.process_pending_advanced_data();
+
         // Packet data is deliberately submitted after all basic-link and
         // control work; UMAC applies the same ordering inside packet bearers.
         had_activity |= self.submit_advanced_link_messages(queue);
@@ -2641,34 +2766,31 @@ mod tests {
         }
     }
 
-    fn queue_advanced_downlink(llc: &mut Llc, queue: &mut MessageQueue, issi: u32, payload: &str) -> TxReporter {
+    fn queue_advanced_downlink(llc: &mut Llc, _queue: &mut MessageQueue, issi: u32, payload: &str) -> TxReporter {
         let reporter = TxReporter::new();
-        llc.rx_tla_tldata_req_bl(
-            queue,
-            SapMsg::new(
-                Sap::TlaSap,
-                TetraEntity::Mle,
-                TetraEntity::Llc,
-                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                    main_address: TetraAddress::issi(issi),
-                    link_id: 0,
-                    endpoint_id: 7,
-                    tl_sdu: BitBuffer::from_bitstr(payload),
-                    stealing_permission: false,
-                    subscriber_class: 0,
-                    fcs_flag: true,
-                    packet_data_flag: true,
-                    air_interface_encryption: None,
-                    stealing_repeats_flag: None,
-                    data_class_info: None,
-                    req_handle: 0,
-                    graceful_degradation: None,
-                    chan_alloc: None,
-                    associated_channel: Llc::packet_route(&llc.config, issi, 2),
-                    tx_reporter: Some(reporter.clone()),
-                }),
-            ),
-        );
+        llc.rx_tla_tldata_req_al_message(SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlaTlDataReqAl {
+                main_address: TetraAddress::issi(issi),
+                link_id: 0,
+                endpoint_id: 7,
+                tl_sdu: BitBuffer::from_bitstr(payload),
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: true,
+                packet_data_flag: true,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                associated_channel: Llc::packet_route(&llc.config, issi, 2),
+                tx_reporter: Some(reporter.clone()),
+            }),
+        ));
         reporter
     }
 
@@ -2725,6 +2847,7 @@ mod tests {
         let SapMsgInner::TmaUnitdataReq(mut change) = queue.pop_front().expect("service change response").msg else {
             panic!("expected TMA response")
         };
+        assert!(!llc.advanced_links[&77_479].ready);
         let change = AlSetup::from_bitbuf(&mut change.pdu).unwrap();
         assert_eq!(change.uplink_slots, Some(3));
         assert_eq!(change.report, 2);
@@ -2737,8 +2860,90 @@ mod tests {
 
         assert!(queue.pop_front().is_none(), "AL-SETUP Success must not be answered");
         let link = &llc.advanced_links[&77_479];
+        assert!(link.ready);
         assert_eq!(link.slots, 3);
         assert_eq!(link.next_tx_ns, 5, "confirming a proposal must preserve queued-link state");
+    }
+
+    #[test]
+    fn advanced_data_waits_for_al_setup_success_and_preserves_order() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        let first = queue_advanced_downlink(&mut llc, &mut queue, 77_468, "10101010");
+        let second = queue_advanced_downlink(&mut llc, &mut queue, 77_468, "01010101");
+
+        assert!(queue.pop_front().is_none(), "advanced data must never fall back to BL-DATA");
+        assert_eq!(llc.pending_advanced_data[&77_468].len(), 2);
+        assert!(llc.outbound_messages.is_empty());
+
+        let mut definition = BitBuffer::new_autoexpand(32);
+        AlSetup {
+            acknowledged: true,
+            link_number: 0,
+            maximum_sdu: 6,
+            connection_width: true,
+            asymmetric: false,
+            uplink_slots: Some(4),
+            downlink_slots: None,
+            throughput: 7,
+            window_size: 2,
+            sdu_retransmissions: 3,
+            segment_retransmissions: 5,
+            report: 1,
+        }
+        .to_bitbuf(&mut definition)
+        .unwrap();
+        definition.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, definition));
+
+        assert!(!llc.advanced_links[&77_468].ready);
+        assert!(!llc.pending_advanced_data.contains_key(&77_468));
+        assert_eq!(
+            llc.advanced_links[&77_468].tx.iter().map(|sdu| sdu.ns).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(!llc.submit_advanced_link_messages(&mut queue));
+        let SapMsgInner::TmaUnitdataReq(mut response) = queue.pop_front().expect("AL-SETUP Service change").msg else {
+            panic!("expected TMA response")
+        };
+        let change = AlSetup::from_bitbuf(&mut response.pdu).unwrap();
+        assert_eq!(change.report, 2);
+        assert!(queue.pop_front().is_none());
+
+        let mut success = BitBuffer::new_autoexpand(32);
+        AlSetup { report: 0, ..change }.to_bitbuf(&mut success).unwrap();
+        success.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, success));
+        assert!(llc.advanced_links[&77_468].ready);
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        assert_eq!(queue.iter_mut().count(), 2);
+
+        for expected_ns in [0, 1] {
+            let SapMsgInner::TmaUnitdataReq(mut request) = queue.pop_front().unwrap().msg else {
+                panic!("expected AL-DATA")
+            };
+            let header = AlDataHeader::from_bitbuf(&mut request.pdu).unwrap();
+            assert_eq!(header.ns, expected_ns);
+        }
+        assert_eq!(first.get_state(), TxState::Pending);
+        assert_eq!(second.get_state(), TxState::Pending);
+    }
+
+    #[test]
+    fn advanced_data_without_al_setup_reports_link_failure() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+        llc.dltime = start;
+        let reporter = queue_advanced_downlink(&mut llc, &mut queue, 77_468, "10101010");
+
+        llc.dltime = start.add_timeslots(AL_SETUP_NEGOTIATION_TIMEOUT as i32);
+        assert!(llc.process_pending_advanced_data());
+
+        assert_eq!(reporter.get_state(), TxState::Lost);
+        assert!(!llc.pending_advanced_data.contains_key(&77_468));
+        assert!(queue.pop_front().is_none());
+        assert!(llc.outbound_messages.is_empty());
     }
 
     #[test]
@@ -2995,32 +3200,29 @@ mod tests {
         establish_advanced_link(&mut llc, &mut queue, 77_468);
         while queue.pop_front().is_some() {}
         let reporter = TxReporter::new();
-        llc.rx_tla_tldata_req_bl(
-            &mut queue,
-            SapMsg::new(
-                Sap::TlaSap,
-                TetraEntity::Mle,
-                TetraEntity::Llc,
-                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                    main_address: TetraAddress::issi(77_468),
-                    link_id: 0,
-                    endpoint_id: 7,
-                    tl_sdu: BitBuffer::from_bitstr(&"11001010".repeat(30)),
-                    stealing_permission: false,
-                    subscriber_class: 0,
-                    fcs_flag: true,
-                    packet_data_flag: true,
-                    air_interface_encryption: None,
-                    stealing_repeats_flag: None,
-                    data_class_info: None,
-                    req_handle: 0,
-                    graceful_degradation: None,
-                    chan_alloc: None,
-                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
-                    tx_reporter: Some(reporter.clone()),
-                }),
-            ),
-        );
+        llc.rx_tla_tldata_req_al_message(SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlaTlDataReqAl {
+                main_address: TetraAddress::issi(77_468),
+                link_id: 0,
+                endpoint_id: 7,
+                tl_sdu: BitBuffer::from_bitstr(&"11001010".repeat(30)),
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: true,
+                packet_data_flag: true,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                tx_reporter: Some(reporter.clone()),
+            }),
+        ));
         llc.submit_advanced_link_messages(&mut queue);
         assert_eq!(reporter.get_state(), TxState::Pending);
         let first = queue.pop_front().expect("first advanced-link segment");
@@ -3270,32 +3472,29 @@ mod tests {
         establish_advanced_link(&mut llc, &mut queue, 77_468);
         while queue.pop_front().is_some() {}
 
-        llc.rx_tla_tldata_req_bl(
-            &mut queue,
-            SapMsg::new(
-                Sap::TlaSap,
-                TetraEntity::Mle,
-                TetraEntity::Llc,
-                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                    main_address: TetraAddress::issi(77_468),
-                    link_id: 0,
-                    endpoint_id: 7,
-                    tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
-                    stealing_permission: false,
-                    subscriber_class: 0,
-                    fcs_flag: true,
-                    packet_data_flag: true,
-                    air_interface_encryption: None,
-                    stealing_repeats_flag: None,
-                    data_class_info: None,
-                    req_handle: 0,
-                    graceful_degradation: None,
-                    chan_alloc: None,
-                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
-                    tx_reporter: Some(TxReporter::new()),
-                }),
-            ),
-        );
+        llc.rx_tla_tldata_req_al_message(SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlaTlDataReqAl {
+                main_address: TetraAddress::issi(77_468),
+                link_id: 0,
+                endpoint_id: 7,
+                tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: true,
+                packet_data_flag: true,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                tx_reporter: Some(TxReporter::new()),
+            }),
+        ));
 
         // Voice takes TS4 after this TL-SDU entered LLC but before its
         // segments are submitted. TS2 and TS3 remain equivalent members of
@@ -3366,32 +3565,29 @@ mod tests {
         llc.advanced_links.get_mut(&77_468).unwrap().max_sdu_retransmissions = 0;
         while queue.pop_front().is_some() {}
         let reporter = TxReporter::new();
-        llc.rx_tla_tldata_req_bl(
-            &mut queue,
-            SapMsg::new(
-                Sap::TlaSap,
-                TetraEntity::Mle,
-                TetraEntity::Llc,
-                SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                    main_address: TetraAddress::issi(77_468),
-                    link_id: 0,
-                    endpoint_id: 7,
-                    tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
-                    stealing_permission: false,
-                    subscriber_class: 0,
-                    fcs_flag: true,
-                    packet_data_flag: true,
-                    air_interface_encryption: None,
-                    stealing_repeats_flag: None,
-                    data_class_info: None,
-                    req_handle: 0,
-                    graceful_degradation: None,
-                    chan_alloc: None,
-                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
-                    tx_reporter: Some(reporter),
-                }),
-            ),
-        );
+        llc.rx_tla_tldata_req_al_message(SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlaTlDataReqAl {
+                main_address: TetraAddress::issi(77_468),
+                link_id: 0,
+                endpoint_id: 7,
+                tl_sdu: BitBuffer::from_bitstr(&"10".repeat(400)),
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: true,
+                packet_data_flag: true,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                tx_reporter: Some(reporter),
+            }),
+        ));
         assert!(llc.submit_advanced_link_messages(&mut queue));
         while queue.pop_front().is_some() {}
         llc.advanced_links[&77_468].tx[0]
@@ -3522,32 +3718,29 @@ mod tests {
         for bit in ["0", "1", "0", "1"] {
             let reporter = TxReporter::new();
             reporters.push(reporter.clone());
-            llc.rx_tla_tldata_req_bl(
-                &mut queue,
-                SapMsg::new(
-                    Sap::TlaSap,
-                    TetraEntity::Mle,
-                    TetraEntity::Llc,
-                    SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
-                        main_address: TetraAddress::issi(77_468),
-                        link_id: 0,
-                        endpoint_id: 7,
-                        tl_sdu: BitBuffer::from_bitstr(&bit.repeat(64)),
-                        stealing_permission: false,
-                        subscriber_class: 0,
-                        fcs_flag: true,
-                        packet_data_flag: true,
-                        air_interface_encryption: None,
-                        stealing_repeats_flag: None,
-                        data_class_info: None,
-                        req_handle: 0,
-                        graceful_degradation: None,
-                        chan_alloc: None,
-                        associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
-                        tx_reporter: Some(reporter),
-                    }),
-                ),
-            );
+            llc.rx_tla_tldata_req_al_message(SapMsg::new(
+                Sap::TlaSap,
+                TetraEntity::Mle,
+                TetraEntity::Llc,
+                SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlaTlDataReqAl {
+                    main_address: TetraAddress::issi(77_468),
+                    link_id: 0,
+                    endpoint_id: 7,
+                    tl_sdu: BitBuffer::from_bitstr(&bit.repeat(64)),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: true,
+                    packet_data_flag: true,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_class_info: None,
+                    req_handle: 0,
+                    graceful_degradation: None,
+                    chan_alloc: None,
+                    associated_channel: Llc::packet_route(&llc.config, 77_468, 2),
+                    tx_reporter: Some(reporter),
+                }),
+            ));
         }
         llc.submit_advanced_link_messages(&mut queue);
         assert_eq!(llc.advanced_links[&77_468].tx.len(), 4);
