@@ -176,9 +176,12 @@ const PRIVATE_CALL_SETUP_TIMEOUT: CallTimeoutSetupPhase = CallTimeoutSetupPhase:
 /// Give a normally responsive central SwMI one TDMA multiframe to decide a
 /// private floor request before telling the terminal that it is queued.
 const PRIVATE_FLOOR_RESPONSE_GRACE_TIMESLOTS: i32 = 18 * 4;
-/// D-CALL RESTORE is sent on the MCCH.  Let the MS process its channel
-/// allocation before sending the FACCH D-TX GRANTED that names the speaker.
-const RESTORE_FLOOR_INDICATION_DELAY_TIMESLOTS: i32 = 18 * 4;
+/// D-CALL RESTORE itself enables the receive U-plane when it says
+/// `GrantedToOtherUser` (TTR 001-01, 10.2.1). The follow-up FACCH indication
+/// only names the current speaker, so hold it for two TDMA frames: long
+/// enough for the replace allocation to reach the MS without imposing a full
+/// multiframe of otherwise avoidable restored-call silence.
+const RESTORE_FLOOR_INDICATION_DELAY_TIMESLOTS: i32 = 8;
 /// SS-TPI is carried in the Facility element of the associated CMCE PDU.
 const SS_TPI_AIR_INTERFACE_ENABLED: bool = true;
 
