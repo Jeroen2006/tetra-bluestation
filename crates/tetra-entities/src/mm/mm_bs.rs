@@ -1592,6 +1592,20 @@ impl MmBs {
                     tracing::info!(issi, expected_generation, "discarded superseded old-serving-cell subscriber state");
                 }
             }
+            // An LST recovery can restore the local subscriber record without
+            // its transient SwMI command id. The SwMI's cleanup is still
+            // authoritative in that case: a newer accepted registration would
+            // have installed a generation, so no generation means this cell
+            // cannot be the terminal's newer serving cell.
+            None => {
+                if self.remove_local_subscriber(queue, issi) {
+                    tracing::info!(
+                        issi,
+                        expected_generation,
+                        "discarded superseded old-serving-cell subscriber state without local generation"
+                    );
+                }
+            }
             current_generation => tracing::info!(
                 issi,
                 expected_generation,
@@ -5884,6 +5898,15 @@ mod tests {
         mm.apply_old_serving_cleanup(&mut queue, issi, 12);
         assert!(!mm.client_mgr.client_is_known(issi));
         assert!(!mm.registration_generations.contains_key(&issi));
+
+        // LST recovery can restore the subscriber state without the ephemeral
+        // per-registration command id. A later authoritative cleanup must
+        // still remove that old-serving-cell state.
+        mm.config.state_write().subscribers.register(issi);
+        mm.client_mgr.try_register_client(issi, true).expect("test terminal must register");
+        mm.apply_old_serving_cleanup(&mut queue, issi, 11);
+        assert!(!mm.client_mgr.client_is_known(issi));
+        assert!(!mm.config.state_read().subscribers.is_registered(issi));
     }
 
     #[test]
