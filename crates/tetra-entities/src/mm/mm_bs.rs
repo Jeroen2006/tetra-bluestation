@@ -422,6 +422,10 @@ struct PendingRegistration {
     energy_saving_information: Option<EnergySavingInformation>,
     has_group_identity_location_demand: bool,
     location_attachment: Option<PendingAttachment>,
+    /// GCK associations from a colliding Figure-20 transaction. Registration
+    /// overrides that transaction, so its associations move into the ensuing
+    /// D-LOCATION UPDATE ACCEPT rather than being silently discarded.
+    interrupted_group_security_gssis: Vec<u32>,
     authentication_successful: bool,
     /// SwMI-selected SC2 information for the final D-LOCATION UPDATE ACCEPT.
     /// The Authentication Downlink is opaque at the BS because it can carry a
@@ -1912,7 +1916,7 @@ impl MmBs {
         // TS 100 392-2 clause 16.8.6: registration overrides a colliding
         // attachment transaction. Its current desired associations are folded
         // into the ensuing D-LOCATION UPDATE ACCEPT instead.
-        self.cancel_group_security_association_for_registration(issi);
+        let interrupted_group_security_gssis = self.cancel_group_security_association_for_registration(issi);
         // ETSI TS 100 392-2 §16.7.1/§16.10.10: the BS may choose a mode and
         // startpoint. Current policy accepts the requested mode and selects
         // the next MCCH phase from the local TDMA clock. For periodic/demand
@@ -2015,6 +2019,7 @@ impl MmBs {
                         energy_saving_information: esi,
                         has_group_identity_location_demand,
                         location_attachment,
+                        interrupted_group_security_gssis,
                         authentication_successful: false,
                         aie: AieLocationUpdateDecision::default(),
                         forward_registration_target_station_id: prim.forward_registration_target_station_id.clone(),
@@ -2113,7 +2118,7 @@ impl MmBs {
         }
         let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
 
-        let registration_security_groups = self.registration_group_security_gssis(issi, Vec::new());
+        let registration_security_groups = self.registration_group_security_gssis(issi, interrupted_group_security_gssis);
 
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
@@ -3296,7 +3301,7 @@ impl MmBs {
                     group_identity_accept_reject: 0,
                     group_identity_downlink: None,
                 }),
-                Vec::new(),
+                pending.interrupted_group_security_gssis,
                 seamless_handover,
                 rua_requested,
             );
@@ -3405,7 +3410,12 @@ impl MmBs {
             let local_results = Self::local_attachment_results(&attachment);
             let (had_rejection, response_groups, security_groups) =
                 self.apply_swmi_attachment_state(queue, command_id, itsi, false, &attachment, local_results);
-            let security_groups = self.registration_group_security_gssis(pending.itsi, security_groups);
+            let security_groups = self.registration_group_security_gssis(
+                pending.itsi,
+                security_groups
+                    .into_iter()
+                    .chain(pending.interrupted_group_security_gssis.iter().copied()),
+            );
             let receipt = self.send_d_location_update_accept_with_handover(
                 queue,
                 pending.itsi,
@@ -3436,7 +3446,8 @@ impl MmBs {
             }
             return;
         }
-        let security_groups = self.registration_group_security_gssis(pending.itsi, Vec::new());
+        let security_groups =
+            self.registration_group_security_gssis(pending.itsi, pending.interrupted_group_security_gssis.iter().copied());
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             pending.itsi,
@@ -3848,7 +3859,12 @@ impl MmBs {
         let (had_rejection, response_groups, security_groups) =
             self.apply_swmi_attachment_state(queue, command_id, itsi, has_rejection, &pending.attachment, results);
         let registration = pending.registration;
-        let security_groups = self.registration_group_security_gssis(registration.itsi, security_groups);
+        let security_groups = self.registration_group_security_gssis(
+            registration.itsi,
+            security_groups
+                .into_iter()
+                .chain(registration.interrupted_group_security_gssis.iter().copied()),
+        );
         let receipt = self.send_d_location_update_accept_with_handover(
             queue,
             registration.itsi,
@@ -4488,16 +4504,26 @@ impl MmBs {
         self.flush_queued_group_security_associations(queue);
     }
 
-    fn cancel_group_security_association_for_registration(&mut self, issi: u32) {
+    fn cancel_group_security_association_for_registration(&mut self, issi: u32) -> Vec<u32> {
         let pending = self.pending_group_security_associations.remove(&issi);
         let queued = self.queued_group_security_associations.remove(&issi);
         self.group_security_not_before.remove(&issi);
+        let mut groups = pending
+            .as_ref()
+            .into_iter()
+            .flat_map(|pending| pending.groups.iter().copied())
+            .chain(queued.as_ref().into_iter().flat_map(|queued| queued.groups.iter().copied()))
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups.dedup();
         if pending.is_some() || queued.is_some() {
             tracing::info!(
                 issi,
+                association_count = groups.len(),
                 "abandoned colliding Figure-20 association transaction in favour of registration"
             );
         }
+        groups
     }
 
     fn send_d_location_update_accept(
@@ -6508,7 +6534,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_cancels_a_colliding_figure20_transaction() {
+    fn registration_moves_colliding_figure20_associations_into_accept() {
         let issi = 77_492;
         let mut mm = test_sc3g_mm(issi, &[1202, 1203]);
         let mut queue = MessageQueue::new();
@@ -6517,11 +6543,40 @@ mod tests {
         assert!(mm.pending_group_security_associations.contains_key(&issi));
         assert!(mm.queued_group_security_associations.contains_key(&issi));
 
-        mm.cancel_group_security_association_for_registration(issi);
+        let interrupted = mm.cancel_group_security_association_for_registration(issi);
 
         assert!(!mm.pending_group_security_associations.contains_key(&issi));
         assert!(!mm.queued_group_security_associations.contains_key(&issi));
         assert!(!mm.group_security_not_before.contains_key(&issi));
+        assert_eq!(interrupted, vec![1202, 1203]);
+
+        let mut queue = MessageQueue::new();
+        mm.send_d_location_update_accept_with_handover(
+            &mut queue,
+            issi,
+            0,
+            LocationUpdateType::ItsiAttach,
+            None,
+            false,
+            &AieLocationUpdateDecision::default(),
+            AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            None,
+            interrupted,
+            None,
+            false,
+        );
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = queue.pop_front().expect("registration accept").msg else {
+            panic!("registration accept must be an LMM downlink")
+        };
+        let accept = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid registration accept");
+        let associations = accept
+            .group_identity_security_related_information
+            .expect("interrupted associations must be embedded")
+            .into_iter()
+            .flat_map(|information| information.associations)
+            .map(|association| association.gssi)
+            .collect::<Vec<_>>();
+        assert_eq!(associations, vec![1202, 1203]);
     }
 
     #[test]

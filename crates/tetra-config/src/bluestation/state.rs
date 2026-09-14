@@ -496,6 +496,15 @@ impl RuntimeAieConfig {
             next.dcks = old.dcks.clone();
             next.pending_dck_requests = old.pending_dck_requests.clone();
             next.dck_requests = old.dck_requests.clone();
+            // CellConfig and the atomic SC3G snapshot are independent SwMI
+            // messages. A compatible live CellConfig update must not create a
+            // window in which group traffic falls back from MGCK to CCK, nor
+            // may an unchanged snapshot revision leave that fallback in place.
+            next.sc3g_revision = old.sc3g_revision;
+            next.linked_gck_crypto_periods = old.linked_gck_crypto_periods;
+            next.gck_vn = old.gck_vn;
+            next.gcks = old.gcks.clone();
+            next.group_associations = old.group_associations.clone();
         }
     }
 
@@ -2443,6 +2452,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn compatible_sc3_cell_update_preserves_sc3g_snapshot() {
+        let mut previous_sc3 = test_sc3(9);
+        previous_sc3
+            .apply_sc3g_snapshot(12, true, 7, vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])], vec![(101, 4)])
+            .unwrap();
+        let previous = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(previous_sc3),
+            rollover: None,
+        };
+        let mut replacement = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: true,
+            sc2: None,
+            sc3: Some(test_sc3(9)),
+            rollover: None,
+        };
+
+        replacement.preserve_sc3_cache_from(&previous);
+
+        let sc3 = replacement.sc3.as_ref().unwrap();
+        assert_eq!(sc3.sc3g_revision, 12);
+        assert_eq!(sc3.gck_vn(), 7);
+        assert!(sc3.gck_supported());
+        assert_eq!(sc3.gckn_for_gssi(101), Some(4));
     }
 }
 
