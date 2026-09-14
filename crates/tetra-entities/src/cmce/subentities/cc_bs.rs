@@ -304,6 +304,10 @@ struct PendingRemoteSwmiCall {
     floor_itsi: u32,
     talking_party: Option<TalkingPartyProfile>,
     acknowledged: bool,
+    /// Keep the chosen advertisement behavior while this call waits for a
+    /// listener or circuit. A service-restoration replay must not turn back
+    /// into a regular group D-SETUP merely because it was queued locally.
+    announce_setup: bool,
 }
 
 /// A new floor holder is deliberately held until the old holder has received
@@ -1203,7 +1207,6 @@ impl CcBsSubentity {
             let Some(call) = self.pending_remote_swmi_calls.remove(&call_id) else {
                 continue;
             };
-            let announce_setup = !self.active_floor_holder_is_local_member(call.gssi, call.floor_itsi);
             self.start_remote_swmi_call(
                 queue,
                 call_id,
@@ -1213,7 +1216,7 @@ impl CcBsSubentity {
                 call.floor_itsi,
                 call.talking_party,
                 call.acknowledged,
-                announce_setup,
+                call.announce_setup,
             );
         }
     }
@@ -1265,10 +1268,25 @@ impl CcBsSubentity {
                 tracing::info!("CMCE: subscriber register issi={} known={}", issi, known);
             }
             BrewSubscriberAction::Deregister => {
+                // A roaming update first removes this terminal's local
+                // private endpoint through `PrivateCallEndpointMoved`.  The
+                // ensuing old-cell deregistration must only clean up an
+                // endpoint that still belongs to this cell.  Looking at the
+                // call's two identities alone would also release the peer
+                // that remains here, ending a correctly restored call.
                 let private_call_ids = self
                     .private_calls
                     .iter()
-                    .filter_map(|(&call_id, call)| (call.caller_itsi == issi || call.callee_itsi == issi).then_some(call_id))
+                    .filter_map(|(&call_id, call)| {
+                        let endpoint_mask = if call.caller_itsi == issi {
+                            0x01
+                        } else if call.callee_itsi == issi {
+                            0x02
+                        } else {
+                            0
+                        };
+                        (call.local_mask & endpoint_mask != 0).then_some(call_id)
+                    })
                     .collect::<Vec<_>>();
                 for call_id in private_call_ids {
                     let cause = DisconnectCause::SwmiRequestedDisconnection;
@@ -2845,6 +2863,7 @@ impl CcBsSubentity {
                 talking_party,
                 acknowledged,
                 protection,
+                restoring_itsi,
             } => {
                 self.config.state_write().aie_sessions.set_group_protection(gssi, protection);
                 let Ok(call_id) = u16::try_from(call_id) else {
@@ -2861,6 +2880,17 @@ impl CcBsSubentity {
                         .find(|(_, pending_gssi)| *pending_gssi == gssi)
                         .copied()
                 });
+                let restoring_itsi = restoring_itsi.and_then(|itsi| u32::try_from(itsi).ok());
+                let restoring_terminal_is_member =
+                    restoring_itsi.is_some_and(|itsi| self.subscriber_groups.get(&itsi).is_some_and(|groups| groups.contains(&gssi)));
+                if restoring_itsi.is_some() && !restoring_terminal_is_member {
+                    tracing::warn!(
+                        call_id,
+                        gssi,
+                        restoring_itsi = ?restoring_itsi,
+                        "ignoring invalid service-restoration group replay marker"
+                    );
+                }
                 if let Some(pending_key) = pending_key {
                     let request = self
                         .pending_swmi_setups
@@ -2881,6 +2911,8 @@ impl CcBsSubentity {
                             floor_itsi: floor_itsi as u32,
                             talking_party,
                             acknowledged,
+                            announce_setup: !restoring_terminal_is_member
+                                && !self.active_floor_holder_is_local_member(gssi, floor_itsi as u32),
                         },
                     );
                     tracing::debug!(
@@ -2891,7 +2923,7 @@ impl CcBsSubentity {
                     );
                 } else {
                     let floor_itsi = floor_itsi as u32;
-                    let announce_setup = !self.active_floor_holder_is_local_member(gssi, floor_itsi);
+                    let announce_setup = !restoring_terminal_is_member && !self.active_floor_holder_is_local_member(gssi, floor_itsi);
                     self.start_remote_swmi_call(
                         queue,
                         call_id,
@@ -4114,6 +4146,7 @@ impl CcBsSubentity {
                             floor_itsi,
                             talking_party,
                             acknowledged,
+                            announce_setup,
                         },
                     );
                     tracing::warn!(call_id, gssi, ?error, "deferring SwMI group call until a local circuit is released");
@@ -6604,6 +6637,45 @@ mod tests {
     }
 
     #[test]
+    fn service_restoration_replay_prepares_group_circuit_without_d_setup() {
+        let gssi = 91;
+        let restoring_itsi: u32 = 430_892;
+        let call_id = 14;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+
+        // A foreign current floor makes a normal start broadcast D-SETUP.
+        // The explicit restoration marker must instead retain a circuit for
+        // U-CALL RESTORE, allowing the individual SC3/GCK transition to
+        // finish before any group-addressed signalling is emitted.
+        cc.handle_swmi_action(
+            &mut queue,
+            SwmiMessage::GroupCallStart {
+                call_id: call_id.into(),
+                owner_itsi: 430_905,
+                gssi,
+                priority: 1,
+                floor_itsi: 430_905,
+                talking_party: None,
+                acknowledged: false,
+                protection: tetra_swmi_protocol::GroupProtection::NetworkEncrypted,
+                restoring_itsi: Some(restoring_itsi.into()),
+            },
+        );
+
+        assert!(cc.active_calls.contains_key(&call_id));
+        assert!(cc.restore_prepared_calls.contains(&call_id));
+        assert!(!queue.iter_mut().any(|message| {
+            matches!(
+                &message.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == gssi
+                        && matches!(prim.main_address.ssi_type, SsiType::Gssi)
+            )
+        }));
+    }
+
+    #[test]
     fn scanning_change_reconciles_active_call_route() {
         let gssi = 91;
         let issi = 77_468;
@@ -6769,6 +6841,39 @@ mod tests {
             local_mask: 0x03,
             talking_party: None,
         }
+    }
+
+    #[test]
+    fn old_cell_deregistration_after_private_endpoint_move_keeps_local_peer() {
+        let call_id = 26;
+        let departed_itsi = 430_892;
+        let remaining_itsi = 430_905;
+        let mut cc = test_cc_with_group(204);
+        let mut queue = MessageQueue::new();
+        let mut call = waiting_test_call();
+        // This is the old cell after `PrivateCallEndpointMoved` has detached
+        // the roaming caller.  Its peer must remain bridged to the SwMI.
+        call.local_mask = 0x02;
+        cc.private_calls.insert(call_id, call);
+
+        cc.handle_subscriber_update(
+            &mut queue,
+            MmSubscriberUpdate {
+                issi: departed_itsi,
+                groups: vec![],
+                action: BrewSubscriberAction::Deregister,
+                class_of_usage: vec![],
+                scanning_enabled: None,
+            },
+        );
+
+        let call = cc
+            .private_calls
+            .get(&call_id)
+            .expect("old-cell deregistration must not release the remaining peer");
+        assert_eq!(call.local_mask, 0x02);
+        assert_eq!(call.callee_itsi, remaining_itsi);
+        assert!(queue.pop_front().is_none());
     }
 
     #[test]

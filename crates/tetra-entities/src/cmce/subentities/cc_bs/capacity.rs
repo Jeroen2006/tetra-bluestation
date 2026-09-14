@@ -40,6 +40,7 @@ mod tests {
             talking_party: None,
             acknowledged: false,
             protection: Default::default(),
+            restoring_itsi: None,
         }
         .encode()
         .unwrap();
@@ -1053,6 +1054,7 @@ impl CcBsSubentity {
             talking_party: None,
             acknowledged: pdu.basic_service_information.communication_type == CommunicationType::P2MpAcked,
             protection: Default::default(),
+            restoring_itsi: None,
         }
         .encode()
         .expect("local group context");
