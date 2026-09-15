@@ -5545,6 +5545,7 @@ impl TetraEntityTrait for MmBs {
                     let accepted_count = accepted.len();
                     let rejected_count = rejected.len();
                     for subscriber in accepted {
+                        let recovered_rua_state = subscriber.rua_assigned;
                         let requested_rua_reassignment = subscriber.rua_assigned == Some(false)
                             && u32::try_from(subscriber.itsi)
                                 .ok()
@@ -5558,6 +5559,19 @@ impl TetraEntityTrait for MmBs {
                             subscriber.energy_economy,
                             subscriber.security_class,
                         );
+                        if let (Ok(issi), Some(assigned)) =
+                            (u32::try_from(subscriber.itsi), recovered_rua_state)
+                        {
+                            // The SwMI returns its durable assignment in an
+                            // LST recovery result when a BS restart erased the
+                            // local observation.  This is an internal cache
+                            // repair: no over-air RUA Book On is sent and the
+                            // terminal is not prompted to log on again.
+                            self.config
+                                .state_write()
+                                .subscribers
+                                .set_rua_assignment_state(issi, Some(assigned));
+                        }
                         if requested_rua_reassignment {
                             let issi = subscriber.itsi as u32;
                             // TTR 001-17 figure 5: a D-LOCATION UPDATE COMMAND
