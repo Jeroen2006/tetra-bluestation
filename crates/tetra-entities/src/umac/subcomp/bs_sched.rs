@@ -6067,10 +6067,10 @@ mod tests {
         );
         assert_eq!(sched.assoc_best_effort_queues[1].len(), 1);
 
-        // An SDS/ordinary resource already waiting on the channel owns the
-        // first free FN18 and leaves the broadcast queued.
+        // An ordinary associated SDS resource owns the first free FN18 and
+        // leaves the broadcast queued.
         let sds_addr = TetraAddress::new(77_468, SsiType::Issi);
-        sched.dl_enqueue_tma_on_timeslot(
+        sched.dl_enqueue_associated_tma(
             2,
             BsChannelScheduler::dl_make_minimal_resource(&sds_addr, None, false),
             BitBuffer::new(0),
@@ -6081,7 +6081,7 @@ mod tests {
         assert!(!first_free.is_mandatory_bsch() && !first_free.is_mandatory_bnch());
         sched.cur_dltime = first_free.add_timeslots(-1);
         let sds_slot = sched.finalize_ts_for_tick();
-        let mut sds_bits = sds_slot.blk1.expect("ordinary FN18 control").mac_block;
+        let mut sds_bits = sds_slot.blk1.expect("ordinary associated FN18 control").mac_block;
         sds_bits.seek(0);
         let sds_resource = MacResource::from_bitbuf(&mut sds_bits).expect("SDS MAC-RESOURCE");
         assert_eq!(sds_resource.addr.map(|addr| addr.ssi), Some(sds_addr.ssi));
@@ -6122,15 +6122,24 @@ mod tests {
             [false, false, true, false],
         );
 
+        // Frame 18 has no ordinary PDCH resource scheduling.  A pending
+        // packet downlink still blocks an all-MS broadcast here, so it is
+        // delivered first in the next PDCH opportunity.
         let first_free = TdmaTime { t: 3, f: 18, m: 1, h: 0 };
         assert!(!first_free.is_mandatory_bsch() && !first_free.is_mandatory_bnch());
         sched.cur_dltime = first_free.add_timeslots(-1);
+        let _frame18_slot = sched.finalize_ts_for_tick();
+        assert_eq!(sched.assoc_best_effort_queues[2].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+
+        let data_time = TdmaTime { t: 3, f: 1, m: 2, h: 0 };
+        sched.cur_dltime = data_time.add_timeslots(-1);
         let data_slot = sched.finalize_ts_for_tick();
-        let mut data_bits = data_slot.blk1.expect("PDCH data in free FN18").mac_block;
+        let mut data_bits = data_slot.blk1.expect("pending PDCH downlink").mac_block;
         data_bits.seek(0);
         let data_resource = MacResource::from_bitbuf(&mut data_bits).expect("PDCH MAC-RESOURCE");
         assert_eq!(data_resource.addr.map(|addr| addr.ssi), Some(data_addr.ssi));
-        assert_eq!(sched.assoc_best_effort_queues[2].len(), 1);
+        assert!(sched.dltx_queues[2].is_empty());
 
         let second_free = TdmaTime { t: 3, f: 18, m: 3, h: 0 };
         assert!(!second_free.is_mandatory_bsch() && !second_free.is_mandatory_bnch());
