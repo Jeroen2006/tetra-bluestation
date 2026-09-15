@@ -975,6 +975,31 @@ impl Sndcp {
     }
 
     fn reserve_bearer(&mut self, queue: &mut MessageQueue, command_id: u64, id: u64, generation: u64, requested: u8) {
+        // A SwMI reconnect can replay a persisted bearer after this BS has
+        // restarted.  At that point there is no local SNDCP context to attach
+        // to it yet.  Opening the bearer anyway strands TS2..TS4: all later
+        // MS access attempts are rejected locally although the SwMI has no
+        // usable session on that bearer.  Only a reservation correlated with
+        // an outstanding Access request may create a new local bearer.  An
+        // already-open bearer remains idempotent across a short reconnect.
+        if !self.bearers.contains_key(&id) && !self.pending_commands.contains_key(&command_id) {
+            tracing::warn!(
+                command_id,
+                bearer_id = id,
+                generation,
+                requested,
+                "rejecting uncorrelated packet bearer reservation without local SNDCP context"
+            );
+            self.submit(PacketDataMessage::BearerReport {
+                command_id,
+                bearer_id: id,
+                bearer_generation: generation,
+                state: PacketBearerState::Failed,
+                timeslot_bitmap: 0,
+                member_count: 0,
+            });
+            return;
+        }
         if let Some(existing) = self.bearers.get(&id) {
             let state = if existing.generation == generation {
                 PacketBearerState::Ready
@@ -3004,6 +3029,41 @@ mod tests {
 
         assert_eq!(sndcp.bearers.get(&17).map(|bearer| bearer.generation), Some(4));
         assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+    }
+
+    #[test]
+    fn uncorrelated_bearer_replay_after_bs_restart_cannot_claim_pdch_slots() {
+        let (mut sndcp, worker) = test_sndcp_with_swmi();
+        let mut queue = MessageQueue::new();
+
+        sndcp.handle_swmi(
+            &mut queue,
+            PacketDataMessage::BearerControl {
+                command_id: 88,
+                bearer_id: 2238,
+                bearer_generation: 1,
+                action: PacketBearerAction::Reserve,
+                timeslot_bitmap: 0b1110,
+                force_after_ms: 2_500,
+            },
+        );
+
+        assert!(sndcp.bearers.is_empty());
+        assert!(queue.pop_front().is_none());
+        for timeslot in 2..=4 {
+            assert_eq!(sndcp.config.state_read().timeslot_alloc.owner(timeslot), None);
+        }
+        assert!(matches!(
+            worker.try_recv_outgoing(),
+            Some(SwmiMessage::PacketData(PacketDataMessage::BearerReport {
+                command_id: 88,
+                bearer_id: 2238,
+                bearer_generation: 1,
+                state: PacketBearerState::Failed,
+                timeslot_bitmap: 0,
+                member_count: 0,
+            }))
+        ));
     }
 
     #[test]
