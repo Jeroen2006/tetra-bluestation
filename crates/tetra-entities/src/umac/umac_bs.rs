@@ -2093,6 +2093,7 @@ impl UmacBs {
         }
         let mut sdu = prim.pdu;
         let associated_channel = prim.associated_channel;
+        let assigned_channel_frame18_broadcast = prim.assigned_channel_frame18_broadcast;
         let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
             AieRequest::clear(
                 AieSubject::Individual {
@@ -2415,6 +2416,31 @@ impl UmacBs {
         //     tracing::warn!("rx_ul_tma_unitdata_req: signaling scheduled for non-MCCH {}", message.dltime.t);
         // }
         // self.channel_scheduler.dl_enqueue_tma(message.dltime.t, pdu, sdu, prim.tx_reporter);
+
+        if assigned_channel_frame18_broadcast {
+            let valid_broadcast = associated_channel.is_none()
+                && prim.chan_alloc.is_none()
+                && prim.main_address.ssi == 0x00ff_ffff
+                && prim.main_address.ssi_type == SsiType::Gssi;
+            if valid_broadcast {
+                let channels = self.channel_scheduler.active_assigned_channels();
+                for timeslot in channels.iter().copied() {
+                    self.channel_scheduler
+                        .dl_enqueue_associated_frame18_broadcast(timeslot, pdu.clone(), sdu.clone(), aie_request);
+                }
+                tracing::debug!(
+                    channels = channels.len(),
+                    "queued D-NWRK-BROADCAST for free FN18 slots on active assigned channels"
+                );
+            } else {
+                tracing::warn!(
+                    address = ?prim.main_address,
+                    ?associated_channel,
+                    has_channel_allocation = prim.chan_alloc.is_some(),
+                    "ignoring invalid assigned-channel frame-18 broadcast marker"
+                );
+            }
+        }
 
         if let Some(channel) = associated_channel {
             // A late-entry D-SETUP is transmitted where the target MS is
@@ -3471,6 +3497,71 @@ mod tests {
     }
 
     #[test]
+    fn marked_broadcast_keeps_mcch_and_fans_out_to_tch_and_pdch() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let mut queue = MessageQueue::new();
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(10, 2)));
+        assert!(umac.channel_scheduler.open_packet_bearer(83, 1, 0b0100));
+
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("0000"),
+                    main_address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: true,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        let mcch_time = TdmaTime { t: 1, f: 5, m: 1, h: 0 };
+        umac.channel_scheduler.cur_dltime = mcch_time.add_timeslots(-1);
+        let mcch = umac.channel_scheduler.finalize_ts_for_tick();
+        let mut mcch_bits = mcch.blk1.expect("original MCCH broadcast").mac_block;
+        mcch_bits.seek(0);
+        let mcch_resource = MacResource::from_bitbuf(&mut mcch_bits).expect("MCCH MAC-RESOURCE");
+        assert_eq!(mcch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+
+        let tch_time = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        assert!(!tch_time.is_mandatory_bsch() && !tch_time.is_mandatory_bnch());
+        umac.channel_scheduler.cur_dltime = tch_time.add_timeslots(-1);
+        let tch = umac.channel_scheduler.finalize_ts_for_tick();
+        assert_eq!(tch.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+        let mut tch_bits = tch.blk1.expect("TCH FN18 broadcast").mac_block;
+        tch_bits.seek(0);
+        let tch_resource = MacResource::from_bitbuf(&mut tch_bits).expect("TCH MAC-RESOURCE");
+        assert_eq!(tch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+
+        let pdch_time = TdmaTime { t: 3, f: 18, m: 3, h: 0 };
+        assert!(!pdch_time.is_mandatory_bsch() && !pdch_time.is_mandatory_bnch());
+        umac.channel_scheduler.cur_dltime = pdch_time.add_timeslots(-1);
+        let pdch = umac.channel_scheduler.finalize_ts_for_tick();
+        assert_eq!(pdch.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+        let mut pdch_bits = pdch.blk1.expect("PDCH FN18 broadcast").mac_block;
+        pdch_bits.seek(0);
+        let pdch_resource = MacResource::from_bitbuf(&mut pdch_bits).expect("PDCH MAC-RESOURCE");
+        assert_eq!(pdch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+    }
+
+    #[test]
     fn ee_group_replay_accepts_only_a_future_pre_rollover_opportunity() {
         let now = TdmaTime::default().add_timeslots(100);
         let due = now.add_timeslots(20);
@@ -3545,6 +3636,7 @@ mod tests {
                     data_category: None,
                     chan_alloc: None,
                     associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: Some(reporter.clone()),
                 }),
             ),
@@ -3611,6 +3703,7 @@ mod tests {
                     data_category: None,
                     chan_alloc: None,
                     associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: None,
                 }),
             ),

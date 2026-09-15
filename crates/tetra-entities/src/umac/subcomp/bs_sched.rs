@@ -150,6 +150,24 @@ pub struct TimeslotSchedule {
     // pub dl: Option<TmvUnitdataReq>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssociatedBestEffortKind {
+    CallRepeat(u16),
+    Frame18Broadcast,
+}
+
+impl AssociatedBestEffortKind {
+    fn is_frame18_only(self) -> bool {
+        matches!(self, Self::Frame18Broadcast)
+    }
+}
+
+#[derive(Debug)]
+struct AssociatedBestEffortElem {
+    kind: AssociatedBestEffortKind,
+    elem: DlSchedElem,
+}
+
 // #[derive(Debug)]
 pub struct BsChannelScheduler {
     pub cur_dltime: TdmaTime,
@@ -166,10 +184,10 @@ pub struct BsChannelScheduler {
     /// Associated-control messages. These are consumed only in FN18 on an
     /// assigned channel and therefore never steal a normal speech frame.
     assoc_dltx_queues: [Vec<DlSchedElem>; 4],
-    /// Expendable periodic associated repeats, keyed by the advertised call.
-    /// They are consumed only when both ordinary signalling queues for the
-    /// target bearer are empty.
-    assoc_best_effort_queues: [Vec<(u16, DlSchedElem)>; 4],
+    /// Expendable periodic associated repeats. Call repeats may also use an
+    /// idle hangtime frame; network broadcasts are restricted to free FN18.
+    /// Both classes remain below all ordinary assigned-channel signalling.
+    assoc_best_effort_queues: [Vec<AssociatedBestEffortElem>; 4],
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
     /// Uplink reservations announced in an associated FN18 grant. They are
     /// kept separate from the ordinary 18-frame ring because the associated
@@ -329,6 +347,7 @@ impl BsChannelScheduler {
                 self.packet_bearers[timeslot as usize - 1] = Some((bearer_id, generation));
             }
         }
+        self.discard_inactive_frame18_broadcasts();
         true
     }
 
@@ -344,6 +363,7 @@ impl BsChannelScheduler {
         self.pending_packet_data_grants
             .retain(|_, request| request.bearer != (bearer_id, generation));
         self.draining_packet_bearers.remove(&(bearer_id, generation));
+        self.discard_inactive_frame18_broadcasts();
         true
     }
 
@@ -371,6 +391,20 @@ impl BsChannelScheduler {
         self.packet_bearer_is_active(timeslot)
             || self.circuits.is_active(Direction::Dl, timeslot)
             || self.circuits.is_active(Direction::Ul, timeslot)
+    }
+
+    /// Return each physical TCH/PDCH on which an assigned MS may currently be
+    /// listening. TS1 remains the MCCH and receives the original broadcast.
+    pub fn active_assigned_channels(&self) -> Vec<u8> {
+        (2..=4).filter(|timeslot| self.assigned_channel_is_active(*timeslot)).collect()
+    }
+
+    fn discard_inactive_frame18_broadcasts(&mut self) {
+        for timeslot in 2..=4 {
+            if !self.assigned_channel_is_active(timeslot) {
+                self.assoc_best_effort_queues[timeslot as usize - 1].retain(|queued| !queued.kind.is_frame18_only());
+            }
+        }
     }
 
     /// Enter/leave hangtime for a traffic timeslot (2..=4).
@@ -1899,21 +1933,41 @@ impl BsChannelScheduler {
     /// on a bearer, preventing the periodic producer from building backlog
     /// when speech/control leaves fewer free opportunities than expected.
     pub fn dl_enqueue_associated_best_effort_tma(&mut self, ts: u8, key: u16, pdu: MacResource, sdu: BitBuffer, aie_request: AieRequest) {
+        self.dl_enqueue_associated_best_effort(ts, AssociatedBestEffortKind::CallRepeat(key), pdu, sdu, aie_request);
+    }
+
+    /// Queue the all-MS neighbour broadcast below SDS, grants, call control,
+    /// packet data and periodic call repeats. It has no frames 1..17 fallback.
+    pub fn dl_enqueue_associated_frame18_broadcast(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, aie_request: AieRequest) {
+        self.dl_enqueue_associated_best_effort(ts, AssociatedBestEffortKind::Frame18Broadcast, pdu, sdu, aie_request);
+    }
+
+    fn dl_enqueue_associated_best_effort(
+        &mut self,
+        ts: u8,
+        kind: AssociatedBestEffortKind,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        aie_request: AieRequest,
+    ) {
         assert!((2..=4).contains(&ts), "associated control must use an assigned timeslot");
         let queue = &mut self.assoc_best_effort_queues[ts as usize - 1];
-        if queue.iter().any(|(queued_key, _)| *queued_key == key) {
-            tracing::trace!(ts, key, "coalescing duplicate best-effort associated repeat");
+        if queue.iter().any(|queued| queued.kind == kind) {
+            tracing::trace!(ts, ?kind, "coalescing duplicate best-effort associated repeat");
             return;
         }
         tracing::debug!(
             ts,
-            key,
+            ?kind,
             addr = ?pdu.addr,
             sdu_bits = sdu.get_len(),
             queued_before = queue.len(),
             "queued best-effort associated repeat"
         );
-        queue.push((key, DlSchedElem::Resource(pdu, sdu, None, aie_request, None)));
+        queue.push(AssociatedBestEffortElem {
+            kind,
+            elem: DlSchedElem::Resource(pdu, sdu, None, aie_request, None),
+        });
     }
 
     /// Deliver a capacity grant through the target channel's FN18 control
@@ -2235,18 +2289,29 @@ impl BsChannelScheduler {
     /// Build one expendable associated repeat. This queue is deliberately
     /// separate from normal control so an in-progress low-priority message can
     /// be abandoned when SDS, a grant, or any other signalling arrives.
-    fn dl_build_best_effort_associated_control_block(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
-        if self.assoc_best_effort_queues[ts.t as usize - 1].is_empty() {
-            return None;
+    fn dl_build_best_effort_associated_control_block(&mut self, ts: TdmaTime, permit_frame18_broadcast: bool) -> Option<BitBuffer> {
+        let queue = &self.assoc_best_effort_queues[ts.t as usize - 1];
+        // Periodic call control is more useful than the neighbour carousel and
+        // therefore wins even if its item was queued later. Outside FN18 the
+        // frame18-only class is deliberately not eligible at all.
+        let index = queue
+            .iter()
+            .position(|queued| !queued.kind.is_frame18_only())
+            .or_else(|| permit_frame18_broadcast.then_some(0).filter(|_| !queue.is_empty()))?;
+        let AssociatedBestEffortElem { kind, elem: item } = self.assoc_best_effort_queues[ts.t as usize - 1].remove(index);
+        if kind.is_frame18_only() {
+            assert!(
+                ts.f == 18 && !ts.is_mandatory_bsch() && !ts.is_mandatory_bnch(),
+                "frame-18 broadcast selected outside a free frame-18 slot"
+            );
         }
-        let (key, item) = self.assoc_best_effort_queues[ts.t as usize - 1].remove(0);
         let mut buf = BitBuffer::new(SCH_F_CAP);
         match item {
             DlSchedElem::Resource(pdu, sdu, _, aie_request, packet_data_slots) => {
                 let pdu = match self.prepare_downlink_resource(pdu, aie_request, ts) {
                     Ok(pdu) => pdu,
                     Err(error) => {
-                        tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated repeat without a valid AIE context");
+                        tracing::debug!(dltime = %ts, ?kind, ?error, "dropping best-effort associated repeat without a valid AIE context");
                         return None;
                     }
                 };
@@ -2254,14 +2319,20 @@ impl BsChannelScheduler {
                 let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
-                    tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated repeat after AIE cipher failure");
+                    tracing::debug!(dltime = %ts, ?kind, ?error, "dropping best-effort associated repeat after AIE cipher failure");
                     return None;
                 }
                 if !complete {
                     if written_before == 0 && buf.get_len_written() == 0 {
-                        tracing::debug!(dltime = %ts, key, "dropping best-effort associated repeat that cannot make progress");
+                        tracing::debug!(dltime = %ts, ?kind, "dropping best-effort associated repeat that cannot make progress");
                     } else {
-                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger, packet_data_slots)));
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(
+                            index,
+                            AssociatedBestEffortElem {
+                                kind,
+                                elem: DlSchedElem::FragBuf(fragger, packet_data_slots),
+                            },
+                        );
                     }
                 }
             }
@@ -2269,14 +2340,20 @@ impl BsChannelScheduler {
                 let written_before = buf.get_len_written();
                 let complete = fragger.get_next_chunk(&mut buf);
                 if let Err(error) = self.cipher_fresh_downlink_chunk(&mut fragger, &mut buf, ts) {
-                    tracing::debug!(dltime = %ts, key, ?error, "dropping best-effort associated fragment after AIE cipher failure");
+                    tracing::debug!(dltime = %ts, ?kind, ?error, "dropping best-effort associated fragment after AIE cipher failure");
                     return None;
                 }
                 if !complete {
                     if written_before == 0 && buf.get_len_written() == 0 {
-                        tracing::debug!(dltime = %ts, key, "dropping best-effort associated fragment that cannot make progress");
+                        tracing::debug!(dltime = %ts, ?kind, "dropping best-effort associated fragment that cannot make progress");
                     } else {
-                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(0, (key, DlSchedElem::FragBuf(fragger, packet_data_slots)));
+                        self.assoc_best_effort_queues[ts.t as usize - 1].insert(
+                            index,
+                            AssociatedBestEffortElem {
+                                kind,
+                                elem: DlSchedElem::FragBuf(fragger, packet_data_slots),
+                            },
+                        );
                     }
                 }
             }
@@ -2288,7 +2365,7 @@ impl BsChannelScheduler {
         tracing::debug!(
             dltime = %ts,
             timeslot = ts.t,
-            key,
+            ?kind,
             used_bits = SCH_F_CAP - remaining_before,
             "building best-effort associated SCH/F control block"
         );
@@ -2301,7 +2378,7 @@ impl BsChannelScheduler {
     fn cancel_interrupted_best_effort_fragment(&mut self, timeslot: u8) {
         let queue = &mut self.assoc_best_effort_queues[timeslot as usize - 1];
         let before = queue.len();
-        queue.retain(|(_, item)| !matches!(item, DlSchedElem::FragBuf(..)));
+        queue.retain(|queued| !matches!(&queued.elem, DlSchedElem::FragBuf(..)));
         if queue.len() != before {
             tracing::debug!(
                 dltime = %self.cur_dltime,
@@ -3154,6 +3231,14 @@ impl BsChannelScheduler {
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
 
         let frame18_broadcast_slot = ts.is_mandatory_bsch() || ts.is_mandatory_bnch();
+        let slot = ts.t as usize - 1;
+        let normal_associated_pending = !self.assoc_dltx_queues[slot].is_empty();
+        let non_frame18_best_effort_pending = self.assoc_best_effort_queues[slot]
+            .iter()
+            .any(|queued| !queued.kind.is_frame18_only());
+        // PDCH traffic and hangtime signalling use the ordinary per-slot
+        // queue. A network broadcast must not consume their FN18 opportunity.
+        let ordinary_downlink_pending = (self.packet_bearer_is_active(ts.t) || hang_effective) && !self.dltx_queues[slot].is_empty();
         if ts.f == 18
             && frame18_broadcast_slot
             && (!self.assoc_dltx_queues[ts.t as usize - 1].is_empty() || !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty())
@@ -3170,7 +3255,8 @@ impl BsChannelScheduler {
         let mut elem = if ts.f == 18
             && ts.t != 1
             && !frame18_broadcast_slot
-            && (self.circuits.is_active(Direction::Dl, ts.t) || self.circuits.is_active(Direction::Ul, ts.t))
+            && self.assigned_channel_is_active(ts.t)
+            && (!ordinary_downlink_pending || normal_associated_pending || non_frame18_best_effort_pending)
         {
             // FN18 is the assigned channel's fixed ACCH opportunity.  Do not
             // borrow capacity from FN1..17 for ordinary call signalling. A
@@ -3180,21 +3266,20 @@ impl BsChannelScheduler {
             // Associated FN18 remains on the assigned TP physical resource,
             // while its logical channel is SCH/F and therefore uses signalling
             // coding in LMAC (encode_cp), not TCH speech coding.
-            let normal_associated_pending = !self.assoc_dltx_queues[ts.t as usize - 1].is_empty();
             if normal_associated_pending {
                 self.cancel_interrupted_best_effort_fragment(ts.t);
             }
             let associated_control = if normal_associated_pending {
                 self.dl_build_associated_control_block(ts)
             } else if !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty() {
-                self.dl_build_best_effort_associated_control_block(ts)
+                self.dl_build_best_effort_associated_control_block(ts, true)
             } else {
                 None
             };
             if associated_control.is_some() {
                 tracing::info!(
                     dltime = %ts,
-                    assigned_traffic_channel = true,
+                    assigned_channel = true,
                     physical_channel = ?PhysicalChannel::Tp,
                     logical_channel = ?LogicalChannel::SchF,
                     "transmitting queued associated FN18 SCH/F control block"
@@ -3291,7 +3376,7 @@ impl BsChannelScheduler {
             }
             let buf = normal_buf.or_else(|| {
                 (ts.f != 18 && hang_effective && dl_circuit_active && !self.assoc_best_effort_queues[ts.t as usize - 1].is_empty())
-                    .then(|| self.dl_build_best_effort_associated_control_block(ts))
+                    .then(|| self.dl_build_best_effort_associated_control_block(ts, false))
                     .flatten()
             });
             if let Some(buf) = buf {
@@ -5924,6 +6009,141 @@ mod tests {
     }
 
     #[test]
+    fn frame18_broadcast_waits_for_free_tch_fn18_and_ordinary_signalling() {
+        use tetra_saps::control::call_control::Circuit;
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let mut sched = get_testing_slotter();
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    call_id: 7,
+                    direction,
+                    ts: 2,
+                    usage: 6,
+                    circuit_mode: CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                },
+            );
+        }
+        sched.set_hangtime(2, true);
+
+        let broadcast_addr = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        for _ in 0..2 {
+            sched.dl_enqueue_associated_frame18_broadcast(
+                2,
+                BsChannelScheduler::dl_make_minimal_resource(&broadcast_addr, None, false),
+                BitBuffer::new(0),
+                AieRequest::clear(AieSubject::Group { gssi: broadcast_addr.ssi }, AieScope::MacResource),
+            );
+        }
+        assert_eq!(
+            sched.assoc_best_effort_queues[1].len(),
+            1,
+            "pending network broadcasts must be coalesced"
+        );
+
+        // Even though hangtime makes frames 1..17 available for signalling,
+        // this class is restricted to FN18.
+        let non_fn18 = TdmaTime { t: 2, f: 5, m: 1, h: 0 };
+        sched.cur_dltime = non_fn18.add_timeslots(-1);
+        let non_fn18_slot = sched.finalize_ts_for_tick();
+        let mut non_fn18_bits = non_fn18_slot.blk1.expect("hangtime idle control").mac_block;
+        non_fn18_bits.seek(0);
+        let non_fn18_resource = MacResource::from_bitbuf(&mut non_fn18_bits).expect("hangtime null resource");
+        assert!(non_fn18_resource.addr.is_none());
+        assert_eq!(sched.assoc_best_effort_queues[1].len(), 1);
+
+        // MN1/TS2 is a mandatory BSCH occurrence, not a free associated slot.
+        let mandatory = TdmaTime { t: 2, f: 18, m: 1, h: 0 };
+        assert!(mandatory.is_mandatory_bsch() || mandatory.is_mandatory_bnch());
+        sched.cur_dltime = mandatory.add_timeslots(-1);
+        let mandatory_slot = sched.finalize_ts_for_tick();
+        assert_eq!(
+            mandatory_slot.blk1.as_ref().map(|block| block.logical_channel),
+            Some(LogicalChannel::Bsch)
+        );
+        assert_eq!(sched.assoc_best_effort_queues[1].len(), 1);
+
+        // An SDS/ordinary resource already waiting on the channel owns the
+        // first free FN18 and leaves the broadcast queued.
+        let sds_addr = TetraAddress::new(77_468, SsiType::Issi);
+        sched.dl_enqueue_tma_on_timeslot(
+            2,
+            BsChannelScheduler::dl_make_minimal_resource(&sds_addr, None, false),
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: sds_addr.ssi }, AieScope::MacResource),
+        );
+        let first_free = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        assert!(!first_free.is_mandatory_bsch() && !first_free.is_mandatory_bnch());
+        sched.cur_dltime = first_free.add_timeslots(-1);
+        let sds_slot = sched.finalize_ts_for_tick();
+        let mut sds_bits = sds_slot.blk1.expect("ordinary FN18 control").mac_block;
+        sds_bits.seek(0);
+        let sds_resource = MacResource::from_bitbuf(&mut sds_bits).expect("SDS MAC-RESOURCE");
+        assert_eq!(sds_resource.addr.map(|addr| addr.ssi), Some(sds_addr.ssi));
+        assert_eq!(sched.assoc_best_effort_queues[1].len(), 1);
+
+        let second_free = TdmaTime { t: 2, f: 18, m: 4, h: 0 };
+        assert!(!second_free.is_mandatory_bsch() && !second_free.is_mandatory_bnch());
+        sched.cur_dltime = second_free.add_timeslots(-1);
+        let broadcast_slot = sched.finalize_ts_for_tick();
+        let mut broadcast_bits = broadcast_slot.blk1.expect("network broadcast FN18 control").mac_block;
+        broadcast_bits.seek(0);
+        let broadcast_resource = MacResource::from_bitbuf(&mut broadcast_bits).expect("broadcast MAC-RESOURCE");
+        assert_eq!(broadcast_resource.addr.map(|addr| addr.ssi), Some(broadcast_addr.ssi));
+        assert!(sched.assoc_best_effort_queues[1].is_empty());
+    }
+
+    #[test]
+    fn frame18_broadcast_waits_for_pdch_downlink() {
+        let mut sched = get_testing_slotter();
+        assert!(sched.open_packet_bearer(83, 1, 0b0100));
+        assert_eq!(sched.active_assigned_channels(), vec![3]);
+
+        let broadcast_addr = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        sched.dl_enqueue_associated_frame18_broadcast(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&broadcast_addr, None, false),
+            BitBuffer::new(0),
+            AieRequest::clear(AieSubject::Group { gssi: broadcast_addr.ssi }, AieScope::MacResource),
+        );
+
+        let data_addr = TetraAddress::new(77_479, SsiType::Issi);
+        sched.dl_enqueue_packet_tma_on_timeslot(
+            3,
+            BsChannelScheduler::dl_make_minimal_resource(&data_addr, None, false),
+            BitBuffer::new(0),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: data_addr.ssi }, AieScope::MacResource),
+            [false, false, true, false],
+        );
+
+        let first_free = TdmaTime { t: 3, f: 18, m: 1, h: 0 };
+        assert!(!first_free.is_mandatory_bsch() && !first_free.is_mandatory_bnch());
+        sched.cur_dltime = first_free.add_timeslots(-1);
+        let data_slot = sched.finalize_ts_for_tick();
+        let mut data_bits = data_slot.blk1.expect("PDCH data in free FN18").mac_block;
+        data_bits.seek(0);
+        let data_resource = MacResource::from_bitbuf(&mut data_bits).expect("PDCH MAC-RESOURCE");
+        assert_eq!(data_resource.addr.map(|addr| addr.ssi), Some(data_addr.ssi));
+        assert_eq!(sched.assoc_best_effort_queues[2].len(), 1);
+
+        let second_free = TdmaTime { t: 3, f: 18, m: 3, h: 0 };
+        assert!(!second_free.is_mandatory_bsch() && !second_free.is_mandatory_bnch());
+        sched.cur_dltime = second_free.add_timeslots(-1);
+        let broadcast_slot = sched.finalize_ts_for_tick();
+        let mut broadcast_bits = broadcast_slot.blk1.expect("PDCH network broadcast FN18 control").mac_block;
+        broadcast_bits.seek(0);
+        let broadcast_resource = MacResource::from_bitbuf(&mut broadcast_bits).expect("broadcast MAC-RESOURCE");
+        assert_eq!(broadcast_resource.addr.map(|addr| addr.ssi), Some(broadcast_addr.ssi));
+        assert!(sched.assoc_best_effort_queues[2].is_empty());
+    }
+
+    #[test]
     fn ordinary_hangtime_control_cancels_partial_best_effort_repeat() {
         use tetra_saps::control::call_control::Circuit;
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
@@ -5961,7 +6181,10 @@ mod tests {
         assert!(first_slot.blk1.is_some());
         assert!(matches!(
             sched.assoc_best_effort_queues[2].first(),
-            Some((10, DlSchedElem::FragBuf(..)))
+            Some(AssociatedBestEffortElem {
+                kind: AssociatedBestEffortKind::CallRepeat(10),
+                elem: DlSchedElem::FragBuf(..),
+            })
         ));
 
         let sds_addr = TetraAddress::new(77_468, SsiType::Issi);

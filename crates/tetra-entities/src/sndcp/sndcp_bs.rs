@@ -469,6 +469,7 @@ impl Sndcp {
                 data_category: None,
                 chan_alloc: Some(Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)),
                 associated_channel: self.route_for(context),
+                assigned_channel_frame18_broadcast: false,
                 tx_reporter: Some(reporter.clone()),
             }),
         ));

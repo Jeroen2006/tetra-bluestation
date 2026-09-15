@@ -144,6 +144,7 @@ impl MleBroadcast {
                 req_handle: 0,
                 chan_alloc: None,
                 associated_channel: None,
+                assigned_channel_frame18_broadcast: true,
                 tx_reporter: None,
             }),
         });

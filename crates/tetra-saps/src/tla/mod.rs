@@ -279,6 +279,11 @@ pub struct TlaTlUnitdataReqBl {
     /// channel. It must survive MLE and LLC for delivery on FN18/FN1–17.
     pub associated_channel: Option<AssociatedChannel>,
 
+    /// BS-only request to retain normal MCCH delivery and additionally repeat
+    /// this broadcast on active assigned channels. UMAC may use only free
+    /// frame-18 associated-control opportunities for those copies.
+    pub assigned_channel_frame18_broadcast: bool,
+
     /// Optional TxReporter that may be included to track transmission and optionally, acknowledgement
     pub tx_reporter: Option<TxReporter>,
 }

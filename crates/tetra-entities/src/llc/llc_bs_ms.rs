@@ -584,6 +584,7 @@ impl Llc {
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 associated_channel: prim.associated_channel,
+                assigned_channel_frame18_broadcast: prim.assigned_channel_frame18_broadcast,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -833,6 +834,7 @@ impl Llc {
                 data_category: None,
                 chan_alloc,
                 associated_channel: route,
+                assigned_channel_frame18_broadcast: false,
                 tx_reporter,
             }),
         ));
@@ -2048,6 +2050,7 @@ impl Llc {
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 associated_channel: prim.associated_channel,
+                assigned_channel_frame18_broadcast: false,
                 tx_reporter: Some(tx_reporter.clone()),
             }),
         };
@@ -2566,6 +2569,7 @@ impl Llc {
                     data_category: None,         // TODO FIXME
                     chan_alloc,
                     associated_channel: packet_route,
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: None, // By definition, no higher layer entity is interested
                 }),
             };

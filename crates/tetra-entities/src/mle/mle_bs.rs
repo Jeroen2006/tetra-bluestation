@@ -330,6 +330,7 @@ impl MleBs {
                 req_handle: 0,
                 chan_alloc,
                 associated_channel: None,
+                assigned_channel_frame18_broadcast: false,
                 tx_reporter: None,
             }),
             _ => SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
@@ -755,6 +756,7 @@ impl MleBs {
                     req_handle: 0,
                     chan_alloc: None,
                     associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
@@ -828,6 +830,7 @@ impl MleBs {
                     req_handle: prim.handle,
                     chan_alloc: prim.chan_alloc.take(),
                     associated_channel: prim.associated_channel.take(),
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             )
@@ -932,6 +935,7 @@ impl MleBs {
 
                     chan_alloc,
                     associated_channel,
+                    assigned_channel_frame18_broadcast: false,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }

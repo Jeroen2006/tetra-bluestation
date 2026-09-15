@@ -78,6 +78,9 @@ pub struct TmaUnitdataReq {
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
     pub associated_channel: Option<AssociatedChannel>,
+    /// Preserve MCCH delivery and repeat this broadcast on active assigned
+    /// channels, strictly in otherwise-unused frame-18 control slots.
+    pub assigned_channel_frame18_broadcast: bool,
     pub tx_reporter: Option<TxReporter>,
 }
 
