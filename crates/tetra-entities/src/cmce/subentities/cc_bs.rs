@@ -1561,6 +1561,16 @@ impl CcBsSubentity {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
             panic!()
         };
+        let recipient = prim.received_tetra_address;
+        // TTR 001-05 §6.7 permits individual and group call-setup
+        // signalling to start and finish on a PDCH.  This D-RELEASE is the
+        // terminal's immediate call-setup response, so an MS that sent its
+        // U-SETUP while on an active packet bearer continues monitoring that
+        // PDCH rather than the MCCH.  Leaving this unassociated makes the
+        // rejection wait for an MCCH opportunity the MS is no longer using.
+        let packet_channel = (recipient.ssi_type == SsiType::Issi)
+            .then(|| self.packet_listener_channel(recipient.ssi))
+            .flatten();
         let pdu = DRelease {
             call_identifier: 0,
             disconnect_cause: cause,
@@ -1586,13 +1596,22 @@ impl CcBsSubentity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
-                associated_channel: None,
-                main_address: prim.received_tetra_address,
+                associated_channel: packet_channel,
+                main_address: recipient,
                 aie_override: None,
                 tx_reporter: None,
             }),
         });
-        tracing::info!(issi = prim.received_tetra_address.ssi, ?cause, "rejected U-SETUP sent as D-RELEASE");
+        if let Some(channel) = packet_channel {
+            tracing::info!(
+                issi = recipient.ssi,
+                packet_bearer_id = channel.call_id,
+                packet_timeslot = channel.timeslot,
+                ?cause,
+                "routing rejected U-SETUP D-RELEASE on originating PDCH"
+            );
+        }
+        tracing::info!(issi = recipient.ssi, ?cause, "rejected U-SETUP sent as D-RELEASE");
     }
 
     /// D-TX WAIT is the explicit response to a floor request while another
@@ -6415,6 +6434,7 @@ mod tests {
     use super::*;
     use crate::umac::subcomp::bs_sched::SCH_F_CAP;
     use tetra_pdus::umac::{fields::channel_allocation::ChanAllocElement, pdus::mac_resource::MacResource};
+    use tetra_saps::lcmc::LcmcMleUnitdataInd;
 
     pub(super) fn test_cc_with_group(gssi: u32) -> CcBsSubentity {
         let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -6708,6 +6728,57 @@ mod tests {
                 .call_identifier,
             33
         );
+    }
+
+    #[test]
+    fn setup_rejection_is_sent_on_originating_terminals_active_pdch() {
+        let issi = 77_479;
+        let packet_route = SubscriberDeliveryRoute {
+            call_id: 70,
+            timeslot: 3,
+            usage: 54,
+        };
+        let mut cc = test_cc_with_group(91);
+        cc.config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .insert(issi, vec![packet_route]);
+        let request = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+                sdu: BitBuffer::new_autoexpand(0),
+                handle: 7,
+                endpoint_id: 8,
+                link_id: 9,
+                received_tetra_address: TetraAddress::new(issi, SsiType::Issi),
+                chan_change_resp_req: false,
+                chan_change_handle: None,
+            }),
+        };
+        let mut queue = MessageQueue::new();
+
+        cc.send_d_release_for_setup_reject(&mut queue, &request, DisconnectCause::RequestedServiceNotAvailable);
+
+        let SapMsgInner::LcmcMleUnitdataReq(mut response) = queue.pop_front().expect("D-RELEASE queued").msg else {
+            panic!("D-RELEASE must be routed to MLE")
+        };
+        assert_eq!(response.main_address.ssi, issi);
+        assert_eq!(response.main_address.ssi_type, SsiType::Issi);
+        assert_eq!(response.layer2service, Layer2Service::Unacknowledged);
+        assert_eq!(response.handle, 7);
+        assert_eq!(response.endpoint_id, 8);
+        assert_eq!(response.link_id, 9);
+        assert_eq!(
+            response
+                .associated_channel
+                .map(|channel| (channel.call_id, channel.timeslot, channel.usage)),
+            Some((packet_route.call_id, packet_route.timeslot, packet_route.usage))
+        );
+        let release = DRelease::from_bitbuf(&mut response.sdu).expect("parse setup-rejection D-RELEASE");
+        assert_eq!(release.call_identifier, 0);
+        assert_eq!(release.disconnect_cause, DisconnectCause::RequestedServiceNotAvailable);
     }
 
     #[test]
