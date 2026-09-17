@@ -14,9 +14,9 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::{N252_BL_MAX_TLSDU_RETRANSMITS_ACKED, N262_AL_MAX_CONNECTION_SETUP_RETRIES};
-use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
-use tetra_pdus::llc::consts::timers::T252_ACK_WAITING_TIMER;
-use tetra_pdus::llc::consts::timers::T261_SETUP_WAITING_TIMER;
+use tetra_pdus::llc::consts::timers::{
+    T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T261_SETUP_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER,
+};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::al::{AlAck, AlAckBlock, AlDataHeader, AlDisconnect, AlReconnect, AlSetup};
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
@@ -214,6 +214,10 @@ struct AdvancedLink {
     /// Lower boundary of the modulo-8 original advanced-link receive window.
     next_rx_ns: u8,
     receiver_ready: bool,
+    /// The most recent AL-RNR reception. T.271 starts again on every RNR;
+    /// once it expires the sender may resume at its oldest unacknowledged
+    /// TL-SDU even if the peer never follows up with AL-ACK.
+    receiver_not_ready_since: Option<TdmaTime>,
     /// True after the AL-SETUP Success response has been sent or received.
     /// A Service change proposal remains false until the peer confirms it.
     ready: bool,
@@ -906,6 +910,7 @@ impl Llc {
         link.next_rx_ns = 0;
         link.rx_sdus.clear();
         link.receiver_ready = false;
+        link.receiver_not_ready_since = None;
         link.ready = false;
         link.setup_started_at = None;
 
@@ -1191,6 +1196,7 @@ impl Llc {
             next_tx_ns: 0,
             next_rx_ns: 0,
             receiver_ready: true,
+            receiver_not_ready_since: None,
             ready: !awaiting_peer_success,
             setup_started_at: awaiting_peer_success.then_some(self.dltime),
             rx_sdus: BTreeMap::new(),
@@ -1210,6 +1216,7 @@ impl Llc {
                 link.endpoint_id = prim.endpoint_id;
                 link.ready = true;
                 link.setup_started_at = None;
+                link.receiver_not_ready_since = None;
                 if link.reset.take().is_some() {
                     // begin_advanced_link_reset already cleared both sequence
                     // directions and the old buffers. Success makes the link
@@ -1429,6 +1436,7 @@ impl Llc {
             tracing::warn!(issi = prim.main_address.ssi, "invalid AL-ACK/RNR");
             return;
         };
+        let now = self.dltime;
         let issi = prim.main_address.ssi;
         let Some(link) = self.advanced_links.get_mut(&issi) else {
             return;
@@ -1438,6 +1446,10 @@ impl Llc {
             return;
         }
         link.receiver_ready = ack.receiver_ready;
+        // TS 100 392-2 22.3.3.2.5: an AL-RNR remains valid from the most
+        // recent RNR for T.271. Refreshing this timestamp prevents an MS
+        // that keeps reporting busy from being treated as ready too early.
+        link.receiver_not_ready_since = (!ack.receiver_ready).then_some(now);
         let mut failed_ns = None;
         let complete_window_report = ack.blocks.len() == usize::from(link.window_size)
             && ack.blocks.windows(2).all(|blocks| blocks[1].nr == (blocks[0].nr + 1) & 0x07);
@@ -1803,8 +1815,25 @@ impl Llc {
                 continue;
             }
 
-            if !link.receiver_ready {
-                continue;
+            let mut receiver_not_ready = !link.receiver_ready;
+            if receiver_not_ready {
+                let receiver_not_ready_expired = link
+                    .receiver_not_ready_since
+                    .is_some_and(|since| now.diff(since) >= T271_RECEIVER_NOT_READY_FOR_TX_TIMER as i32);
+                if receiver_not_ready_expired {
+                    // T.271 expiry is an active recovery point, rather than
+                    // a permanent flow-control state. Resume from the oldest
+                    // unacknowledged N(S) below.
+                    link.receiver_ready = true;
+                    link.receiver_not_ready_since = None;
+                    receiver_not_ready = false;
+                    tracing::info!(issi = *issi, "resuming advanced-link transmission after receiver-not-ready timer");
+                } else if link.receiver_not_ready_since.is_none() {
+                    // `receiver_ready = false` also represents the distinct
+                    // AL-SETUP reset state. That path is handled above and
+                    // must not be mistaken for a peer AL-RNR.
+                    continue;
+                }
             }
             let routes = &active_routes[issi];
             if routes.is_empty() {
@@ -1848,8 +1877,13 @@ impl Llc {
                         && sdu.attempt_reporter.is_none()
                         && sdu.sent_at.is_none()
                         && !sdu.acknowledgement_requested
-                        && sdu.retransmissions <= link.max_sdu_retransmissions)
-                        .then_some(index)
+                        && sdu.retransmissions <= link.max_sdu_retransmissions
+                        // An AL-RNR suppresses new TL-SDUs, but ETSI
+                        // 22.3.3.2.5 permits retransmitting the segments it
+                        // (or an earlier acknowledgement) identified as
+                        // missing while the flow-control timer is running.
+                        && (!receiver_not_ready || sdu.pending_segments.as_ref().is_some_and(|segments| !segments.is_empty())))
+                    .then_some(index)
                 })
                 .take(available)
                 .collect::<Vec<_>>();
@@ -3264,6 +3298,91 @@ mod tests {
         llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, ack));
         assert_eq!(reporter.get_state(), TxState::Acknowledged);
         assert!(llc.advanced_links.get(&77_468).unwrap().tx.is_empty());
+    }
+
+    #[test]
+    fn advanced_downlink_resumes_when_receiver_not_ready_timer_expires() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        let rnr_at = llc.dltime;
+        queue_advanced_downlink(&mut llc, &mut queue, 77_468, "10101010");
+
+        let mut rnr = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: false,
+            // This is a valid AL-RNR while N(S)=0 is still queued locally;
+            // therefore its positive acknowledgement must not retire the
+            // unsent TL-SDU.
+            blocks: vec![AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 0,
+                first_missing_segment: None,
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut rnr)
+        .unwrap();
+        rnr.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, rnr));
+
+        let link = &llc.advanced_links[&77_468];
+        assert!(!link.receiver_ready);
+        assert_eq!(link.receiver_not_ready_since, Some(rnr_at));
+        assert!(!llc.submit_advanced_link_messages(&mut queue));
+        assert!(queue.pop_front().is_none());
+
+        llc.dltime = rnr_at.add_timeslots(T271_RECEIVER_NOT_READY_FOR_TX_TIMER as i32 - 1);
+        assert!(!llc.submit_advanced_link_messages(&mut queue));
+        assert!(queue.pop_front().is_none());
+
+        llc.dltime = rnr_at.add_timeslots(T271_RECEIVER_NOT_READY_FOR_TX_TIMER as i32);
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        let link = &llc.advanced_links[&77_468];
+        assert!(link.receiver_ready);
+        assert_eq!(link.receiver_not_ready_since, None);
+        let SapMsgInner::TmaUnitdataReq(mut resumed) = queue.pop_front().expect("AL-DATA after T.271").msg else {
+            panic!("expected advanced-link data")
+        };
+        assert_eq!(AlDataHeader::from_bitbuf(&mut resumed.pdu).unwrap().ns, 0);
+    }
+
+    #[test]
+    fn advanced_downlink_retransmits_rnr_requested_segments_before_t271() {
+        let mut llc = Llc::new(test_config());
+        let mut queue = MessageQueue::new();
+        establish_advanced_link(&mut llc, &mut queue, 77_468);
+        while queue.pop_front().is_some() {}
+        queue_advanced_downlink(&mut llc, &mut queue, 77_468, &"10".repeat(200));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        while queue.pop_front().is_some() {}
+
+        let mut rnr = BitBuffer::new_autoexpand(16);
+        AlAck {
+            receiver_ready: false,
+            blocks: vec![AlAckBlock {
+                nr: 0,
+                acknowledgement_length: 1,
+                first_missing_segment: Some(0),
+                acknowledgement_bitmap: Vec::new(),
+            }],
+        }
+        .to_bitbuf(&mut rnr)
+        .unwrap();
+        rnr.seek(0);
+        llc.rx_tma_unitdata_ind(&mut queue, advanced_indication(77_468, rnr));
+
+        let link = &llc.advanced_links[&77_468];
+        assert!(!link.receiver_ready);
+        assert_eq!(link.tx.front().and_then(|sdu| sdu.pending_segments.clone()), Some(vec![0]));
+        assert!(llc.submit_advanced_link_messages(&mut queue));
+        assert!(!llc.advanced_links[&77_468].receiver_ready);
+        let SapMsgInner::TmaUnitdataReq(mut retransmission) = queue.pop_front().expect("RNR-requested AL-DATA").msg else {
+            panic!("expected advanced-link data")
+        };
+        let header = AlDataHeader::from_bitbuf(&mut retransmission.pdu).unwrap();
+        assert_eq!((header.ns, header.segment), (0, 0));
     }
 
     #[test]
