@@ -1682,6 +1682,20 @@ impl CcBsSubentity {
         queue.push_back(cmd);
     }
 
+    /// A group circuit may remain floorless during call establishment and
+    /// simplex hangtime.  Its downlink must nevertheless use the group's
+    /// traffic AIE policy from the moment the TCH is opened; otherwise those
+    /// TCH/S frames are emitted clear until the first floor grant.  UMAC keeps
+    /// the uplink policy empty until that grant identifies a floor holder.
+    fn signal_umac_group_traffic_aie(queue: &mut MessageQueue, call_id: u16, gssi: u32, ts: u8) {
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::ConfigureGroupTrafficAie { call_id, gssi, ts }),
+        });
+    }
+
     fn signal_umac_circuit_close(queue: &mut MessageQueue, circuit: CmceCircuit) {
         let cmd = SapMsg {
             sap: Sap::Control,
@@ -1886,6 +1900,7 @@ impl CcBsSubentity {
 
         // Signal UMAC to open DL+UL circuits
         Self::signal_umac_circuit_open(queue, &circuit);
+        Self::signal_umac_group_traffic_aie(queue, circuit.call_id, dest_gssi, circuit.ts);
 
         // === 1) Send D-CALL-PROCEEDING and D-CONNECT to the calling MS ===
         // This acknowledges the U-SETUP and keeps the radio on the existing
@@ -4240,6 +4255,7 @@ impl CcBsSubentity {
             }
         };
         Self::signal_umac_circuit_open(queue, &circuit);
+        Self::signal_umac_group_traffic_aie(queue, call_id, gssi, circuit.ts);
         let d_setup = DSetup {
             call_identifier: call_id,
             call_time_out: CallTimeout::T5m,
@@ -5837,6 +5853,7 @@ impl CcBsSubentity {
 
         // Signal UMAC to open DL and UL circuits
         Self::signal_umac_circuit_open(queue, &circuit);
+        Self::signal_umac_group_traffic_aie(queue, call_id, dest_gssi, ts);
 
         tracing::debug!(
             "CMCE: sending D-SETUP for NEW call call_id={} gssi={} (network-initiated)",

@@ -46,6 +46,15 @@ pub enum CallControl {
         direction: Direction,
         ts: u8,
     },
+    /// Install group traffic protection for a newly opened RF circuit before
+    /// a simplex floor is granted.  This protects idle/hangtime TCH/S
+    /// downlink frames while deliberately leaving the uplink unbound until a
+    /// terminal receives a real floor grant.
+    ConfigureGroupTrafficAie {
+        call_id: u16,
+        gssi: u32,
+        ts: u8,
+    },
     /// Floor granted: a speaker has been given transmission permission.
     /// Sent to UMAC to exit hangtime (resume traffic mode) and to Brew to start forwarding voice.
     FloorGranted {

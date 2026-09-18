@@ -2931,6 +2931,26 @@ impl UmacBs {
             CallControl::Close { .. } => {
                 self.rx_control_circuit_close(queue, prim);
             }
+            CallControl::ConfigureGroupTrafficAie { call_id, gssi, ts } => {
+                if !self.owns_traffic_slot(call_id, ts) {
+                    tracing::warn!(
+                        call_id,
+                        ts,
+                        gssi,
+                        "ignoring stale group traffic AIE configuration after traffic-timeslot recycling"
+                    );
+                    return;
+                }
+                let downlink = self.active_aie_request(AieSubject::Group { gssi }, AieScope::Traffic);
+                self.set_traffic_aie(queue, ts, downlink, None);
+                tracing::info!(
+                    call_id,
+                    ts,
+                    gssi,
+                    downlink_policy = ?downlink,
+                    "installed floorless group downlink traffic AIE context"
+                );
+            }
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { call_id, ts } => {
                 if !self.owns_traffic_slot(call_id, ts) {
@@ -3454,6 +3474,53 @@ mod tests {
         assert_eq!(umac.channel_scheduler.traffic_aie(ts), Some(tg91));
         assert!(umac.channel_scheduler.circuit_is_active(Direction::Dl, ts));
         assert!(umac.channel_scheduler.circuit_is_active(Direction::Ul, ts));
+    }
+
+    #[test]
+    fn floorless_group_call_installs_only_downlink_traffic_aie() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let config = SharedConfig::from_parts(config, None);
+        let gssi = 204;
+        {
+            let mut state = config.state_write();
+            state.aie = RuntimeAieConfig {
+                enabled: true,
+                sc1_allowed: false,
+                sc2: None,
+                sc3: Some(RuntimeSc3Aie::new(
+                    tetra_config::bluestation::RuntimeSc3TeaAlgorithm::Tea1,
+                    1,
+                    [0x6c; 10],
+                    true,
+                    true,
+                )),
+                rollover: None,
+            };
+        }
+        let mut umac = UmacBs::new(config.clone());
+        // The example configuration does not enable a SwMI endpoint.  Mirror
+        // the live endpoint update so this focused test exercises the active
+        // traffic-AIE policy path.
+        umac.aie = config.state_read().aie.clone();
+        let mut queue = MessageQueue::new();
+        let call_id = 12;
+        let ts = 2;
+
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(call_id, ts)));
+        assert_eq!(umac.channel_scheduler.traffic_aie(ts), None);
+
+        deliver_control(&mut umac, &mut queue, CallControl::ConfigureGroupTrafficAie { call_id, gssi, ts });
+
+        assert_eq!(
+            umac.channel_scheduler.traffic_aie(ts),
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic))
+        );
+        assert_eq!(umac.uplink_traffic_aie[ts as usize - 1], None);
+        assert_eq!(umac.traffic_floor_holder[ts as usize - 1], None);
     }
 
     #[test]
