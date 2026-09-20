@@ -1120,6 +1120,56 @@ impl CcBsSubentity {
         result
     }
 
+    /// Every distinct active bearer where a member of `gssi` can currently
+    /// receive a group SDS.  The MCCH remains mandatory and is deliberately
+    /// not represented here: callers retain that original PDU and add one
+    /// associated copy for each returned route.
+    ///
+    /// Group membership alone is insufficient. `group_is_receivable` applies
+    /// the current class-of-usage, selected/locked group and scan-enabled
+    /// state.  `listener_channels_for` then retains the active group bearer
+    /// candidates, including another group that a scanner is following. A
+    /// connected private call is intentionally excluded because it is not a
+    /// group listening opportunity.
+    ///
+    /// A multislot PD bearer is one terminal listening opportunity. Its
+    /// primary PDCH is enough for basic-link signalling; sending the same SDS
+    /// on every assigned PDCH would only compete with its advanced-link data.
+    fn group_sds_listener_channels_for(&self, gssi: u32) -> Vec<AssociatedChannel> {
+        let listeners = self
+            .subscriber_groups
+            .iter()
+            .filter_map(|(&issi, groups)| {
+                (groups.contains(&gssi) && self.group_is_receivable(issi, gssi) && !self.private_call_is_connected_for(issi))
+                    .then_some(issi)
+            })
+            .collect::<Vec<_>>();
+        let mut result = Vec::new();
+        let mut push_unique = |channel: AssociatedChannel| {
+            if !result.iter().any(|existing: &AssociatedChannel| {
+                existing.call_id == channel.call_id && existing.timeslot == channel.timeslot && existing.usage == channel.usage
+            }) {
+                result.push(channel);
+            }
+        };
+
+        let state = self.config.state_read();
+        for issi in listeners {
+            for channel in self.listener_channels_for(issi) {
+                push_unique(channel);
+            }
+            if let Some(route) = state.subscriber_packet_delivery_routes.get(&issi).and_then(|routes| routes.first()) {
+                push_unique(AssociatedChannel {
+                    call_id: route.call_id,
+                    timeslot: route.timeslot,
+                    usage: route.usage,
+                    best_effort_key: None,
+                });
+            }
+        }
+        result
+    }
+
     /// Active group bearers on which members of another scanned group may
     /// currently be listening. These are used only for expendable periodic
     /// late-entry repeats. The destination call's own bearer is excluded: its
@@ -1144,6 +1194,37 @@ impl CcBsSubentity {
     /// message onto a released slot.
     pub fn decorate_pending_downlinks(&self, queue: &mut MessageQueue) {
         self.refresh_delivery_routes();
+
+        // Keep the original group SDS on MCCH, including UMAC's energy-economy
+        // replay handling.  Associated copies are a reachability supplement
+        // for terminals currently on TCH/PDCH, never a replacement for MCCH.
+        let mut group_sds_fanout = Vec::new();
+        for message in queue.iter() {
+            let SapMsgInner::LcmcMleUnitdataReq(prim) = &message.msg else {
+                continue;
+            };
+            if prim.associated_channel.is_some() || prim.stealing_permission || prim.chan_alloc.is_some() {
+                continue;
+            }
+            if prim.main_address.ssi_type != SsiType::Gssi {
+                continue;
+            }
+            let mut cmce_sdu = prim.sdu.clone();
+            cmce_sdu.seek(0);
+            if cmce_sdu.read_field(5, "cmce_pdu_type").ok() != Some(CmcePduTypeDl::DSdsData.into_raw()) {
+                continue;
+            }
+            for channel in self.group_sds_listener_channels_for(prim.main_address.ssi) {
+                let mut copy = message.clone();
+                let SapMsgInner::LcmcMleUnitdataReq(copy_prim) = &mut copy.msg else {
+                    unreachable!("cloned LCMC request must remain an LCMC request");
+                };
+                copy_prim.associated_channel = Some(channel);
+                group_sds_fanout.push(copy);
+            }
+        }
+        queue.extend(group_sds_fanout);
+
         for message in queue.iter_mut() {
             let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else {
                 continue;
@@ -1168,19 +1249,13 @@ impl CcBsSubentity {
             cmce_sdu.seek(0);
             let pdu_type = cmce_sdu.read_field(5, "cmce_pdu_type").ok();
             if pdu_type == Some(CmcePduTypeDl::DSdsData.into_raw()) {
-                let channel = match prim.main_address.ssi_type {
-                    SsiType::Issi => self.preferred_listener_channel(prim.main_address.ssi),
-                    SsiType::Gssi => self.active_calls.iter().find_map(|(&call_id, call)| {
-                        (call.dest_gssi == prim.main_address.ssi).then_some(AssociatedChannel {
-                            call_id,
-                            timeslot: call.ts,
-                            usage: call.usage,
-                            best_effort_key: None,
-                        })
-                    }),
-                    _ => None,
-                };
-                if let Some(channel) = channel {
+                // Group copies were added above while retaining their MCCH
+                // original. Individual SDS still follows its single best
+                // current listening route.
+                if prim.main_address.ssi_type == SsiType::Gssi {
+                    continue;
+                }
+                if let Some(channel) = self.preferred_listener_channel(prim.main_address.ssi) {
                     tracing::info!(
                         address = ?prim.main_address,
                         call_id = channel.call_id,
@@ -6616,6 +6691,109 @@ mod tests {
             "a call must never receive its own D-SETUP repeat"
         );
         assert_eq!(associated[0].best_effort_key, Some(8));
+    }
+
+    #[test]
+    fn group_sds_keeps_mcch_copy_and_fans_out_to_group_scan_and_pdch_routes() {
+        let gssi = 91;
+        let scanned_gssi = 92;
+        let scanning_issi = 77_479;
+        let pd_issi = 77_480;
+        let mut cc = test_cc_with_group(gssi);
+        let mut lifecycle = MessageQueue::new();
+
+        // This MS can receive the destination group while following its
+        // higher-priority scan-list group. Both active group bearers are
+        // therefore possible delivery locations.
+        cc.handle_subscriber_update(
+            &mut lifecycle,
+            MmSubscriberUpdate {
+                issi: scanning_issi,
+                groups: vec![gssi, scanned_gssi],
+                action: BrewSubscriberAction::Affiliate,
+                class_of_usage: vec![3, 4],
+                scanning_enabled: None,
+            },
+        );
+        cc.handle_subscriber_update(
+            &mut lifecycle,
+            MmSubscriberUpdate {
+                issi: pd_issi,
+                groups: vec![gssi],
+                action: BrewSubscriberAction::Affiliate,
+                class_of_usage: vec![4],
+                scanning_enabled: None,
+            },
+        );
+        cc.start_remote_swmi_call(&mut lifecycle, 7, 430_892, gssi, 1, 430_892, None, false, true);
+        cc.start_remote_swmi_call(&mut lifecycle, 8, 430_893, scanned_gssi, 2, 430_893, None, false, true);
+        while lifecycle.pop_front().is_some() {}
+
+        let target_channel = cc
+            .active_calls
+            .get(&7)
+            .map(|call| (call.ts, call.usage))
+            .expect("target group call must be active");
+        let scanned_channel = cc
+            .active_calls
+            .get(&8)
+            .map(|call| (call.ts, call.usage))
+            .expect("scanned group call must be active");
+        let pd_timeslot = (2..=4)
+            .find(|timeslot| *timeslot != target_channel.0 && *timeslot != scanned_channel.0)
+            .expect("one traffic slot must remain free for packet data");
+        let pd_route = SubscriberDeliveryRoute {
+            call_id: 70,
+            timeslot: pd_timeslot,
+            usage: 54,
+        };
+        cc.config
+            .state_write()
+            .subscriber_packet_delivery_routes
+            .insert(pd_issi, vec![pd_route]);
+
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        sdu.write_bits(CmcePduTypeDl::DSdsData.into_raw(), 5);
+        sdu.seek(0);
+        let mut queue = MessageQueue::new();
+        queue.push_back(CcBsSubentity::build_sapmsg(
+            sdu,
+            None,
+            TetraAddress::new(gssi, SsiType::Gssi),
+            Layer2Service::Unacknowledged,
+            None,
+        ));
+
+        cc.decorate_pending_downlinks(&mut queue);
+
+        let mut mcch_copies = 0;
+        let mut associated = HashSet::new();
+        while let Some(message) = queue.pop_front() {
+            let SapMsgInner::LcmcMleUnitdataReq(prim) = message.msg else {
+                continue;
+            };
+            assert_eq!(prim.main_address.ssi, gssi);
+            assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+            let mut pdu = prim.sdu.clone();
+            pdu.seek(0);
+            assert_eq!(pdu.read_field(5, "cmce_pdu_type").unwrap(), CmcePduTypeDl::DSdsData.into_raw());
+            if let Some(channel) = prim.associated_channel {
+                associated.insert((channel.call_id, channel.timeslot, channel.usage));
+            } else {
+                mcch_copies += 1;
+            }
+        }
+
+        assert_eq!(mcch_copies, 1, "the original group SDS must remain on MCCH");
+        assert_eq!(
+            associated,
+            HashSet::from([
+                (7, target_channel.0, target_channel.1),
+                (8, scanned_channel.0, scanned_channel.1),
+                (pd_route.call_id, pd_route.timeslot, pd_route.usage),
+            ]),
+            "group SDS must cover the target call, scanned call and active PDCH exactly once"
+        );
     }
 
     #[test]
