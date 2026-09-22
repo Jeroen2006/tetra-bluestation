@@ -51,7 +51,7 @@ use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatusGatewayPayload;
-use tetra_pdus::mm::pdus::otar::{DOtar, UOtar};
+use tetra_pdus::mm::pdus::otar::{DOtar, OtarSessionKey, UOtar};
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
@@ -552,9 +552,8 @@ impl MmBs {
     }
 
     /// Class-3 group-addressed signalling uses MGCK when the GSSI has an
-    /// association and CCK otherwise. The all-MS address deliberately has no
-    /// GCK association, so normative broadcasts such as the full GCK-VN use
-    /// CCK instead of being sent in clear (EN 300 392-7 clause 6.5).
+    /// association and CCK otherwise. CMG-addressed security OTAR uses the
+    /// latter because CMG is never an ordinary talkgroup.
     fn group_downlink_aie_request(&self, gssi: u32) -> AieRequest {
         let state = self.config.state_read();
         let sc3g = state.aie.sc3.as_ref().is_some_and(|sc3| sc3.gckn_for_gssi(gssi).is_some());
@@ -589,6 +588,22 @@ impl MmBs {
             return Ok(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource));
         }
         Err("SC2-only OTAR downlink has no active terminal cipher context")
+    }
+
+    /// CMG-addressed GCK OTAR is group-addressed, unacknowledged at basic
+    /// link and protected by the class-3 CCK context. Its GCK payload is
+    /// separately sealed with EGSKO (TTR 001-11 §§6.2.10 and 6.3.2.3).
+    fn cmg_otar_downlink_aie_request(&self, cmg_gssi: u32) -> Result<AieRequest, &'static str> {
+        let state = self.config.state_read();
+        if !state.aie.enabled {
+            return Ok(AieRequest::clear(AieSubject::Group { gssi: cmg_gssi }, AieScope::MacResource));
+        }
+        let sc3_enabled = state.aie.sc3.is_some();
+        drop(state);
+        if sc3_enabled {
+            return Ok(self.group_downlink_aie_request(cmg_gssi));
+        }
+        Err("CMG-addressed GCK OTAR requires class-3 air-interface security")
     }
 
     fn remember_otar_outcome(&mut self, delivery: CompletedOtarDelivery) {
@@ -1280,9 +1295,9 @@ impl MmBs {
     }
 
     /// Queue the TTR 001-11 table-1 full current GCK-VN advertisement. It is
-    /// broadcast-addressed and unacknowledged, protected with the class-3 CCK
-    /// as required for a group address without a GCK association, and copied
-    /// to active TCH/STCH bearers for terminals in calls.
+    /// broadcast-addressed and unacknowledged and deliberately clear: clause
+    /// 6.2.14.2 permits D-CK CHANGE DEMAND clear, so an MS with an old or
+    /// missing CCK can still learn the full GCK-VN and recover its GCK.
     fn send_gck_change_broadcast(
         &self,
         queue: &mut MessageQueue,
@@ -1314,7 +1329,7 @@ impl MmBs {
                 stealing_permission: traffic_channels,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
-                aie_request: self.group_downlink_aie_request(0x00ff_ffff),
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
                     assigned_channel_frame18_broadcast: false,
                 frame18_rollover_activation,
@@ -1362,7 +1377,7 @@ impl MmBs {
 
     /// A newly registered MS can have missed the periodic clear broadcast
     /// while it was powered off. Send the same normative Table-1 indication
-    /// individually under its DCK, both after registration and after GCK
+    /// individually and clear, both after registration and after GCK
     /// provisioning, so a stale full GCK-VN cannot keep selecting an old key
     /// version even though the current key material is already present.
     fn send_current_gck_version_to_terminal(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
@@ -1410,7 +1425,7 @@ impl MmBs {
                     stealing_permission: false,
                     stealing_repeats_flag: false,
                     encryption_flag: false,
-                    aie_request: self.downlink_aie_request(issi),
+                    aie_request: AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource),
                     is_null_pdu: false,
                 assigned_channel_frame18_broadcast: false,
                     frame18_rollover_activation: None,
@@ -5185,12 +5200,14 @@ impl TetraEntityTrait for MmBs {
             if due && self.send_gck_rollover_broadcast_round(queue, target_vn, activation) {
                 self.last_gck_rollover_broadcast = Some((rollover_id, ts));
             }
-            // UMAC finalizes one slot ahead.  Queue the dedicated marker on
-            // the immediately preceding TS so it can reserve TS1..TS4 of
-            // FN18, whose last resource is directly before the TS1/FN1
-            // `Immediate` activation boundary.
+            // UMAC finalizes one slot ahead, after consuming messages routed
+            // through MM, MLE and LLC.  Queue the dedicated marker two
+            // physical slots before TS1/FN18 so UMAC receives it before it
+            // finalizes that TS, then reserves TS1..TS4 of FN18.  The last
+            // of those resources is directly before the TS1/FN1 `Immediate`
+            // activation boundary.
             if self.gck_rollover_immediate_sent != Some(rollover_id)
-                && ts == activation.add_timeslots(-5)
+                && ts == activation.add_timeslots(-6)
                 && self.send_gck_rollover_immediate(queue, target_vn, activation)
             {
                 self.gck_rollover_immediate_sent = Some(rollover_id);
@@ -5497,15 +5514,6 @@ impl TetraEntityTrait for MmBs {
                         tracing::warn!(command_id, itsi, "discarding OTAR downlink with invalid ISSI");
                         continue;
                     };
-                    if address_ssi != issi {
-                        tracing::warn!(
-                            command_id,
-                            itsi,
-                            address_ssi,
-                            "discarding OTAR downlink with mismatched terminal address"
-                        );
-                        continue;
-                    }
                     if usize::from(payload_bit_len) > payload.len().saturating_mul(8) {
                         tracing::warn!(command_id, issi, "discarding OTAR downlink with invalid bit length");
                         continue;
@@ -5521,7 +5529,29 @@ impl TetraEntityTrait for MmBs {
                         }
                     };
                     let kind = OtarDownlinkKind::from_pdu(&pdu);
-                    let aie_request = match self.otar_downlink_aie_request(issi, kind) {
+                    let cmg_addressed_gck = matches!(
+                        &pdu,
+                        DOtar::GckProvide(provide)
+                            if matches!(provide.session_key, OtarSessionKey::Group { .. })
+                    );
+                    let group_addressed = cmg_addressed_gck;
+                    if address_ssi != issi && !group_addressed {
+                        tracing::warn!(command_id, itsi, address_ssi, ?kind, "discarding OTAR downlink with mismatched terminal address");
+                        continue;
+                    }
+                    if group_addressed && acknowledged {
+                        tracing::warn!(command_id, issi, cmg_gssi = address_ssi, "discarding CMG-addressed GCK OTAR with acknowledged basic-link service");
+                        continue;
+                    }
+                    if !group_addressed && !acknowledged {
+                        tracing::warn!(command_id, issi, ?kind, "discarding unacknowledged individually addressed OTAR");
+                        continue;
+                    }
+                    let aie_request = match if group_addressed {
+                        self.cmg_otar_downlink_aie_request(address_ssi)
+                    } else {
+                        self.otar_downlink_aie_request(issi, kind)
+                    } {
                         Ok(request) => request,
                         Err(reason) => {
                             tracing::warn!(command_id, issi, ?kind, reason, "rejecting unsafe clear D-OTAR in SC2-only mode");
@@ -5535,14 +5565,7 @@ impl TetraEntityTrait for MmBs {
                             continue;
                         }
                     };
-                    if !acknowledged {
-                        // MLE's MM route currently supports acknowledged
-                        // basic-link service only. Rejecting this explicitly
-                        // is safer than reaching its assertion and claiming a
-                        // delivery status we cannot observe.
-                        tracing::warn!(command_id, issi, ?kind, "cannot schedule unacknowledged D-OTAR on the MM route");
-                        continue;
-                    }
+                    if !group_addressed {
                     match &pdu {
                         DOtar::GskoProvide(provide) => {
                             self.gsko_bootstraps.insert(
@@ -5566,7 +5589,9 @@ impl TetraEntityTrait for MmBs {
                         }
                         _ => {}
                     }
-                    let tx_reporter = TxReporter::new();
+                    }
+                    let tx_reporter = acknowledged.then(TxReporter::new);
+                    if let Some(tx_reporter) = tx_reporter.as_ref() {
                     self.pending_otar_deliveries.insert(
                         command_id,
                         PendingOtarDelivery {
@@ -5581,6 +5606,7 @@ impl TetraEntityTrait for MmBs {
                         },
                     );
                     self.report_rollover_otar_status(command_id, issi, air_handle, kind, "announced", None);
+                    }
                     sdu.seek(0);
                     queue.push_back(SapMsg {
                         sap: Sap::LmmSap,
@@ -5589,8 +5615,8 @@ impl TetraEntityTrait for MmBs {
                         msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                             sdu,
                             handle: air_handle,
-                            address: TetraAddress::issi(address_ssi),
-                            layer2service: Layer2Service::Acknowledged,
+                            address: if group_addressed { TetraAddress::new(address_ssi, SsiType::Gssi) } else { TetraAddress::issi(address_ssi) },
+                            layer2service: if acknowledged { Layer2Service::Acknowledged } else { Layer2Service::Unacknowledged },
                             stealing_permission: false,
                             stealing_repeats_flag: false,
                             encryption_flag: false,
@@ -5598,7 +5624,7 @@ impl TetraEntityTrait for MmBs {
                             is_null_pdu: false,
                             assigned_channel_frame18_broadcast: false,
                             frame18_rollover_activation: None,
-                            tx_reporter: Some(tx_reporter),
+                            tx_reporter,
                             seamless_handover: None,
                         }),
                     });
@@ -5607,6 +5633,7 @@ impl TetraEntityTrait for MmBs {
                         issi,
                         address_ssi,
                         acknowledged,
+                        group_addressed,
                         ?kind,
                         encrypted = aie_request.is_encrypted(),
                         "scheduled SwMI D-OTAR PDU"
@@ -6790,7 +6817,7 @@ mod tests {
     }
 
     #[test]
-    fn full_gck_version_broadcast_uses_cck_protected_group_signalling() {
+    fn full_gck_version_broadcast_is_explicitly_clear_for_key_recovery() {
         let config = test_config();
         let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
         sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2)])
@@ -6815,10 +6842,9 @@ mod tests {
         assert!(matches!(request.address.ssi_type, tetra_core::SsiType::Gssi));
         assert!(matches!(
             request.aie_request,
-            AieRequest::Sc3 {
-                subject: AieSubject::Group { gssi: 0x00ff_ffff },
+            AieRequest::Clear {
+                subject: AieSubject::System,
                 scope: AieScope::MacResource,
-                ..
             }
         ));
     }

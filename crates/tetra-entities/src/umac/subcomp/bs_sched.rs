@@ -1987,9 +1987,9 @@ impl BsChannelScheduler {
         // its old activation was superseded before its FN18. Treating that
         // stale fragment as a collision made the new marker fail completely,
         // so no MS received the mandatory final notification. There can be
-        // only one locally staged SC3G rollover; a marker accepted one tick
-        // before its own FN18 is authoritative and replaces every old
-        // fragment as one set.
+        // only one locally staged SC3G rollover; a marker accepted while the
+        // preceding TS4/FN17 is finalized is authoritative and replaces every
+        // old fragment as one set.
         let replaced = self
             .final_gck_rollover_immediate
             .iter()

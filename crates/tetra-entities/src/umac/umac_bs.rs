@@ -2063,8 +2063,9 @@ impl UmacBs {
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
         if let Some(activation) = prim.frame18_rollover_activation {
             // EN 300 392-7 4.5.5.6 defines Immediate as the first TS of the
-            // next downlink multiframe.  The MM requested this one scheduler
-            // tick before the four preceding FN18 resources are built.  It is
+            // next downlink multiframe.  The MM emits the marker two UMAC
+            // scheduler ticks before the four preceding FN18 resources are
+            // built, allowing for MM -> MLE -> LLC -> UMAC routing. It is
             // deliberately not eligible for normal all-MS traffic fan-out:
             // UMAC reserves all four physical FN18 resources itself.
             let final_frame18 = activation.add_timeslots(-4);
@@ -2074,7 +2075,7 @@ impl UmacBs {
                 || prim.chan_alloc.is_some()
                 || activation.t != 1
                 || activation.f != 1
-                || final_frame18 != self.dltime.add_timeslots(1)
+                || final_frame18 != self.dltime.add_timeslots(2)
             {
                 tracing::error!(
                     dltime = %self.dltime,
@@ -3677,6 +3678,66 @@ mod tests {
         pdch_bits.seek(0);
         let pdch_resource = MacResource::from_bitbuf(&mut pdch_bits).expect("PDCH MAC-RESOURCE");
         assert_eq!(pdch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+    }
+
+    #[test]
+    fn early_final_sc3g_marker_reaches_every_frame18_timeslot() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let activation = TdmaTime {
+            t: 1,
+            f: 1,
+            m: 2,
+            h: 0,
+        };
+        // MM -> MLE -> LLC -> UMAC needs one scheduler tick before UMAC
+        // builds TS1/FN18.  The marker therefore arrives while TS4/FN17 is
+        // being finalized, rather than after TS1/FN18 has already gone out.
+        umac.dltime = activation.add_timeslots(-6);
+        umac.channel_scheduler.cur_dltime = umac.dltime;
+        let mut queue = MessageQueue::new();
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::new(0),
+                    main_address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: Some(activation),
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_some));
+        let preceding = umac.channel_scheduler.finalize_ts_for_tick();
+        assert_eq!(preceding.ts, activation.add_timeslots(-5));
+        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_some));
+
+        umac.channel_scheduler.cur_dltime = preceding.ts;
+        for timeslot in 1..=4 {
+            let output = umac.channel_scheduler.finalize_ts_for_tick();
+            assert_eq!(output.ts.t, timeslot);
+            assert_eq!(output.ts.f, 18);
+            umac.channel_scheduler.cur_dltime = output.ts;
+        }
+        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_none));
     }
 
     #[test]
