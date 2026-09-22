@@ -1,4 +1,4 @@
-use tetra_core::{AieRequest, BitBuffer, EndpointId, TetraAddress, Todo, TxReporter};
+use tetra_core::{AieRequest, BitBuffer, EndpointId, TdmaTime, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
@@ -81,6 +81,8 @@ pub struct TmaUnitdataReq {
     /// Preserve MCCH delivery and repeat this broadcast on active assigned
     /// channels, strictly in otherwise-unused frame-18 control slots.
     pub assigned_channel_frame18_broadcast: bool,
+    /// See `LmmMleUnitdataReq::frame18_rollover_activation`.
+    pub frame18_rollover_activation: Option<TdmaTime>,
     pub tx_reporter: Option<TxReporter>,
 }
 

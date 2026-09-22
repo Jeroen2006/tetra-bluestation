@@ -73,6 +73,14 @@ pub struct RuntimeSc3Gck {
     key: [u8; 10],
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct RuntimeSc3GRollover {
+    rollover_id: u64,
+    activation_unix: u64,
+    local_activation_tdma: Option<TdmaTime>,
+    activated: bool,
+}
+
 impl RuntimeSc3Gck {
     pub fn new(gckn: u16, gck_vn: u16, key: [u8; 10]) -> Self {
         Self { gckn, gck_vn, key }
@@ -125,6 +133,9 @@ pub struct RuntimeSc3Aie {
     linked_gck_crypto_periods: bool,
     gck_vn: u16,
     gcks: HashMap<u16, RuntimeSc3Gck>,
+    future_gck_vn: Option<u16>,
+    future_gcks: HashMap<u16, RuntimeSc3Gck>,
+    gck_rollover: Option<RuntimeSc3GRollover>,
     group_associations: HashMap<u32, u16>,
 }
 
@@ -149,6 +160,9 @@ impl RuntimeSc3Aie {
             linked_gck_crypto_periods: false,
             gck_vn: 0,
             gcks: HashMap::new(),
+            future_gck_vn: None,
+            future_gcks: HashMap::new(),
+            gck_rollover: None,
             group_associations: HashMap::new(),
         }
     }
@@ -162,6 +176,29 @@ impl RuntimeSc3Aie {
         linked_gck_crypto_periods: bool,
         gck_vn: u16,
         keys: Vec<RuntimeSc3Gck>,
+        associations: Vec<(u32, u16)>,
+    ) -> Result<bool, &'static str> {
+        self.apply_sc3g_snapshot_with_rollover(
+            revision,
+            linked_gck_crypto_periods,
+            gck_vn,
+            keys,
+            None,
+            Vec::new(),
+            None,
+            associations,
+        )
+    }
+
+    pub fn apply_sc3g_snapshot_with_rollover(
+        &mut self,
+        revision: u64,
+        linked_gck_crypto_periods: bool,
+        gck_vn: u16,
+        keys: Vec<RuntimeSc3Gck>,
+        future_gck_vn: Option<u16>,
+        future_keys: Vec<RuntimeSc3Gck>,
+        rollover: Option<(u64, u64)>,
         associations: Vec<(u32, u16)>,
     ) -> Result<bool, &'static str> {
         if revision < self.sc3g_revision {
@@ -182,15 +219,62 @@ impl RuntimeSc3Aie {
                 return Err("invalid SC3G association");
             }
         }
+        let mut next_future = HashMap::new();
+        match (future_gck_vn, rollover) {
+            (None, None) if future_keys.is_empty() => {}
+            (Some(vn), Some((_id, activation_unix))) if activation_unix > 0 && !future_keys.is_empty() => {
+                for key in future_keys {
+                    if key.gck_vn != vn || !next_keys.contains_key(&key.gckn) || next_future.insert(key.gckn, key).is_some() {
+                        return Err("invalid or duplicate SC3G future key");
+                    }
+                }
+            }
+            _ => return Err("invalid SC3G rollover plan"),
+        }
+        let next_rollover = rollover.map(|(rollover_id, activation_unix)| RuntimeSc3GRollover {
+            rollover_id,
+            activation_unix,
+            local_activation_tdma: self.gck_rollover.as_ref().filter(|old| old.rollover_id == rollover_id).and_then(|old| old.local_activation_tdma),
+            activated: self.gck_rollover.as_ref().is_some_and(|old| old.rollover_id == rollover_id && old.activated),
+        });
+
+        // The SwMI promotes durable state at the UTC deadline so a BS which
+        // starts afterwards uses the new generation immediately.  A running
+        // cell may have rounded that same UTC value forward to its own next
+        // TS1/FN1, though.  Do not let this later durable snapshot move that
+        // cell early: it must retain the old generation until its announced
+        // local Absolute-IV boundary.  The association table is still safe
+        // to refresh because GCKNs do not change in a linked crypto period.
+        let waiting_for_local_activation = rollover.is_none()
+            && self.gck_rollover.as_ref().is_some_and(|old| {
+                !old.activated && old.local_activation_tdma.is_some()
+            })
+            && self.future_gck_vn == Some(gck_vn)
+            && self.future_gcks == next_keys;
+        if waiting_for_local_activation {
+            let changed = revision != self.sc3g_revision
+                || self.linked_gck_crypto_periods != linked_gck_crypto_periods
+                || self.group_associations != next_associations;
+            self.sc3g_revision = revision;
+            self.linked_gck_crypto_periods = linked_gck_crypto_periods;
+            self.group_associations = next_associations;
+            return Ok(changed);
+        }
         let changed = revision != self.sc3g_revision
             || self.linked_gck_crypto_periods != linked_gck_crypto_periods
             || self.gck_vn != gck_vn
             || self.gcks != next_keys
+            || self.future_gck_vn != future_gck_vn
+            || self.future_gcks != next_future
+            || self.gck_rollover != next_rollover
             || self.group_associations != next_associations;
         self.sc3g_revision = revision;
         self.linked_gck_crypto_periods = linked_gck_crypto_periods;
         self.gck_vn = gck_vn;
         self.gcks = next_keys;
+        self.future_gck_vn = future_gck_vn;
+        self.future_gcks = next_future;
+        self.gck_rollover = next_rollover;
         self.group_associations = next_associations;
         Ok(changed)
     }
@@ -205,6 +289,60 @@ impl RuntimeSc3Aie {
 
     pub fn gck_vn(&self) -> u16 {
         self.gck_vn
+    }
+
+    pub fn gck_vn_at(&self, time: TdmaTime) -> u16 {
+        self.gck_rollover
+            .as_ref()
+            .filter(|rollover| rollover.local_activation_tdma.is_some_and(|activation| activation.age(time) >= 0))
+            .and_then(|_| self.future_gck_vn)
+            .unwrap_or(self.gck_vn)
+    }
+
+    fn gck_at(&self, gckn: u16, time: TdmaTime) -> Option<&RuntimeSc3Gck> {
+        if self.gck_rollover.as_ref().is_some_and(|rollover| rollover.local_activation_tdma.is_some_and(|activation| activation.age(time) >= 0)) {
+            self.future_gcks.get(&gckn)
+        } else {
+            self.gcks.get(&gckn)
+        }
+    }
+
+    pub fn gck_rollover_notification(&self) -> Option<(u64, u16, Option<TdmaTime>)> {
+        let rollover = self.gck_rollover.as_ref()?;
+        if rollover.activated {
+            Some((rollover.rollover_id, self.gck_vn, None))
+        } else {
+            Some((rollover.rollover_id, self.future_gck_vn?, rollover.local_activation_tdma))
+        }
+    }
+
+    pub fn schedule_gck_rollover(&mut self, unix_now: u64, current: TdmaTime) -> Option<(u64, TdmaTime)> {
+        let rollover = self.gck_rollover.as_mut()?;
+        if rollover.activated || rollover.local_activation_tdma.is_some() {
+            return None;
+        }
+        let slots = rollover.activation_unix.saturating_sub(unix_now).saturating_mul(1200).saturating_add(16) / 17;
+        let slots = i32::try_from(slots).ok()?;
+        let target = current.add_timeslots(slots).forward_to_multiframe_start();
+        rollover.local_activation_tdma = Some(target);
+        Some((rollover.rollover_id, target))
+    }
+
+    pub fn activate_gck_rollover_if_due(&mut self, current: TdmaTime) -> Option<u64> {
+        let rollover = self.gck_rollover.as_ref()?;
+        let target = rollover.local_activation_tdma?;
+        if rollover.activated || target.age(current) < 0 {
+            return None;
+        }
+        let future_vn = self.future_gck_vn?;
+        if self.future_gcks.is_empty() {
+            return None;
+        }
+        self.gck_vn = future_vn;
+        self.gcks = self.future_gcks.clone();
+        let rollover = self.gck_rollover.as_mut()?;
+        rollover.activated = true;
+        Some(rollover.rollover_id)
     }
 
     pub fn gckn_for_gssi(&self, gssi: u32) -> Option<u16> {
@@ -504,6 +642,9 @@ impl RuntimeAieConfig {
             next.linked_gck_crypto_periods = old.linked_gck_crypto_periods;
             next.gck_vn = old.gck_vn;
             next.gcks = old.gcks.clone();
+            next.future_gck_vn = old.future_gck_vn;
+            next.future_gcks = old.future_gcks.clone();
+            next.gck_rollover = old.gck_rollover.clone();
             next.group_associations = old.group_associations.clone();
         }
     }
@@ -809,7 +950,7 @@ impl BsAieKeyProvider {
             } => {
                 let state = self.config.state_read();
                 let sc3 = active_sc3(&state.aie)?;
-                let key = sc3_identifier_for_subject(sc3, subject)?;
+                let key = sc3_identifier_for_subject(sc3, subject, time)?;
                 if requested_key.is_some_and(|requested| requested != key) {
                     return Err(AieContextError::StaleKeyIdentity);
                 }
@@ -850,7 +991,7 @@ impl BsAieKeyProvider {
         if let Ok(sc3) = active_sc3(&state.aie) {
             let raw = tetra_crypto::ta61_inverse(&sc3.cck, &[(esi >> 16) as u8, (esi >> 8) as u8, esi as u8]);
             let issi = u32::from_be_bytes([0, raw[0], raw[1], raw[2]]);
-            let key = sc3_identifier_for_subject(sc3, AieSubject::Individual { issi })?;
+            let key = sc3_identifier_for_subject(sc3, AieSubject::Individual { issi }, time)?;
             return Ok((
                 issi,
                 AieContext::sc3(AieSubject::Individual { issi }, AieDirection::Uplink, time, scope, key),
@@ -1189,7 +1330,7 @@ impl BsAieKeyProvider {
         }
         let state = self.config.state_read();
         let sc3 = active_sc3(&state.aie)?;
-        if sc3_identifier_for_subject(sc3, subject)? != key {
+        if sc3_identifier_for_subject(sc3, subject, time)? != key {
             return Err(AieContextError::StaleKeyIdentity);
         }
         let material = match key.key_type {
@@ -1205,7 +1346,7 @@ impl BsAieKeyProvider {
                     .get(&gssi)
                     .copied()
                     .ok_or(AieContextError::StaleKeyIdentity)?;
-                let gck = sc3.gcks.get(&gckn).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+                let gck = sc3.gck_at(gckn, time).ok_or(AieContextError::GckNotProvisioned(gckn))?;
                 tetra_crypto::ta71(&gck.key, &sc3.cck)
             }
         };
@@ -1246,7 +1387,7 @@ fn subject_gssi(subject: AieSubject) -> Option<u32> {
     }
 }
 
-fn sc3_identifier_for_subject(sc3: &RuntimeSc3Aie, subject: AieSubject) -> Result<Sc3KeyIdentifier, AieContextError> {
+fn sc3_identifier_for_subject(sc3: &RuntimeSc3Aie, subject: AieSubject, time: TdmaTime) -> Result<Sc3KeyIdentifier, AieContextError> {
     let algorithm = match sc3.algorithm {
         RuntimeSc3TeaAlgorithm::Tea1 => AieAlgorithm::Tea1,
         RuntimeSc3TeaAlgorithm::Tea3 => AieAlgorithm::Tea3,
@@ -1266,7 +1407,7 @@ fn sc3_identifier_for_subject(sc3: &RuntimeSc3Aie, subject: AieSubject) -> Resul
     if let Some(gssi) = subject_gssi(subject)
         && let Some(gckn) = sc3.group_associations.get(&gssi).copied()
     {
-        let gck = sc3.gcks.get(&gckn).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+        let gck = sc3.gck_at(gckn, time).ok_or(AieContextError::GckNotProvisioned(gckn))?;
         let mut context_id = [0_u8; 16];
         context_id[12..14].copy_from_slice(&gck.gckn.to_be_bytes());
         context_id[14..].copy_from_slice(&gck.gck_vn.to_be_bytes());
@@ -1767,6 +1908,10 @@ pub struct StackState {
     /// SwMI worker. Keeping them in shared state lets the TDMA-owned MLE
     /// activate at a slot boundary without putting secrets on a SAP.
     pub sc2_rollover_events: VecDeque<RuntimeSc2RolloverEvent>,
+    /// Key-free SC3G lifecycle reports.  The event carries the local packed
+    /// Absolute-IV rather than key material, allowing the SwMI UI to show
+    /// the independently scheduled moment for every cell.
+    pub sc3g_rollover_events: VecDeque<RuntimeSc3GRolloverEvent>,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
     /// Active external DMO gateways served by this BS.
@@ -1788,6 +1933,24 @@ pub struct RuntimeSc2RolloverEvent {
     pub rollover_id: u64,
     pub activated: bool,
     pub local_network_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSc3GRolloverEvent {
+    pub rollover_id: u64,
+    pub activated: bool,
+    pub local_absolute_iv: u32,
+}
+
+/// Pack a local TETRA Absolute-IV for the backhaul status plane.  The air
+/// interface PDU itself retains the individual fields, but the status form
+/// is compact and unambiguous (HN16, MN6, FN5, zero-based TN).
+pub fn pack_sc3g_absolute_iv(time: TdmaTime) -> u32 {
+    debug_assert!(time.is_valid());
+    (u32::from(time.h) << 14)
+        | (u32::from(time.m) << 8)
+        | (u32::from(time.f) << 3)
+        | u32::from(time.t - 1)
 }
 
 #[cfg(test)]
@@ -2483,6 +2646,50 @@ mod tests {
         assert!(sc3.gck_supported());
         assert_eq!(sc3.gckn_for_gssi(101), Some(4));
     }
+
+    #[test]
+    fn sc3g_rollover_waits_for_its_local_multiframe_boundary() {
+        let mut sc3 = test_sc3(9);
+        let current = TdmaTime { t: 4, f: 17, m: 3, h: 5 };
+        sc3.apply_sc3g_snapshot_with_rollover(
+            1,
+            true,
+            7,
+            vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])],
+            Some(8),
+            vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])],
+            Some((91, 1_002)),
+            vec![(101, 4)],
+        )
+        .expect("staged SC3G snapshot");
+
+        let (rollover_id, activation) = sc3
+            .schedule_gck_rollover(1_000, current)
+            .expect("local rollover schedule");
+        assert_eq!(rollover_id, 91);
+        assert_eq!((activation.t, activation.f), (1, 1));
+        assert_eq!(sc3.gck_vn_at(activation.add_timeslots(-1)), 7);
+        assert_eq!(sc3.gck_vn_at(activation), 8);
+
+        // A snapshot promoted by the SwMI at its UTC deadline must not make a
+        // running cell change before this cell's notified Absolute IV.
+        sc3.apply_sc3g_snapshot_with_rollover(
+            2,
+            true,
+            8,
+            vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])],
+            None,
+            Vec::new(),
+            None,
+            vec![(101, 4)],
+        )
+        .expect("post-deadline durable snapshot");
+        assert_eq!(sc3.gck_vn(), 7);
+        assert_eq!(sc3.activate_gck_rollover_if_due(activation.add_timeslots(-1)), None);
+        assert_eq!(sc3.activate_gck_rollover_if_due(activation), Some(91));
+        assert_eq!(sc3.gck_vn(), 8);
+        assert_eq!(sc3.gck_rollover_notification(), Some((91, 8, None)));
+    }
 }
 
 impl Default for StackState {
@@ -2494,6 +2701,7 @@ impl Default for StackState {
             aie: RuntimeAieConfig::default(),
             aie_sessions: RuntimeAieSessions::default(),
             sc2_rollover_events: VecDeque::new(),
+            sc3g_rollover_events: VecDeque::new(),
             subscribers: SubscriberRegistry::new(),
             dm_gateways: DmGatewayRegistry::default(),
             subscriber_delivery_routes: HashMap::new(),

@@ -4,7 +4,7 @@ use crate::mle::components::{broadcast::MleBroadcast, network_time};
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::net_swmi::SwmiMleEndpoint;
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::RuntimeSc2RolloverEvent;
+use tetra_config::bluestation::{RuntimeSc2RolloverEvent, RuntimeSc3GRolloverEvent, pack_sc3g_absolute_iv};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
@@ -331,6 +331,7 @@ impl MleBs {
                 chan_alloc,
                 associated_channel: None,
                 assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                 tx_reporter: None,
             }),
             _ => SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
@@ -756,7 +757,8 @@ impl MleBs {
                     req_handle: 0,
                     chan_alloc: None,
                     associated_channel: None,
-                    assigned_channel_frame18_broadcast: false,
+                    assigned_channel_frame18_broadcast: prim.assigned_channel_frame18_broadcast,
+                    frame18_rollover_activation: prim.frame18_rollover_activation,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
@@ -831,6 +833,7 @@ impl MleBs {
                     chan_alloc: prim.chan_alloc.take(),
                     associated_channel: prim.associated_channel.take(),
                     assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             )
@@ -936,6 +939,7 @@ impl MleBs {
                     chan_alloc,
                     associated_channel,
                     assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }
@@ -987,6 +991,40 @@ impl TetraEntityTrait for MleBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
+        // SC3G rollover targets are supplied as UTC. The BS owns its TDMA
+        // counter, so it fixes a cell-local Absolute IV at the first TS1/FN1
+        // on or after that moment. Unlike SC2 this does not depend on the
+        // optional Network Time broadcast service.
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let mut state = self.config.state_write();
+        let (scheduled_sc3g_rollover, activated_sc3g_rollover) = if let Some(sc3) = state.aie.sc3.as_mut() {
+            (
+                sc3.schedule_gck_rollover(unix_now, ts),
+                sc3.activate_gck_rollover_if_due(ts),
+            )
+        } else {
+            (None, None)
+        };
+        if let Some((rollover_id, activation)) = scheduled_sc3g_rollover {
+            tracing::info!(rollover_id, activation = %activation, "scheduled local SC3G GCK rollover at TS1/FN1");
+            state.sc3g_rollover_events.push_back(RuntimeSc3GRolloverEvent {
+                rollover_id,
+                activated: false,
+                local_absolute_iv: pack_sc3g_absolute_iv(activation),
+            });
+        }
+        if let Some(rollover_id) = activated_sc3g_rollover {
+            tracing::info!(rollover_id, tdma_time = %ts, "activated local SC3G GCK rollover");
+            state.sc3g_rollover_events.push_back(RuntimeSc3GRolloverEvent {
+                rollover_id,
+                activated: true,
+                local_absolute_iv: pack_sc3g_absolute_iv(ts),
+            });
+        }
+        drop(state);
         // The Network Time value is the common rollover target, but this BS
         // is authoritative for its local TDMA slot. Activation therefore
         // happens here at a real downlink tick rather than in the WSS worker.

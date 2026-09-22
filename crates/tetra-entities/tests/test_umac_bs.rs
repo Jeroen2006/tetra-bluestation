@@ -155,6 +155,8 @@ fn test_out_fragmented_resource() {
         encryption_flag: false,
         aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
         is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
         tx_reporter: None,
         seamless_handover: None,
     };
@@ -213,6 +215,8 @@ fn sc2_mm_downlink_sets_esi_mode_and_ciphers_only_the_payload() {
             encryption_flag: true,
             aie_request: AieRequest::sc2(AieSubject::Individual { issi }, AieScope::MacResource),
             is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
             tx_reporter: None,
             seamless_handover: None,
         }),

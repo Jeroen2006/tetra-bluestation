@@ -2061,6 +2061,56 @@ impl UmacBs {
 
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
+        if let Some(activation) = prim.frame18_rollover_activation {
+            // EN 300 392-7 4.5.5.6 defines Immediate as the first TS of the
+            // next downlink multiframe.  The MM requested this one scheduler
+            // tick before the four preceding FN18 resources are built.  It is
+            // deliberately not eligible for normal all-MS traffic fan-out:
+            // UMAC reserves all four physical FN18 resources itself.
+            let final_frame18 = activation.add_timeslots(-4);
+            if prim.main_address.ssi != 0x00ff_ffff
+                || prim.main_address.ssi_type != SsiType::Gssi
+                || prim.associated_channel.is_some()
+                || prim.chan_alloc.is_some()
+                || activation.t != 1
+                || activation.f != 1
+                || final_frame18 != self.dltime.add_timeslots(1)
+            {
+                tracing::error!(
+                    dltime = %self.dltime,
+                    activation = %activation,
+                    address = ?prim.main_address,
+                    "discarding invalid or late final SC3G GCK rollover Immediate request"
+                );
+                return;
+            }
+            let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
+                AieRequest::clear(AieSubject::System, AieScope::MacResource)
+            });
+            let mut pdu = MacResource {
+                fill_bits: false,
+                pos_of_grant: 0,
+                encryption_mode: 0,
+                random_access_flag: false,
+                length_ind: 0,
+                addr: Some(prim.main_address),
+                event_label: None,
+                usage_marker: None,
+                power_control_element: None,
+                slot_granting_element: None,
+                chan_alloc_element: None,
+            };
+            pdu.update_len_and_fill_ind(prim.pdu.get_len());
+            if let Err(error) = self
+                .channel_scheduler
+                .reserve_gck_rollover_immediate(activation, pdu, prim.pdu, aie_request)
+            {
+                tracing::error!(dltime = %self.dltime, activation = %activation, error, "cannot reserve final SC3G GCK rollover Immediate resources");
+            } else {
+                tracing::info!(dltime = %self.dltime, activation = %activation, "reserved final all-timeslot SC3G GCK rollover Immediate resources");
+            }
+            return;
+        }
         let all_ms_traffic_broadcast = prim.stealing_permission
             && prim.main_address.ssi == 0x00ff_ffff
             && prim.main_address.ssi_type == SsiType::Gssi
@@ -3594,6 +3644,7 @@ mod tests {
                     chan_alloc: None,
                     associated_channel: None,
                     assigned_channel_frame18_broadcast: true,
+                    frame18_rollover_activation: None,
                     tx_reporter: None,
                 }),
             ),
@@ -3704,6 +3755,7 @@ mod tests {
                     chan_alloc: None,
                     associated_channel: None,
                     assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                     tx_reporter: Some(reporter.clone()),
                 }),
             ),
@@ -3771,6 +3823,7 @@ mod tests {
                     chan_alloc: None,
                     associated_channel: None,
                     assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                     tx_reporter: None,
                 }),
             ),

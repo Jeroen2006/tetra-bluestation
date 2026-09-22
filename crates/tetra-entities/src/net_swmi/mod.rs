@@ -20,6 +20,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use tetra_config::bluestation::{
     CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm,
+    RuntimeSc3GRolloverEvent,
     RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
 };
 use tetra_swmi_protocol::{
@@ -717,6 +718,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         }
                         Ok(SwmiMessage::Sc3GSnapshot(snapshot)) => {
                             let command_id = snapshot.command_id;
+                            let rollover_id = snapshot.rollover_id;
                             let result = self
                                 .stack_config
                                 .state_write()
@@ -725,7 +727,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 .as_mut()
                                 .ok_or("SC3 is disabled")
                                 .and_then(|sc3| {
-                                    sc3.apply_sc3g_snapshot(
+                                    sc3.apply_sc3g_snapshot_with_rollover(
                                         snapshot.revision,
                                         snapshot.linked_crypto_periods,
                                         snapshot.gck_vn,
@@ -734,6 +736,13 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                             .into_iter()
                                             .map(|key| RuntimeSc3Gck::new(key.gckn, key.gck_vn, key.key.into_bytes()))
                                             .collect(),
+                                        snapshot.future_gck_vn,
+                                        snapshot
+                                            .future_keys
+                                            .into_iter()
+                                            .map(|key| RuntimeSc3Gck::new(key.gckn, key.gck_vn, key.key.into_bytes()))
+                                            .collect(),
+                                        snapshot.rollover_id.zip(snapshot.activation_unix),
                                         snapshot
                                             .associations
                                             .into_iter()
@@ -747,11 +756,24 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 accepted,
                                 code: if accepted { 0 } else { 2 },
                             });
+                            if !accepted {
+                                if let Some(rollover_id) = rollover_id {
+                                    let _ = self.send(SwmiMessage::Sc3GRolloverStatus {
+                                        command_id,
+                                        rollover_id,
+                                        status: Sc2RolloverStatus::Rejected,
+                                        local_absolute_iv: None,
+                                        detail: Some("BS rejected SC3G rollover snapshot".to_owned()),
+                                    });
+                                }
+                            }
                             match result {
                                 Ok(changed) => tracing::info!(
                                     command_id,
                                     revision = snapshot.revision,
                                     gck_vn = snapshot.gck_vn,
+                                    future_gck_vn = snapshot.future_gck_vn,
+                                    rollover_id = snapshot.rollover_id,
                                     changed,
                                     "applied SC3G key/association snapshot"
                                 ),
@@ -929,6 +951,26 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             Sc2RolloverStatus::Failed
                         },
                         local_cutover_network_time: Some(event.local_network_time),
+                        detail: None,
+                    });
+                }
+                let sc3g_rollover_events: Vec<RuntimeSc3GRolloverEvent> = self
+                    .stack_config
+                    .state_write()
+                    .sc3g_rollover_events
+                    .drain(..)
+                    .collect();
+                for event in sc3g_rollover_events {
+                    let command_id = self.next_command_id();
+                    let _ = self.send(SwmiMessage::Sc3GRolloverStatus {
+                        command_id,
+                        rollover_id: event.rollover_id,
+                        status: if event.activated {
+                            Sc2RolloverStatus::Activated
+                        } else {
+                            Sc2RolloverStatus::Prepared
+                        },
+                        local_absolute_iv: Some(event.local_absolute_iv),
                         detail: None,
                     });
                 }

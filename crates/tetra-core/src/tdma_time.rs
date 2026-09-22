@@ -27,7 +27,7 @@ macro_rules! frames {
     };
 }
 
-#[derive(Clone, Copy, PartialEq, Encode, Decode, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
 pub struct TdmaTime {
     /// Timeslot, from 1 to 4
     pub t: u8,
@@ -128,6 +128,19 @@ impl TdmaTime {
             time = time.add_timeslots(1);
         }
         unreachable!("SC2 security SYSINFO opportunity missing from a multiframe")
+    }
+
+    /// First slot of the first frame of the current or a later multiframe.
+    /// SC3G `Immediate` key changes are defined at this exact boundary.
+    pub fn forward_to_multiframe_start(self) -> TdmaTime {
+        let mut time = self;
+        for _ in 0..(18 * 4) {
+            if time.t == 1 && time.f == 1 {
+                return time;
+            }
+            time = time.add_timeslots(1);
+        }
+        unreachable!("multiframe boundary missing")
     }
 
     /// Returns true if this DL timeslot should contain a mandatory BSCH (SYNC) block

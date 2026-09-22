@@ -1,6 +1,6 @@
 // Clause 17.3.2 Service primitives for the LMM-SAP
 #![allow(unused)]
-use tetra_core::{AieRequest, BitBuffer, Layer2Service, MleHandle, TetraAddress, Todo, TxReporter};
+use tetra_core::{AieRequest, BitBuffer, Layer2Service, MleHandle, TdmaTime, TetraAddress, Todo, TxReporter};
 
 /// This shall be used as a request to initiate the selection of a cell for communications. The
 /// request shall always be made after power on and may be made at any time thereafter.
@@ -156,6 +156,14 @@ pub struct LmmMleUnitdataReq {
     /// Bootstrap/OTAR PDUs use `Clear`; protected traffic uses `Sc2`.
     pub aie_request: AieRequest,
     pub is_null_pdu: bool, // Prio should be lowest and may not steal
+    /// A one-shot SC3G rollover Immediate demand.  UMAC reserves every
+    /// physical FN18 directly before this TS1/FN1 activation instead of
+    /// placing it behind ordinary signalling.
+    pub frame18_rollover_activation: Option<TdmaTime>,
+    /// Keep the normal MCCH copy and repeat an all-MS broadcast only on
+    /// otherwise unused assigned-channel FN18 resources.  This is below SDS,
+    /// call signalling and packet data.
+    pub assigned_channel_frame18_broadcast: bool,
     pub tx_reporter: Option<TxReporter>,
     /// Present only for a forward-registration D-LOCATION UPDATE ACCEPT that
     /// can complete as announced Type-1 seamless handover.

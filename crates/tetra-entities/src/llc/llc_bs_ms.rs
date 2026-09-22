@@ -589,6 +589,7 @@ impl Llc {
                 chan_alloc: prim.chan_alloc,
                 associated_channel: prim.associated_channel,
                 assigned_channel_frame18_broadcast: prim.assigned_channel_frame18_broadcast,
+                frame18_rollover_activation: prim.frame18_rollover_activation,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -839,6 +840,7 @@ impl Llc {
                 chan_alloc,
                 associated_channel: route,
                 assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                 tx_reporter,
             }),
         ));
@@ -2085,6 +2087,7 @@ impl Llc {
                 chan_alloc: prim.chan_alloc,
                 associated_channel: prim.associated_channel,
                 assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
             }),
         };
@@ -2604,6 +2607,7 @@ impl Llc {
                     chan_alloc,
                     associated_channel: packet_route,
                     assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                     tx_reporter: None, // By definition, no higher layer entity is interested
                 }),
             };

@@ -168,6 +168,18 @@ struct AssociatedBestEffortElem {
     elem: DlSchedElem,
 }
 
+/// One non-fragmentable all-MS D-CK CHANGE DEMAND that must occupy every
+/// physical frame-18 immediately before a local SC3G activation.  This is
+/// intentionally separate from the normal and best-effort queues: neither
+/// call traffic nor packet data may delay `Immediate`.
+#[derive(Clone)]
+struct FinalGckRolloverImmediate {
+    activation: TdmaTime,
+    pdu: MacResource,
+    sdu: BitBuffer,
+    aie_request: AieRequest,
+}
+
 // #[derive(Debug)]
 pub struct BsChannelScheduler {
     pub cur_dltime: TdmaTime,
@@ -188,6 +200,10 @@ pub struct BsChannelScheduler {
     /// idle hangtime frame; network broadcasts are restricted to free FN18.
     /// Both classes remain below all ordinary assigned-channel signalling.
     assoc_best_effort_queues: [Vec<AssociatedBestEffortElem>; 4],
+    /// One reservation for each physical TS.  The same air PDU is copied to
+    /// TS1..TS4 on FN18, using the legal BSCH/SCH-HD and SCH-HD/BNCH mappings
+    /// where the multiframe requires them.
+    final_gck_rollover_immediate: [Option<FinalGckRolloverImmediate>; 4],
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
     /// Uplink reservations announced in an associated FN18 grant. They are
     /// kept separate from the ordinary 18-frame ring because the associated
@@ -308,6 +324,7 @@ impl BsChannelScheduler {
             dltx_half_duplex_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             assoc_dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             assoc_best_effort_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            final_gck_rollover_immediate: std::array::from_fn(|_| None),
             ulsched: EMPTY_SCHED,
             associated_ulsched: Vec::new(),
             circuits: CircuitMgr::new(),
@@ -631,7 +648,10 @@ impl BsChannelScheduler {
         ext_services.dck_retrieval_during_cell_select = sc3.map(|sc3| sc3.dck_retrieval_during_initial_cell_selection);
         ext_services.dck_retrieval_during_cell_reselect = sc3.map(|sc3| sc3.dck_retrieval_during_cell_reselection);
         ext_services.linked_gck_crypto_periods = sc3.map(|sc3| sc3.linked_gck_crypto_periods());
-        ext_services.short_gck_vn = sc3.map(|sc3| (sc3.gck_vn() & 0x03) as u8);
+        // A scheduled SC3G boundary is selected by the actual air slot. This
+        // keeps SYSINFO's short GCK-VN in lock-step with MGCK selection at
+        // TS1/FN1, even though the scheduler constructs one slot ahead.
+        ext_services.short_gck_vn = sc3.map(|sc3| (sc3.gck_vn_at(air_time) & 0x03) as u8);
         ext_services.gck_supported = sc3.is_some_and(RuntimeSc3Aie::gck_supported);
         self.precomps.mle_sysinfo.bs_service_details.aie_service = aie.enabled;
 
@@ -1942,6 +1962,147 @@ impl BsChannelScheduler {
         self.dl_enqueue_associated_best_effort(ts, AssociatedBestEffortKind::Frame18Broadcast, pdu, sdu, aie_request);
     }
 
+    /// Reserve the four physical FN18 resources directly before a TS1/FN1
+    /// SC3G change.  This is called only by the marker carried with the
+    /// all-MS `D-CK CHANGE DEMAND` whose time type is `Immediate`.
+    pub fn reserve_gck_rollover_immediate(
+        &mut self,
+        activation: TdmaTime,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        aie_request: AieRequest,
+    ) -> Result<(), &'static str> {
+        if !activation.is_valid() || activation.t != 1 || activation.f != 1 {
+            return Err("SC3G rollover activation must be TS1/FN1");
+        }
+        if !pdu.addr.is_some_and(|address| {
+            address.ssi == 0x00ff_ffff && address.ssi_type == SsiType::Gssi
+        }) {
+            return Err("SC3G rollover Immediate must be all-MS GSSI addressed");
+        }
+        for slot in 0..4 {
+            if let Some(existing) = self.final_gck_rollover_immediate[slot].as_ref() {
+                if existing.activation != activation {
+                    return Err("a different SC3G rollover Immediate is already reserved");
+                }
+                continue;
+            }
+            self.final_gck_rollover_immediate[slot] = Some(FinalGckRolloverImmediate {
+                activation,
+                pdu: pdu.clone(),
+                sdu: sdu.clone(),
+                aie_request,
+            });
+        }
+        Ok(())
+    }
+
+    fn take_final_gck_rollover_immediate(&mut self, ts: TdmaTime) -> Option<FinalGckRolloverImmediate> {
+        if ts.f != 18 {
+            return None;
+        }
+        let slot = usize::from(ts.t - 1);
+        let item = self.final_gck_rollover_immediate[slot].as_ref()?;
+        // TS1..TS4 of this FN18 are respectively four, three, two and one
+        // timeslots before the TS1/FN1 change.  `diff` is wrap-safe at the
+        // hyperframe boundary.
+        if !(1..=4).contains(&item.activation.diff(ts)) {
+            return None;
+        }
+        self.final_gck_rollover_immediate[slot].take()
+    }
+
+    fn build_final_gck_rollover_resource(
+        &mut self,
+        item: FinalGckRolloverImmediate,
+        ts: TdmaTime,
+        capacity: usize,
+    ) -> BitBuffer {
+        let pdu = self
+            .prepare_downlink_resource(item.pdu, item.aie_request, ts)
+            .expect("reserved SC3G GCK rollover Immediate has a valid old-key context");
+        let mut buffer = BitBuffer::new(capacity);
+        let mut fragger = BsFragger::new_with_aie(pdu, item.sdu, None, item.aie_request);
+        let complete = fragger.get_next_chunk(&mut buffer);
+        assert!(
+            complete,
+            "reserved SC3G GCK rollover Immediate must fit in one FN18 signalling resource"
+        );
+        self.cipher_fresh_downlink_chunk(&mut fragger, &mut buffer, ts)
+            .expect("reserved SC3G GCK rollover Immediate ciphering must succeed");
+        finalize_downlink_mac_block(&mut buffer);
+        buffer
+    }
+
+    fn build_final_gck_rollover_slot(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
+        let assigned_channel = ts.t != 1 && self.assigned_channel_is_active(ts.t);
+        let ul_phy_chan = if assigned_channel {
+            PhysicalChannel::Tp
+        } else {
+            PhysicalChannel::Cp
+        };
+        let sch_hd = |scheduler: &mut Self, item: FinalGckRolloverImmediate| TmvUnitdataReq {
+            logical_channel: LogicalChannel::SchHd,
+            mac_block: scheduler.build_final_gck_rollover_resource(item, ts, SCH_HD_CAP),
+            scrambling_code: scheduler.scrambling_code,
+            air_interface_encryption: None,
+            cipher_region: None,
+        };
+        if ts.is_mandatory_bsch() {
+            let mut sync = BitBuffer::new(60);
+            self.precomps.mac_sync.to_bitbuf(&mut sync);
+            self.precomps.mle_sync.to_bitbuf(&mut sync);
+            TmvUnitdataReqSlot {
+                ts,
+                blk1: Some(TmvUnitdataReq {
+                    logical_channel: LogicalChannel::Bsch,
+                    mac_block: sync,
+                    scrambling_code: scrambler::SCRAMB_INIT,
+                    air_interface_encryption: None,
+                    cipher_region: None,
+                }),
+                blk2: Some(sch_hd(self, item)),
+                bbk: None,
+                ul_phy_chan,
+            }
+        } else if ts.is_mandatory_bnch() {
+            let mut sysinfo = BitBuffer::new(SCH_HD_CAP);
+            if use_default_access_sysinfo(ts) {
+                self.precomps.mac_sysinfo1.to_bitbuf(&mut sysinfo);
+            } else {
+                self.precomps.mac_sysinfo2.to_bitbuf(&mut sysinfo);
+            }
+            self.precomps.mle_sysinfo.to_bitbuf(&mut sysinfo);
+            TmvUnitdataReqSlot {
+                ts,
+                blk1: Some(sch_hd(self, item)),
+                blk2: Some(TmvUnitdataReq {
+                    logical_channel: LogicalChannel::Bnch,
+                    mac_block: sysinfo,
+                    scrambling_code: self.scrambling_code,
+                    air_interface_encryption: None,
+                    cipher_region: None,
+                }),
+                bbk: None,
+                ul_phy_chan,
+            }
+        } else {
+            TmvUnitdataReqSlot {
+                ts,
+                blk1: Some(TmvUnitdataReq {
+                    logical_channel: LogicalChannel::SchF,
+                    mac_block: self.build_final_gck_rollover_resource(item, ts, SCH_F_CAP),
+                    scrambling_code: self.scrambling_code,
+                    air_interface_encryption: None,
+                    cipher_region: None,
+                }),
+                blk2: None,
+                bbk: None,
+                ul_phy_chan,
+            }
+        }
+    }
+
     fn dl_enqueue_associated_best_effort(
         &mut self,
         ts: u8,
@@ -3226,6 +3387,12 @@ impl BsChannelScheduler {
         let dl_is_traffic = dl_circuit_active && !hang_effective;
         let ul_is_traffic = ul_circuit_active && !hang_effective;
 
+        // This consumes the dedicated reservation before every normal queue,
+        // call block or packet-data opportunity.  It is the one exception to
+        // the scheduler's ordinary signalling priority because EN 300 392-7
+        // fixes `Immediate` to the following TS1/FN1 boundary.
+        let final_gck_rollover_immediate = self.take_final_gck_rollover_immediate(ts);
+
         // Build the block for this timeslot with anything scheduled (traffic or signalling)
         // For traffic timeslots, also check for FACCH/stealing (STCH half-slot)
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
@@ -3252,7 +3419,16 @@ impl BsChannelScheduler {
                 "deferring associated SACCH control for mandatory frame-18 broadcast"
             );
         }
-        let mut elem = if ts.f == 18
+        let mut elem = if let Some(item) = final_gck_rollover_immediate {
+            tracing::info!(
+                dltime = %ts,
+                activation = %item.activation,
+                mandatory_bsch = ts.is_mandatory_bsch(),
+                mandatory_bnch = ts.is_mandatory_bnch(),
+                "transmitting final SC3G GCK rollover Immediate on FN18"
+            );
+            self.build_final_gck_rollover_slot(item, ts)
+        } else if ts.f == 18
             && ts.t != 1
             && !frame18_broadcast_slot
             && self.assigned_channel_is_active(ts.t)
@@ -6630,6 +6806,56 @@ mod tests {
         assert!(sched.close_packet_bearer(17, 1));
         let released_frame = sched.generate_default_blks(TdmaTime { t: 2, f: 5, m: 1, h: 0 });
         assert_eq!(released_frame.logical_channel, LogicalChannel::Bsch);
+    }
+
+    #[test]
+    fn final_sc3g_gck_immediate_uses_all_frame18_slots_and_keeps_sync() {
+        let mut sched = get_testing_slotter();
+        // TS1/FN1/MN2 makes the preceding FN18 a regular frame-18 across
+        // all four physical timeslots while still exercising mandatory BSCH
+        // and BNCH mapping selected by the multiframe counter.
+        let activation = TdmaTime {
+            t: 1,
+            f: 1,
+            m: 2,
+            h: 0,
+        };
+        let address = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&address, None, false);
+        resource.update_len_and_fill_ind(0);
+        sched
+            .reserve_gck_rollover_immediate(
+                activation,
+                resource,
+                BitBuffer::new(0),
+                AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            )
+            .expect("reserve final Immediate");
+
+        sched.cur_dltime = activation.add_timeslots(-5);
+        for timeslot in 1..=4 {
+            let output = sched.finalize_ts_for_tick();
+            assert_eq!(output.ts.t, timeslot);
+            assert_eq!(output.ts.f, 18);
+            if output.ts.is_mandatory_bsch() {
+                assert_eq!(output.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Bsch));
+                assert_eq!(output.blk2.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchHd));
+            } else if output.ts.is_mandatory_bnch() {
+                assert_eq!(output.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchHd));
+                assert_eq!(output.blk2.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Bnch));
+            } else {
+                assert_eq!(output.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+                assert!(output.blk2.is_none());
+            }
+            sched.cur_dltime = output.ts;
+        }
+        assert!(sched.final_gck_rollover_immediate.iter().all(Option::is_none));
+
+        // The reservation cannot bleed into a later multiframe.
+        sched.cur_dltime = activation.add_timeslots(18 * 4 - 5);
+        let later = sched.finalize_ts_for_tick();
+        assert_ne!(later.ts, activation.add_timeslots(-4));
+        assert!(sched.final_gck_rollover_immediate.iter().all(Option::is_none));
     }
 
     #[test]

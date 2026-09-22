@@ -287,6 +287,8 @@ impl Sndcp {
                 // the MM registration procedure establishes a fresh one.
                 aie_request: AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -470,6 +472,7 @@ impl Sndcp {
                 chan_alloc: Some(Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)),
                 associated_channel: self.route_for(context),
                 assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
                 tx_reporter: Some(reporter.clone()),
             }),
         ));

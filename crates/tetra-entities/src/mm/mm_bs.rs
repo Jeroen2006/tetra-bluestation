@@ -111,6 +111,9 @@ const ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS: i32 = 64 * 18 * 4;
 /// SCK rollover. Unlike the short SYSINFO value, this PDU carries all 16 bits
 /// and therefore also repairs terminals returning after several periods.
 const GCK_VERSION_BROADCAST_INTERVAL_TIMESLOTS: i32 = 64 * 18 * 4;
+/// Repeat the planned change on a short cadence. The scheduler may defer these
+/// low-priority messages behind SDS/call traffic.
+const GCK_ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS: i32 = 5 * 18 * 4;
 /// Repeat the exact same Absolute-IV demand in three separate rounds shortly
 /// before cutover.  Each round is sent on MCCH and as STCH on every active
 /// traffic channel.  Four frames of final lead time leaves the entity and
@@ -403,6 +406,10 @@ pub struct MmBs {
     last_rollover_broadcast: Option<(u64, TdmaTime)>,
     /// Last periodic full current GCK-VN advertisement.
     last_gck_version_broadcast: Option<(u16, TdmaTime)>,
+    last_gck_rollover_broadcast: Option<(u64, TdmaTime)>,
+    /// The final all-timeslot `Immediate` demand is one-shot and sent by a
+    /// dedicated scheduler reservation, never by the best-effort queue.
+    gck_rollover_immediate_sent: Option<u64>,
     /// Bit mask of the three pre-cutover all-MS broadcast rounds already
     /// queued for the current rollover.  This replaces per-terminal D-CK
     /// CHANGE delivery; OTAR key provisioning remains individually tracked.
@@ -1029,6 +1036,8 @@ impl MmBs {
             pending_security_activations: HashMap::new(),
             last_rollover_broadcast: None,
             last_gck_version_broadcast: None,
+            last_gck_rollover_broadcast: None,
+            gck_rollover_immediate_sent: None,
             rollover_late_broadcast_mask: None,
             current_time: TdmaTime::default(),
         }
@@ -1237,11 +1246,17 @@ impl MmBs {
                 // acknowledgement. BL-DATA is individual-addressed only;
                 // using it for the all-MS GSSI would panic in LLC.
                 layer2service: Layer2Service::Unacknowledged,
-                stealing_permission: traffic_channels,
+                // Rollover announcements may be copied to an assigned
+                // channel, but only as an expendable FN18 resource.  They
+                // must never steal a traffic half-slot from voice or pre-empt
+                // SDS/call signalling.
+                stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
                 aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: traffic_channels,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -1268,11 +1283,18 @@ impl MmBs {
     /// broadcast-addressed and unacknowledged, protected with the class-3 CCK
     /// as required for a group address without a GCK association, and copied
     /// to active TCH/STCH bearers for terminals in calls.
-    fn send_gck_version_broadcast(&self, queue: &mut MessageQueue, gck_vn: u16, traffic_channels: bool) -> bool {
+    fn send_gck_change_broadcast(
+        &self,
+        queue: &mut MessageQueue,
+        gck_vn: u16,
+        time: CkChangeTime,
+        traffic_channels: bool,
+        frame18_rollover_activation: Option<TdmaTime>,
+    ) -> bool {
         let pdu = DAllGcksChangeDemand {
             acknowledgement_required: false,
             gck_version_number: gck_vn,
-            time: CkChangeTime::CurrentlyInUse,
+            time,
         };
         let mut sdu = BitBuffer::new_autoexpand(32);
         if pdu.to_bitbuf(&mut sdu).is_err() {
@@ -1294,6 +1316,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.group_downlink_aie_request(0x00ff_ffff),
                 is_null_pdu: false,
+                    assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -1301,9 +1325,13 @@ impl MmBs {
         tracing::debug!(
             gck_vn,
             bearer = if traffic_channels { "all-active-TCH/STCH" } else { "MCCH" },
-            "queued full current GCK-VN advertisement"
+            "queued full GCK-VN change advertisement"
         );
         true
+    }
+
+    fn send_gck_version_broadcast(&self, queue: &mut MessageQueue, gck_vn: u16, traffic_channels: bool) -> bool {
+        self.send_gck_change_broadcast(queue, gck_vn, CkChangeTime::CurrentlyInUse, traffic_channels, None)
     }
 
     fn send_gck_version_broadcast_round(&self, queue: &mut MessageQueue, gck_vn: u16) -> bool {
@@ -1312,49 +1340,86 @@ impl MmBs {
         mcch && traffic
     }
 
+    fn send_gck_rollover_broadcast_round(&self, queue: &mut MessageQueue, gck_vn: u16, activation: TdmaTime) -> bool {
+        let time = absolute_iv_time(activation);
+        let mcch = self.send_gck_change_broadcast(queue, gck_vn, time.clone(), false, None);
+        let traffic = self.send_gck_change_broadcast(queue, gck_vn, time, true, None);
+        mcch && traffic
+    }
+
+    /// The final change indication is not an ordinary traffic-channel copy.
+    /// At the pipeline tick preceding TS1/FN18, UMAC reserves each of TS1..4
+    /// and emits this `Immediate` all-GCK demand on the four physical slots.
+    fn send_gck_rollover_immediate(&self, queue: &mut MessageQueue, gck_vn: u16, activation: TdmaTime) -> bool {
+        self.send_gck_change_broadcast(
+            queue,
+            gck_vn,
+            CkChangeTime::Immediate,
+            false,
+            Some(activation),
+        )
+    }
+
     /// A newly registered MS can have missed the periodic clear broadcast
     /// while it was powered off. Send the same normative Table-1 indication
     /// individually under its DCK, both after registration and after GCK
     /// provisioning, so a stale full GCK-VN cannot keep selecting an old key
     /// version even though the current key material is already present.
     fn send_current_gck_version_to_terminal(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
-        let gck_vn = {
+        let (gck_vn, pending_rollover) = {
             let state = self.config.state_read();
-            state.aie.sc3.as_ref().filter(|sc3| sc3.gck_supported()).map(|sc3| sc3.gck_vn())
+            let Some(sc3) = state.aie.sc3.as_ref().filter(|sc3| sc3.gck_supported()) else {
+                return false;
+            };
+            (
+                sc3.gck_vn(),
+                sc3.gck_rollover_notification().and_then(|(_, future_vn, activation)| {
+                    activation.map(|activation| (future_vn, activation))
+                }),
+            )
         };
-        let Some(gck_vn) = gck_vn else {
-            return false;
-        };
-        let pdu = DAllGcksChangeDemand {
-            acknowledgement_required: false,
-            gck_version_number: gck_vn,
-            time: CkChangeTime::CurrentlyInUse,
-        };
-        let mut sdu = BitBuffer::new_autoexpand(32);
-        if pdu.to_bitbuf(&mut sdu).is_err() {
-            tracing::warn!(issi, gck_vn, "cannot encode individual current GCK-VN advertisement");
-            return false;
+        let has_pending_rollover = pending_rollover.is_some();
+        let mut indications = vec![(gck_vn, CkChangeTime::CurrentlyInUse)];
+        if let Some((future_vn, activation)) = pending_rollover {
+            // A terminal which reselects or roams forgets a pending key-change
+            // notification.  Send the target cell's local Absolute-IV after
+            // the current indication so it can retain both stored versions.
+            indications.push((future_vn, absolute_iv_time(activation)));
         }
-        sdu.seek(0);
-        queue.push_back(SapMsg {
-            sap: Sap::LmmSap,
-            src: TetraEntity::Mm,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
-                sdu,
-                handle,
-                address: TetraAddress::issi(issi),
-                layer2service: Layer2Service::Acknowledged,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                encryption_flag: false,
-                aie_request: self.downlink_aie_request(issi),
-                is_null_pdu: false,
-                tx_reporter: None,
-                seamless_handover: None,
-            }),
-        });
-        tracing::info!(issi, gck_vn, "queued individual full current GCK-VN advertisement");
+        for (version, time) in indications {
+            let pdu = DAllGcksChangeDemand {
+                acknowledgement_required: false,
+                gck_version_number: version,
+                time,
+            };
+            let mut sdu = BitBuffer::new_autoexpand(32);
+            if pdu.to_bitbuf(&mut sdu).is_err() {
+                tracing::warn!(issi, version, "cannot encode individual GCK-VN advertisement");
+                return false;
+            }
+            sdu.seek(0);
+            queue.push_back(SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                    sdu,
+                    handle,
+                    address: TetraAddress::issi(issi),
+                    layer2service: Layer2Service::Acknowledged,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    encryption_flag: false,
+                    aie_request: self.downlink_aie_request(issi),
+                    is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
+                    seamless_handover: None,
+                }),
+            });
+        }
+        tracing::info!(issi, gck_vn, pending = has_pending_rollover, "queued current and pending full GCK-VN advertisements");
         true
     }
 
@@ -2175,6 +2240,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
+                            assigned_channel_frame18_broadcast: false,
+                            frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover: None,
             }),
@@ -2587,6 +2654,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                                assigned_channel_frame18_broadcast: false,
+                                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -3955,6 +4024,8 @@ impl MmBs {
                 // it must retain the terminal's active SC2 context.
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                                assigned_channel_frame18_broadcast: false,
+                                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -4131,6 +4202,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                            assigned_channel_frame18_broadcast: false,
+                            frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover: None,
             }),
@@ -4272,6 +4345,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover: None,
             }),
@@ -4679,6 +4754,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request,
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
                 seamless_handover,
             }),
@@ -4762,6 +4839,8 @@ impl MmBs {
                 // terminal's established DCK/SCK context when one exists.
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -4825,6 +4904,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -4870,6 +4951,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -4905,6 +4988,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -4946,6 +5031,8 @@ impl MmBs {
                 encryption_flag: false,
                 aie_request: self.downlink_aie_request(issi),
                 is_null_pdu: false,
+                assigned_channel_frame18_broadcast: false,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
                 seamless_handover: None,
             }),
@@ -5086,6 +5173,33 @@ impl TetraEntityTrait for MmBs {
         self.update_terminal_control_statuses();
         self.update_security_activations(queue);
         self.update_otar_delivery_statuses();
+        // TTR 001-11 permits the Absolute-IV all-GCK demand on any channel.
+        // It is deliberately best-effort: normal SDS and call signalling own
+        // the queues, while the five-second cadence gives each free MCCH,
+        // traffic and PD monitoring opportunity a repeated announcement.
+        let gck_rollover = self.config.state_read().aie.sc3.as_ref().and_then(|sc3| sc3.gck_rollover_notification());
+        if let Some((rollover_id, target_vn, Some(activation))) = gck_rollover {
+            let due = self.last_gck_rollover_broadcast.is_none_or(|(last_id, last)| {
+                last_id != rollover_id || last.age(ts) >= GCK_ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS
+            });
+            if due && self.send_gck_rollover_broadcast_round(queue, target_vn, activation) {
+                self.last_gck_rollover_broadcast = Some((rollover_id, ts));
+            }
+            // UMAC finalizes one slot ahead.  Queue the dedicated marker on
+            // the immediately preceding TS so it can reserve TS1..TS4 of
+            // FN18, whose last resource is directly before the TS1/FN1
+            // `Immediate` activation boundary.
+            if self.gck_rollover_immediate_sent != Some(rollover_id)
+                && ts == activation.add_timeslots(-5)
+                && self.send_gck_rollover_immediate(queue, target_vn, activation)
+            {
+                self.gck_rollover_immediate_sent = Some(rollover_id);
+                tracing::info!(rollover_id, activation = %activation, "queued final all-timeslot SC3G GCK rollover Immediate");
+            }
+        } else {
+            self.last_gck_rollover_broadcast = None;
+            self.gck_rollover_immediate_sent = None;
+        }
         let active_gck_vn = {
             let state = self.config.state_read();
             state.aie.sc3.as_ref().filter(|sc3| sc3.gck_supported()).map(|sc3| sc3.gck_vn())
@@ -5238,6 +5352,8 @@ impl TetraEntityTrait for MmBs {
                             encryption_flag: false,
                             aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                             is_null_pdu: false,
+                            assigned_channel_frame18_broadcast: false,
+                            frame18_rollover_activation: None,
                             tx_reporter: None,
                             seamless_handover: None,
                         }),
@@ -5278,6 +5394,8 @@ impl TetraEntityTrait for MmBs {
                                 encryption_flag: false,
                                 aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                                 is_null_pdu: false,
+                                assigned_channel_frame18_broadcast: false,
+                                frame18_rollover_activation: None,
                                 tx_reporter: None,
                                 seamless_handover: None,
                             }),
@@ -5335,6 +5453,8 @@ impl TetraEntityTrait for MmBs {
                                 encryption_flag: false,
                                 aie_request: self.aie_request_for_registration_command(command_id, itsi as u32),
                                 is_null_pdu: false,
+                                assigned_channel_frame18_broadcast: false,
+                                frame18_rollover_activation: None,
                                 tx_reporter: None,
                                 seamless_handover: None,
                             }),
@@ -5476,6 +5596,8 @@ impl TetraEntityTrait for MmBs {
                             encryption_flag: false,
                             aie_request,
                             is_null_pdu: false,
+                            assigned_channel_frame18_broadcast: false,
+                            frame18_rollover_activation: None,
                             tx_reporter: Some(tx_reporter),
                             seamless_handover: None,
                         }),
