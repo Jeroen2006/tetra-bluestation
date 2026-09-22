@@ -695,6 +695,8 @@ impl BsChannelScheduler {
                 tracing::info!(
                     dltime = %air_time,
                     cck_id = sc3.cck_id,
+                    gck_vn = sc3.gck_vn_at(air_time),
+                    short_gck_vn = ext_services.short_gck_vn,
                     sc1_allowed = aie.sc1_allowed,
                     "BS SYSINFO SC3 AIE policy updated for air slot"
                 );
@@ -1980,20 +1982,39 @@ impl BsChannelScheduler {
         }) {
             return Err("SC3G rollover Immediate must be all-MS GSSI addressed");
         }
-        for slot in 0..4 {
-            if let Some(existing) = self.final_gck_rollover_immediate[slot].as_ref() {
-                if existing.activation != activation {
-                    return Err("a different SC3G rollover Immediate is already reserved");
-                }
-                continue;
-            }
-            self.final_gck_rollover_immediate[slot] = Some(FinalGckRolloverImmediate {
-                activation,
-                pdu: pdu.clone(),
-                sdu: sdu.clone(),
-                aie_request,
-            });
+        // A final `Immediate` is an atomic four-timeslot operation. A
+        // previous request can be left partly reserved if a cell is reset or
+        // its old activation was superseded before its FN18. Treating that
+        // stale fragment as a collision made the new marker fail completely,
+        // so no MS received the mandatory final notification. There can be
+        // only one locally staged SC3G rollover; a marker accepted one tick
+        // before its own FN18 is authoritative and replaces every old
+        // fragment as one set.
+        let replaced = self
+            .final_gck_rollover_immediate
+            .iter()
+            .flatten()
+            .any(|existing| existing.activation != activation);
+        if replaced {
+            let previous = self
+                .final_gck_rollover_immediate
+                .iter()
+                .flatten()
+                .map(|existing| existing.activation)
+                .next();
+            tracing::warn!(
+                previous_activation = ?previous,
+                activation = %activation,
+                "replacing stale partial SC3G GCK rollover Immediate reservation"
+            );
         }
+        let reservation = FinalGckRolloverImmediate {
+            activation,
+            pdu,
+            sdu,
+            aie_request,
+        };
+        self.final_gck_rollover_immediate = std::array::from_fn(|_| Some(reservation.clone()));
         Ok(())
     }
 
@@ -6855,6 +6876,60 @@ mod tests {
         sched.cur_dltime = activation.add_timeslots(18 * 4 - 5);
         let later = sched.finalize_ts_for_tick();
         assert_ne!(later.ts, activation.add_timeslots(-4));
+        assert!(sched.final_gck_rollover_immediate.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn final_sc3g_gck_immediate_replaces_stale_partial_reservation_atomically() {
+        let mut sched = get_testing_slotter();
+        let address = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&address, None, false);
+        resource.update_len_and_fill_ind(0);
+        let old_activation = TdmaTime {
+            t: 1,
+            f: 1,
+            m: 1,
+            h: 0,
+        };
+        let activation = TdmaTime {
+            t: 1,
+            f: 1,
+            m: 2,
+            h: 0,
+        };
+        sched
+            .reserve_gck_rollover_immediate(
+                old_activation,
+                resource.clone(),
+                BitBuffer::new(0),
+                AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            )
+            .expect("reserve stale Immediate");
+        // Model the old error path: one reservation survived while the other
+        // physical FN18 slots were no longer paired with it.
+        sched.final_gck_rollover_immediate[1] = None;
+        sched.final_gck_rollover_immediate[3] = None;
+
+        sched
+            .reserve_gck_rollover_immediate(
+                activation,
+                resource,
+                BitBuffer::new(0),
+                AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            )
+            .expect("replace stale final Immediate");
+        assert!(sched
+            .final_gck_rollover_immediate
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|item| item.activation == activation)));
+
+        sched.cur_dltime = activation.add_timeslots(-5);
+        for timeslot in 1..=4 {
+            let output = sched.finalize_ts_for_tick();
+            assert_eq!(output.ts.t, timeslot);
+            assert_eq!(output.ts.f, 18);
+            sched.cur_dltime = output.ts;
+        }
         assert!(sched.final_gck_rollover_immediate.iter().all(Option::is_none));
     }
 
