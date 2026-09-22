@@ -166,6 +166,16 @@ enum OtarDownlinkKind {
     CmgGtsiProvide,
 }
 
+/// A group sealing key does not by itself make an OTAR PDU group-addressed.
+/// The radio address determines the basic-link service and the AIE route.
+fn otar_downlink_is_group_addressed(pdu: &DOtar, address_ssi: u32, issi: u32) -> bool {
+    matches!(
+        pdu,
+        DOtar::GckProvide(provide)
+            if matches!(provide.session_key, OtarSessionKey::Group { .. })
+    ) && address_ssi != issi
+}
+
 impl OtarDownlinkKind {
     fn from_pdu(pdu: &DOtar) -> Self {
         match pdu {
@@ -5529,12 +5539,7 @@ impl TetraEntityTrait for MmBs {
                         }
                     };
                     let kind = OtarDownlinkKind::from_pdu(&pdu);
-                    let cmg_addressed_gck = matches!(
-                        &pdu,
-                        DOtar::GckProvide(provide)
-                            if matches!(provide.session_key, OtarSessionKey::Group { .. })
-                    );
-                    let group_addressed = cmg_addressed_gck;
+                    let group_addressed = otar_downlink_is_group_addressed(&pdu, address_ssi, issi);
                     if address_ssi != issi && !group_addressed {
                         tracing::warn!(command_id, itsi, address_ssi, ?kind, "discarding OTAR downlink with mismatched terminal address");
                         continue;
@@ -5940,6 +5945,7 @@ impl TetraEntityTrait for MmBs {
 mod tests {
     use super::{
         MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
+        otar_downlink_is_group_addressed,
         sc2_ksg_number, supports_security_information_protocol,
     };
     use crate::MessageQueue;
@@ -6225,6 +6231,27 @@ mod tests {
             ),
             current.unwrap(),
         );
+    }
+
+    #[test]
+    fn egsko_sealed_gck_uses_the_individual_path_when_radio_addressed_to_an_issi() {
+        use tetra_pdus::mm::pdus::otar::{DGckProvide, GroupAssociation, OtarSessionKey, OtarTail, DOtar};
+
+        let pdu = DOtar::GckProvide(DGckProvide {
+            acknowledgement_required: true,
+            explicit_response: true,
+            max_response_timer: 0,
+            session_key: OtarSessionKey::Group {
+                gsko_version_number: 2,
+            },
+            keys: Vec::new(),
+            ksg_number: 0,
+            association: GroupAssociation::GckNumber,
+            retry_interval: 1,
+            tail: OtarTail::default(),
+        });
+        assert!(!otar_downlink_is_group_addressed(&pdu, 77_492, 77_492));
+        assert!(otar_downlink_is_group_addressed(&pdu, 16_000_001, 77_492));
     }
 
     #[test]
