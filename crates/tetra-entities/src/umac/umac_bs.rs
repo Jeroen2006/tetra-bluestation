@@ -445,9 +445,11 @@ impl UmacBs {
             return None;
         }
         let anchor = (i32::from(multiframe - 1) * 18 + i32::from(frame - 1)).rem_euclid(period);
-        // Every period divides the 1080-frame hyperframe. Search one full
-        // EG7 period plus the remainder of the current timeslot.
-        for offset in 1..=(360 * 4 + 4) {
+        // The scheduler finalizes the air slot one tick ahead. Leave at
+        // least one whole tick before the chosen reception slot so the
+        // deferred resource can be released in time.
+        // Every period divides the 1080-frame hyperframe.
+        for offset in (MACSCHED_TX_AHEAD as i32 + 1)..=(360 * 4 + 4) {
             let candidate = self.dltime.add_timeslots(offset);
             let hyperframe_frame = i32::from(candidate.m - 1) * 18 + i32::from(candidate.f - 1);
             if candidate.t == 1 && hyperframe_frame.rem_euclid(period) == anchor {
@@ -3359,16 +3361,18 @@ impl TetraEntityTrait for UmacBs {
             self.channel_scheduler.tick_start(ts);
         }
 
-        // Release EE-gated MCCH resources only on/after their exact TS1
-        // monitoring occasion. `age >= 0` also makes a missed radio tick
-        // recover safely rather than retaining a PDU forever.
+        // The scheduler finalizes the following air slot on this tick. Feed
+        // EE-gated resources into its queue on the tick before the MS's TS1
+        // reception occasion; releasing at TS1 itself transmits at TS1 of
+        // the next frame and systematically misses the listening window.
+        let air_time = ts.add_timeslots(MACSCHED_TX_AHEAD as i32);
         let mut retained = VecDeque::new();
         while let Some(resource) = self.deferred_mcch.pop_front() {
             if resource.tx_reporter.as_ref().is_some_and(TxReporter::is_discarded) {
                 tracing::debug!(due = %resource.due, "dropping cancelled deferred MCCH copy");
                 continue;
             }
-            if resource.due.age(ts) >= 0 {
+            if resource.due.age(air_time) >= 0 {
                 self.channel_scheduler
                     .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter, resource.aie_request);
             } else {
@@ -3852,6 +3856,45 @@ mod tests {
             vec![TdmaTime { t: 1, f: 2, m: 1, h: 0 }, TdmaTime { t: 1, f: 5, m: 1, h: 0 }],
             "each listening phase gets one copy, including the unassociated all-MS address"
         );
+    }
+
+    #[test]
+    fn ee_replay_is_finalized_on_the_terminal_reception_slot() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let due = TdmaTime { t: 1, f: 5, m: 2, h: 0 };
+        umac.deferred_mcch.push_back(DeferredMcch {
+            due,
+            pdu: BsChannelScheduler::dl_make_minimal_resource(
+                &TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                None,
+                false,
+            ),
+            sdu: BitBuffer::from_bitstr("00100010010000100000000000000100111"),
+            tx_reporter: None,
+            aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+        });
+        umac.channel_scheduler.cur_dltime = due.add_timeslots(-3);
+        let mut queue = MessageQueue::new();
+
+        umac.tick_start(&mut queue, due.add_timeslots(-2));
+        assert_eq!(umac.deferred_mcch.len(), 1, "the replay must not be released two ticks early");
+        queue.pop_front().expect("preceding slot is finalized");
+
+        umac.tick_start(&mut queue, due.add_timeslots(-1));
+        assert!(umac.deferred_mcch.is_empty());
+        let output = queue.pop_front().expect("reception slot is finalized");
+        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else { panic!("expected downlink slot") };
+        assert_eq!(slot.ts, due);
+        let mut bits = slot.blk1.expect("GCK broadcast on SCH/F").mac_block;
+        bits.seek(0);
+        let resource = MacResource::from_bitbuf(&mut bits).expect("broadcast MAC-RESOURCE");
+        let address = resource.addr.expect("all-MS broadcast address");
+        assert_eq!(address.ssi, 0x00ff_ffff);
     }
 
     #[test]
