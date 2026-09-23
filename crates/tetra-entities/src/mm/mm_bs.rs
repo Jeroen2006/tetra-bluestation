@@ -2891,28 +2891,7 @@ impl MmBs {
                     all_accepted,
                 );
 
-                // Some deployed terminals do not retain a GSSI -> GCKN
-                // association received just before the corresponding GCK was
-                // provisioned.  TTR 001-11 clause 6.2.8.2 permits the SwMI to
-                // send Group Identity Security Related Information in an
-                // unsolicited D-ATTACH/DETACH GROUP IDENTITY PDU.  Repeat the
-                // association only after the terminal explicitly confirms
-                // that it accepted that GCK.  This keeps the normative
-                // attachment acknowledgement as the primary association path
-                // while making key-first ordering deterministic for those
-                // terminals.
-                let accepted_gckns = result
-                    .results
-                    .iter()
-                    .filter(|entry| entry.provision_result == 0)
-                    .map(|entry| entry.gck_number)
-                    .collect::<HashSet<_>>();
-                if !accepted_gckns.is_empty() {
-                    self.send_group_security_association_refresh(queue, prim.received_address.ssi, prim.handle, &accepted_gckns);
-                }
-                if all_accepted {
-                    self.send_current_gck_version_to_terminal(queue, prim.received_address.ssi, prim.handle);
-                }
+                self.refresh_group_security_after_gck_result(queue, prim.received_address.ssi, prim.handle, result);
             }
             UOtar::GskoDemand(_) => {
                 self.gsko_bootstraps
@@ -4061,6 +4040,36 @@ impl MmBs {
         // the exchange it initiated.
         self.group_security_not_before
             .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
+    }
+
+    /// Announce the version to use before reapplying group associations.
+    /// TTR 001-11 6.2.4/6.2.8: storing a future key does not activate it.
+    /// A future-only or stale result must not refresh a live association as
+    /// though the current key had been accepted. A partial result can still
+    /// recover the groups whose current key succeeded.
+    fn refresh_group_security_after_gck_result(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        result: &tetra_pdus::mm::pdus::otar::UGckResult,
+    ) {
+        let accepted_gckns = {
+            let state = self.config.state_read();
+            let Some(sc3) = state.aie.sc3.as_ref() else { return };
+            result.results.iter()
+                .filter(|entry| entry.provision_result == 0 && entry.version_number == sc3.gck_vn())
+                .map(|entry| entry.gck_number)
+                .collect::<HashSet<_>>()
+        };
+        if accepted_gckns.is_empty() {
+            return;
+        }
+        // Both PDUs use the same acknowledged individual basic link. Queue
+        // the current-version indication first, so attachment cannot select
+        // a stale version while the following indication is still in flight.
+        self.send_current_gck_version_to_terminal(queue, issi, handle);
+        self.send_group_security_association_refresh(queue, issi, handle, &accepted_gckns);
     }
 
     /// Re-advertise the currently attached GSSI associations whose GCK was
@@ -6416,6 +6425,49 @@ mod tests {
             .expect("security association must be present");
         assert_eq!(security[0].associations[0].gssi, 1202);
         assert_eq!(security[0].associations[0].selection, GckSelectNumber::Selected(2));
+    }
+
+    #[test]
+    fn gck_result_announces_current_version_before_group_attachment() {
+        use tetra_pdus::mm::pdus::otar::{GckProvisionResult, OtarTail, UGckResult};
+        let issi = 77_479;
+        let mut mm = test_sc3g_mm(issi, &[1502]);
+        let mut queue = MessageQueue::new();
+        // A failure for a future key must not prevent recovery of the
+        // successfully accepted current key, or reverse the signalling order.
+        let result = UGckResult {
+            results: vec![
+                GckProvisionResult { gck_number: 1, version_number: 1, provision_result: 0, current_version_number: None },
+                GckProvisionResult { gck_number: 1, version_number: 2, provision_result: 1, current_version_number: None },
+            ],
+            tail: OtarTail::default(),
+        };
+        mm.refresh_group_security_after_gck_result(&mut queue, issi, 0, &result);
+        let SapMsgInner::LmmMleUnitdataReq(mut version) = queue.pop_front().unwrap().msg else { panic!() };
+        let pdu = DAllGcksChangeDemand::from_bitbuf(&mut version.sdu).unwrap();
+        assert_eq!(pdu.gck_version_number, 1);
+        assert!(matches!(pdu.time, CkChangeTime::CurrentlyInUse));
+        let SapMsgInner::LmmMleUnitdataReq(mut attachment) = queue.pop_front().unwrap().msg else { panic!() };
+        let pdu = DAttachDetachGroupIdentity::from_bitbuf(&mut attachment.sdu).unwrap();
+        assert!(pdu.group_identity_acknowledgement_request);
+        assert_eq!(pdu.group_identity_security_related_information.unwrap()[0].associations[0].gssi, 1502);
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn future_or_stale_gck_result_does_not_reactivate_group_attachment() {
+        use tetra_pdus::mm::pdus::otar::{GckProvisionResult, OtarTail, UGckResult};
+        let issi = 77_479;
+        let mut mm = test_sc3g_mm(issi, &[1502]);
+        let mut queue = MessageQueue::new();
+        for (vn, code) in [(0, 0), (2, 0), (1, 1)] {
+            mm.refresh_group_security_after_gck_result(&mut queue, issi, 0, &UGckResult {
+                results: vec![GckProvisionResult { gck_number: 1, version_number: vn, provision_result: code, current_version_number: None }],
+                tail: OtarTail::default(),
+            });
+            assert!(queue.pop_front().is_none());
+            assert!(!mm.pending_group_security_associations.contains_key(&issi));
+        }
     }
 
     #[test]
