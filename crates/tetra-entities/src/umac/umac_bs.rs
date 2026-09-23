@@ -2149,10 +2149,23 @@ impl UmacBs {
             let channels = self.channel_scheduler.active_downlink_traffic_channels();
             for (timeslot, usage) in &channels {
                 let mut copy = prim.clone();
+                // A listener on an assigned group channel follows that
+                // channel's group address and cipher context. Address the
+                // change notice to the actual group there, so it is decoded
+                // with the same (still current) MGCK as other call control.
+                // The separate MCCH copy remains all-MS addressed.
+                if let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
+                    self.channel_scheduler.traffic_aie(*timeslot)
+                {
+                    copy.main_address = TetraAddress::new(gssi, SsiType::Gssi);
+                    copy.air_interface_encryption = Some(AieRequest::sc3(
+                        AieSubject::Group { gssi },
+                        AieScope::MacResource,
+                    ));
+                }
                 // The synthetic association is routing-only. call_id zero is
-                // never exposed on air; timeslot selects the TCH and usage is
-                // retained as route metadata (the all-MS on-air resource omits
-                // it below so that the PDU fits in one STCH half-slot).
+                // never exposed on air; timeslot selects the TCH. Its usage
+                // marker is route metadata, not part of this broadcast PDU.
                 copy.associated_channel = Some(AssociatedChannel {
                     call_id: 0,
                     timeslot: *timeslot,
@@ -2205,12 +2218,13 @@ impl UmacBs {
                 const NULL_PDU_LEN_BITS: usize = 16;
 
                 let all_ms_address = prim.main_address.ssi == 0x00ff_ffff && prim.main_address.ssi_type == SsiType::Gssi;
-                // The traffic bearer already identifies the associated call.
-                // Do not add its usage marker to an all-MS broadcast: the six
-                // extra address bits make this 74-bit BL-UDATA resource 123
-                // bits long, whose mandatory octet-alignment fill would need
-                // 128 bits and cannot fit in a 124-bit STCH half-slot.
-                let usage_marker = if all_ms_address {
+                // The traffic bearer identifies the associated call. The
+                // synthetic call_id 0 is used for the all-MS fan-out, even
+                // when its on-air copy is addressed to the actual group. A
+                // usage marker adds six bits and makes the Absolute-IV PDU
+                // overflow this 124-bit STCH half-slot after octet fill.
+                let broadcast_copy = associated_channel.is_some_and(|channel| channel.call_id == 0);
+                let usage_marker = if all_ms_address || broadcast_copy {
                     None
                 } else {
                     associated_channel
@@ -3759,6 +3773,94 @@ mod tests {
         pdch_bits.seek(0);
         let pdch_resource = MacResource::from_bitbuf(&mut pdch_bits).expect("PDCH MAC-RESOURCE");
         assert_eq!(pdch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+    }
+
+    #[test]
+    fn absolute_iv_notice_on_group_tch_uses_group_key_and_fits_stch() {
+        use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm};
+
+        let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration");
+        let config = SharedConfig::from_parts(parsed, None);
+        let gssi = 1502;
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x35; 10], true, true);
+        sc3.apply_sc3g_snapshot(1, true, 10, vec![RuntimeSc3Gck::new(4, 10, [0x41; 10])], vec![(gssi, 4)])
+            .expect("group key");
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let mut umac = UmacBs::new(config);
+        let mut queue = MessageQueue::new();
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(10, 2)));
+        umac.set_traffic_aie(
+            &mut queue,
+            2,
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic)),
+            None,
+        );
+
+        // A linked-GCK Absolute-IV demand plus BL-UDATA is 74 bits. It must
+        // survive the fan-out and mandatory octet fill in a 124-bit STCH.
+        let mut sdu = BitBuffer::new_autoexpand(74);
+        sdu.write_bits(0, 64);
+        sdu.write_bits(0, 10);
+        sdu.seek(0);
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: sdu,
+                    main_address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: true,
+                    subscriber_class: 0,
+                    air_interface_encryption: Some(AieRequest::sc3(
+                        AieSubject::Group { gssi: 0x00ff_ffff },
+                        AieScope::MacResource,
+                    )),
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+
+        umac.channel_scheduler.cur_dltime = TdmaTime { t: 1, f: 5, m: 1, h: 0 };
+        let output = umac.channel_scheduler.finalize_ts_for_tick();
+        assert_eq!(output.ts.t, 2);
+        let mut stch = output.blk1.expect("group rollover STCH");
+        assert_eq!(stch.logical_channel, LogicalChannel::Stch);
+        assert_eq!(
+            stch.air_interface_encryption,
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Facch))
+        );
+        stch.mac_block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut stch.mac_block).expect("valid STCH MAC-RESOURCE");
+        let group_context = umac
+            .aie_provider
+            .resolve(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource), AieDirection::Downlink, output.ts)
+            .expect("current group key");
+        let gesi = umac.aie_provider.encrypted_short_identity(group_context, gssi).expect("group GESI");
+        // The MAC parser represents the shared 24-bit SSI/GESI wire field as
+        // Ssi; encryption_mode distinguishes its encrypted interpretation.
+        assert_eq!(resource.addr.expect("group address").ssi, gesi);
+        assert_ne!(resource.encryption_mode, 0);
+        assert!(resource.usage_marker.is_none());
     }
 
     #[test]

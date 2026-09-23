@@ -2067,8 +2067,20 @@ impl BsChannelScheduler {
         buffer
     }
 
-    fn build_final_gck_rollover_slot(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
+    fn build_final_gck_rollover_slot(&mut self, mut item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
         let assigned_channel = ts.t != 1 && self.assigned_channel_is_active(ts.t);
+        if assigned_channel
+            && let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
+                self.traffic_aie[ts.t as usize - 1]
+        {
+            // The active group follows its assigned channel at FN18. Give
+            // it the same group address and pre-rollover MGCK as its other
+            // call control, rather than an all-MS/CCK resource which some
+            // terminals do not apply while staying in the call.
+            item.pdu.addr = Some(TetraAddress::new(gssi, SsiType::Gssi));
+            item.aie_request = AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
+            tracing::info!(dltime = %ts, gssi, "addressing final GCK rollover Immediate to assigned group");
+        }
         let ul_phy_chan = if assigned_channel {
             PhysicalChannel::Tp
         } else {
@@ -2636,7 +2648,6 @@ impl BsChannelScheduler {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn traffic_aie(&self, ts: u8) -> Option<AieRequest> {
         (1..=4).contains(&ts).then(|| self.traffic_aie[ts as usize - 1]).flatten()
     }
@@ -6938,6 +6949,92 @@ mod tests {
         let later = sched.finalize_ts_for_tick();
         assert_ne!(later.ts, activation.add_timeslots(-4));
         assert!(sched.final_gck_rollover_immediate.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn final_gck_immediate_on_group_tch_uses_pre_rollover_group_context() {
+        use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig};
+        use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+
+        let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration");
+        let config = SharedConfig::from_parts(parsed, None);
+        let gssi = 1502;
+        let activation = TdmaTime { t: 1, f: 1, m: 2, h: 0 };
+        let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x35; 10], true, true);
+        sc3.apply_sc3g_snapshot_with_rollover(
+            1,
+            true,
+            10,
+            vec![RuntimeSc3Gck::new(4, 10, [0x41; 10])],
+            Some(11),
+            vec![RuntimeSc3Gck::new(4, 11, [0x42; 10])],
+            Some((1, 1)),
+            vec![(gssi, 4)],
+        )
+        .expect("current and future group keys");
+        assert_eq!(sc3.schedule_gck_rollover(1, activation.add_timeslots(-4)).map(|(_, at)| at), Some(activation));
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config);
+        let mut sched = get_testing_slotter();
+        sched.aie_provider = Some(provider.clone());
+        sched.create_circuit(
+            Direction::Dl,
+            Circuit {
+                call_id: 10,
+                direction: Direction::Dl,
+                ts: 2,
+                usage: 6,
+                circuit_mode: CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            },
+        );
+        sched.set_traffic_aie(2, Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic)));
+
+        let all_ms = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        sdu.write_bits(0, 34);
+        sdu.seek(0);
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&all_ms, None, false);
+        resource.update_len_and_fill_ind(sdu.get_len());
+        sched
+            .reserve_gck_rollover_immediate(
+                activation,
+                resource,
+                sdu,
+                AieRequest::sc3(AieSubject::Group { gssi: all_ms.ssi }, AieScope::MacResource),
+            )
+            .expect("reserve Immediate on all slots");
+        sched.cur_dltime = activation.add_timeslots(-4);
+        let output = sched.finalize_ts_for_tick();
+        assert_eq!(output.ts.t, 2);
+        assert_eq!(output.ts.f, 18);
+        let mut block = [output.blk1, output.blk2]
+            .into_iter()
+            .flatten()
+            .find(|block| matches!(block.logical_channel, LogicalChannel::SchHd | LogicalChannel::SchF))
+            .expect("group Immediate")
+            .mac_block;
+        block.seek(0);
+        let header = MacResource::from_bitbuf(&mut block).expect("Immediate MAC-RESOURCE");
+        let group_request = AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
+        let old = provider.resolve(group_request, AieDirection::Downlink, output.ts).expect("old MGCK");
+        let new = provider.resolve(group_request, AieDirection::Downlink, activation).expect("new MGCK");
+        assert_ne!(old, new);
+        let gesi = provider.encrypted_short_identity(old, gssi).expect("group GESI");
+        assert_eq!(header.addr.expect("group address").ssi, gesi);
+        assert_ne!(header.encryption_mode, 0);
+        assert!(header.usage_marker.is_none());
     }
 
     #[test]
