@@ -1305,9 +1305,10 @@ impl MmBs {
     }
 
     /// Queue the TTR 001-11 table-1 full current GCK-VN advertisement. It is
-    /// broadcast-addressed and unacknowledged and deliberately clear: clause
-    /// 6.2.14.2 permits D-CK CHANGE DEMAND clear, so an MS with an old or
-    /// missing CCK can still learn the full GCK-VN and recover its GCK.
+    /// broadcast-addressed and unacknowledged. Protect it with the serving
+    /// cell's CCK: security clause 4.2.3 assigns CCK to broadcast addresses,
+    /// and the all-MS address has no associated GCK. Clause 6.2.14.2 permits
+    /// clear delivery, but does not require it.
     fn send_gck_change_broadcast(
         &self,
         queue: &mut MessageQueue,
@@ -1339,7 +1340,7 @@ impl MmBs {
                 stealing_permission: traffic_channels,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
-                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                aie_request: AieRequest::sc3(AieSubject::Group { gssi: 0x00ff_ffff }, AieScope::MacResource),
                 is_null_pdu: false,
                     assigned_channel_frame18_broadcast: false,
                 frame18_rollover_activation,
@@ -1389,7 +1390,7 @@ impl MmBs {
     /// Use its negotiated signalling protection for the individual copy,
     /// consistently with the following group association. TTR 001-11
     /// 6.2.14.2 permits clear CK CHANGE but does not require it; the cell-wide
-    /// recovery broadcast remains clear for terminals without a current CCK.
+    /// broadcast uses the serving CCK so registered SC3 terminals can decode it.
     fn send_current_gck_version_to_terminal(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
         let (gck_vn, pending_rollover) = {
             let state = self.config.state_read();
@@ -6935,9 +6936,10 @@ mod tests {
         assert!(matches!(request.address.ssi_type, tetra_core::SsiType::Gssi));
         assert!(matches!(
             request.aie_request,
-            AieRequest::Clear {
-                subject: AieSubject::System,
+            AieRequest::Sc3 {
+                subject: AieSubject::Group { gssi: 0x00ff_ffff },
                 scope: AieScope::MacResource,
+                key: None,
             }
         ));
     }

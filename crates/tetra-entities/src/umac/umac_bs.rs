@@ -230,6 +230,17 @@ struct DeferredMcch {
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
     aie_request: AieRequest,
+    ee_retry: Option<EeReplayRetry>,
+}
+
+/// A replay is useful only in the MS's one-frame EE reception window. If
+/// SCH/F congestion displaces it, cancel the stale MAC resource and try the
+/// next reception frame instead of transmitting while the MS is asleep.
+struct EeReplayRetry {
+    period_slots: i32,
+    attempts_left: u8,
+    cutoff: Option<TdmaTime>,
+    in_flight: Option<TxReporter>,
 }
 
 struct PendingSc3Access {
@@ -2447,6 +2458,12 @@ impl UmacBs {
                         sdu: sdu.clone(),
                         tx_reporter: None,
                         aie_request,
+                        ee_retry: all_ms.then_some(EeReplayRetry {
+                            period_slots: period_frames * 4,
+                            attempts_left: 4,
+                            cutoff: rollover_activation,
+                            in_flight: None,
+                        }),
                     });
                 }
             }
@@ -2484,6 +2501,7 @@ impl UmacBs {
                         sdu,
                         tx_reporter: prim.tx_reporter,
                         aie_request,
+                        ee_retry: None,
                     });
                     return;
                 }
@@ -3367,9 +3385,40 @@ impl TetraEntityTrait for UmacBs {
         // the next frame and systematically misses the listening window.
         let air_time = ts.add_timeslots(MACSCHED_TX_AHEAD as i32);
         let mut retained = VecDeque::new();
-        while let Some(resource) = self.deferred_mcch.pop_front() {
+        while let Some(mut resource) = self.deferred_mcch.pop_front() {
             if resource.tx_reporter.as_ref().is_some_and(TxReporter::is_discarded) {
                 tracing::debug!(due = %resource.due, "dropping cancelled deferred MCCH copy");
+                continue;
+            }
+            if let Some(retry) = resource.ee_retry.as_mut() {
+                if let Some(reporter) = retry.in_flight.as_ref() {
+                    if reporter.is_transmitted() {
+                        tracing::debug!(due = %resource.due, "EE replay transmitted in reception frame");
+                        continue;
+                    }
+                    if resource.due.age(air_time) > 0 {
+                        if !reporter.is_discarded() {
+                            reporter.mark_discarded();
+                        }
+                        tracing::debug!(due = %resource.due, "EE replay missed its reception frame; retrying on next phase");
+                        retry.in_flight = None;
+                        resource.due = resource.due.add_timeslots(retry.period_slots);
+                    }
+                }
+                if retry.in_flight.is_none() && resource.due.age(air_time) >= 0 {
+                    if retry.attempts_left == 0
+                        || retry.cutoff.is_some_and(|cutoff| cutoff.diff(resource.due) <= 0)
+                    {
+                        continue;
+                    }
+                    let reporter = TxReporter::new_unacked();
+                    self.channel_scheduler.dl_enqueue_ee_mcch_tma(
+                        resource.pdu.clone(), resource.sdu.clone(), reporter.clone(), resource.aie_request,
+                    );
+                    retry.in_flight = Some(reporter);
+                    retry.attempts_left -= 1;
+                }
+                retained.push_back(resource);
                 continue;
             }
             if resource.due.age(air_time) >= 0 {
@@ -3877,6 +3926,7 @@ mod tests {
             sdu: BitBuffer::from_bitstr("00100010010000100000000000000100111"),
             tx_reporter: None,
             aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            ee_retry: None,
         });
         umac.channel_scheduler.cur_dltime = due.add_timeslots(-3);
         let mut queue = MessageQueue::new();
@@ -3913,12 +3963,53 @@ mod tests {
             sdu: BitBuffer::from_bitstr("1010"),
             tx_reporter: Some(reporter.clone()),
             aie_request: AieRequest::clear(AieSubject::Individual { issi: 77_468 }, AieScope::MacResource),
+            ee_retry: None,
         });
 
         reporter.mark_discarded();
         umac.tick_start(&mut MessageQueue::new(), tick);
 
         assert!(umac.deferred_mcch.is_empty());
+    }
+
+    #[test]
+    fn missed_all_ms_ee_frame_is_cancelled_and_retried_in_next_window() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let due = TdmaTime { t: 1, f: 5, m: 2, h: 0 };
+        let missed = TxReporter::new_unacked();
+        umac.deferred_mcch.push_back(DeferredMcch {
+            due,
+            pdu: BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::new(0x00ff_ffff, SsiType::Gssi), None, false),
+            sdu: BitBuffer::from_bitstr("00100010010000100000000000000100111"),
+            tx_reporter: None,
+            aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+            ee_retry: Some(EeReplayRetry {
+                period_slots: 4 * 18,
+                attempts_left: 1,
+                cutoff: None,
+                in_flight: Some(missed.clone()),
+            }),
+        });
+
+        umac.channel_scheduler.cur_dltime = due;
+        umac.tick_start(&mut MessageQueue::new(), due.add_timeslots(1));
+        assert!(missed.is_discarded(), "stale copy must never be emitted in a frame the MS does not hear");
+        let next = due.add_timeslots(4 * 18);
+        assert_eq!(umac.deferred_mcch.front().expect("retry retained").due, next);
+
+        umac.channel_scheduler.cur_dltime = next.add_timeslots(-2);
+        let mut queue = MessageQueue::new();
+        umac.tick_start(&mut queue, next.add_timeslots(-1));
+        let retry = umac.deferred_mcch.front().expect("retry receipt retained");
+        assert!(retry.ee_retry.as_ref().expect("EE state").in_flight.as_ref().expect("sent copy").is_transmitted());
+        let output = queue.pop_front().expect("reception slot finalized");
+        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else { panic!("expected downlink slot") };
+        assert_eq!(slot.ts, next);
     }
 
     #[test]

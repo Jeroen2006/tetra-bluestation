@@ -1895,6 +1895,13 @@ impl BsChannelScheduler {
         }
     }
 
+    /// An all-MS security notice released for an EE reception frame takes
+    /// precedence over ordinary queued MCCH resources. In-progress MAC
+    /// fragments and announced uplink grants retain their scheduler priority.
+    pub fn dl_enqueue_ee_mcch_tma(&mut self, pdu: MacResource, sdu: BitBuffer, reporter: TxReporter, aie_request: AieRequest) {
+        self.dltx_queues[0].insert(0, DlSchedElem::Resource(pdu, sdu, Some(reporter), aie_request, None));
+    }
+
     /// Queue ordinary signalling on a currently allocated, non-traffic
     /// channel.  This is used for a tracked listener during hangtime: the MS
     /// is still tuned to that slot, but no speech is being carried so FN1-17
@@ -4312,6 +4319,55 @@ mod tests {
         mcch_reporter.mark_discarded();
         assert!(sched.dl_take_prioritized_sched_item(TdmaTime { t: 1, f: 2, m: 2, h: 0 }).is_none());
         assert!(sched.dltx_queues[0].is_empty());
+    }
+
+    #[test]
+    fn all_ms_gck_notice_uses_cck_and_precedes_ordinary_mcch() {
+        use tetra_config::bluestation::{RuntimeSc3Aie, RuntimeSc3TeaAlgorithm, SharedConfig};
+
+        let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example BS configuration");
+        let config = SharedConfig::from_parts(parsed, None);
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x35; 10], true, true)),
+            rollover: None,
+        };
+        let mut sched = get_testing_slotter();
+        sched.aie_provider = Some(BsAieKeyProvider::new(config));
+        let time = TdmaTime { t: 1, f: 5, m: 1, h: 1 };
+        let request = AieRequest::sc3(AieSubject::Group { gssi: 0x00ff_ffff }, AieScope::MacResource);
+        let context = sched.resolve_downlink_context(request, time).expect("all-MS CCK context");
+        assert!(matches!(context, AieContext::Sc3 { key, .. } if key.key_type == tetra_core::Sc3KeyType::Cck));
+
+        let broadcast = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        let prepared = sched
+            .prepare_downlink_resource(BsChannelScheduler::dl_make_minimal_resource(&broadcast, None, false), request, time)
+            .expect("protected all-MS resource");
+        assert_eq!(prepared.addr.expect("encrypted broadcast address").ssi_type, SsiType::Esi);
+        assert_ne!(prepared.encryption_mode, 0);
+
+        let ordinary = TetraAddress::issi(77_468);
+        sched.dl_enqueue_tma(
+            BsChannelScheduler::dl_make_minimal_resource(&ordinary, None, false),
+            BitBuffer::from_bitstr("1010"),
+            None,
+            AieRequest::clear(AieSubject::Individual { issi: ordinary.ssi }, AieScope::MacResource),
+        );
+        sched.dl_enqueue_ee_mcch_tma(
+            BsChannelScheduler::dl_make_minimal_resource(&broadcast, None, false),
+            BitBuffer::from_bitstr("00100010010000100000000000000100111"),
+            TxReporter::new_unacked(),
+            request,
+        );
+        let first = sched.dl_take_prioritized_sched_item(time).expect("EE notice queued");
+        assert!(matches!(first, DlSchedElem::Resource(pdu, ..)
+            if pdu.addr.is_some_and(|address| address.ssi == broadcast.ssi && address.ssi_type == broadcast.ssi_type)));
     }
 
     #[test]
