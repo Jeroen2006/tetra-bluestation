@@ -1385,11 +1385,11 @@ impl MmBs {
         )
     }
 
-    /// A newly registered MS can have missed the periodic clear broadcast
-    /// while it was powered off. Send the same normative Table-1 indication
-    /// individually and clear, both after registration and after GCK
-    /// provisioning, so a stale full GCK-VN cannot keep selecting an old key
-    /// version even though the current key material is already present.
+    /// A newly registered MS can have missed the periodic full-VN broadcast.
+    /// Use its negotiated signalling protection for the individual copy,
+    /// consistently with the following group association. TTR 001-11
+    /// 6.2.14.2 permits clear CK CHANGE but does not require it; the cell-wide
+    /// recovery broadcast remains clear for terminals without a current CCK.
     fn send_current_gck_version_to_terminal(&self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
         let (gck_vn, pending_rollover) = {
             let state = self.config.state_read();
@@ -1403,6 +1403,7 @@ impl MmBs {
                 }),
             )
         };
+        let aie_request = self.downlink_aie_request(issi);
         let has_pending_rollover = pending_rollover.is_some();
         let mut indications = vec![(gck_vn, CkChangeTime::CurrentlyInUse)];
         if let Some((future_vn, activation)) = pending_rollover {
@@ -1435,16 +1436,16 @@ impl MmBs {
                     stealing_permission: false,
                     stealing_repeats_flag: false,
                     encryption_flag: false,
-                    aie_request: AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource),
+                    aie_request,
                     is_null_pdu: false,
-                assigned_channel_frame18_broadcast: false,
+                    assigned_channel_frame18_broadcast: false,
                     frame18_rollover_activation: None,
                     tx_reporter: None,
                     seamless_handover: None,
                 }),
             });
         }
-        tracing::info!(issi, gck_vn, pending = has_pending_rollover, "queued current and pending full GCK-VN advertisements");
+        tracing::info!(issi, gck_vn, pending = has_pending_rollover, ?aie_request, "queued current and pending full GCK-VN advertisements");
         true
     }
 
@@ -6868,9 +6869,13 @@ mod tests {
     #[test]
     fn registered_terminal_receives_full_current_gck_version() {
         let config = test_config();
+        let issi = 77_492;
         let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x6c; 10], true, true);
-        sc3.apply_sc3g_snapshot(1, true, 1, vec![RuntimeSc3Gck::new(2, 1, [0x32; 10])], vec![(1202, 2)])
+        // VN9 and VN1 have the same short SYSINFO value. The individual
+        // indication must preserve the full value and the registered DCK.
+        sc3.apply_sc3g_snapshot(1, true, 9, vec![RuntimeSc3Gck::new(2, 9, [0x32; 10])], vec![(1202, 2)])
             .expect("valid linked SC3G snapshot");
+        sc3.install_dck(issi, RuntimeSc3Dck::new([0xd3; 16], [0x5a; 10], true, None));
         config.state_write().aie = RuntimeAieConfig {
             enabled: true,
             sc1_allowed: false,
@@ -6878,7 +6883,7 @@ mod tests {
             sc3: Some(sc3),
             rollover: None,
         };
-        let issi = 77_492;
+        config.state_write().aie_sessions.set_terminal_class(issi, TerminalSecurityClass::Sc3, None);
         let mm = MmBs::new(config, None, None, None);
         let mut queue = MessageQueue::new();
 
@@ -6890,8 +6895,17 @@ mod tests {
         };
         assert_eq!(request.address.ssi, issi);
         assert_eq!(request.address.ssi_type, tetra_core::SsiType::Issi);
+        assert_eq!(request.layer2service, tetra_core::Layer2Service::Acknowledged);
+        assert!(matches!(request.aie_request, AieRequest::Sc3 {
+            subject: AieSubject::Individual { issi: protected_issi },
+            scope: AieScope::MacResource,
+            ..
+        } if protected_issi == issi));
+        // TTR 001-11 table 1, independent of the decoder under test.
+        assert_eq!(request.sdu.dump_bin(), "^0010000100000000000000100111");
         let pdu = DAllGcksChangeDemand::from_bitbuf(&mut request.sdu).expect("valid full GCK-VN advertisement");
-        assert_eq!(pdu.gck_version_number, 1);
+        assert_eq!(pdu.gck_version_number, 9);
+        assert!(!pdu.acknowledgement_required);
         assert_eq!(pdu.time, CkChangeTime::CurrentlyInUse);
     }
 
