@@ -2033,6 +2033,11 @@ impl BsChannelScheduler {
         self.final_gck_rollover_immediate[slot].take()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_final_gck_rollover_count(&self) -> usize {
+        self.final_gck_rollover_immediate.iter().filter(|reservation| reservation.is_some()).count()
+    }
+
     fn build_final_gck_rollover_resource(
         &mut self,
         item: FinalGckRolloverImmediate,

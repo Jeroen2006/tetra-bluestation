@@ -414,28 +414,43 @@ impl UmacBs {
     }
 
     /// Return the next MCCH TS1 monitoring opportunity for an individual
-    /// terminal. EE mode n repeats on the ESI phase every 2^(n-1)
-    /// multiframes; the ESI itself is the phase/activation anchor.
+    /// terminal. ETSI TS 100 392-2 table 23.9 defines the sleep duration in
+    /// TDMA frames; the reception period is one frame longer.
     fn next_energy_economy_mcch(&self, issi: u32) -> Option<TdmaTime> {
         let (mode, frame, multiframe) = self.config.state_read().subscribers.energy_economy(issi)?;
         self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe)
     }
 
-    fn next_energy_economy_mcch_for_assignment(&self, mode: u8, frame: Option<u8>, multiframe: Option<u8>) -> Option<TdmaTime> {
-        if mode == 0 {
-            return None;
+    fn energy_economy_period_frames(mode: u8) -> Option<i32> {
+        match mode {
+            1 => Some(2),
+            2 => Some(3),
+            3 => Some(6),
+            4 => Some(9),
+            5 => Some(18),
+            6 => Some(72),
+            7 => Some(360),
+            _ => None,
         }
+    }
+
+    fn next_energy_economy_mcch_for_assignment(&self, mode: u8, frame: Option<u8>, multiframe: Option<u8>) -> Option<TdmaTime> {
+        let period = Self::energy_economy_period_frames(mode)?;
         let (Some(frame), Some(multiframe)) = (frame, multiframe) else {
             tracing::warn!(mode, "invalid local EE assignment; falling back to immediate MCCH");
             return None;
         };
-        let period = 1_i32 << (mode - 1);
-        let anchor = i32::from(multiframe - 1).rem_euclid(period);
-        // At most 64 multiframes plus one frame are searched (EG7).
-        for offset in 1..=(64 * 18 * 4 + 4) {
+        if !(1..=18).contains(&frame) || !(1..=60).contains(&multiframe) {
+            tracing::warn!(mode, frame, multiframe, "invalid local EE start point; falling back to immediate MCCH");
+            return None;
+        }
+        let anchor = (i32::from(multiframe - 1) * 18 + i32::from(frame - 1)).rem_euclid(period);
+        // Every period divides the 1080-frame hyperframe. Search one full
+        // EG7 period plus the remainder of the current timeslot.
+        for offset in 1..=(360 * 4 + 4) {
             let candidate = self.dltime.add_timeslots(offset);
-            let absolute_multiframe = i32::from(candidate.h) * 60 + i32::from(candidate.m - 1);
-            if candidate.t == 1 && candidate.f == frame && absolute_multiframe.rem_euclid(period) == anchor {
+            let hyperframe_frame = i32::from(candidate.m - 1) * 18 + i32::from(candidate.f - 1);
+            if candidate.t == 1 && hyperframe_frame.rem_euclid(period) == anchor {
                 return Some(candidate);
             }
         }
@@ -2364,15 +2379,28 @@ impl UmacBs {
             let all_ms = prim.main_address.ssi == 0x00ff_ffff && prim.main_address.ssi_type == SsiType::Gssi;
             let (assignments, rollover_activation, all_ms_rollover) = {
                 let state = self.config.state_read();
-                let rollover = all_ms.then(|| state.aie.rollover_notification()).flatten();
-                let assignments = if rollover.is_some() {
+                // The all-ones broadcast address has no group affiliates.
+                // Full GCK-VN advertisements (TTR 001-11 table 1) must also
+                // reach sleeping MSs when no SCK rollover is pending.
+                // Respect their negotiated reception pattern, TS 100 392-2
+                // 23.7.6, rather than looking up a fictitious talkgroup.
+                let rollover = all_ms.then(|| {
+                    state.aie.rollover_notification().map(|(_, activation)| activation)
+                        .or_else(|| state.aie.sc3.as_ref()?.gck_rollover_notification()
+                            .map(|(_, _, activation)| activation))
+                }).flatten();
+                let assignments = if all_ms_traffic_broadcast {
+                    // MM also sends an MCCH copy of these TCH/STCH notices.
+                    // Replay that copy once per listening phase, not both.
+                    Vec::new()
+                } else if all_ms {
                     state.subscribers.active_energy_economies()
                 } else {
                     state.subscribers.group_energy_economies(prim.main_address.ssi)
                 };
                 (
                     assignments,
-                    rollover.as_ref().and_then(|(_, activation)| *activation),
+                    rollover.flatten(),
                     rollover.is_some(),
                 )
             };
@@ -2387,8 +2415,8 @@ impl UmacBs {
                     continue;
                 }
 
-                let period_multiframes = 1_i32 << mode.saturating_sub(1);
-                let second = due.add_timeslots(period_multiframes * 18 * 4);
+                let period_frames = Self::energy_economy_period_frames(mode).expect("valid EE assignment");
+                let second = due.add_timeslots(period_frames * 4);
                 let second = if rollover_activation.is_none_or(|activation| activation.diff(second) > 0) {
                     second
                 } else {
@@ -3725,10 +3753,10 @@ mod tests {
             ),
         );
 
-        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_some));
+        assert_eq!(umac.channel_scheduler.pending_final_gck_rollover_count(), 4);
         let preceding = umac.channel_scheduler.finalize_ts_for_tick();
         assert_eq!(preceding.ts, activation.add_timeslots(-5));
-        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_some));
+        assert_eq!(umac.channel_scheduler.pending_final_gck_rollover_count(), 4);
 
         umac.channel_scheduler.cur_dltime = preceding.ts;
         for timeslot in 1..=4 {
@@ -3737,7 +3765,7 @@ mod tests {
             assert_eq!(output.ts.f, 18);
             umac.channel_scheduler.cur_dltime = output.ts;
         }
-        assert!(umac.channel_scheduler.final_gck_rollover_immediate.iter().all(Option::is_none));
+        assert_eq!(umac.channel_scheduler.pending_final_gck_rollover_count(), 0);
     }
 
     #[test]
@@ -3752,6 +3780,78 @@ mod tests {
         assert!(!UmacBs::ee_replay_is_usable(now.add_timeslots(-1), now, None));
         assert!(!UmacBs::ee_replay_is_usable(activation, now, Some(activation)));
         assert!(!UmacBs::ee_replay_is_usable(activation.add_timeslots(1), now, Some(activation)));
+    }
+
+    #[test]
+    fn ee_reception_follows_table_23_9_across_multiframe_and_hyperframe_boundaries() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        for (mode, period) in [(1, 2), (2, 3), (3, 6), (4, 9), (5, 18), (6, 72), (7, 360)] {
+            let anchor = TdmaTime { t: 1, f: 17, m: 60, h: 2 };
+            umac.dltime = anchor;
+            let due = umac
+                .next_energy_economy_mcch_for_assignment(mode, Some(anchor.f), Some(anchor.m))
+                .expect("valid EE assignment has a reception opportunity");
+            assert_eq!(due, anchor.add_timeslots(period * 4), "EG{mode} must use the spec frame period");
+            umac.dltime = due;
+            let next = umac
+                .next_energy_economy_mcch_for_assignment(mode, Some(anchor.f), Some(anchor.m))
+                .expect("EE cycle continues after hyperframe rollover");
+            assert_eq!(next, due.add_timeslots(period * 4), "EG{mode} must keep its phase");
+        }
+    }
+
+    #[test]
+    fn all_ms_broadcast_reaches_distinct_ee_frames_without_group_affiliation() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let config = SharedConfig::from_parts(config, None);
+        for (issi, frame) in [(430_893, 2), (430_905, 5), (77_480, 5)] {
+            let mut state = config.state_write();
+            state.subscribers.register(issi);
+            assert!(state.subscribers.set_energy_economy(issi, 5, Some(frame), Some(1)));
+            state.subscribers.mark_active(issi);
+        }
+        let mut umac = UmacBs::new(config);
+        let mut queue = MessageQueue::new();
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("0010000100000000000000100111"),
+                    main_address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+        let mut due = umac.deferred_mcch.iter().map(|replay| replay.due).collect::<Vec<_>>();
+        due.sort_by_key(|time| time.to_int());
+        assert_eq!(
+            due,
+            vec![TdmaTime { t: 1, f: 2, m: 1, h: 0 }, TdmaTime { t: 1, f: 5, m: 1, h: 0 }],
+            "each listening phase gets one copy, including the unassociated all-MS address"
+        );
     }
 
     #[test]
