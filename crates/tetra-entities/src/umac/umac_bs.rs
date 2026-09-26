@@ -2149,20 +2149,12 @@ impl UmacBs {
             let channels = self.channel_scheduler.active_downlink_traffic_channels();
             for (timeslot, usage) in &channels {
                 let mut copy = prim.clone();
-                // Address the D-CK change notice to the assigned group, but
-                // send it clear as TTR 001-11 §6.2.14.2 permits. A terminal
-                // still on an older GCK-VN cannot decrypt this with the
-                // serving cell's current MGCK to learn the correct version.
-                // The separate MCCH copy remains all-MS addressed.
-                if let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
-                    self.channel_scheduler.traffic_aie(*timeslot)
-                {
-                    copy.main_address = TetraAddress::new(gssi, SsiType::Gssi);
-                    copy.air_interface_encryption = Some(AieRequest::clear(
-                        AieSubject::Group { gssi },
-                        AieScope::MacResource,
-                    ));
-                }
+                // Keep the all-MS broadcast address on assigned channels.
+                // TTR 001-11 §6.2.7.1 permits a broadcast CK change on any
+                // channel. Its §6.2.10 reserves CMG GSSIs for group-addressed
+                // security signalling; the active *talkgroup* is not a CMG.
+                // Readdressing this MM PDU to the talkgroup made it invisible
+                // to MS-MM during the observed in-call GCK rollover.
                 // The synthetic association is routing-only. call_id zero is
                 // never exposed on air; timeslot selects the TCH. Its usage
                 // marker is route metadata, not part of this broadcast PDU.
@@ -3825,10 +3817,7 @@ mod tests {
                     endpoint_id: 0,
                     stealing_permission: true,
                     subscriber_class: 0,
-                    air_interface_encryption: Some(AieRequest::sc3(
-                        AieSubject::Group { gssi: 0x00ff_ffff },
-                        AieScope::MacResource,
-                    )),
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::System, AieScope::MacResource)),
                     stealing_repeats_flag: None,
                     data_category: None,
                     chan_alloc: None,
@@ -3843,15 +3832,15 @@ mod tests {
         umac.channel_scheduler.cur_dltime = TdmaTime { t: 1, f: 5, m: 1, h: 0 };
         let output = umac.channel_scheduler.finalize_ts_for_tick();
         assert_eq!(output.ts.t, 2);
-        let mut stch = output.blk1.expect("group rollover STCH");
+        let mut stch = output.blk1.expect("broadcast rollover STCH");
         assert_eq!(stch.logical_channel, LogicalChannel::Stch);
         assert_eq!(
             stch.air_interface_encryption,
-            Some(AieRequest::clear(AieSubject::Group { gssi }, AieScope::Facch))
+            Some(AieRequest::clear(AieSubject::System, AieScope::Facch))
         );
         stch.mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut stch.mac_block).expect("valid STCH MAC-RESOURCE");
-        assert_eq!(resource.addr.expect("group address").ssi, gssi);
+        assert_eq!(resource.addr.expect("broadcast address").ssi, 0x00ff_ffff);
         assert_eq!(resource.encryption_mode, 0);
         assert!(resource.usage_marker.is_none());
     }

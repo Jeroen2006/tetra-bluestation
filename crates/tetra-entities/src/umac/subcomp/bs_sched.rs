@@ -2063,20 +2063,11 @@ impl BsChannelScheduler {
         buffer
     }
 
-    fn build_final_gck_rollover_slot(&mut self, mut item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
+    fn build_final_gck_rollover_slot(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
         let assigned_channel = ts.t != 1 && self.assigned_channel_is_active(ts.t);
-        if assigned_channel
-            && let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
-                self.traffic_aie[ts.t as usize - 1]
-        {
-            // An assigned-group listener follows this FN18 slot. Send the
-            // GSSI-addressed D-CK change notice clear as permitted by
-            // TTR 001-11 §6.2.14.2; a terminal with a stale GCK must still
-            // be able to read the immediate switch announcement.
-            item.pdu.addr = Some(TetraAddress::new(gssi, SsiType::Gssi));
-            item.aie_request = AieRequest::clear(AieSubject::Group { gssi }, AieScope::MacResource);
-            tracing::info!(dltime = %ts, gssi, "addressing final GCK rollover Immediate to assigned group");
-        }
+        // The Immediate is broadcast addressed even on an assigned channel.
+        // The voice GSSI is not the CMG GSSI for group-addressed security
+        // signalling (TTR 001-11 §6.2.10).
         let ul_phy_chan = if assigned_channel {
             PhysicalChannel::Tp
         } else {
@@ -6943,7 +6934,7 @@ mod tests {
     }
 
     #[test]
-    fn final_gck_immediate_on_group_tch_is_group_addressed_and_clear() {
+    fn final_gck_immediate_on_group_tch_is_broadcast_addressed_and_clear() {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig};
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -7003,7 +6994,7 @@ mod tests {
                 activation,
                 resource,
                 sdu,
-                AieRequest::sc3(AieSubject::Group { gssi: all_ms.ssi }, AieScope::MacResource),
+                AieRequest::clear(AieSubject::System, AieScope::MacResource),
             )
             .expect("reserve Immediate on all slots");
         sched.cur_dltime = activation.add_timeslots(-4);
@@ -7018,8 +7009,8 @@ mod tests {
             .mac_block;
         block.seek(0);
         let header = MacResource::from_bitbuf(&mut block).expect("Immediate MAC-RESOURCE");
-        let address = header.addr.expect("group address");
-        assert_eq!(address.ssi, gssi);
+        let address = header.addr.expect("broadcast address");
+        assert_eq!(address.ssi, 0x00ff_ffff);
         // MAC-RESOURCE's SSI address field does not distinguish ISSI/GSSI.
         assert_eq!(address.ssi_type, SsiType::Ssi);
         assert_eq!(header.encryption_mode, 0);
