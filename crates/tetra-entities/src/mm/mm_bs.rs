@@ -243,6 +243,8 @@ struct PendingOtarDelivery {
     air_handle: u32,
     kind: OtarDownlinkKind,
     expected_response: Option<OtarTerminalResponse>,
+    /// GCK RESULT has no command identifier; retain the public key identities.
+    gck_keys: Option<Vec<(u16, u16)>>,
     tx_reporter: TxReporter,
     status: OtarDeliveryStatus,
     result_deadline: TdmaTime,
@@ -938,6 +940,44 @@ impl MmBs {
         self.report_rollover_otar_status(command_id, issi, air_handle, kind, "key-result", Some(success));
     }
 
+    fn complete_gck_terminal_response(
+        &mut self,
+        issi: u32,
+        air_handle: u32,
+        result: &tetra_pdus::mm::pdus::otar::UGckResult,
+    ) {
+        if result.results.is_empty() {
+            return;
+        }
+        let mut result_keys = result.results.iter()
+            .map(|entry| (entry.gck_number, entry.version_number))
+            .collect::<Vec<_>>();
+        result_keys.sort_unstable();
+        let success = result.results.iter().all(|entry| entry.provision_result == 0);
+        let matching = self.pending_otar_deliveries.iter().filter_map(|(&command_id, pending)| {
+            (pending.issi == issi
+                && pending.air_handle == air_handle
+                && pending.expected_response == Some(OtarTerminalResponse::GckResult)
+                && matches!(pending.status, OtarDeliveryStatus::AirTransmitted
+                    | OtarDeliveryStatus::LinkAcknowledged
+                    | OtarDeliveryStatus::AwaitingTerminalResult)
+                && pending.gck_keys.as_deref() == Some(result_keys.as_slice()))
+                .then_some(command_id)
+        }).collect::<Vec<_>>();
+        if matching.is_empty() {
+            tracing::debug!(issi, air_handle, ?result_keys,
+                "U-OTAR GCK RESULT has no matching transmitted provision");
+            return;
+        }
+        // Identical already-transmitted provisions carry the same key set;
+        // the air result cannot identify one of their command IDs.
+        for command_id in matching {
+            self.complete_otar_delivery(command_id, OtarDeliveryStatus::TerminalResult { success });
+            tracing::debug!(command_id, issi, air_handle, success,
+                "U-OTAR GCK RESULT correlated by GCKN and version");
+        }
+    }
+
     /// Decode Table A.35. The optional RAND2 is a Type-2 field, so even an
     /// Authentication Uplink that only requests the CK contains two bits:
     /// the request flag followed by the Type-2 presence flag. Do not discard
@@ -1305,10 +1345,9 @@ impl MmBs {
     }
 
     /// Queue the TTR 001-11 table-1 full current GCK-VN advertisement. It is
-    /// broadcast-addressed and unacknowledged. Protect it with the serving
-    /// cell's CCK: security clause 4.2.3 assigns CCK to broadcast addresses,
-    /// and the all-MS address has no associated GCK. Clause 6.2.14.2 permits
-    /// clear delivery, but does not require it.
+    /// broadcast-addressed and unacknowledged. Send it clear as permitted by
+    /// TTR 001-11 clause 6.2.14.2: a terminal still using an old GCK version
+    /// must be able to read the full current version on MCCH.
     fn send_gck_change_broadcast(
         &self,
         queue: &mut MessageQueue,
@@ -1340,7 +1379,7 @@ impl MmBs {
                 stealing_permission: traffic_channels,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
-                aie_request: AieRequest::sc3(AieSubject::Group { gssi: 0x00ff_ffff }, AieScope::MacResource),
+                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
                 is_null_pdu: false,
                     assigned_channel_frame18_broadcast: false,
                 frame18_rollover_activation,
@@ -2885,13 +2924,7 @@ impl MmBs {
                 result.results.iter().all(|entry| entry.provision_result == 0),
             ),
             UOtar::GckResult(result) => {
-                let all_accepted = !result.results.is_empty() && result.results.iter().all(|entry| entry.provision_result == 0);
-                self.complete_otar_terminal_response(
-                    prim.received_address.ssi,
-                    prim.handle,
-                    OtarTerminalResponse::GckResult,
-                    all_accepted,
-                );
+                self.complete_gck_terminal_response(prim.received_address.ssi, prim.handle, result);
 
                 self.refresh_group_security_after_gck_result(queue, prim.received_address.ssi, prim.handle, result);
             }
@@ -5616,6 +5649,16 @@ impl TetraEntityTrait for MmBs {
                             air_handle,
                             kind,
                             expected_response: kind.expected_response(),
+                            gck_keys: match &pdu {
+                                DOtar::GckProvide(provide) => {
+                                    let mut keys = provide.keys.iter()
+                                        .map(|key| (key.gck_number, key.version_number))
+                                        .collect::<Vec<_>>();
+                                    keys.sort_unstable();
+                                    Some(keys)
+                                }
+                                _ => None,
+                            },
                             tx_reporter: tx_reporter.clone(),
                             status: OtarDeliveryStatus::Queued,
                             result_deadline: self.current_time.add_timeslots(ROLLOVER_OTAR_RESULT_TIMEOUT_TIMESLOTS),
@@ -5955,7 +5998,7 @@ impl TetraEntityTrait for MmBs {
 #[cfg(test)]
 mod tests {
     use super::{
-        MmBs, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
+        MmBs, OtarDeliveryStatus, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingOtarDelivery, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
         otar_downlink_is_group_addressed,
         sc2_ksg_number, supports_security_information_protocol,
     };
@@ -6936,10 +6979,9 @@ mod tests {
         assert!(matches!(request.address.ssi_type, tetra_core::SsiType::Gssi));
         assert!(matches!(
             request.aie_request,
-            AieRequest::Sc3 {
-                subject: AieSubject::Group { gssi: 0x00ff_ffff },
+            AieRequest::Clear {
+                subject: AieSubject::System,
                 scope: AieScope::MacResource,
-                key: None,
             }
         ));
     }
@@ -6963,6 +7005,39 @@ mod tests {
             Some(OtarTerminalResponse::CmgGtsiResult)
         );
         assert_eq!(OtarDownlinkKind::SckReject.expected_response(), None);
+    }
+
+    #[test]
+    fn concurrent_gck_results_match_the_provided_key_set() {
+        use tetra_pdus::mm::pdus::otar::{GckProvisionResult, OtarTail, UGckResult};
+
+        let mut mm = MmBs::new(test_config(), None, None, None);
+        let issi = 77_491;
+        for (command_id, keys) in [
+            (1, vec![(2, 13), (2, 14), (4, 13), (4, 14)]),
+            (2, vec![(1, 13), (1, 14)]),
+            (3, vec![(2, 13), (2, 14), (4, 13), (4, 14)]),
+        ] {
+            mm.pending_otar_deliveries.insert(command_id, PendingOtarDelivery {
+                command_id, issi, air_handle: 0, kind: OtarDownlinkKind::GckProvide,
+                expected_response: Some(OtarTerminalResponse::GckResult),
+                gck_keys: Some(keys), tx_reporter: TxReporter::new(),
+                status: OtarDeliveryStatus::AwaitingTerminalResult,
+                result_deadline: mm.current_time.add_timeslots(100),
+            });
+        }
+        let result = UGckResult {
+            results: [(4, 14), (2, 13), (4, 13), (2, 14)].into_iter().map(|(gck_number, version_number)| {
+                GckProvisionResult { gck_number, version_number, provision_result: 0, current_version_number: None }
+            }).collect(),
+            tail: OtarTail::default(),
+        };
+        mm.complete_gck_terminal_response(issi, 0, &result);
+        assert!(!mm.pending_otar_deliveries.contains_key(&1));
+        assert!(mm.pending_otar_deliveries.contains_key(&2));
+        assert!(!mm.pending_otar_deliveries.contains_key(&3));
+        assert_eq!(mm.recent_otar_deliveries.iter().filter(|entry|
+            matches!(entry.status, OtarDeliveryStatus::TerminalResult { success: true })).count(), 2);
     }
 
     #[test]

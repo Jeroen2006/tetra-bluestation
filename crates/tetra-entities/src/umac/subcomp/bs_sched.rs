@@ -1984,9 +1984,10 @@ impl BsChannelScheduler {
         if !activation.is_valid() || activation.t != 1 || activation.f != 1 {
             return Err("SC3G rollover activation must be TS1/FN1");
         }
-        if !pdu.addr.is_some_and(|address| {
-            address.ssi == 0x00ff_ffff && address.ssi_type == SsiType::Gssi
-        }) {
+        if !pdu
+            .addr
+            .is_some_and(|address| address.ssi == 0x00ff_ffff && address.ssi_type == SsiType::Gssi)
+        {
             return Err("SC3G rollover Immediate must be all-MS GSSI addressed");
         }
         // A final `Immediate` is an atomic four-timeslot operation. A
@@ -2045,12 +2046,7 @@ impl BsChannelScheduler {
         self.final_gck_rollover_immediate.iter().filter(|reservation| reservation.is_some()).count()
     }
 
-    fn build_final_gck_rollover_resource(
-        &mut self,
-        item: FinalGckRolloverImmediate,
-        ts: TdmaTime,
-        capacity: usize,
-    ) -> BitBuffer {
+    fn build_final_gck_rollover_resource(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime, capacity: usize) -> BitBuffer {
         let pdu = self
             .prepare_downlink_resource(item.pdu, item.aie_request, ts)
             .expect("reserved SC3G GCK rollover Immediate has a valid old-key context");
@@ -2073,12 +2069,12 @@ impl BsChannelScheduler {
             && let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
                 self.traffic_aie[ts.t as usize - 1]
         {
-            // The active group follows its assigned channel at FN18. Give
-            // it the same group address and pre-rollover MGCK as its other
-            // call control, rather than an all-MS/CCK resource which some
-            // terminals do not apply while staying in the call.
+            // An assigned-group listener follows this FN18 slot. Send the
+            // GSSI-addressed D-CK change notice clear as permitted by
+            // TTR 001-11 §6.2.14.2; a terminal with a stale GCK must still
+            // be able to read the immediate switch announcement.
             item.pdu.addr = Some(TetraAddress::new(gssi, SsiType::Gssi));
-            item.aie_request = AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
+            item.aie_request = AieRequest::clear(AieSubject::Group { gssi }, AieScope::MacResource);
             tracing::info!(dltime = %ts, gssi, "addressing final GCK rollover Immediate to assigned group");
         }
         let ul_phy_chan = if assigned_channel {
@@ -6907,12 +6903,7 @@ mod tests {
         // TS1/FN1/MN2 makes the preceding FN18 a regular frame-18 across
         // all four physical timeslots while still exercising mandatory BSCH
         // and BNCH mapping selected by the multiframe counter.
-        let activation = TdmaTime {
-            t: 1,
-            f: 1,
-            m: 2,
-            h: 0,
-        };
+        let activation = TdmaTime { t: 1, f: 1, m: 2, h: 0 };
         let address = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
         let mut resource = BsChannelScheduler::dl_make_minimal_resource(&address, None, false);
         resource.update_len_and_fill_ind(0);
@@ -6952,7 +6943,7 @@ mod tests {
     }
 
     #[test]
-    fn final_gck_immediate_on_group_tch_uses_pre_rollover_group_context() {
+    fn final_gck_immediate_on_group_tch_is_group_addressed_and_clear() {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig};
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -7027,13 +7018,11 @@ mod tests {
             .mac_block;
         block.seek(0);
         let header = MacResource::from_bitbuf(&mut block).expect("Immediate MAC-RESOURCE");
-        let group_request = AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource);
-        let old = provider.resolve(group_request, AieDirection::Downlink, output.ts).expect("old MGCK");
-        let new = provider.resolve(group_request, AieDirection::Downlink, activation).expect("new MGCK");
-        assert_ne!(old, new);
-        let gesi = provider.encrypted_short_identity(old, gssi).expect("group GESI");
-        assert_eq!(header.addr.expect("group address").ssi, gesi);
-        assert_ne!(header.encryption_mode, 0);
+        let address = header.addr.expect("group address");
+        assert_eq!(address.ssi, gssi);
+        // MAC-RESOURCE's SSI address field does not distinguish ISSI/GSSI.
+        assert_eq!(address.ssi_type, SsiType::Ssi);
+        assert_eq!(header.encryption_mode, 0);
         assert!(header.usage_marker.is_none());
     }
 
@@ -7043,18 +7032,8 @@ mod tests {
         let address = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
         let mut resource = BsChannelScheduler::dl_make_minimal_resource(&address, None, false);
         resource.update_len_and_fill_ind(0);
-        let old_activation = TdmaTime {
-            t: 1,
-            f: 1,
-            m: 1,
-            h: 0,
-        };
-        let activation = TdmaTime {
-            t: 1,
-            f: 1,
-            m: 2,
-            h: 0,
-        };
+        let old_activation = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let activation = TdmaTime { t: 1, f: 1, m: 2, h: 0 };
         sched
             .reserve_gck_rollover_immediate(
                 old_activation,
@@ -7076,10 +7055,12 @@ mod tests {
                 AieRequest::clear(AieSubject::System, AieScope::MacResource),
             )
             .expect("replace stale final Immediate");
-        assert!(sched
-            .final_gck_rollover_immediate
-            .iter()
-            .all(|entry| entry.as_ref().is_some_and(|item| item.activation == activation)));
+        assert!(
+            sched
+                .final_gck_rollover_immediate
+                .iter()
+                .all(|entry| entry.as_ref().is_some_and(|item| item.activation == activation))
+        );
 
         sched.cur_dltime = activation.add_timeslots(-5);
         for timeslot in 1..=4 {

@@ -2113,9 +2113,9 @@ impl UmacBs {
                 );
                 return;
             }
-            let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
-                AieRequest::clear(AieSubject::System, AieScope::MacResource)
-            });
+            let aie_request = prim
+                .air_interface_encryption
+                .unwrap_or_else(|| AieRequest::clear(AieSubject::System, AieScope::MacResource));
             let mut pdu = MacResource {
                 fill_bits: false,
                 pos_of_grant: 0,
@@ -2149,16 +2149,16 @@ impl UmacBs {
             let channels = self.channel_scheduler.active_downlink_traffic_channels();
             for (timeslot, usage) in &channels {
                 let mut copy = prim.clone();
-                // A listener on an assigned group channel follows that
-                // channel's group address and cipher context. Address the
-                // change notice to the actual group there, so it is decoded
-                // with the same (still current) MGCK as other call control.
+                // Address the D-CK change notice to the assigned group, but
+                // send it clear as TTR 001-11 §6.2.14.2 permits. A terminal
+                // still on an older GCK-VN cannot decrypt this with the
+                // serving cell's current MGCK to learn the correct version.
                 // The separate MCCH copy remains all-MS addressed.
                 if let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, .. }) =
                     self.channel_scheduler.traffic_aie(*timeslot)
                 {
                     copy.main_address = TetraAddress::new(gssi, SsiType::Gssi);
-                    copy.air_interface_encryption = Some(AieRequest::sc3(
+                    copy.air_interface_encryption = Some(AieRequest::clear(
                         AieSubject::Group { gssi },
                         AieScope::MacResource,
                     ));
@@ -3776,7 +3776,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_iv_notice_on_group_tch_uses_group_key_and_fits_stch() {
+    fn absolute_iv_notice_on_group_tch_is_clear_and_fits_stch() {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm};
 
         let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -3847,19 +3847,12 @@ mod tests {
         assert_eq!(stch.logical_channel, LogicalChannel::Stch);
         assert_eq!(
             stch.air_interface_encryption,
-            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Facch))
+            Some(AieRequest::clear(AieSubject::Group { gssi }, AieScope::Facch))
         );
         stch.mac_block.seek(0);
         let resource = MacResource::from_bitbuf(&mut stch.mac_block).expect("valid STCH MAC-RESOURCE");
-        let group_context = umac
-            .aie_provider
-            .resolve(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource), AieDirection::Downlink, output.ts)
-            .expect("current group key");
-        let gesi = umac.aie_provider.encrypted_short_identity(group_context, gssi).expect("group GESI");
-        // The MAC parser represents the shared 24-bit SSI/GESI wire field as
-        // Ssi; encryption_mode distinguishes its encrypted interpretation.
-        assert_eq!(resource.addr.expect("group address").ssi, gesi);
-        assert_ne!(resource.encryption_mode, 0);
+        assert_eq!(resource.addr.expect("group address").ssi, gssi);
+        assert_eq!(resource.encryption_mode, 0);
         assert!(resource.usage_marker.is_none());
     }
 
@@ -3871,12 +3864,7 @@ mod tests {
         )))
         .expect("example configuration must remain valid");
         let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
-        let activation = TdmaTime {
-            t: 1,
-            f: 1,
-            m: 2,
-            h: 0,
-        };
+        let activation = TdmaTime { t: 1, f: 1, m: 2, h: 0 };
         // MM -> MLE -> LLC -> UMAC needs one scheduler tick before UMAC
         // builds TS1/FN18.  The marker therefore arrives while TS4/FN17 is
         // being finalized, rather than after TS1/FN18 has already gone out.
