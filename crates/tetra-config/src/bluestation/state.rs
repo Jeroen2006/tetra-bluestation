@@ -133,6 +133,9 @@ pub struct RuntimeSc3Aie {
     linked_gck_crypto_periods: bool,
     gck_vn: u16,
     gcks: HashMap<u16, RuntimeSc3Gck>,
+    /// Keys retained for traffic channels allocated before a rollover. A
+    /// running call keeps its original GCK until the channel is released.
+    retired_gcks: HashMap<(u16, u16), RuntimeSc3Gck>,
     future_gck_vn: Option<u16>,
     future_gcks: HashMap<u16, RuntimeSc3Gck>,
     gck_rollover: Option<RuntimeSc3GRollover>,
@@ -160,6 +163,7 @@ impl RuntimeSc3Aie {
             linked_gck_crypto_periods: false,
             gck_vn: 0,
             gcks: HashMap::new(),
+            retired_gcks: HashMap::new(),
             future_gck_vn: None,
             future_gcks: HashMap::new(),
             gck_rollover: None,
@@ -234,8 +238,15 @@ impl RuntimeSc3Aie {
         let next_rollover = rollover.map(|(rollover_id, activation_unix)| RuntimeSc3GRollover {
             rollover_id,
             activation_unix,
-            local_activation_tdma: self.gck_rollover.as_ref().filter(|old| old.rollover_id == rollover_id).and_then(|old| old.local_activation_tdma),
-            activated: self.gck_rollover.as_ref().is_some_and(|old| old.rollover_id == rollover_id && old.activated),
+            local_activation_tdma: self
+                .gck_rollover
+                .as_ref()
+                .filter(|old| old.rollover_id == rollover_id)
+                .and_then(|old| old.local_activation_tdma),
+            activated: self
+                .gck_rollover
+                .as_ref()
+                .is_some_and(|old| old.rollover_id == rollover_id && old.activated),
         });
 
         // The SwMI promotes durable state at the UTC deadline so a BS which
@@ -246,9 +257,10 @@ impl RuntimeSc3Aie {
         // local Absolute-IV boundary.  The association table is still safe
         // to refresh because GCKNs do not change in a linked crypto period.
         let waiting_for_local_activation = rollover.is_none()
-            && self.gck_rollover.as_ref().is_some_and(|old| {
-                !old.activated && old.local_activation_tdma.is_some()
-            })
+            && self
+                .gck_rollover
+                .as_ref()
+                .is_some_and(|old| !old.activated && old.local_activation_tdma.is_some())
             && self.future_gck_vn == Some(gck_vn)
             && self.future_gcks == next_keys;
         if waiting_for_local_activation {
@@ -270,6 +282,11 @@ impl RuntimeSc3Aie {
             || self.group_associations != next_associations;
         self.sc3g_revision = revision;
         self.linked_gck_crypto_periods = linked_gck_crypto_periods;
+        if self.gck_vn != gck_vn {
+            for key in self.gcks.values() {
+                self.retired_gcks.insert((key.gckn, key.gck_vn), key.clone());
+            }
+        }
         self.gck_vn = gck_vn;
         self.gcks = next_keys;
         self.future_gck_vn = future_gck_vn;
@@ -300,11 +317,21 @@ impl RuntimeSc3Aie {
     }
 
     fn gck_at(&self, gckn: u16, time: TdmaTime) -> Option<&RuntimeSc3Gck> {
-        if self.gck_rollover.as_ref().is_some_and(|rollover| rollover.local_activation_tdma.is_some_and(|activation| activation.age(time) >= 0)) {
+        if self
+            .gck_rollover
+            .as_ref()
+            .is_some_and(|rollover| rollover.local_activation_tdma.is_some_and(|activation| activation.age(time) >= 0))
+        {
             self.future_gcks.get(&gckn)
         } else {
             self.gcks.get(&gckn)
         }
+    }
+
+    fn gck_by_version(&self, gckn: u16, gck_vn: u16) -> Option<&RuntimeSc3Gck> {
+        self.gcks.get(&gckn).filter(|key| key.gck_vn == gck_vn)
+            .or_else(|| self.future_gcks.get(&gckn).filter(|key| key.gck_vn == gck_vn))
+            .or_else(|| self.retired_gcks.get(&(gckn, gck_vn)))
     }
 
     pub fn gck_rollover_notification(&self) -> Option<(u64, u16, Option<TdmaTime>)> {
@@ -321,7 +348,12 @@ impl RuntimeSc3Aie {
         if rollover.activated || rollover.local_activation_tdma.is_some() {
             return None;
         }
-        let slots = rollover.activation_unix.saturating_sub(unix_now).saturating_mul(1200).saturating_add(16) / 17;
+        let slots = rollover
+            .activation_unix
+            .saturating_sub(unix_now)
+            .saturating_mul(1200)
+            .saturating_add(16)
+            / 17;
         let slots = i32::try_from(slots).ok()?;
         let target = current.add_timeslots(slots).forward_to_multiframe_start();
         rollover.local_activation_tdma = Some(target);
@@ -337,6 +369,9 @@ impl RuntimeSc3Aie {
         let future_vn = self.future_gck_vn?;
         if self.future_gcks.is_empty() {
             return None;
+        }
+        for key in self.gcks.values() {
+            self.retired_gcks.insert((key.gckn, key.gck_vn), key.clone());
         }
         self.gck_vn = future_vn;
         self.gcks = self.future_gcks.clone();
@@ -642,6 +677,7 @@ impl RuntimeAieConfig {
             next.linked_gck_crypto_periods = old.linked_gck_crypto_periods;
             next.gck_vn = old.gck_vn;
             next.gcks = old.gcks.clone();
+            next.retired_gcks = old.retired_gcks.clone();
             next.future_gck_vn = old.future_gck_vn;
             next.future_gcks = old.future_gcks.clone();
             next.gck_rollover = old.gck_rollover.clone();
@@ -950,10 +986,19 @@ impl BsAieKeyProvider {
             } => {
                 let state = self.config.state_read();
                 let sc3 = active_sc3(&state.aie)?;
-                let key = sc3_identifier_for_subject(sc3, subject, time)?;
-                if requested_key.is_some_and(|requested| requested != key) {
-                    return Err(AieContextError::StaleKeyIdentity);
-                }
+                let key = match requested_key {
+                    Some(requested) if requested.key_type == Sc3KeyType::Gck => {
+                        sc3_pinned_gck(sc3, subject, requested)?;
+                        requested
+                    }
+                    requested => {
+                        let current = sc3_identifier_for_subject(sc3, subject, time)?;
+                        if requested.is_some_and(|key| key != current) {
+                            return Err(AieContextError::StaleKeyIdentity);
+                        }
+                        current
+                    }
+                };
                 Ok(tetra_core::AieContext::sc3(subject, direction, time, scope, key))
             }
         }
@@ -1330,7 +1375,9 @@ impl BsAieKeyProvider {
         }
         let state = self.config.state_read();
         let sc3 = active_sc3(&state.aie)?;
-        if sc3_identifier_for_subject(sc3, subject, time)? != key {
+        if key.key_type == Sc3KeyType::Gck {
+            sc3_pinned_gck(sc3, subject, key)?;
+        } else if sc3_identifier_for_subject(sc3, subject, time)? != key {
             return Err(AieContextError::StaleKeyIdentity);
         }
         let material = match key.key_type {
@@ -1340,13 +1387,7 @@ impl BsAieKeyProvider {
                 sc3.dcks.get(&issi).ok_or(AieContextError::DckNotProvisioned(issi))?.key
             }
             Sc3KeyType::Gck => {
-                let gssi = subject_gssi(subject).ok_or(AieContextError::UnsupportedSubject)?;
-                let gckn = sc3
-                    .group_associations
-                    .get(&gssi)
-                    .copied()
-                    .ok_or(AieContextError::StaleKeyIdentity)?;
-                let gck = sc3.gck_at(gckn, time).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+                let gck = sc3_pinned_gck(sc3, subject, key)?;
                 tetra_crypto::ta71(&gck.key, &sc3.cck)
             }
         };
@@ -1385,6 +1426,28 @@ fn subject_gssi(subject: AieSubject) -> Option<u32> {
         } => Some(gssi),
         _ => None,
     }
+}
+
+fn sc3_pinned_gck(
+    sc3: &RuntimeSc3Aie,
+    subject: AieSubject,
+    key: Sc3KeyIdentifier,
+) -> Result<&RuntimeSc3Gck, AieContextError> {
+    let gssi = subject_gssi(subject).ok_or(AieContextError::UnsupportedSubject)?;
+    let gckn = sc3.group_associations.get(&gssi).copied().ok_or(AieContextError::StaleKeyIdentity)?;
+    let gck_vn = u16::from_be_bytes([key.context_id[14], key.context_id[15]]);
+    let gck = sc3.gck_by_version(gckn, gck_vn).ok_or(AieContextError::GckNotProvisioned(gckn))?;
+    let mut context_id = [0_u8; 16];
+    context_id[12..14].copy_from_slice(&gckn.to_be_bytes());
+    context_id[14..].copy_from_slice(&gck_vn.to_be_bytes());
+    let algorithm = match sc3.algorithm {
+        RuntimeSc3TeaAlgorithm::Tea1 => AieAlgorithm::Tea1,
+        RuntimeSc3TeaAlgorithm::Tea3 => AieAlgorithm::Tea3,
+    };
+    if key != (Sc3KeyIdentifier { algorithm, cck_id: sc3.cck_id, context_id, key_type: Sc3KeyType::Gck }) {
+        return Err(AieContextError::StaleKeyIdentity);
+    }
+    Ok(gck)
 }
 
 fn sc3_identifier_for_subject(sc3: &RuntimeSc3Aie, subject: AieSubject, time: TdmaTime) -> Result<Sc3KeyIdentifier, AieContextError> {
@@ -1947,10 +2010,7 @@ pub struct RuntimeSc3GRolloverEvent {
 /// is compact and unambiguous (HN16, MN6, FN5, zero-based TN).
 pub fn pack_sc3g_absolute_iv(time: TdmaTime) -> u32 {
     debug_assert!(time.is_valid());
-    (u32::from(time.h) << 14)
-        | (u32::from(time.m) << 8)
-        | (u32::from(time.f) << 3)
-        | u32::from(time.t - 1)
+    (u32::from(time.h) << 14) | (u32::from(time.m) << 8) | (u32::from(time.f) << 3) | u32::from(time.t - 1)
 }
 
 #[cfg(test)]
@@ -2618,6 +2678,53 @@ mod tests {
     }
 
     #[test]
+    fn sc3g_traffic_can_keep_its_original_key_after_cell_rollover() {
+        let config = test_shared_config();
+        let mut sc3 = test_sc3(9);
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 1 };
+        sc3.apply_sc3g_snapshot_with_rollover(
+            1, true, 7, vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])],
+            Some(8), vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])],
+            Some((11, 1_002)), vec![(101, 4)],
+        ).unwrap();
+        let (_, activation) = sc3.schedule_gck_rollover(1_000, start).unwrap();
+        config.state_write().aie = RuntimeAieConfig {
+            enabled: true, sc1_allowed: false, sc2: None, sc3: Some(sc3), rollover: None,
+        };
+        let provider = BsAieKeyProvider::new(config.clone());
+        let subject = AieSubject::Group { gssi: 101 };
+        let old = provider.resolve(
+            AieRequest::sc3(subject, AieScope::Traffic), AieDirection::Downlink,
+            activation.add_timeslots(-1),
+        ).unwrap();
+        let AieContext::Sc3 { key: old_key, .. } = old else { panic!("GCK context") };
+
+        {
+            let mut state = config.state_write();
+            let sc3 = state.aie.sc3.as_mut().unwrap();
+            assert_eq!(sc3.activate_gck_rollover_if_due(activation), Some(11));
+            sc3.apply_sc3g_snapshot(2, true, 8,
+                vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])], vec![(101, 4)]).unwrap();
+        }
+        let air_time = activation.add_timeslots(12);
+        let pinned = provider.resolve(
+            AieRequest::sc3_with_key(subject, AieScope::Traffic, old_key),
+            AieDirection::Downlink, air_time,
+        ).expect("existing call retains the old GCK");
+        let new_call = provider.resolve(
+            AieRequest::sc3(subject, AieScope::Traffic), AieDirection::Downlink, air_time,
+        ).expect("new call uses the new GCK");
+        let AieContext::Sc3 { key: pinned_key, .. } = pinned else { panic!("pinned GCK context") };
+        let AieContext::Sc3 { key: new_key, .. } = new_call else { panic!("new GCK context") };
+        assert_eq!(pinned_key, old_key);
+        assert_ne!(pinned_key, new_key);
+        let mut payload = BitBuffer::new_autoexpand(64);
+        payload.write_bits(0, 64);
+        provider.cipher_downlink_traffic(pinned, &mut payload, 0, 64)
+            .expect("old key material remains usable until channel release");
+    }
+
+    #[test]
     fn compatible_sc3_cell_update_preserves_sc3g_snapshot() {
         let mut previous_sc3 = test_sc3(9);
         previous_sc3
@@ -2663,9 +2770,7 @@ mod tests {
         )
         .expect("staged SC3G snapshot");
 
-        let (rollover_id, activation) = sc3
-            .schedule_gck_rollover(1_000, current)
-            .expect("local rollover schedule");
+        let (rollover_id, activation) = sc3.schedule_gck_rollover(1_000, current).expect("local rollover schedule");
         assert_eq!(rollover_id, 91);
         assert_eq!((activation.t, activation.f), (1, 1));
         assert_eq!(sc3.gck_vn_at(activation.add_timeslots(-1)), 7);
