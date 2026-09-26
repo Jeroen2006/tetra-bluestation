@@ -114,6 +114,10 @@ const GCK_VERSION_BROADCAST_INTERVAL_TIMESLOTS: i32 = 64 * 18 * 4;
 /// Repeat the planned change on a short cadence. The scheduler may defer these
 /// low-priority messages behind SDS/call traffic.
 const GCK_ROLLOVER_BROADCAST_INTERVAL_TIMESLOTS: i32 = 5 * 18 * 4;
+/// An individually addressed copy can be acknowledged on a listener's
+/// assigned channel. Space retries so several listeners do not monopolize
+/// the call's FN18 signalling opportunities.
+const GCK_ASSIGNED_NOTICE_INTERVAL_TIMESLOTS: i32 = 60 * 18 * 4;
 /// Repeat the exact same Absolute-IV demand in three separate rounds shortly
 /// before cutover.  Each round is sent on MCCH and as STCH on every active
 /// traffic channel.  Four frames of final lead time leaves the entity and
@@ -419,6 +423,8 @@ pub struct MmBs {
     /// Last periodic full current GCK-VN advertisement.
     last_gck_version_broadcast: Option<(u16, TdmaTime)>,
     last_gck_rollover_broadcast: Option<(u64, TdmaTime)>,
+    /// Last individual Absolute-IV notice for each current listening route.
+    assigned_gck_notices: HashMap<(u64, u32), (u8, TdmaTime)>,
     /// The final all-timeslot `Immediate` demand is one-shot and sent by a
     /// dedicated scheduler reservation, never by the best-effort queue.
     gck_rollover_immediate_sent: Option<u64>,
@@ -1102,6 +1108,7 @@ impl MmBs {
             last_rollover_broadcast: None,
             last_gck_version_broadcast: None,
             last_gck_rollover_broadcast: None,
+            assigned_gck_notices: HashMap::new(),
             gck_rollover_immediate_sent: None,
             rollover_late_broadcast_mask: None,
             current_time: TdmaTime::default(),
@@ -1410,6 +1417,81 @@ impl MmBs {
         let mcch = self.send_gck_change_broadcast(queue, gck_vn, time.clone(), false, None);
         let traffic = self.send_gck_change_broadcast(queue, gck_vn, time, true, None);
         mcch && traffic
+    }
+
+    /// Repeat the same Absolute-IV indication individually to MSs that call
+    /// control currently places on a traffic channel. A delivery route is
+    /// enough evidence here: after a BS restart a listener may be on a group
+    /// traffic channel before it has performed a new registration. TTR 001-11 §6.2.7.1
+    /// explicitly allows an individual D-CK CHANGE DEMAND on an assigned
+    /// channel. A basic-link ACK supplies delivery evidence without asking
+    /// for the layer-3 U-CK CHANGE RESULT prohibited by that clause. LLC
+    /// resolves the live route at transmission time, including a changed
+    /// scan-list slot. Two new transactions per five-second round leave the
+    /// assigned FN18 channel available for call control and SDS.
+    fn send_assigned_gck_rollover_notices(
+        &mut self,
+        queue: &mut MessageQueue,
+        rollover_id: u64,
+        gck_vn: u16,
+        activation: TdmaTime,
+        now: TdmaTime,
+    ) {
+        if activation.diff(now) <= 2 * 18 * 4 {
+            return;
+        }
+        self.assigned_gck_notices.retain(|(id, _), _| *id == rollover_id);
+        let mut listeners = {
+            let state = self.config.state_read();
+            state.subscriber_delivery_routes.iter()
+                .filter_map(|(&issi, routes)| {
+                    routes.first().map(|route| (issi, route.timeslot))
+                })
+                .filter(|(_, timeslot)| (2..=4).contains(timeslot))
+                .collect::<Vec<_>>()
+        };
+        listeners.retain(|&(issi, timeslot)| {
+            self.assigned_gck_notices.get(&(rollover_id, issi)).is_none_or(|&(previous_slot, sent)| {
+                previous_slot != timeslot || sent.age(now) >= GCK_ASSIGNED_NOTICE_INTERVAL_TIMESLOTS
+            })
+        });
+        listeners.sort_unstable_by_key(|&(issi, _)| (self.assigned_gck_notices.contains_key(&(rollover_id, issi)), issi));
+        for (issi, timeslot) in listeners.into_iter().take(2) {
+            let demand = DAllGcksChangeDemand {
+                acknowledgement_required: false,
+                gck_version_number: gck_vn,
+                time: absolute_iv_time(activation),
+            };
+            let mut sdu = BitBuffer::new_autoexpand(64);
+            if demand.to_bitbuf(&mut sdu).is_err() {
+                tracing::warn!(issi, gck_vn, "cannot encode individual assigned GCK rollover notice");
+                continue;
+            }
+            sdu.seek(0);
+            queue.push_back(SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                    sdu,
+                    handle: 0,
+                    address: TetraAddress::issi(issi),
+                    layer2service: Layer2Service::Acknowledged,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    encryption_flag: false,
+                    aie_request: self.downlink_aie_request(issi),
+                    is_null_pdu: false,
+                    assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
+                    seamless_handover: None,
+                }),
+            });
+            self.assigned_gck_notices.insert((rollover_id, issi), (timeslot, now));
+            tracing::info!(issi, timeslot, gck_vn, activation = %activation,
+                "queued acknowledged individual GCK rollover notice for assigned listener");
+        }
     }
 
     /// The final change indication is not an ordinary traffic-channel copy.
@@ -5253,6 +5335,7 @@ impl TetraEntityTrait for MmBs {
             });
             if due && self.send_gck_rollover_broadcast_round(queue, target_vn, activation) {
                 self.last_gck_rollover_broadcast = Some((rollover_id, ts));
+                self.send_assigned_gck_rollover_notices(queue, rollover_id, target_vn, activation, ts);
             }
             // UMAC finalizes one slot ahead, after consuming messages routed
             // through MM, MLE and LLC.  Queue the dedicated marker two
@@ -5269,6 +5352,7 @@ impl TetraEntityTrait for MmBs {
             }
         } else {
             self.last_gck_rollover_broadcast = None;
+            self.assigned_gck_notices.clear();
             self.gck_rollover_immediate_sent = None;
         }
         let active_gck_vn = {
@@ -6006,9 +6090,11 @@ mod tests {
     use std::collections::HashSet;
     use tetra_config::bluestation::{
         RuntimeAieConfig, RuntimeSc2TeaAlgorithm, RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
+        SubscriberDeliveryRoute,
     };
     use tetra_core::{
-        AieRequest, AieScope, AieSubject, Sap, SsiType, TxReporter, tetra_entities::TetraEntity, typed_pdu_fields::Type3FieldGeneric,
+        AieRequest, AieScope, AieSubject, Layer2Service, Sap, SsiType, TdmaTime, TxReporter, tetra_entities::TetraEntity,
+        typed_pdu_fields::Type3FieldGeneric,
     };
     use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
     use tetra_pdus::mm::fields::group_identity_security_related_information::GckSelectNumber;
@@ -6060,6 +6146,54 @@ mod tests {
                 .expect("test group must attach");
         }
         mm
+    }
+
+    #[test]
+    fn assigned_gck_rollover_notices_are_individual_acknowledged_and_bounded() {
+        let mut mm = test_sc3g_mm(77_468, &[1502]);
+        {
+            let mut state = mm.config.state_write();
+            for issi in [77_468, 77_479, 77_480, 77_491] {
+                state.subscribers.register(issi);
+                state.subscriber_delivery_routes.insert(issi, vec![SubscriberDeliveryRoute {
+                    call_id: 12,
+                    timeslot: 2,
+                    usage: 4,
+                }]);
+            }
+            // A listener can have a valid traffic route without a completed
+            // registration transaction since this BS restarted.
+        }
+        let now = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let activation = now.add_timeslots(5 * 60 * 18 * 4);
+        let mut first = MessageQueue::new();
+        mm.send_assigned_gck_rollover_notices(&mut first, 7, 15, activation, now);
+        for _ in 0..2 {
+            let message = first.pop_front().expect("two listeners in the first round");
+            let SapMsgInner::LmmMleUnitdataReq(mut request) = message.msg else {
+                panic!("individual MM notice required")
+            };
+            assert_eq!(request.layer2service, Layer2Service::Acknowledged);
+            assert!(!request.stealing_permission);
+            assert!([77_468, 77_479, 77_480, 77_491].contains(&request.address.ssi));
+            let demand = DAllGcksChangeDemand::from_bitbuf(&mut request.sdu).expect("valid CK change");
+            assert!(!demand.acknowledgement_required, "TTR 001-11 forbids L3 ACK here");
+            assert_eq!(demand.gck_version_number, 15);
+            assert!(matches!(demand.time, CkChangeTime::AbsoluteIv { .. }));
+        }
+        assert!(first.pop_front().is_none(), "one round must leave FN18 capacity for other signalling");
+        let mut second = MessageQueue::new();
+        mm.send_assigned_gck_rollover_notices(&mut second, 7, 15, activation, now.add_timeslots(5 * 18 * 4));
+        for expected in [77_480, 77_491] {
+            let SapMsgInner::LmmMleUnitdataReq(request) = second.pop_front().expect("remaining listener").msg else {
+                panic!("individual MM notice required")
+            };
+            assert_eq!(request.address.ssi, expected);
+        }
+        assert!(second.pop_front().is_none());
+        let mut third = MessageQueue::new();
+        mm.send_assigned_gck_rollover_notices(&mut third, 7, 15, activation, now.add_timeslots(10 * 18 * 4));
+        assert!(third.pop_front().is_none(), "a previous round must not immediately repeat the same notice");
     }
 
     #[test]
