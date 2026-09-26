@@ -290,9 +290,9 @@ enum CallOrigin {
 
 /// A call being released. The call is removed from active_calls when this is created, so
 /// it cannot be re-keyed or reused. D-RELEASE is stolen onto the traffic channel (it only
-/// transmits while the slot is in traffic mode) at sent_at, then the circuit is closed a
-/// couple frames later. Carries everything teardown needs, since the active_calls entry is
-/// already gone.
+/// transmits while the slot is in traffic mode). The circuit stays allocated until the
+/// transmission receipt is observed and its drain interval has elapsed. Carries everything
+/// teardown needs, since the active_calls entry is already gone.
 struct ReleasingCall {
     call_id: u16,
     ts: u8,
@@ -300,7 +300,9 @@ struct ReleasingCall {
     source_issi: u32,
     is_local: bool,
     brew_uuid: Option<uuid::Uuid>,
-    sent_at: TdmaTime,
+    queued_at: TdmaTime,
+    transmitted_at: Option<TdmaTime>,
+    tx_reporter: TxReporter,
 }
 
 struct ReleasingPrivateCircuit {
@@ -4558,7 +4560,13 @@ impl CcBsSubentity {
         match self.cached_setups.remove(&call_id) {
             Some((d_setup, dest_addr, _)) => {
                 let sdu = Self::build_d_release_from_d_setup(&d_setup, disconnect_cause);
-                queue.push_back(Self::build_sapmsg_stealing(sdu, dest_addr, ts));
+                let tx_reporter = TxReporter::new_unacked();
+                let mut message = Self::build_sapmsg_stealing(sdu, dest_addr, ts);
+                let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut message.msg else {
+                    unreachable!()
+                };
+                prim.tx_reporter = Some(tx_reporter.clone());
+                queue.push_back(message);
                 self.releasing_calls.push(ReleasingCall {
                     call_id,
                     ts,
@@ -4566,7 +4574,9 @@ impl CcBsSubentity {
                     source_issi,
                     is_local,
                     brew_uuid,
-                    sent_at: self.dltime,
+                    queued_at: self.dltime,
+                    transmitted_at: None,
+                    tx_reporter,
                 });
             }
             None => {
@@ -4576,21 +4586,35 @@ impl CcBsSubentity {
         }
     }
 
-    /// Close a releasing call's circuit once enough frames have passed since the D-RELEASE
-    /// was stolen for it to transmit. Driven once per tick.
+    /// Close a releasing call's circuit once a complete multiframe has passed since the
+    /// D-RELEASE was actually transmitted. Driven once per tick.
     fn process_releasing_calls(&mut self, queue: &mut MessageQueue) {
-        // A shared simplex slot can carry two individually addressed
-        // D-RELEASE PDUs. Keep the traffic channel for one complete
-        // multiframe so both FACCH blocks have a transmission opportunity;
-        // closing after the first one makes the other MS fall back to its
-        // local timeout and display "Geen antwoord".
+        // The FACCH queue can contain other signalling when D-RELEASE is
+        // enqueued. Keep the traffic channel for a complete multiframe after
+        // MAC actually transmits it, rather than timing teardown from enqueue.
+        // A bounded fallback prevents a permanently blocked queue from
+        // reserving the circuit forever.
         const CLOSE_AFTER_SEND_TS: i32 = 18 * 4;
+        const RELEASE_TX_TIMEOUT_TS: i32 = 18 * 4 * 3;
 
         let now = self.dltime;
         let mut resources_freed = false;
         let mut i = 0;
         while i < self.releasing_calls.len() {
-            if self.releasing_calls[i].sent_at.age(now) >= CLOSE_AFTER_SEND_TS {
+            let releasing = &mut self.releasing_calls[i];
+            if releasing.transmitted_at.is_none() && releasing.tx_reporter.is_transmitted() {
+                releasing.transmitted_at = Some(now);
+                tracing::debug!(call_id = releasing.call_id, ts = releasing.ts, "group D-RELEASE transmitted on FACCH");
+            }
+            let transmitted_and_drained = releasing.transmitted_at
+                .is_some_and(|transmitted_at| transmitted_at.age(now) >= CLOSE_AFTER_SEND_TS);
+            let timed_out = releasing.queued_at.age(now) >= RELEASE_TX_TIMEOUT_TS;
+            if transmitted_and_drained || timed_out {
+                if timed_out && releasing.transmitted_at.is_none() {
+                    tracing::warn!(call_id = releasing.call_id, ts = releasing.ts,
+                        tx_state = ?releasing.tx_reporter.get_state(),
+                        "group D-RELEASE never transmitted before bounded circuit teardown");
+                }
                 let rc = self.releasing_calls.remove(i);
                 self.finalize_release(queue, rc.call_id, rc.ts, rc.dest_gssi, rc.is_local, rc.brew_uuid);
                 resources_freed = true;
@@ -7499,6 +7523,8 @@ mod tests {
         assert!(!cc.active_calls.contains_key(&4));
 
         cc.release_call(&mut queue, 1, DisconnectCause::UserRequestedDisconnection);
+        cc.releasing_calls[0].tx_reporter.mark_transmitted();
+        cc.process_releasing_calls(&mut queue);
         cc.dltime = cc.dltime.add_timeslots(18 * 4);
         cc.process_releasing_calls(&mut queue);
 
@@ -7530,6 +7556,31 @@ mod tests {
             "release-draining circuit must not be classified as an expired orphan"
         );
         assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), Some(call_id));
+    }
+
+    #[test]
+    fn group_release_waits_for_actual_facch_transmission() {
+        let gssi = 204;
+        let call_id = 42;
+        let mut cc = test_cc_with_group(gssi);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(&mut queue, call_id, 430_892, gssi, 1, 0, None, false, true);
+        let ts = cc.active_calls[&call_id].ts;
+        cc.release_call(&mut queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+
+        cc.dltime = cc.dltime.add_timeslots(18 * 4);
+        cc.process_releasing_calls(&mut queue);
+        assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), Some(call_id));
+
+        cc.releasing_calls[0].tx_reporter.mark_transmitted();
+        cc.process_releasing_calls(&mut queue);
+        cc.dltime = cc.dltime.add_timeslots(18 * 4 - 1);
+        cc.process_releasing_calls(&mut queue);
+        assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), Some(call_id));
+
+        cc.dltime = cc.dltime.add_timeslots(1);
+        cc.process_releasing_calls(&mut queue);
+        assert_eq!(cc.circuits.call_id_at(ts, Direction::Both), None);
     }
 
     #[test]
@@ -7652,6 +7703,8 @@ mod tests {
             cc.start_remote_swmi_call(&mut queue, call_id, 430_892, gssi, 1, 0, None, false, true);
         }
         cc.release_call(&mut queue, 2, DisconnectCause::UserRequestedDisconnection);
+        cc.releasing_calls[0].tx_reporter.mark_transmitted();
+        cc.process_releasing_calls(&mut queue);
 
         let private_call_id = 10;
         cc.private_calls.insert(
