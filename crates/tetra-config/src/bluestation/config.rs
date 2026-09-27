@@ -215,6 +215,9 @@ impl StackConfig {
                 return Err("Invalid IANA timezone name in network_broadcast.timezone");
             }
         }
+        if !self.neighbour_cells.ids.is_empty() && !self.network_broadcast.time_enabled {
+            return Err("network_broadcast.time_enabled must be true when neighbour cells are configured");
+        }
 
         Ok(())
     }
@@ -238,10 +241,8 @@ impl SharedConfig {
         }
 
         let mut state = state.unwrap_or_default();
-        // Use the local value until a connected SwMI provides the authoritative
-        // serving-cell policy.  The SwMI worker overwrites this when CellConfig
-        // arrives, so SYSINFO can follow central policy at runtime.
-        state.authentication_required = cfg.cell.authentication_required;
+        // Central provisioning supplies this before the radio can transmit.
+        state.authentication_required = false;
         state.network_broadcast = RuntimeNetworkBroadcast {
             version: 1,
             neighbours: cfg.neighbour_cells.clone(),

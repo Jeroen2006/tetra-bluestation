@@ -32,7 +32,7 @@ impl MleBroadcast {
     }
 
     pub fn replace_neighbours(&mut self, snapshot: NeighbourCellSnapshot) {
-        if snapshot.directory_version < self.snapshot_version {
+        if snapshot.directory_version < self.snapshot_version && self.config.state_read().neighbours_ready {
             tracing::debug!(
                 current = self.snapshot_version,
                 received = snapshot.directory_version,
@@ -42,6 +42,7 @@ impl MleBroadcast {
         }
         self.snapshot_version = snapshot.directory_version;
         self.neighbours = snapshot.neighbours;
+        self.config.state_write().neighbours_ready = true;
         self.next_batch = 0;
         tracing::info!(
             directory_version = self.snapshot_version,
@@ -69,6 +70,9 @@ impl MleBroadcast {
         }
         if broadcast.cell_load_ca > 3 {
             return Err("cell_load_ca must be 0-3");
+        }
+        if !neighbours.is_empty() && !broadcast.time_enabled {
+            return Err("time_enabled must be true when neighbour cells are configured");
         }
         if broadcast.time_enabled {
             let Some(timezone) = &broadcast.timezone else {

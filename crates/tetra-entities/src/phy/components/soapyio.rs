@@ -40,6 +40,7 @@ pub struct SoapyIo {
     rx: Option<soapysdr::RxStream<StreamType>>,
     /// Transmit stream. None if transmitting is disabled.
     tx: Option<soapysdr::TxStream<StreamType>>,
+    tx_active: bool,
 }
 
 /// Soapy/Lime timestamps can occasionally jitter by a single sample.
@@ -169,16 +170,13 @@ impl SoapyIo {
         } else {
             None
         };
-        let mut tx = if tx_enabled {
+        let tx = if tx_enabled {
             Some(soapycheck!("setup TX stream", dev.tx_stream_args(&[tx_ch], tx_args)))
         } else {
             None
         };
         if let Some(rx) = &mut rx {
             soapycheck!("activate RX stream", rx.activate(None));
-        }
-        if let Some(tx) = &mut tx {
-            soapycheck!("activate TX stream", tx.activate(None));
         }
         Ok(Self {
             rx_ch,
@@ -192,7 +190,20 @@ impl SoapyIo {
             dev,
             rx,
             tx,
+            tx_active: false,
         })
+    }
+
+    /// Switch the physical transmitter without disturbing the receive clock.
+    pub fn set_tx_active(&mut self, active: bool) -> Result<(), soapysdr::Error> {
+        if self.tx_active == active {
+            return Ok(());
+        }
+        if let Some(tx) = &mut self.tx {
+            if active { tx.activate(None)?; } else { tx.deactivate(None)?; }
+            self.tx_active = active;
+        }
+        Ok(())
     }
 
     pub fn receive(&mut self, buffer: &mut [StreamType]) -> Result<RxResult, RxTxDevError> {
@@ -255,6 +266,9 @@ impl SoapyIo {
     }
 
     pub fn transmit(&mut self, buffer: &[StreamType], count: Option<SampleCount>) -> Result<(), RxTxDevError> {
+        if !self.tx_active {
+            return Err(RxTxDevError::RxReadError);
+        }
         if let Some(tx) = &mut self.tx {
             if let Some(initial_time) = self.initial_time {
                 tx.write_all(
@@ -308,7 +322,7 @@ impl SoapyIo {
     pub fn tx_possible(&self) -> bool {
         // initial_time is obtained from the first RX read (that includes a timestamp),
         // so prevent TX before it is available.
-        self.tx_enabled() && self.initial_time.is_some()
+        self.tx_enabled() && self.tx_active && self.initial_time.is_some()
     }
 
     pub fn rx_sample_rate(&self) -> f64 {

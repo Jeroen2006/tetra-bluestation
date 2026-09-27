@@ -1301,7 +1301,10 @@ impl BsAieKeyProvider {
         direction: AieDirection,
     ) -> Result<(), AieContextError> {
         let config = self.config.config();
-        let eck = tetra_crypto::tb5(config.cell.main_carrier, config.cell.location_area, config.cell.colour_code, key)
+        let location_area = self.config.state_read().station_provisioning.as_ref()
+            .map(|provisioning| provisioning.cell.location_area)
+            .ok_or(AieContextError::CryptoInput)?;
+        let eck = tetra_crypto::tb5(config.cell.main_carrier, location_area, config.cell.colour_code, key)
             .map_err(|_| AieContextError::CryptoInput)?;
         if kss_offset % 8 != 0 {
             return Err(AieContextError::CryptoInput);
@@ -1960,6 +1963,15 @@ pub struct StackState {
     pub timeslot_alloc: TimeslotAllocator,
     /// Backhaul/network connection to SwMI (e.g., Brew/TetraPack). False -> fallback mode.
     pub network_connected: bool,
+    /// Current authenticated, complete serving-cell assignment for this run.
+    pub station_provisioning: Option<tetra_swmi_protocol::StationProvisioning>,
+    pub advertisement_accepted: bool,
+    pub neighbours_ready: bool,
+    pub recovery_ready: bool,
+    pub sc3g_ready: bool,
+    pub radio_tx_allowed: bool,
+    pub radio_tx_active: bool,
+    pub provisioned_once: bool,
     /// Authentication policy advertised by the currently connected SwMI cell.
     /// This is mutable because the central SwMI sends it after the BS starts.
     pub authentication_required: bool,
@@ -2024,11 +2036,39 @@ mod tests {
             "/../../example_config/config.toml"
         )))
         .expect("example configuration must remain valid");
-        SharedConfig::from_parts(config, None)
+        let shared = SharedConfig::from_parts(config, None);
+        shared.state_write().station_provisioning = Some(tetra_swmi_protocol::StationProvisioning {
+            cell: tetra_swmi_protocol::CellConfig {
+                config_version: 1,
+                mcc: 204,
+                mnc: 2671,
+                location_area: 101,
+                authentication_required: false,
+                aie: tetra_swmi_protocol::CellAieConfig::disabled(),
+            },
+            requested_rui_type: 4,
+            cmg_gssis: Vec::new(),
+            sc3g_required: false,
+        });
+        shared
     }
 
     fn test_sc2(sckn: u8, sck_vn: u16) -> RuntimeSc2Aie {
         RuntimeSc2Aie::new(RuntimeSc2TeaAlgorithm::Tea3, sckn, sck_vn, [0x5a; 10])
+    }
+
+    #[test]
+    fn sc2_cipher_uses_provisioned_location_area() {
+        let config = test_shared_config();
+        let provider = BsAieKeyProvider::new(config.clone());
+        let time = TdmaTime::default();
+        let mut la101 = BitBuffer::new(128);
+        provider.cipher_mac_with_key(time, true, &[0x5a; 10], &mut la101, 0, 128, 0, AieDirection::Downlink).unwrap();
+
+        config.state_write().station_provisioning.as_mut().unwrap().cell.location_area = 102;
+        let mut la102 = BitBuffer::new(128);
+        provider.cipher_mac_with_key(time, true, &[0x5a; 10], &mut la102, 0, 128, 0, AieDirection::Downlink).unwrap();
+        assert_ne!(la101.to_bitstr(), la102.to_bitstr());
     }
 
     fn test_sc3(cck_id: u16) -> RuntimeSc3Aie {
@@ -2802,6 +2842,14 @@ impl Default for StackState {
         Self {
             timeslot_alloc: TimeslotAllocator::default(),
             network_connected: false,
+            station_provisioning: None,
+            advertisement_accepted: false,
+            neighbours_ready: false,
+            recovery_ready: false,
+            sc3g_ready: false,
+            radio_tx_allowed: false,
+            radio_tx_active: false,
+            provisioned_once: false,
             authentication_required: false,
             aie: RuntimeAieConfig::default(),
             aie_sessions: RuntimeAieSessions::default(),

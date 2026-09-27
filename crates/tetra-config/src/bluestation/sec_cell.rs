@@ -50,6 +50,8 @@ pub struct NetworkBroadcastDto {
     pub cell_load_ca: Option<u8>,
     pub time_enabled: Option<bool>,
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub neighbour_cells: NeighbourCellsDto,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -212,6 +214,9 @@ pub struct CellInfoDto {
     pub reverse_operation: bool,
     pub custom_duplex_spacing: Option<u32>,
 
+    // The protocol provisions this value; retaining the internal field avoids
+    // exposing a local bootstrap identity in the TOML format.
+    #[serde(skip)]
     pub location_area: u16,
     pub authentication_required: Option<bool>,
 
@@ -243,9 +248,6 @@ pub struct CellInfoDto {
     pub rxlev_access_min: Option<u8>,
     pub access_parameter: Option<u8>,
 
-    #[serde(default)]
-    pub random_access: Option<RandomAccessDto>,
-
     pub local_ssi_ranges: Option<Vec<(u32, u32)>>,
 
     pub timezone: Option<String>,
@@ -275,12 +277,12 @@ pub struct RandomAccessDto {
     pub ewma_alpha_percent: Option<u8>,
     pub frame_factor_activation_windows: Option<u8>,
     pub frame_factor_release_windows: Option<u8>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
-pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
-    let random_access = ci
-        .random_access
-        .map(|dto| CfgRandomAccess {
+pub fn cell_dto_to_cfg(ci: CellInfoDto, dto: RandomAccessDto) -> CfgCellInfo {
+    let random_access = CfgRandomAccess {
             enabled: dto.enabled.unwrap_or(true),
             update_interval_multiframes: dto.update_interval_multiframes.unwrap_or(1),
             startup_grace_multiframes: dto.startup_grace_multiframes.unwrap_or(5),
@@ -300,8 +302,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
             ewma_alpha_percent: dto.ewma_alpha_percent.unwrap_or(50),
             frame_factor_activation_windows: dto.frame_factor_activation_windows.unwrap_or(3),
             frame_factor_release_windows: dto.frame_factor_release_windows.unwrap_or(3),
-        })
-        .unwrap_or_default();
+        };
 
     CfgCellInfo {
         main_carrier: ci.main_carrier,
@@ -426,6 +427,7 @@ mod tests {
                 cell_load_ca: None,
                 time_enabled: None,
                 timezone: None,
+                neighbour_cells: NeighbourCellsDto::default(),
                 extra: HashMap::new(),
             },
             None,

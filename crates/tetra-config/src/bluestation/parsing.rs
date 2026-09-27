@@ -7,8 +7,8 @@ use serde::Deserialize;
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgRuaDto, NeighbourCellsDto, NetInfoDto, NetworkBroadcastDto, apply_control_patch, apply_rua_patch,
-    cell_dto_to_cfg, neighbour_cells_dto_to_cfg, net_dto_to_cfg, network_broadcast_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgNetInfo, CfgRua, NetworkBroadcastDto, RandomAccessDto, apply_control_patch,
+    cell_dto_to_cfg, neighbour_cells_dto_to_cfg, network_broadcast_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -22,7 +22,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
     let root: TomlConfigRoot = toml::from_str(toml_str)?;
 
     // Various sanity checks
-    let expected_config_version = "0.6";
+    let expected_config_version = "0.7";
     if !root.config_version.eq(expected_config_version) {
         return Err(format!(
             "Unrecognized config_version: {}, expect {}",
@@ -47,9 +47,6 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             return Err(format!("Unrecognized fields: phy_io.soapysdr::{:?}", extra_keys_filtered).into());
         }
     }
-    if !root.net_info.extra.is_empty() {
-        return Err(format!("Unrecognized fields in net_info: {:?}", sorted_keys(&root.net_info.extra)).into());
-    }
     if !root.cell_info.extra.is_empty() {
         return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&root.cell_info.extra)).into());
     }
@@ -63,12 +60,15 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
         return Err("[brew] has been removed; configure the central connection with [swmi]".into());
     }
-    if !root.neighbour_cells.extra.is_empty() {
+    if !root.network_broadcast.neighbour_cells.extra.is_empty() {
         return Err(format!(
-            "Unrecognized fields in neighbour_cells: {:?}",
-            sorted_keys(&root.neighbour_cells.extra)
+            "Unrecognized fields in network_broadcast.neighbour_cells: {:?}",
+            sorted_keys(&root.network_broadcast.neighbour_cells.extra)
         )
         .into());
+    }
+    if !root.random_access.extra.is_empty() {
+        return Err(format!("Unrecognized fields in random_access: {:?}", sorted_keys(&root.random_access.extra)).into());
     }
     if !root.network_broadcast.extra.is_empty() {
         return Err(format!(
@@ -94,9 +94,6 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             return Err(format!("Unrecognized fields in swmi config: {:?}", sorted_keys(&swmi.extra)).into());
         }
     }
-    if !root.rua.extra.is_empty() {
-        return Err(format!("Unrecognized fields in rua config: {:?}", sorted_keys(&root.rua.extra)).into());
-    }
 
     // Optional telemetry section
     if let Some(ref telemetry) = root.telemetry {
@@ -107,24 +104,24 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
 
     // Build config from required and optional values
     let legacy_timezone = root.cell_info.timezone.clone();
+    let mut network_broadcast = root.network_broadcast;
+    let neighbours = neighbour_cells_dto_to_cfg(std::mem::take(&mut network_broadcast.neighbour_cells));
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
         debug_log: root.debug_log,
         phy_io: phy_dto_to_cfg(root.phy_io),
-        net: net_dto_to_cfg(root.net_info),
-        cell: cell_dto_to_cfg(root.cell_info),
-        neighbour_cells: neighbour_cells_dto_to_cfg(root.neighbour_cells),
-        network_broadcast: network_broadcast_dto_to_cfg(root.network_broadcast, legacy_timezone)?,
-        rua: apply_rua_patch(root.rua),
+        net: CfgNetInfo { mcc: 0, mnc: 0 },
+        cell: cell_dto_to_cfg(root.cell_info, root.random_access),
+        neighbour_cells: neighbours,
+        network_broadcast: network_broadcast_dto_to_cfg(network_broadcast, legacy_timezone)?,
+        rua: CfgRua::default(),
         brew: None,
         swmi: None,
         telemetry: None,
         control: None,
     };
 
-    if let Some(swmi) = root.swmi {
-        cfg.swmi = Some(apply_swmi_patch(swmi)?);
-    }
+    cfg.swmi = Some(apply_swmi_patch(root.swmi.ok_or("[swmi] is required")?)?);
 
     if let Some(telemetry) = root.telemetry {
         cfg.telemetry = Some(apply_telemetry_patch(telemetry)?);
@@ -168,14 +165,11 @@ struct TomlConfigRoot {
     debug_log: Option<String>,
 
     phy_io: PhyIoDto,
-    net_info: NetInfoDto,
     cell_info: CellInfoDto,
-    #[serde(default)]
-    neighbour_cells: NeighbourCellsDto,
     #[serde(default)]
     network_broadcast: NetworkBroadcastDto,
     #[serde(default)]
-    rua: CfgRuaDto,
+    random_access: RandomAccessDto,
 
     brew: Option<CfgBrewDto>,
     swmi: Option<CfgSwmiDto>,
@@ -184,4 +178,29 @@ struct TomlConfigRoot {
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::from_toml_str;
+
+    const EXAMPLE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+
+    #[test]
+    fn central_fields_are_not_accepted_locally() {
+        assert!(from_toml_str(&format!("{EXAMPLE}\n[net_info]\nmcc = 204\nmnc = 2671\n")).is_err());
+        assert!(from_toml_str(&EXAMPLE.replace("[cell_info]", "[cell_info]\nlocation_area = 101")).is_err());
+        assert!(from_toml_str(&EXAMPLE.replace("[swmi]", "[rua]\nrequested_rui_type = \"alpha_tag\"\n[swmi]")).is_err());
+        assert!(from_toml_str(&EXAMPLE.replace("[random_access]", "[random_access]\nunknown_parameter = 1")).is_err());
+    }
+
+    #[test]
+    fn neighbours_require_time_broadcast() {
+        let mut cfg = from_toml_str(EXAMPLE).expect("new example is valid");
+        cfg.neighbour_cells.ids.push("bs-neighbour".to_owned());
+        assert!(cfg.validate().is_err());
+        cfg.network_broadcast.time_enabled = true;
+        cfg.network_broadcast.timezone = Some("Europe/Amsterdam".to_owned());
+        assert!(cfg.validate().is_ok());
+    }
 }

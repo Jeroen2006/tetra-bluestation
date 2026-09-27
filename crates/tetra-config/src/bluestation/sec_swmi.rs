@@ -22,9 +22,8 @@ pub struct CfgSwmi {
     pub reconnect_delay: Duration,
     pub heartbeat_interval: Duration,
     pub heartbeat_timeout: Duration,
-    /// CMG GSSIs provisioned by the SwMI. These keep rollover notices
-    /// group-addressed after a BS restart, before any fresh GSKO result.
-    pub cmg_gssis: Vec<u32>,
+    /// Permit transmitting with the last provisioned cell after SwMI loss.
+    pub allow_lst: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -44,8 +43,8 @@ pub struct CfgSwmiDto {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
-    #[serde(default)]
-    pub cmg_gssis: Vec<u32>,
+    #[serde(default = "default_allow_lst")]
+    pub allow_lst: bool,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -54,6 +53,9 @@ fn default_swmi_port() -> u16 {
     443
 }
 fn default_tls() -> bool {
+    true
+}
+fn default_allow_lst() -> bool {
     true
 }
 fn default_reconnect_delay_secs() -> u64 {
@@ -76,11 +78,6 @@ pub fn apply_swmi_patch(src: CfgSwmiDto) -> Result<CfgSwmi, &'static str> {
     if !src.tls && src.ca_certificate.is_some() {
         return Err("swmi ca_certificate requires tls = true");
     }
-    if src.cmg_gssis.iter().any(|&gssi| gssi == 0 || gssi >= 0x00ff_ffff)
-        || src.cmg_gssis.iter().enumerate().any(|(index, gssi)| src.cmg_gssis[..index].contains(gssi))
-    {
-        return Err("swmi cmg_gssis must contain distinct CMG GSSIs below the all-MS address");
-    }
     Ok(CfgSwmi {
         host: src.host,
         port: src.port,
@@ -91,6 +88,6 @@ pub fn apply_swmi_patch(src: CfgSwmiDto) -> Result<CfgSwmi, &'static str> {
         reconnect_delay: Duration::from_secs(src.reconnect_delay_secs),
         heartbeat_interval: Duration::from_secs(src.heartbeat_interval_secs),
         heartbeat_timeout: Duration::from_secs(src.heartbeat_timeout_secs),
-        cmg_gssis: src.cmg_gssis,
+        allow_lst: src.allow_lst,
     })
 }

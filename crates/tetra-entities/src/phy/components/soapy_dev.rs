@@ -38,6 +38,7 @@ pub struct PhyConfig<'a> {
 }
 
 pub struct RxTxDevSoapySdr {
+    config: SharedConfig,
     sdr: soapyio::SoapyIo,
     rx_dsp: Option<RxDsp>,
     tx_dsp: Option<TxDsp>,
@@ -81,6 +82,7 @@ impl RxTxDevSoapySdr {
         let mut sdr = soapyio::SoapyIo::new(cfg).unwrap();
 
         Self {
+            config: cfg.clone(),
             rx_dsp: if sdr.rx_enabled() {
                 Some(RxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
             } else {
@@ -126,6 +128,21 @@ impl RxTxDevSoapySdr {
 }
 
 impl RxTxDev for RxTxDevSoapySdr {
+    fn set_transmit_enabled(&mut self, enabled: bool) -> Result<(), RxTxDevError> {
+        if !enabled {
+            self.sdr.set_tx_active(false).map_err(|_| RxTxDevError::RxReadError)?;
+            self.tx_dsp = None;
+            return Ok(());
+        }
+        if self.tx_dsp.is_none() {
+            let c = self.config.config();
+            let dl_freq = c.phy_io.soapysdr.as_ref().expect("Soapy settings").dl_freq_corrected().0;
+            let frequencies = [dl_freq];
+            let phy_config = PhyConfig { bs_dl_frequencies: &frequencies, ..Default::default() };
+            self.tx_dsp = Some(TxDsp::new(&mut FftPlanner::new(), &mut self.sdr, &phy_config));
+        }
+        self.sdr.set_tx_active(true).map_err(|_| RxTxDevError::RxReadError)
+    }
     fn rxtx_timeslot<'a>(
         &'a mut self,
         tx_slot: &[TxSlotBits],

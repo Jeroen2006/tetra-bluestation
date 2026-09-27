@@ -461,6 +461,8 @@ struct SwmiWorker<T: NetworkTransport> {
     command_sequence: u64,
     current_cell_config: Option<CellConfig>,
     last_advertisement_version: u64,
+    pending_advertisement_command_id: Option<u64>,
+    last_radio_status: bool,
     recovery_request_id: Option<u64>,
 }
 
@@ -476,6 +478,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             command_sequence: 1,
             current_cell_config: None,
             last_advertisement_version: 0,
+            pending_advertisement_command_id: None,
+            last_radio_status: false,
             recovery_request_id: None,
         }
     }
@@ -507,7 +511,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             while self.transport.is_connected() {
                 for incoming in self.transport.receive_reliable() {
                     match SwmiMessage::decode(&incoming.payload) {
-                        Ok(SwmiMessage::CellConfig { command_id, cell }) => {
+                        Ok(SwmiMessage::StationProvisioning { command_id, provisioning }) => {
+                            let cell = provisioning.cell;
                             // A CellConfig also arrives during initial LST
                             // recovery.  Once that recovery is complete,
                             // though, it is a live policy update (for example
@@ -547,8 +552,25 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             // The central SwMI is authoritative for the serving
                             // cell policy.  UMAC reads this mutable value and
                             // updates the broadcast Extended Services field.
-                            {
+                            let identity_changed = {
                                 let mut state = self.stack_config.state_write();
+                                let identity_changed = state.station_provisioning.as_ref().is_some_and(|old| {
+                                    (old.cell.mcc, old.cell.mnc, old.cell.location_area)
+                                        != (cell.mcc, cell.mnc, cell.location_area)
+                                });
+                                let keep_lst = self.config.allow_lst
+                                    && state.provisioned_once
+                                    && state.station_provisioning.as_ref() == Some(&provisioning);
+                                state.radio_tx_allowed = keep_lst;
+                                state.provisioned_once = keep_lst;
+                                state.advertisement_accepted = false;
+                                state.neighbours_ready = was_online && !identity_changed && state.neighbours_ready;
+                                state.recovery_ready = was_online && !identity_changed && state.recovery_ready;
+                                if identity_changed {
+                                    tracing::warn!("SwMI changed network identity; restarting radio stack");
+                                }
+                                state.station_provisioning = Some(provisioning.clone());
+                                state.sc3g_ready = !provisioning.sc3g_required;
                                 state.authentication_required = cell.authentication_required;
                                 aie.preserve_sc3_cache_from(&state.aie);
                                 state.aie = aie;
@@ -560,6 +582,13 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 if !was_online {
                                     state.network_connected = false;
                                 }
+                                identity_changed
+                            };
+                            if identity_changed {
+                                // The service supervisor starts a fresh stack so no calls,
+                                // scrambling state or queued bursts survive a network move.
+                                thread::sleep(std::time::Duration::from_millis(100));
+                                std::process::exit(75);
                             }
                             self.current_cell_config = Some(cell);
                             let accepted = self.report_current_advertisement();
@@ -574,6 +603,10 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 self.endpoint.online.store(false, Ordering::Release);
                                 self.stack_config.state_write().network_connected = false;
                             }
+                        }
+                        Ok(SwmiMessage::CellConfig { command_id, .. }) => {
+                            tracing::warn!(command_id, "legacy CellConfig cannot provision a v41 base station");
+                            let _ = self.send(SwmiMessage::Receipt { command_id, accepted: false, code: 2 });
                         }
                         Ok(SwmiMessage::Sc2RolloverPrepare {
                             command_id,
@@ -751,6 +784,9 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                     )
                                 });
                             let accepted = result.is_ok();
+                            if accepted {
+                                self.stack_config.state_write().sc3g_ready = true;
+                            }
                             let _ = self.send(SwmiMessage::Receipt {
                                 command_id,
                                 accepted,
@@ -802,7 +838,21 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             command_id,
                             accepted,
                             code,
-                        }) => tracing::debug!(command_id, accepted, code, "SwMI command receipt"),
+                        }) => {
+                            if self.pending_advertisement_command_id == Some(command_id) {
+                                self.pending_advertisement_command_id = None;
+                                self.stack_config.state_write().advertisement_accepted = accepted;
+                                if accepted {
+                                    // A new SwMI session clears radio readiness. Re-send the
+                                    // current TX state even when LST kept the transmitter on.
+                                    self.last_radio_status = false;
+                                }
+                                if !accepted {
+                                    tracing::error!(command_id, code, "SwMI rejected serving-cell advertisement; radio remains silent");
+                                }
+                            }
+                            tracing::debug!(command_id, accepted, code, "SwMI command receipt");
+                        }
                         Ok(
                             message @ (SwmiMessage::RegistrationDecision { .. }
                             | SwmiMessage::AttachmentDecision { .. }
@@ -978,6 +1028,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                 if self.current_cell_config.is_some() && advertisement_version != self.last_advertisement_version {
                     let _ = self.report_current_advertisement();
                 }
+                self.refresh_radio_permission();
                 if last_heartbeat.elapsed() >= self.config.heartbeat_interval {
                     self.heartbeat_sequence += 1;
                     if !self.send(SwmiMessage::Heartbeat {
@@ -992,7 +1043,13 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             }
             tracing::warn!("SwMI control connection lost; entering reconnect loop");
             self.endpoint.online.store(false, Ordering::Release);
-            self.stack_config.state_write().network_connected = false;
+            {
+                let mut state = self.stack_config.state_write();
+                state.network_connected = false;
+                if !self.config.allow_lst {
+                    state.radio_tx_allowed = false;
+                }
+            }
             thread::sleep(self.config.reconnect_delay);
         }
     }
@@ -1001,6 +1058,31 @@ impl<T: NetworkTransport> SwmiWorker<T> {
         let id = self.command_sequence;
         self.command_sequence += 1;
         id
+    }
+    fn refresh_radio_permission(&mut self) {
+        {
+            let mut state = self.stack_config.state_write();
+            let ready = state.station_provisioning.is_some()
+                && state.advertisement_accepted
+                && state.neighbours_ready
+                && state.recovery_ready
+                && state.sc3g_ready
+                && state.network_connected;
+            if ready {
+                state.provisioned_once = true;
+            }
+            let allowed = ready || (self.config.allow_lst && state.provisioned_once);
+            state.radio_tx_allowed = allowed;
+        }
+        let state = self.stack_config.state_read();
+        let transmitting = state.radio_tx_active;
+        let config_version = state.station_provisioning.as_ref().map_or(0, |p| p.cell.config_version);
+        drop(state);
+        if transmitting != self.last_radio_status {
+            self.last_radio_status = transmitting;
+            tracing::info!(config_version, transmitting, "radio transmission permission changed");
+            let _ = self.send(SwmiMessage::RadioStatus { config_version, transmitting });
+        }
     }
     fn report_current_advertisement(&mut self) -> bool {
         let Some(cell) = self.current_cell_config.clone() else {
@@ -1015,6 +1097,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
         });
         if accepted {
             self.last_advertisement_version = runtime.version;
+            self.pending_advertisement_command_id = Some(command_id);
+            self.stack_config.state_write().advertisement_accepted = false;
         }
         accepted
     }

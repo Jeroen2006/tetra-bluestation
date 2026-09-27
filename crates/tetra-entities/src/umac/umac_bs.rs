@@ -325,7 +325,10 @@ impl UmacBs {
 
     pub fn new_with_swmi(config: SharedConfig, swmi_rf: Option<SwmiRfEndpoint>) -> Self {
         let c = config.config();
-        let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
+        let net = config.state_read().station_provisioning.as_ref()
+            .map(|provisioning| (provisioning.cell.mcc, provisioning.cell.mnc))
+            .unwrap_or((c.net.mcc, c.net.mnc));
+        let scrambling_code = scrambler::tetra_scramb_get_init(net.0, net.1, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
         let authentication_required = Self::get_authentication_required_state(&config);
         let aie = Self::get_aie_config(&config);
@@ -475,6 +478,9 @@ impl UmacBs {
     /// Needs to be re-invoked if any network parameter changes
     pub fn generate_precomps(config: &SharedConfig) -> PrecomputedUmacPdus {
         let c = config.config();
+        let serving = config.state_read().station_provisioning.as_ref()
+            .map(|provisioning| (provisioning.cell.mcc, provisioning.cell.mnc, provisioning.cell.location_area))
+            .unwrap_or((c.net.mcc, c.net.mnc, c.cell.location_area));
         let aie = Self::get_aie_config(config);
 
         // TODO FIXME make more/all parameters configurable
@@ -557,7 +563,7 @@ impl UmacBs {
 
         let system_wide_services = Self::get_system_wide_services_state(config);
         let mle_sysinfo_pdu = DMleSysinfo {
-            location_area: c.cell.location_area,
+            location_area: serving.2,
             subscriber_class: c.cell.subscriber_class,
             bs_service_details: BsServiceDetails {
                 registration: c.cell.registration,
@@ -585,8 +591,8 @@ impl UmacBs {
         };
 
         let mle_sync_pdu = DMleSync {
-            mcc: c.net.mcc,
-            mnc: c.net.mnc,
+            mcc: serving.0,
+            mnc: serving.1,
             neighbor_cell_broadcast: 2, // Broadcast supported, but enquiry not supported
             cell_load_ca: 0,            // TODO implement dynamic setting. 0 = info unavailable
             late_entry_supported: c.cell.late_entry_supported,

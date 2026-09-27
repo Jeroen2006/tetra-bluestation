@@ -191,6 +191,9 @@ struct Args {
     /// Config file (required)
     #[arg(help = "TOML config with network/cell parameters")]
     config: String,
+    /// Validate configuration and exit without opening the radio.
+    #[arg(long)]
+    check_config: bool,
 }
 
 fn main() {
@@ -207,6 +210,10 @@ fn main() {
     // Build immutable, cheaply clonable SharedConfig and build the base station stack
     let stack_cfg = load_config_from_toml(&args.config);
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
+    if args.check_config {
+        println!("Configuration valid");
+        return;
+    }
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
     let (swmi_worker, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf, swmi_packet) = if cfg.config().swmi.is_some() {
@@ -215,6 +222,22 @@ fn main() {
     } else {
         (None, None, None, None, None, None, None)
     };
+    let is_running = Arc::new(AtomicBool::new(true));
+    let is_running_clone = is_running.clone();
+    ctrlc::set_handler(move || {
+        is_running_clone.store(false, Ordering::SeqCst);
+    })
+    .expect("failed to set Ctrl+C handler");
+
+    if let Some(swmi_worker) = swmi_worker {
+        net_swmi::start(cfg.clone(), swmi_worker);
+        while is_running.load(Ordering::Relaxed) && cfg.state_read().station_provisioning.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !is_running.load(Ordering::Relaxed) {
+            return;
+        }
+    }
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf, swmi_packet);
 
     // Start Telemetry and Control threads, if enabled
@@ -224,18 +247,6 @@ fn main() {
     if cfg.config().control.is_some() {
         start_control_worker(cfg.clone(), cdispatchers);
     };
-    if let Some(swmi_worker) = swmi_worker {
-        net_swmi::start(cfg.clone(), swmi_worker);
-    };
-
-    // Set up Ctrl+C handler for graceful shutdown
-    let is_running = Arc::new(AtomicBool::new(true));
-    let is_running_clone = is_running.clone();
-    ctrlc::set_handler(move || {
-        is_running_clone.store(false, Ordering::SeqCst);
-    })
-    .expect("failed to set Ctrl+C handler");
-
     // Start the stack
     router.run_stack(None, Some(is_running));
 

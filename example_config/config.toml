@@ -2,7 +2,7 @@
 # This is an example configuration file for the TETRA base station stack
 # DO NOT RUN without editing to stay within legal limits of your jurisdiction
 
-config_version = "0.6"
+config_version = "0.7"
 
 # Stack operation mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
 stack_mode = "Bs"
@@ -61,15 +61,6 @@ rx_freq = 433025000
 
 ###############################################################################
 
-# Network Information
-[net_info]
-# Mobile Country Code (MCC) - identifies your country
-mcc = 204  # Netherlands
-
-# Mobile Network Code (MNC) - identifies the TETRA network
-# MAKE SURE MNC MAY BE USED, CONSULT RELEVANT AUTHORITIES IF NEEDED
-mnc = 1337
-
 # Cell Information
 [cell_info]
 
@@ -84,7 +75,6 @@ freq_offset = 0                     # Offset from carrier. Usually 0. Options: 0
 reverse_operation = false           # False: UL below DL. True: UL above DL.
 
 # Location Area identifier
-location_area = 2
 
 # Colour code (0-63), helps distinguish between adjacent cells on the same frequency
 colour_code = 1
@@ -101,9 +91,6 @@ colour_code = 1
 # Cell load (Channel Allocation) - current load
 # cell_load_ca = 0
 
-# Dynamic common random access for access code A on the MCCH. SYSINFO keeps the
-# bootstrap values; ACCESS-DEFINE updates these parameters once per interval.
-# random_access = { enabled = true, update_interval_multiframes = 1, startup_grace_multiframes = 5, recovery_step_multiframes = 3, low_load_threshold = 2, high_load_threshold = 8, imm_min = 0, imm_max = 15, wt_min = 3, wt_max = 8, nu_min = 3, nu_max = 5, frame_len_min = 2, frame_len_max = 8, retry_window_multiframes = 30, retry_weight_percent = 33, ewma_alpha_percent = 50, frame_factor_activation_windows = 3, frame_factor_release_windows = 3 }
 
 # Late entry support - allows joining ongoing group calls
 # late_entry_supported = true
@@ -164,11 +151,6 @@ local_ssi_ranges = [
     [0, 90],
 ]
 
-# CA neighbours are the stable IDs from the SwMI [base_stations] list. Their
-# configured order becomes the per-cell CA identifiers 1..31 advertised to MSs.
-[neighbour_cells]
-ids = []
-
 # D-NWRK-BROADCAST settings. Time is encoded as TETRA network time and uses an
 # IANA timezone so the local offset follows daylight-saving changes.
 [network_broadcast]
@@ -178,6 +160,11 @@ ids = []
 cell_load_ca = 0
 time_enabled = false
 # timezone = "Europe/Amsterdam"
+
+# CA neighbours are stable IDs from SwMI [[base_stations]]. Their order
+# becomes the per-cell CA identifiers 1..31. Neighbours require time_enabled.
+[network_broadcast.neighbour_cells]
+ids = []
 
 # ETSI TS 100 392-2 table 18.38: the four cell-reselection thresholds sent in
 # D-NWRK-BROADCAST.  Set values in dB, using only even values 0..30 (the TETRA
@@ -196,16 +183,31 @@ time_enabled = false
 
 ###############################################################################
 
-# TTR 001-17 identity type requested when the SwMI requires Radio User
-# Assignment. Supported values: "run", "ssi", "ms_isdn" and "alpha_tag".
-[rua]
-requested_rui_type = "alpha_tag"
+# Dynamic common random access for access code A on the MCCH.
+[random_access]
+enabled = true
+update_interval_multiframes = 1
+startup_grace_multiframes = 5
+recovery_step_multiframes = 3
+low_load_threshold = 2
+high_load_threshold = 8
+imm_min = 0
+imm_max = 15
+wt_min = 3
+wt_max = 8
+nu_min = 3
+nu_max = 5
+frame_len_min = 2
+frame_len_max = 8
+retry_window_multiframes = 30
+retry_weight_percent = 33
+ewma_alpha_percent = 50
+frame_factor_activation_windows = 3
+frame_factor_release_windows = 3
 
 ###############################################################################
 
-# Native central SwMI connection. MCC, MNC and location area are centrally
-# owned. The existing net_info and cell_info.location_area values are a
-# bootstrap/LST cache until the air-interface stack reads CellConfig at runtime.
+# Native central SwMI connection. The BS remains silent until provisioning.
 
 [swmi]
 host = "swmi.example.net"
@@ -219,6 +221,4 @@ password = "replace-before-use"
 reconnect_delay_secs = 5
 heartbeat_interval_secs = 2
 heartbeat_timeout_secs = 10
-# Mirror the SwMI's aie.sc3.cmgs GSSIs so GCK rollover notices keep the
-# CMG address immediately after a BS restart (before fresh GSKO results).
-# cmg_gssis = [16000001]
+allow_lst = true

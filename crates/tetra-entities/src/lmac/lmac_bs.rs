@@ -96,16 +96,19 @@ impl LmacBs {
         // Retrieve initial basic network params from config
         let (stack_mode, sc) = {
             let c = config.config();
+            let net = config.state_read().station_provisioning.as_ref()
+                .map(|provisioning| (provisioning.cell.mcc, provisioning.cell.mnc))
+                .unwrap_or((c.net.mcc, c.net.mnc));
             tracing::info!(
                 "LmacBs: initialized with stack mode {:?}, mcc {} mnc {} cc {}",
                 c.stack_mode,
-                c.net.mcc,
-                c.net.mnc,
+                net.0,
+                net.1,
                 c.cell.colour_code
             );
             (
                 c.stack_mode,
-                scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code),
+                scrambler::tetra_scramb_get_init(net.0, net.1, c.cell.colour_code),
             )
         };
 
