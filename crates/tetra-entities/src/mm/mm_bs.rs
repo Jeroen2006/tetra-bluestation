@@ -616,10 +616,11 @@ impl MmBs {
         if !state.aie.enabled {
             return Ok(AieRequest::clear(AieSubject::Group { gssi: cmg_gssi }, AieScope::MacResource));
         }
-        let sc3_enabled = state.aie.sc3.is_some();
-        drop(state);
-        if sc3_enabled {
-            return Ok(self.group_downlink_aie_request(cmg_gssi));
+        if state.aie.sc3.is_some() {
+            // A CMG is a key-management group without an ordinary GCK
+            // association. Its group-addressed signalling uses the CCK;
+            // group_protection() describes voice groups and may be Clear.
+            return Ok(AieRequest::sc3(AieSubject::Group { gssi: cmg_gssi }, AieScope::MacResource));
         }
         Err("CMG-addressed GCK OTAR requires class-3 air-interface security")
     }
@@ -1362,6 +1363,7 @@ impl MmBs {
         time: CkChangeTime,
         traffic_channels: bool,
         frame18_rollover_activation: Option<TdmaTime>,
+        cmg_gssi: Option<u32>,
     ) -> bool {
         let pdu = DAllGcksChangeDemand {
             acknowledgement_required: false,
@@ -1381,14 +1383,17 @@ impl MmBs {
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
                 handle: 0,
-                address: TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
+                address: TetraAddress::new(cmg_gssi.unwrap_or(0x00ff_ffff), SsiType::Gssi),
                 layer2service: Layer2Service::Unacknowledged,
-                stealing_permission: traffic_channels,
+                stealing_permission: traffic_channels && cmg_gssi.is_none(),
                 stealing_repeats_flag: false,
                 encryption_flag: false,
-                aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                aie_request: cmg_gssi.map_or_else(
+                    || AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                    |gssi| AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource),
+                ),
                 is_null_pdu: false,
-                    assigned_channel_frame18_broadcast: false,
+                assigned_channel_frame18_broadcast: traffic_channels && cmg_gssi.is_some(),
                 frame18_rollover_activation,
                 tx_reporter: None,
                 seamless_handover: None,
@@ -1396,14 +1401,15 @@ impl MmBs {
         });
         tracing::debug!(
             gck_vn,
-            bearer = if traffic_channels { "all-active-TCH/STCH" } else { "MCCH" },
+            cmg_gssi,
+            bearer = if traffic_channels { "assigned-FN18" } else { "MCCH" },
             "queued full GCK-VN change advertisement"
         );
         true
     }
 
     fn send_gck_version_broadcast(&self, queue: &mut MessageQueue, gck_vn: u16, traffic_channels: bool) -> bool {
-        self.send_gck_change_broadcast(queue, gck_vn, CkChangeTime::CurrentlyInUse, traffic_channels, None)
+        self.send_gck_change_broadcast(queue, gck_vn, CkChangeTime::CurrentlyInUse, traffic_channels, None, None)
     }
 
     fn send_gck_version_broadcast_round(&self, queue: &mut MessageQueue, gck_vn: u16) -> bool {
@@ -1412,11 +1418,30 @@ impl MmBs {
         mcch && traffic
     }
 
+    fn rollover_cmg_gssis(&self) -> Vec<u32> {
+        let mut gssis = self.config.config().swmi.as_ref()
+            .map_or_else(Vec::new, |swmi| swmi.cmg_gssis.clone());
+        gssis.extend(self.gsko_bootstraps.values().filter_map(|status| match status {
+            GskoBootstrapStatus::Provisioned { cmg_gssi, .. } if *cmg_gssi > 0 && *cmg_gssi < 0x00ff_ffff => Some(*cmg_gssi),
+            _ => None,
+        }));
+        gssis.sort_unstable();
+        gssis.dedup();
+        gssis
+    }
+
     fn send_gck_rollover_broadcast_round(&self, queue: &mut MessageQueue, gck_vn: u16, activation: TdmaTime) -> bool {
         let time = absolute_iv_time(activation);
-        let mcch = self.send_gck_change_broadcast(queue, gck_vn, time.clone(), false, None);
-        let traffic = self.send_gck_change_broadcast(queue, gck_vn, time, true, None);
-        mcch && traffic
+        let cmgs = self.rollover_cmg_gssis();
+        if cmgs.is_empty() {
+            tracing::warn!(gck_vn, "no provisioned CMG available; using all-MS rollover address");
+        }
+        let targets: Vec<_> = if cmgs.is_empty() { vec![None] } else { cmgs.into_iter().map(Some).collect() };
+        targets.into_iter().all(|cmg| {
+            let mcch = self.send_gck_change_broadcast(queue, gck_vn, time.clone(), false, None, cmg);
+            let traffic = self.send_gck_change_broadcast(queue, gck_vn, time.clone(), true, None, cmg);
+            mcch && traffic
+        })
     }
 
     /// Repeat the same Absolute-IV indication individually to MSs that call
@@ -1498,12 +1523,21 @@ impl MmBs {
     /// At the pipeline tick preceding TS1/FN18, UMAC reserves each of TS1..4
     /// and emits this `Immediate` all-GCK demand on the four physical slots.
     fn send_gck_rollover_immediate(&self, queue: &mut MessageQueue, gck_vn: u16, activation: TdmaTime) -> bool {
+        let cmgs = self.rollover_cmg_gssis();
+        // One physical FN18 resource exists on each timeslot. Multiple CMGs
+        // cannot each receive an Immediate on every timeslot at this boundary;
+        // their Absolute-IV notices remain authoritative in that case.
+        if cmgs.len() > 1 {
+            tracing::warn!(?cmgs, gck_vn, "multiple CMGs: relying on Absolute-IV; no final Immediate can cover every CMG on every timeslot");
+            return true;
+        }
         self.send_gck_change_broadcast(
             queue,
             gck_vn,
             CkChangeTime::Immediate,
             false,
             Some(activation),
+            cmgs.first().copied(),
         )
     }
 
@@ -6082,7 +6116,7 @@ impl TetraEntityTrait for MmBs {
 #[cfg(test)]
 mod tests {
     use super::{
-        MmBs, OtarDeliveryStatus, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingOtarDelivery, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
+        GskoBootstrapStatus, MmBs, OtarDeliveryStatus, OtarDownlinkKind, OtarTerminalResponse, PendingAttachment, PendingOtarDelivery, PendingTerminalControl, TERMINAL_CONTROL_TIMEOUT_TIMESLOTS,
         otar_downlink_is_group_addressed,
         sc2_ksg_number, supports_security_information_protocol,
     };
@@ -6146,6 +6180,51 @@ mod tests {
                 .expect("test group must attach");
         }
         mm
+    }
+
+    #[test]
+    fn rollover_uses_provisioned_cmg_on_mcch_and_assigned_channels() {
+        let mut mm = test_sc3g_mm(77_468, &[1502]);
+        mm.gsko_bootstraps.insert(77_468, GskoBootstrapStatus::Provisioned {
+            version_number: 2,
+            cmg_gssi: 42_001,
+        });
+        let activation = TdmaTime { t: 1, f: 1, m: 2, h: 0 };
+        let mut queue = MessageQueue::new();
+        assert!(mm.send_gck_rollover_broadcast_round(&mut queue, 18, activation));
+        for assigned in [false, true] {
+            let SapMsgInner::LmmMleUnitdataReq(mut request) = queue.pop_front().expect("CMG notice").msg else {
+                panic!("MM unitdata required")
+            };
+            assert_eq!(request.address.ssi, 42_001);
+            assert_eq!(request.address.ssi_type, SsiType::Gssi);
+            assert_eq!(request.layer2service, Layer2Service::Unacknowledged);
+            assert_eq!(request.aie_request, AieRequest::sc3(AieSubject::Group { gssi: 42_001 }, AieScope::MacResource));
+            assert_eq!(request.assigned_channel_frame18_broadcast, assigned);
+            assert!(!request.stealing_permission);
+            let demand = DAllGcksChangeDemand::from_bitbuf(&mut request.sdu).expect("valid GCK change");
+            assert_eq!(demand.gck_version_number, 18);
+            assert!(matches!(demand.time, CkChangeTime::AbsoluteIv { .. }));
+        }
+        assert!(queue.pop_front().is_none());
+
+        assert!(mm.send_gck_rollover_immediate(&mut queue, 18, activation));
+        let SapMsgInner::LmmMleUnitdataReq(mut request) = queue.pop_front().expect("CMG Immediate").msg else {
+            panic!("MM unitdata required")
+        };
+        assert_eq!(request.address.ssi, 42_001);
+        assert_eq!(request.frame18_rollover_activation, Some(activation));
+        assert!(matches!(DAllGcksChangeDemand::from_bitbuf(&mut request.sdu).unwrap().time, CkChangeTime::Immediate));
+    }
+
+    #[test]
+    fn configured_cmg_is_available_before_any_new_gsko_result() {
+        let mut parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"
+        ))).unwrap();
+        parsed.swmi.as_mut().expect("SwMI example").cmg_gssis = vec![16_000_001];
+        let mm = MmBs::new(SharedConfig::from_parts(parsed, None), None, None, None);
+        assert_eq!(mm.rollover_cmg_gssis(), vec![16_000_001]);
     }
 
     #[test]

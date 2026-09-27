@@ -8,7 +8,7 @@ use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieCon
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
-    AieCipherRegion, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, Sap, Sc3KeyIdentifier, Sc3KeyType, SsiType, TdmaTime,
+    AieCipherRegion, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime,
     TetraAddress, Todo, TxReporter,
 };
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
@@ -72,9 +72,6 @@ pub struct UmacBs {
     /// is the generation token for the slot: teardown and floor/media events
     /// from an older call are ignored after the slot has been recycled.
     traffic_call_owner: [Option<u16>; 4],
-    /// The GCK chosen when a group traffic channel opened remains in use
-    /// until that call releases, even if the cell changes its current GCK.
-    group_call_key: [Option<(u16, u32, Sc3KeyIdentifier)>; 4],
     /// First central downlink voice frame admitted to the RF scheduler for
     /// each traffic-slot call generation.  One log entry per call makes the
     /// media half of call restoration observable without per-frame logging.
@@ -351,7 +348,6 @@ impl UmacBs {
             aie_provider,
             uplink_traffic_aie: [None; 4],
             traffic_call_owner: [None; 4],
-            group_call_key: [None; 4],
             first_central_downlink_voice: [None; 4],
             traffic_floor_holder: [None; 4],
             last_ul_voice: [None; 4],
@@ -730,29 +726,6 @@ impl UmacBs {
         } else {
             AieRequest::sc2(subject, scope)
         })
-    }
-
-    fn group_traffic_aie_for_call(&mut self, call_id: u16, gssi: u32, ts: u8) -> Option<AieRequest> {
-        let request = self.active_aie_request(AieSubject::Group { gssi }, AieScope::Traffic)?;
-        if !(1..=4).contains(&ts) {
-            return Some(request);
-        }
-        if let Some((owner, group, key)) = self.group_call_key[ts as usize - 1]
-            && owner == call_id && group == gssi
-        {
-            return Some(AieRequest::sc3_with_key(AieSubject::Group { gssi }, AieScope::Traffic, key));
-        }
-        if let AieRequest::Sc3 { .. } = request
-            && let Ok(tetra_core::AieContext::Sc3 { key, .. }) =
-                self.aie_provider.resolve(request, AieDirection::Downlink, self.dltime)
-            && key.key_type == Sc3KeyType::Gck
-        {
-            self.group_call_key[ts as usize - 1] = Some((call_id, gssi, key));
-            tracing::info!(call_id, ts, gssi, gck_vn = u16::from_be_bytes([key.context_id[14], key.context_id[15]]),
-                "pinned GCK for group traffic until call release");
-            return Some(AieRequest::sc3_with_key(AieSubject::Group { gssi }, AieScope::Traffic, key));
-        }
-        Some(request)
     }
 
     /// Resolve the cipher context of an event-label-addressed uplink.  The
@@ -2115,35 +2088,17 @@ impl UmacBs {
         }
 
         // Extract sdu
-        let SapMsgInner::TmaUnitdataReq(mut prim) = message.msg else { panic!() };
-        // Group-addressed control on this call's assigned channel must use
-        // the same GCK as its speech. FACCH carries the traffic slot in the
-        // channel allocation rather than associated_channel, so cover both.
-        let call_channel = prim.associated_channel.map(|channel| (channel.timeslot, Some(channel.call_id)))
-            .or_else(|| prim.stealing_permission.then(|| {
-                prim.chan_alloc.as_ref().and_then(|allocation| allocation.timeslots.iter().position(|&set| set))
-                    .map(|index| ((index + 1) as u8, None))
-            }).flatten());
-        if let Some((ts, call_id)) = call_channel
-            && (1..=4).contains(&ts)
-            && let Some((owner, group, key)) = self.group_call_key[ts as usize - 1]
-            && call_id.is_none_or(|call_id| call_id == owner)
-            && prim.main_address.ssi_type == SsiType::Gssi
-            && let Some(AieRequest::Sc3 { subject: AieSubject::Group { gssi }, scope, .. }) = prim.air_interface_encryption
-            && gssi == group && gssi == prim.main_address.ssi
-        {
-            prim.air_interface_encryption = Some(AieRequest::sc3_with_key(AieSubject::Group { gssi }, scope, key));
-        }
+        let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
         if let Some(activation) = prim.frame18_rollover_activation {
             // EN 300 392-7 4.5.5.6 defines Immediate as the first TS of the
             // next downlink multiframe.  The MM emits the marker two UMAC
             // scheduler ticks before the four preceding FN18 resources are
             // built, allowing for MM -> MLE -> LLC -> UMAC routing. It is
-            // deliberately not eligible for normal all-MS traffic fan-out:
+            // deliberately not eligible for normal traffic fan-out:
             // UMAC reserves all four physical FN18 resources itself.
             let final_frame18 = activation.add_timeslots(-4);
-            if prim.main_address.ssi != 0x00ff_ffff
-                || prim.main_address.ssi_type != SsiType::Gssi
+            if prim.main_address.ssi_type != SsiType::Gssi
+                || prim.main_address.ssi == 0
                 || prim.associated_channel.is_some()
                 || prim.chan_alloc.is_some()
                 || activation.t != 1
@@ -2181,7 +2136,8 @@ impl UmacBs {
             {
                 tracing::error!(dltime = %self.dltime, activation = %activation, error, "cannot reserve final SC3G GCK rollover Immediate resources");
             } else {
-                tracing::info!(dltime = %self.dltime, activation = %activation, "reserved final all-timeslot SC3G GCK rollover Immediate resources");
+                tracing::info!(dltime = %self.dltime, activation = %activation, address = ?prim.main_address,
+                    "reserved final all-timeslot SC3G GCK rollover Immediate resources");
             }
             return;
         }
@@ -2570,8 +2526,8 @@ impl UmacBs {
         if assigned_channel_frame18_broadcast {
             let valid_broadcast = associated_channel.is_none()
                 && prim.chan_alloc.is_none()
-                && prim.main_address.ssi == 0x00ff_ffff
-                && prim.main_address.ssi_type == SsiType::Gssi;
+                && prim.main_address.ssi_type == SsiType::Gssi
+                && prim.main_address.ssi != 0;
             if valid_broadcast {
                 let channels = self.channel_scheduler.active_assigned_channels();
                 for timeslot in channels.iter().copied() {
@@ -2582,6 +2538,11 @@ impl UmacBs {
                     channels = channels.len(),
                     "queued D-NWRK-BROADCAST for free FN18 slots on active assigned channels"
                 );
+                // A CMG Absolute-IV copy is specifically for assigned
+                // listeners. Its separate MCCH copy was already queued by MM.
+                if prim.main_address.ssi != 0x00ff_ffff {
+                    return;
+                }
             } else {
                 tracing::warn!(
                     address = ?prim.main_address,
@@ -2911,7 +2872,6 @@ impl UmacBs {
             // Do not carry either the previous group's GCK policy or queued
             // private-call state into the next generation of this slot.
             self.set_traffic_aie(queue, ts, None, None);
-            self.group_call_key[ts as usize - 1] = None;
             self.channel_scheduler.set_hangtime(ts, false);
             self.first_central_downlink_voice[ts as usize - 1] = None;
             self.traffic_floor_holder[ts as usize - 1] = None;
@@ -3007,7 +2967,6 @@ impl UmacBs {
         self.set_traffic_aie(queue, ts, None, None);
         if (1..=4).contains(&ts) {
             self.traffic_call_owner[ts as usize - 1] = None;
-            self.group_call_key[ts as usize - 1] = None;
             self.first_central_downlink_voice[ts as usize - 1] = None;
             self.traffic_floor_holder[ts as usize - 1] = None;
             self.last_ul_voice[ts as usize - 1] = None;
@@ -3093,7 +3052,9 @@ impl UmacBs {
                     );
                     return;
                 }
-                let downlink = self.group_traffic_aie_for_call(call_id, gssi, ts);
+                // Leave the request unpinned: the AIE provider resolves the
+                // active GCK for each physical air slot at transmission time.
+                let downlink = self.active_aie_request(AieSubject::Group { gssi }, AieScope::Traffic);
                 self.set_traffic_aie(queue, ts, downlink, None);
                 tracing::info!(
                     call_id,
@@ -3142,7 +3103,7 @@ impl UmacBs {
                 // SC2 group traffic uses the active TMO SCK. GSKO/GCK remain
                 // separate OTAR/key-management flows; their absence must not
                 // cause an active SC2 group call to leak traffic in clear.
-                let downlink = self.group_traffic_aie_for_call(call_id, dest_gssi, ts);
+                let downlink = self.active_aie_request(AieSubject::Group { gssi: dest_gssi }, AieScope::Traffic);
                 let uplink = self.active_aie_request(subject, AieScope::Traffic);
                 self.set_traffic_aie(queue, ts, downlink, uplink);
                 tracing::info!(
@@ -3175,7 +3136,6 @@ impl UmacBs {
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.traffic_call_owner[ts as usize - 1] = None;
-                    self.group_call_key[ts as usize - 1] = None;
                     self.first_central_downlink_voice[ts as usize - 1] = None;
                     self.traffic_floor_holder[ts as usize - 1] = None;
                     self.last_ul_voice[ts as usize - 1] = None;
@@ -3710,7 +3670,7 @@ mod tests {
     }
 
     #[test]
-    fn group_traffic_keeps_its_gck_across_rollover_until_call_end() {
+    fn active_group_traffic_resolves_new_gck_without_call_release() {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm};
 
         let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
@@ -3730,7 +3690,9 @@ mod tests {
         let ts = 2;
         deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(11, ts)));
         deliver_control(&mut umac, &mut queue, CallControl::ConfigureGroupTrafficAie { call_id: 11, gssi, ts });
-        let old_key = umac.group_call_key[ts as usize - 1].expect("original group key").2;
+        let request = umac.channel_scheduler.traffic_aie(ts).expect("group traffic request");
+        let old_context = umac.aie_provider.resolve(request, AieDirection::Downlink, umac.dltime).unwrap();
+        let tetra_core::AieContext::Sc3 { key: old_key, .. } = old_context else { panic!("SC3 GCK required") };
         assert_eq!(u16::from_be_bytes([old_key.context_id[14], old_key.context_id[15]]), 7);
 
         config.state_write().aie.sc3.as_mut().unwrap().apply_sc3g_snapshot(2, true, 8,
@@ -3740,10 +3702,12 @@ mod tests {
         });
         assert_eq!(
             umac.channel_scheduler.traffic_aie(ts),
-            Some(AieRequest::sc3_with_key(AieSubject::Group { gssi }, AieScope::Traffic, old_key))
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic))
         );
-        // Floor control on FACCH carries its traffic slot in chan_alloc,
-        // not associated_channel. It must also retain the call's old key.
+        let new_context = umac.aie_provider.resolve(request, AieDirection::Downlink, umac.dltime).unwrap();
+        let tetra_core::AieContext::Sc3 { key: new_key, .. } = new_context else { panic!("SC3 GCK required") };
+        assert_eq!(u16::from_be_bytes([new_key.context_id[14], new_key.context_id[15]]), 8);
+        // FACCH must likewise resolve the new generation on the active call.
         let mut timeslots = [false; 4];
         timeslots[ts as usize - 1] = true;
         umac.rx_ul_tma_unitdata_req(&mut queue, SapMsg::new(
@@ -3773,14 +3737,12 @@ mod tests {
         let stch = umac.channel_scheduler.finalize_ts_for_tick().blk1.expect("group FACCH");
         assert_eq!(stch.logical_channel, LogicalChannel::Stch);
         assert_eq!(stch.air_interface_encryption,
-            Some(AieRequest::sc3_with_key(AieSubject::Group { gssi }, AieScope::Facch, old_key)));
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Facch)));
 
         deliver_control(&mut umac, &mut queue, CallControl::CallEnded { call_id: 11, ts });
-        assert!(umac.group_call_key[ts as usize - 1].is_none());
         deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(12, ts)));
         deliver_control(&mut umac, &mut queue, CallControl::ConfigureGroupTrafficAie { call_id: 12, gssi, ts });
-        let new_key = umac.group_call_key[ts as usize - 1].expect("new group key").2;
-        assert_eq!(u16::from_be_bytes([new_key.context_id[14], new_key.context_id[15]]), 8);
+        assert_eq!(umac.channel_scheduler.traffic_aie(ts), Some(request));
     }
 
     #[test]
@@ -3887,6 +3849,51 @@ mod tests {
         pdch_bits.seek(0);
         let pdch_resource = MacResource::from_bitbuf(&mut pdch_bits).expect("PDCH MAC-RESOURCE");
         assert_eq!(pdch_resource.addr.map(|addr| addr.ssi), Some(0x00ff_ffff));
+    }
+
+    #[test]
+    fn cmg_rollover_notice_keeps_its_address_on_assigned_fn18() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .expect("example configuration must remain valid");
+        let mut umac = UmacBs::new(SharedConfig::from_parts(config, None));
+        let mut queue = MessageQueue::new();
+        deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(10, 2)));
+        let cmg_gssi = 42_001;
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("0000"),
+                    main_address: TetraAddress::new(cmg_gssi, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: Some(AieRequest::clear(AieSubject::Group { gssi: cmg_gssi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: true,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
+                }),
+            ),
+        );
+        let tch_time = TdmaTime { t: 2, f: 18, m: 2, h: 0 };
+        umac.channel_scheduler.cur_dltime = tch_time.add_timeslots(-1);
+        let tch = umac.channel_scheduler.finalize_ts_for_tick();
+        assert_eq!(tch.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+        let mut bits = tch.blk1.unwrap().mac_block;
+        bits.seek(0);
+        let resource = MacResource::from_bitbuf(&mut bits).expect("CMG MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|address| address.ssi), Some(cmg_gssi));
     }
 
     #[test]

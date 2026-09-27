@@ -219,3 +219,6 @@ password = "replace-before-use"
 reconnect_delay_secs = 5
 heartbeat_interval_secs = 2
 heartbeat_timeout_secs = 10
+# Mirror the SwMI's aie.sc3.cmgs GSSIs so GCK rollover notices keep the
+# CMG address immediately after a BS restart (before fresh GSKO results).
+# cmg_gssis = [16000001]

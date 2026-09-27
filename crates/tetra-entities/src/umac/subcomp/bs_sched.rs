@@ -153,12 +153,12 @@ pub struct TimeslotSchedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AssociatedBestEffortKind {
     CallRepeat(u16),
-    Frame18Broadcast,
+    Frame18Broadcast(u32),
 }
 
 impl AssociatedBestEffortKind {
     fn is_frame18_only(self) -> bool {
-        matches!(self, Self::Frame18Broadcast)
+        matches!(self, Self::Frame18Broadcast(_))
     }
 }
 
@@ -168,7 +168,7 @@ struct AssociatedBestEffortElem {
     elem: DlSchedElem,
 }
 
-/// One non-fragmentable all-MS D-CK CHANGE DEMAND that must occupy every
+/// One non-fragmentable GCK change demand that must occupy every
 /// physical frame-18 immediately before a local SC3G activation.  This is
 /// intentionally separate from the normal and best-effort queues: neither
 /// call traffic nor packet data may delay `Immediate`.
@@ -1968,12 +1968,13 @@ impl BsChannelScheduler {
     /// Queue the all-MS neighbour broadcast below SDS, grants, call control,
     /// packet data and periodic call repeats. It has no frames 1..17 fallback.
     pub fn dl_enqueue_associated_frame18_broadcast(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, aie_request: AieRequest) {
-        self.dl_enqueue_associated_best_effort(ts, AssociatedBestEffortKind::Frame18Broadcast, pdu, sdu, aie_request);
+        let gssi = pdu.addr.map_or(0, |address| address.ssi);
+        self.dl_enqueue_associated_best_effort(ts, AssociatedBestEffortKind::Frame18Broadcast(gssi), pdu, sdu, aie_request);
     }
 
     /// Reserve the four physical FN18 resources directly before a TS1/FN1
     /// SC3G change.  This is called only by the marker carried with the
-    /// all-MS `D-CK CHANGE DEMAND` whose time type is `Immediate`.
+    /// `D-CK CHANGE DEMAND` whose time type is `Immediate`.
     pub fn reserve_gck_rollover_immediate(
         &mut self,
         activation: TdmaTime,
@@ -1986,9 +1987,9 @@ impl BsChannelScheduler {
         }
         if !pdu
             .addr
-            .is_some_and(|address| address.ssi == 0x00ff_ffff && address.ssi_type == SsiType::Gssi)
+            .is_some_and(|address| address.ssi != 0 && address.ssi_type == SsiType::Gssi)
         {
-            return Err("SC3G rollover Immediate must be all-MS GSSI addressed");
+            return Err("SC3G rollover Immediate must be GSSI addressed");
         }
         // A final `Immediate` is an atomic four-timeslot operation. A
         // previous request can be left partly reserved if a cell is reset or
@@ -2065,9 +2066,8 @@ impl BsChannelScheduler {
 
     fn build_final_gck_rollover_slot(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime) -> TmvUnitdataReqSlot {
         let assigned_channel = ts.t != 1 && self.assigned_channel_is_active(ts.t);
-        // The Immediate is broadcast addressed even on an assigned channel.
-        // The voice GSSI is not the CMG GSSI for group-addressed security
-        // signalling (TTR 001-11 §6.2.10).
+        // Preserve the MM-selected GSSI, including the CMG address on an
+        // assigned channel. It must not become the voice talkgroup address.
         let ul_phy_chan = if assigned_channel {
             PhysicalChannel::Tp
         } else {
@@ -3454,6 +3454,7 @@ impl BsChannelScheduler {
             tracing::info!(
                 dltime = %ts,
                 activation = %item.activation,
+                target = ?item.pdu.addr,
                 mandatory_bsch = ts.is_mandatory_bsch(),
                 mandatory_bnch = ts.is_mandatory_bnch(),
                 "transmitting final SC3G GCK rollover Immediate on FN18"
@@ -6934,7 +6935,7 @@ mod tests {
     }
 
     #[test]
-    fn final_gck_immediate_on_group_tch_is_broadcast_addressed_and_clear() {
+    fn final_gck_immediate_on_group_tch_keeps_cmg_and_cck() {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig};
         use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -6983,20 +6984,21 @@ mod tests {
         );
         sched.set_traffic_aie(2, Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic)));
 
-        let all_ms = TetraAddress::new(0x00ff_ffff, SsiType::Gssi);
+        let cmg_gssi = 42_001;
+        let cmg = TetraAddress::new(cmg_gssi, SsiType::Gssi);
         let mut sdu = BitBuffer::new_autoexpand(40);
         sdu.write_bits(0, 34);
         sdu.seek(0);
-        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&all_ms, None, false);
+        let mut resource = BsChannelScheduler::dl_make_minimal_resource(&cmg, None, false);
         resource.update_len_and_fill_ind(sdu.get_len());
         sched
             .reserve_gck_rollover_immediate(
                 activation,
                 resource,
                 sdu,
-                AieRequest::clear(AieSubject::System, AieScope::MacResource),
+                AieRequest::sc3(AieSubject::Group { gssi: cmg_gssi }, AieScope::MacResource),
             )
-            .expect("reserve Immediate on all slots");
+            .expect("reserve CMG Immediate on all slots");
         sched.cur_dltime = activation.add_timeslots(-4);
         let output = sched.finalize_ts_for_tick();
         assert_eq!(output.ts.t, 2);
@@ -7009,11 +7011,11 @@ mod tests {
             .mac_block;
         block.seek(0);
         let header = MacResource::from_bitbuf(&mut block).expect("Immediate MAC-RESOURCE");
-        let address = header.addr.expect("broadcast address");
-        assert_eq!(address.ssi, 0x00ff_ffff);
+        let address = header.addr.expect("encrypted CMG address");
+        assert_ne!(address.ssi, cmg_gssi);
         // MAC-RESOURCE's SSI address field does not distinguish ISSI/GSSI.
         assert_eq!(address.ssi_type, SsiType::Ssi);
-        assert_eq!(header.encryption_mode, 0);
+        assert_eq!(header.encryption_mode, 0b11);
         assert!(header.usage_marker.is_none());
     }
 
