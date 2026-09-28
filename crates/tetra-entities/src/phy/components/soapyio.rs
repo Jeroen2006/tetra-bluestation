@@ -9,7 +9,18 @@ use super::soapy_settings::{SdrSettings, SupportedDevice};
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
 
 type StreamType = ComplexSample;
-const SOAPY_FREQ_OFFSET: f64 = 20000.0;
+const CHANNEL_HALF_BANDWIDTH_GUARD_HZ: f64 = 20_000.0;
+
+fn validate_lo_offset(offset_hz: i64, sample_rate: f64, direction: &str) -> Result<(), soapysdr::Error> {
+    let half_bandwidth = (offset_hz as f64).abs() + CHANNEL_HALF_BANDWIDTH_GUARD_HZ;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 || half_bandwidth >= sample_rate / 2.0 {
+        return Err(soapysdr::Error {
+            code: soapysdr::ErrorCode::Other,
+            message: format!("{direction} LO offset {offset_hz} Hz exceeds the available baseband range at {sample_rate} S/s"),
+        });
+    }
+    Ok(())
+}
 
 pub struct RxResult {
     /// Number of samples read
@@ -83,12 +94,12 @@ impl SoapyIo {
 
         let (rx_freq, tx_freq) = match mode {
             StackMode::Bs => (
-                Some(ul_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                Some(dl_corrected),
+                Some(ul_corrected + soapy_cfg.rx_lo_offset_hz as f64),
+                Some(dl_corrected + soapy_cfg.tx_lo_offset_hz as f64),
             ),
             StackMode::Ms => (
-                Some(dl_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                Some(ul_corrected),
+                Some(dl_corrected + soapy_cfg.rx_lo_offset_hz as f64),
+                Some(ul_corrected + soapy_cfg.tx_lo_offset_hz as f64),
             ),
             StackMode::Mon => {
                 unimplemented!("Monitor mode not implemented yet");
@@ -107,6 +118,7 @@ impl SoapyIo {
             // Read the actual sample rate obtained and store it
             // to avoid having to read it again every time it is needed.
             rx_fs = soapycheck!("get RX sample rate", dev.sample_rate(soapysdr::Direction::Rx, rx_ch));
+            validate_lo_offset(soapy_cfg.rx_lo_offset_hz, rx_fs, "RX")?;
         }
         let mut tx_fs: f64 = 0.0;
         if tx_enabled {
@@ -115,6 +127,7 @@ impl SoapyIo {
                 dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, sdr_settings.fs)
             );
             tx_fs = soapycheck!("get TX sample rate", dev.sample_rate(soapysdr::Direction::Tx, tx_ch));
+            validate_lo_offset(soapy_cfg.tx_lo_offset_hz, tx_fs, "TX")?;
         }
 
         if rx_enabled {
@@ -487,4 +500,16 @@ fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::De
     }
 
     Ok((opened_device.dev, sdr_settings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_lo_offset;
+
+    #[test]
+    fn lo_offset_must_leave_room_for_the_tetra_channel() {
+        assert!(validate_lo_offset(-50_000, 600_000.0, "TX").is_ok());
+        assert!(validate_lo_offset(-280_000, 600_000.0, "TX").is_err());
+        assert!(validate_lo_offset(-20_000, f64::NAN, "RX").is_err());
+    }
 }

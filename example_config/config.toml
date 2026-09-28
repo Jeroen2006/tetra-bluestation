@@ -29,6 +29,12 @@ backend = "SoapySdr"
 tx_freq = 438025000
 rx_freq = 433025000
 
+# Local-oscillator offsets from the configured RF carrier, in Hz.
+# Positive values put the LO above the carrier; negative values put it below.
+# Defaults preserve the existing tuning: TX on the carrier, RX 20 kHz below.
+# tx_lo_offset_hz = 0
+# rx_lo_offset_hz = -20000
+
 # Adjust if your SDR has a non-negligible tuning error
 # ppm_err = 0.0
 

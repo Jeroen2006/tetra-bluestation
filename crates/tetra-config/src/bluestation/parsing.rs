@@ -203,4 +203,21 @@ mod tests {
         cfg.network_broadcast.timezone = Some("Europe/Amsterdam".to_owned());
         assert!(cfg.validate().is_ok());
     }
+
+    #[test]
+    fn soapy_lo_offsets_default_to_existing_tuning_and_accept_overrides() {
+        let cfg = from_toml_str(EXAMPLE).expect("example config is valid");
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
+        assert_eq!(soapy.rx_lo_offset_hz, -20_000);
+        assert_eq!(soapy.tx_lo_offset_hz, 0);
+
+        let customized = EXAMPLE.replace(
+            "rx_freq = 433025000",
+            "rx_freq = 433025000\nrx_lo_offset_hz = -45000\ntx_lo_offset_hz = -50000",
+        );
+        let cfg = from_toml_str(&customized).expect("LO offset fields are accepted");
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
+        assert_eq!(soapy.rx_lo_offset_hz, -45_000);
+        assert_eq!(soapy.tx_lo_offset_hz, -50_000);
+    }
 }

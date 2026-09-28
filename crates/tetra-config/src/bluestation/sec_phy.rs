@@ -49,6 +49,11 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
         CfgSoapySdr {
             ul_freq: soapy_dto.rx_freq,
             dl_freq: soapy_dto.tx_freq,
+            // Preserve the previous RX tuning point (20 kHz below the carrier)
+            // unless a config explicitly selects a different offset.
+            rx_lo_offset_hz: soapy_dto.rx_lo_offset_hz.unwrap_or(-20_000),
+            // The TX LO previously matched the carrier frequency.
+            tx_lo_offset_hz: soapy_dto.tx_lo_offset_hz.unwrap_or(0),
             ppm_err: soapy_dto.ppm_err.unwrap_or(0.0),
             device: soapy_dto.device,
             fs: soapy_dto.sample_rate,

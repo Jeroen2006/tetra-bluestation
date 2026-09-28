@@ -9,6 +9,10 @@ pub struct CfgSoapySdr {
     pub ul_freq: f64,
     /// Downlink frequency in Hz
     pub dl_freq: f64,
+    /// RX LO offset from the selected carrier in Hz. Positive values place the LO above the carrier.
+    pub rx_lo_offset_hz: i64,
+    /// TX LO offset from the selected carrier in Hz. Positive values place the LO above the carrier.
+    pub tx_lo_offset_hz: i64,
     /// PPM frequency error correction
     pub ppm_err: f64,
     /// Argument string to select a specific SDR device.
@@ -52,6 +56,8 @@ impl CfgSoapySdr {
 pub struct SoapySdrDto {
     pub rx_freq: f64,
     pub tx_freq: f64,
+    pub rx_lo_offset_hz: Option<i64>,
+    pub tx_lo_offset_hz: Option<i64>,
     pub ppm_err: Option<f64>,
 
     pub device: Option<String>,
