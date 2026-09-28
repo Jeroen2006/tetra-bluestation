@@ -21,7 +21,7 @@ pub struct CfgSoapySdr {
     pub tx_iq_gain_db: f32,
     /// TX I/Q quadrature phase correction in degrees.
     pub tx_iq_phase_deg: f32,
-    /// Run SXceiver RF-loopback TX DC and I/Q calibration before starting the BS stack.
+    /// Run SXceiver/MuCell SX1255 RF-loopback TX DC and I/Q calibration before starting the BS stack.
     pub tx_dc_calibration_on_startup: bool,
     /// PPM frequency error correction
     pub ppm_err: f64,

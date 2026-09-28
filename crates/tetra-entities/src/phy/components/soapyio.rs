@@ -496,14 +496,17 @@ fn find_supported_device(filter_args: soapysdr::Args) -> Result<OpenedDevice, so
 
 /// Open a given device if argument string is given,
 /// automatically find the first supported device if not.
-pub(super) fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::Device, SdrSettings, bool), soapysdr::Error> {
+pub(super) fn open_device(
+    soapy_cfg: &CfgSoapySdr,
+    mode: StackMode,
+) -> Result<(soapysdr::Device, SdrSettings, bool), soapysdr::Error> {
     let mut opened_device = if let Some(arg_string) = &soapy_cfg.device {
         open_given_device(arg_string.as_str().into())
     } else {
         find_supported_device(soapysdr::Args::new())
     }?;
 
-    let is_sxceiver = matches!(&opened_device.detected_device, SupportedDevice::SXceiver);
+    let supports_tx_loopback_calibration = opened_device.detected_device.supports_tx_loopback_calibration();
     let mut sdr_settings = match SdrSettings::get_settings(&soapy_cfg, opened_device.detected_device, mode) {
         Ok(sdr_settings) => sdr_settings,
         Err(soapy_settings::Error::InvalidConfiguration) => {
@@ -558,7 +561,7 @@ pub(super) fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(s
         }
     }
 
-    Ok((opened_device.dev, sdr_settings, is_sxceiver))
+    Ok((opened_device.dev, sdr_settings, supports_tx_loopback_calibration))
 }
 
 #[cfg(test)]

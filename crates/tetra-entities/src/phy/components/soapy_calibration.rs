@@ -1,4 +1,4 @@
-//! Startup TX DC and I/Q calibration for SXceiver radios with SX1255 RF loopback.
+//! Startup TX DC and I/Q calibration for SX1255-based radios with RF loopback.
 
 use soapysdr::{Args, Direction, Error, ErrorCode};
 use tetra_config::bluestation::{StackMode, sec_phy_soapy::CfgSoapySdr};
@@ -22,7 +22,7 @@ const MEASURED_BLOCKS: usize = 4;
 /// to persist in the station configuration.
 pub fn calibrate_tx(cfg: &CfgSoapySdr, mode: StackMode) -> Result<(f32, f32, f32, f32), Error> {
     if mode != StackMode::Bs {
-        return Err(calibration_error("SXceiver TX calibration requires BS mode"));
+        return Err(calibration_error("SX1255 TX calibration requires BS mode"));
     }
 
     if cfg.tx_dc_i.abs() > MAX_TX_DC_CORRECTION || cfg.tx_dc_q.abs() > MAX_TX_DC_CORRECTION {
@@ -40,9 +40,11 @@ pub fn calibrate_tx(cfg: &CfgSoapySdr, mode: StackMode) -> Result<(f32, f32, f32
     // retained. This config clone is used only while the temporary radio is open.
     let mut loopback_cfg = cfg.clone();
     loopback_cfg.rx_ant = Some("LB".to_string());
-    let (dev, settings, is_sxceiver) = open_device(&loopback_cfg, mode)?;
-    if !is_sxceiver {
-        return Err(calibration_error("Startup TX calibration is only supported by the SXceiver driver"));
+    let (dev, settings, supports_tx_loopback_calibration) = open_device(&loopback_cfg, mode)?;
+    if !supports_tx_loopback_calibration {
+        return Err(calibration_error(
+            "Startup TX calibration is only supported by SXceiver (driver 'sx') and MuCell (driver 'mucell') SX1255 devices",
+        ));
     }
 
     let rx_ch = settings.rx_ch;
@@ -79,12 +81,12 @@ fn run_calibration(
     let tx_fs = dev.sample_rate(Direction::Tx, tx_ch)?;
     if !rx_fs.is_finite() || !tx_fs.is_finite() || rx_fs <= 0.0 || tx_fs <= 0.0 || (rx_fs - tx_fs).abs() > 1.0 {
         return Err(calibration_error(format!(
-            "Unsupported SXceiver sample rates RX={rx_fs}, TX={tx_fs}"
+            "Unsupported SX1255 sample rates RX={rx_fs}, TX={tx_fs}"
         )));
     }
     if TX_PILOT_HZ + RX_LO_OFFSET_HZ + 20_000.0 >= rx_fs / 2.0 {
         return Err(calibration_error(format!(
-            "Sample rate {rx_fs} S/s is too low for SXceiver TX calibration"
+            "Sample rate {rx_fs} S/s is too low for SX1255 TX calibration"
         )));
     }
 
@@ -98,7 +100,7 @@ fn run_calibration(
 
     let rx_antennas = dev.antennas(Direction::Rx, rx_ch)?;
     if !rx_antennas.iter().any(|antenna| antenna == "LB") {
-        return Err(calibration_error("SXceiver driver does not expose the RF loopback antenna (LB)"));
+        return Err(calibration_error("The selected SX1255 driver does not expose the RF loopback antenna (LB)"));
     }
     dev.set_antenna(Direction::Rx, rx_ch, "LB")?;
 
@@ -125,7 +127,7 @@ fn run_calibration(
     tx.activate(None)?;
     dev.set_antenna(Direction::Tx, tx_ch, "TX")?;
 
-    tracing::info!("Measuring SXceiver TX LO leakage and I/Q image through RF loopback; startup may take several seconds");
+    tracing::info!("Measuring SX1255 TX LO leakage and I/Q image through RF loopback; startup may take several seconds");
     let (tx_dc_i, tx_dc_q, before, after, pilot_power, _) = minimize_tx_dc(cfg.tx_dc_i, cfg.tx_dc_q, |i, q| {
         measure_loopback(&mut tx, &mut rx, tx_fs, i, q, cfg.tx_iq_gain_db, cfg.tx_iq_phase_deg)
     })?;
@@ -138,7 +140,7 @@ fn run_calibration(
     tx.deactivate(None)?;
     rx.deactivate(None)?;
     tracing::info!(
-        "SXceiver TX calibration complete: TX DC I={tx_dc_i:.5}, TX DC Q={tx_dc_q:.5}; TX I/Q gain={tx_iq_gain_db:.4} dB, phase={tx_iq_phase_deg:.4} deg; LO leakage {:.1} -> {:.1} dBc, image {:.1} -> {:.1} dBc",
+        "SX1255 TX calibration complete: TX DC I={tx_dc_i:.5}, TX DC Q={tx_dc_q:.5}; TX I/Q gain={tx_iq_gain_db:.4} dB, phase={tx_iq_phase_deg:.4} deg; LO leakage {:.1} -> {:.1} dBc, image {:.1} -> {:.1} dBc",
         ratio_db(before, pilot_power),
         ratio_db(after, pilot_power),
         ratio_db(image_before, 1.0),
@@ -184,7 +186,7 @@ fn measure_loopback(
         while filled < rx_samples.len() {
             let received = rx.read(&mut [&mut rx_samples[filled..]], 1_000_000)?;
             if received == 0 {
-                return Err(calibration_error("SXceiver returned an empty RX loopback buffer"));
+                return Err(calibration_error("SX1255 driver returned an empty RX loopback buffer"));
             }
             filled += received;
         }
@@ -207,13 +209,13 @@ fn measure_loopback(
 
     if peak > 0.95 {
         return Err(calibration_error(format!(
-            "SXceiver RX loopback is clipping (peak sample {peak:.3})"
+            "SX1255 RX loopback is clipping (peak sample {peak:.3})"
         )));
     }
     let pilot_power = pilot_power / MEASURED_BLOCKS as f64;
     if !pilot_power.is_finite() || pilot_power < 1e-12 {
         return Err(calibration_error(format!(
-            "No usable TX pilot was detected through SXceiver RF loopback (power {pilot_power:.3e})"
+            "No usable TX pilot was detected through SX1255 RF loopback (power {pilot_power:.3e})"
         )));
     }
     Ok((

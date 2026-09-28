@@ -346,13 +346,13 @@ fn main() {
     if let Some(soapy_cfg) = stack_cfg.phy_io.soapysdr.as_mut()
         && soapy_cfg.tx_dc_calibration_on_startup
     {
-        eprintln!("Starting opt-in SXceiver TX DC and I/Q calibration before the BS stack");
+        eprintln!("Starting opt-in SX1255 TX DC and I/Q calibration for SXceiver/MuCell before the BS stack");
         let (tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg) = calibrate_tx(soapy_cfg, stack_mode).unwrap_or_else(|err| {
-            eprintln!("SXceiver startup TX calibration failed: {err}");
+            eprintln!("SX1255 startup TX calibration failed: {err}");
             std::process::exit(1);
         });
         persist_calibrated_tx(&args.config, tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg).unwrap_or_else(|err| {
-            eprintln!("Failed to save SXceiver TX calibration: {err}");
+            eprintln!("Failed to save SX1255 TX calibration: {err}");
             std::process::exit(1);
         });
         soapy_cfg.tx_dc_i = tx_dc_i;
