@@ -13,6 +13,10 @@ pub struct CfgSoapySdr {
     pub rx_lo_offset_hz: i64,
     /// TX LO offset from the selected carrier in Hz. Positive values place the LO above the carrier.
     pub tx_lo_offset_hz: i64,
+    /// TX baseband DC correction added to active I samples, in normalized sample units.
+    pub tx_dc_i: f32,
+    /// TX baseband DC correction added to active Q samples, in normalized sample units.
+    pub tx_dc_q: f32,
     /// PPM frequency error correction
     pub ppm_err: f64,
     /// Argument string to select a specific SDR device.
@@ -58,6 +62,8 @@ pub struct SoapySdrDto {
     pub tx_freq: f64,
     pub rx_lo_offset_hz: Option<i64>,
     pub tx_lo_offset_hz: Option<i64>,
+    pub tx_dc_i: Option<f32>,
+    pub tx_dc_q: Option<f32>,
     pub ppm_err: Option<f64>,
 
     pub device: Option<String>,

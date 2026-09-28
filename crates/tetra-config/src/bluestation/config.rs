@@ -107,6 +107,10 @@ impl StackConfig {
                 .as_ref()
                 .expect("SoapySdr config must be set for SoapySdr PhyIo");
 
+            if !soapy_cfg.tx_dc_i.is_finite() || !soapy_cfg.tx_dc_q.is_finite() {
+                return Err("SoapySdr TX DC corrections must be finite");
+            }
+
             let Ok(freq_info) = FreqInfo::from_components(
                 self.cell.freq_band,
                 self.cell.main_carrier,

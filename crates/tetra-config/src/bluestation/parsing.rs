@@ -210,14 +210,25 @@ mod tests {
         let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
         assert_eq!(soapy.rx_lo_offset_hz, -20_000);
         assert_eq!(soapy.tx_lo_offset_hz, 0);
+        assert_eq!(soapy.tx_dc_i, 0.0);
+        assert_eq!(soapy.tx_dc_q, 0.0);
 
         let customized = EXAMPLE.replace(
             "rx_freq = 433025000",
-            "rx_freq = 433025000\nrx_lo_offset_hz = -45000\ntx_lo_offset_hz = -50000",
+            "rx_freq = 433025000\nrx_lo_offset_hz = -45000\ntx_lo_offset_hz = -50000\ntx_dc_i = 0.0015\ntx_dc_q = -0.0025",
         );
         let cfg = from_toml_str(&customized).expect("LO offset fields are accepted");
         let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
         assert_eq!(soapy.rx_lo_offset_hz, -45_000);
         assert_eq!(soapy.tx_lo_offset_hz, -50_000);
+        assert_eq!(soapy.tx_dc_i, 0.0015);
+        assert_eq!(soapy.tx_dc_q, -0.0025);
+    }
+
+    #[test]
+    fn soapy_tx_dc_corrections_must_be_finite() {
+        let customized = EXAMPLE.replace("rx_freq = 433025000", "rx_freq = 433025000\ntx_dc_i = nan");
+        let cfg = from_toml_str(&customized).expect("TOML supports NaN values");
+        assert_eq!(cfg.validate(), Err("SoapySdr TX DC corrections must be finite"));
     }
 }

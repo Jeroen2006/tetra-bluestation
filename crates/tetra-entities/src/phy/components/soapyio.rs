@@ -22,6 +22,20 @@ fn validate_lo_offset(offset_hz: i64, sample_rate: f64, direction: &str) -> Resu
     Ok(())
 }
 
+fn apply_tx_dc_offset(samples: &[StreamType], dc_i: f32, dc_q: f32) -> Vec<StreamType> {
+    let correction = ComplexSample::new(dc_i, dc_q);
+    samples
+        .iter()
+        .map(|sample| {
+            if *sample == ComplexSample::ZERO {
+                *sample
+            } else {
+                *sample + correction
+            }
+        })
+        .collect()
+}
+
 pub struct RxResult {
     /// Number of samples read
     pub len: usize,
@@ -34,6 +48,8 @@ pub struct SoapyIo {
     tx_ch: usize,
     rx_fs: f64,
     tx_fs: f64,
+    tx_dc_i: f32,
+    tx_dc_q: f32,
     /// Timestamp for the first sample read from SDR.
     /// This is subtracted from all following timestamps,
     /// so that sample counter startsB210 from 0 even if timestamp does not.
@@ -196,6 +212,8 @@ impl SoapyIo {
             tx_ch,
             rx_fs,
             tx_fs,
+            tx_dc_i: soapy_cfg.tx_dc_i,
+            tx_dc_q: soapy_cfg.tx_dc_q,
             initial_time: None,
             rx_next_count: 0,
             prev_time_ns: -1,
@@ -282,10 +300,16 @@ impl SoapyIo {
         if !self.tx_active {
             return Err(RxTxDevError::RxReadError);
         }
+        let corrected_buffer = if self.tx_dc_i == 0.0 && self.tx_dc_q == 0.0 {
+            None
+        } else {
+            Some(apply_tx_dc_offset(buffer, self.tx_dc_i, self.tx_dc_q))
+        };
+        let samples = corrected_buffer.as_deref().unwrap_or(buffer);
         if let Some(tx) = &mut self.tx {
             if let Some(initial_time) = self.initial_time {
                 tx.write_all(
-                    &[buffer],
+                    &[samples],
                     count.map(|count| initial_time + ticks_to_time_ns(count, self.tx_fs)),
                     false,
                     1000000,
@@ -504,7 +528,25 @@ fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::De
 
 #[cfg(test)]
 mod tests {
-    use super::validate_lo_offset;
+    use super::{apply_tx_dc_offset, validate_lo_offset};
+    use crate::phy::components::dsp_types::ComplexSample;
+
+    #[test]
+    fn tx_dc_offset_changes_signal_samples_and_preserves_silence() {
+        let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5), ComplexSample::ZERO];
+
+        let output = apply_tx_dc_offset(&input, 0.01, -0.02);
+
+        assert_eq!(output[0], ComplexSample::ZERO);
+        assert_eq!(output[1], ComplexSample::new(0.26, -0.52));
+        assert_eq!(output[2], ComplexSample::ZERO);
+    }
+
+    #[test]
+    fn zero_tx_dc_offset_preserves_samples() {
+        let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5)];
+        assert_eq!(apply_tx_dc_offset(&input, 0.0, 0.0), input);
+    }
 
     #[test]
     fn lo_offset_must_leave_room_for_the_tetra_channel() {

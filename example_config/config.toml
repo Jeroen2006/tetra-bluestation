@@ -35,6 +35,11 @@ rx_freq = 433025000
 # tx_lo_offset_hz = 0
 # rx_lo_offset_hz = -20000
 
+# Optional TX baseband DC correction, in normalized I/Q sample units.
+# Corrections are added only to non-zero TX samples, so digital silence stays silent.
+# tx_dc_i = 0.0
+# tx_dc_q = 0.0
+
 # Adjust if your SDR has a non-negligible tuning error
 # ppm_err = 0.0
 
