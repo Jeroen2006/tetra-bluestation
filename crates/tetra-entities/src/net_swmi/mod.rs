@@ -375,6 +375,7 @@ struct LocalRadioProfile {
     service_flags: u16,
     ms_txpwr_max_cell: u8,
     rxlev_access_min: u8,
+    access_parameter: u8,
     subscriber_class: u16,
     tdma_synchronized: bool,
     tdma_frame_offset: u8,
@@ -409,6 +410,7 @@ impl LocalRadioProfile {
             service_flags,
             ms_txpwr_max_cell: cell.ms_txpwr_max_cell,
             rxlev_access_min: cell.rxlev_access_min,
+            access_parameter: cell.access_parameter,
             subscriber_class: cell.subscriber_class,
             tdma_synchronized: cell.tdma_synchronized,
             tdma_frame_offset: cell.tdma_frame_offset,
@@ -442,6 +444,7 @@ impl LocalRadioProfile {
             service_flags: self.effective_service_flags(network_connected, cell.aie.enabled),
             ms_txpwr_max_cell: self.ms_txpwr_max_cell,
             rxlev_access_min: self.rxlev_access_min,
+            access_parameter: Some(self.access_parameter),
             subscriber_class: self.subscriber_class,
             cell_load_ca: runtime.broadcast.cell_load_ca,
             neighbour_station_ids: runtime.neighbours.ids.clone(),
@@ -1194,6 +1197,7 @@ mod tests {
             system_code: 0,
             ms_txpwr_max_cell: 0,
             rxlev_access_min: 0,
+            access_parameter: 0,
             subscriber_class: 0,
             tdma_synchronized: false,
             tdma_frame_offset: 0,
@@ -1201,6 +1205,6 @@ mod tests {
 
         assert_eq!(profile.effective_service_flags(false, false), 0b000_0100_0011);
         assert_eq!(profile.effective_service_flags(true, false), 0b000_0110_0011);
-        assert_eq!(profile.effective_service_flags(true, true), 0b100_0110_0011);
+        assert_eq!(profile.effective_service_flags(true, true), 0b010_0110_0011);
     }
 }
