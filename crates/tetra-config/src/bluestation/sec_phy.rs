@@ -57,6 +57,8 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
             // A zero correction preserves the existing baseband samples.
             tx_dc_i: soapy_dto.tx_dc_i.unwrap_or(0.0),
             tx_dc_q: soapy_dto.tx_dc_q.unwrap_or(0.0),
+            tx_iq_gain_db: soapy_dto.tx_iq_gain_db.unwrap_or(0.0),
+            tx_iq_phase_deg: soapy_dto.tx_iq_phase_deg.unwrap_or(0.0),
             tx_dc_calibration_on_startup: soapy_dto.tx_dc_calibration_on_startup.unwrap_or(false),
             ppm_err: soapy_dto.ppm_err.unwrap_or(0.0),
             device: soapy_dto.device,

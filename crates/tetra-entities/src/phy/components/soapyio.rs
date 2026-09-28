@@ -22,15 +22,40 @@ fn validate_lo_offset(offset_hz: i64, sample_rate: f64, direction: &str) -> Resu
     Ok(())
 }
 
-fn apply_tx_dc_offset(samples: &[StreamType], dc_i: f32, dc_q: f32) -> Vec<StreamType> {
-    let correction = ComplexSample::new(dc_i, dc_q);
+#[derive(Clone, Copy)]
+pub(super) struct TxIqCorrection {
+    q_gain: f32,
+    phase_tangent: f32,
+    phase_inverse_cosine: f32,
+}
+
+impl TxIqCorrection {
+    pub(super) fn new(gain_db: f32, phase_deg: f32) -> Self {
+        let phase = phase_deg.to_radians();
+        Self {
+            q_gain: 10.0_f32.powf(gain_db / 20.0),
+            phase_tangent: phase.tan(),
+            phase_inverse_cosine: 1.0 / phase.cos(),
+        }
+    }
+
+    pub(super) fn apply(self, sample: ComplexSample) -> ComplexSample {
+        ComplexSample::new(
+            sample.re + sample.im * self.phase_tangent,
+            sample.im * self.q_gain * self.phase_inverse_cosine,
+        )
+    }
+}
+
+fn apply_tx_corrections(samples: &[StreamType], dc_i: f32, dc_q: f32, iq_correction: TxIqCorrection) -> Vec<StreamType> {
+    let dc_correction = ComplexSample::new(dc_i, dc_q);
     samples
         .iter()
         .map(|sample| {
             if *sample == ComplexSample::ZERO {
                 *sample
             } else {
-                *sample + correction
+                iq_correction.apply(*sample) + dc_correction
             }
         })
         .collect()
@@ -50,6 +75,7 @@ pub struct SoapyIo {
     tx_fs: f64,
     tx_dc_i: f32,
     tx_dc_q: f32,
+    tx_iq_correction: TxIqCorrection,
     /// Timestamp for the first sample read from SDR.
     /// This is subtracted from all following timestamps,
     /// so that sample counter startsB210 from 0 even if timestamp does not.
@@ -214,6 +240,7 @@ impl SoapyIo {
             tx_fs,
             tx_dc_i: soapy_cfg.tx_dc_i,
             tx_dc_q: soapy_cfg.tx_dc_q,
+            tx_iq_correction: TxIqCorrection::new(soapy_cfg.tx_iq_gain_db, soapy_cfg.tx_iq_phase_deg),
             initial_time: None,
             rx_next_count: 0,
             prev_time_ns: -1,
@@ -304,10 +331,13 @@ impl SoapyIo {
         if !self.tx_active {
             return Err(RxTxDevError::RxReadError);
         }
-        let corrected_buffer = if self.tx_dc_i == 0.0 && self.tx_dc_q == 0.0 {
+        let correction_is_identity = self.tx_iq_correction.q_gain == 1.0
+            && self.tx_iq_correction.phase_tangent == 0.0
+            && self.tx_iq_correction.phase_inverse_cosine == 1.0;
+        let corrected_buffer = if self.tx_dc_i == 0.0 && self.tx_dc_q == 0.0 && correction_is_identity {
             None
         } else {
-            Some(apply_tx_dc_offset(buffer, self.tx_dc_i, self.tx_dc_q))
+            Some(apply_tx_corrections(buffer, self.tx_dc_i, self.tx_dc_q, self.tx_iq_correction))
         };
         let samples = corrected_buffer.as_deref().unwrap_or(buffer);
         if let Some(tx) = &mut self.tx {
@@ -533,14 +563,14 @@ pub(super) fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(s
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_tx_dc_offset, validate_lo_offset};
+    use super::{TxIqCorrection, apply_tx_corrections, validate_lo_offset};
     use crate::phy::components::dsp_types::ComplexSample;
 
     #[test]
-    fn tx_dc_offset_changes_signal_samples_and_preserves_silence() {
+    fn tx_corrections_change_signal_samples_and_preserve_silence() {
         let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5), ComplexSample::ZERO];
 
-        let output = apply_tx_dc_offset(&input, 0.01, -0.02);
+        let output = apply_tx_corrections(&input, 0.01, -0.02, TxIqCorrection::new(0.0, 0.0));
 
         assert_eq!(output[0], ComplexSample::ZERO);
         assert_eq!(output[1], ComplexSample::new(0.26, -0.52));
@@ -550,7 +580,17 @@ mod tests {
     #[test]
     fn zero_tx_dc_offset_preserves_samples() {
         let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5)];
-        assert_eq!(apply_tx_dc_offset(&input, 0.0, 0.0), input);
+        assert_eq!(apply_tx_corrections(&input, 0.0, 0.0, TxIqCorrection::new(0.0, 0.0)), input);
+    }
+
+    #[test]
+    fn tx_iq_correction_adjusts_q_gain_and_phase() {
+        let sample = ComplexSample::new(0.25, 0.5);
+        let correction = TxIqCorrection::new(20.0 * 0.01_f32.log10(), 45.0);
+        let corrected = correction.apply(sample);
+
+        assert!((corrected.re - 0.75).abs() < 1e-6);
+        assert!((corrected.im - 0.5 * 10.0_f32.powf((20.0 * 0.01_f32.log10()) / 20.0) * 2.0_f32.sqrt()).abs() < 1e-6);
     }
 
     #[test]

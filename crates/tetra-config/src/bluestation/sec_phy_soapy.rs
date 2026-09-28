@@ -17,7 +17,11 @@ pub struct CfgSoapySdr {
     pub tx_dc_i: f32,
     /// TX baseband DC correction added to active Q samples, in normalized sample units.
     pub tx_dc_q: f32,
-    /// Run an SXceiver RF-loopback TX DC calibration before starting the BS stack.
+    /// Relative TX Q-path gain correction in dB.
+    pub tx_iq_gain_db: f32,
+    /// TX I/Q quadrature phase correction in degrees.
+    pub tx_iq_phase_deg: f32,
+    /// Run SXceiver RF-loopback TX DC and I/Q calibration before starting the BS stack.
     pub tx_dc_calibration_on_startup: bool,
     /// PPM frequency error correction
     pub ppm_err: f64,
@@ -66,6 +70,8 @@ pub struct SoapySdrDto {
     pub tx_lo_offset_hz: Option<i64>,
     pub tx_dc_i: Option<f32>,
     pub tx_dc_q: Option<f32>,
+    pub tx_iq_gain_db: Option<f32>,
+    pub tx_iq_phase_deg: Option<f32>,
     pub tx_dc_calibration_on_startup: Option<bool>,
     pub ppm_err: Option<f64>,
 

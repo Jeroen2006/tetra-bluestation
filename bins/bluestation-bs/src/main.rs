@@ -30,7 +30,7 @@ use tetra_entities::{
     mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
     phy::{
-        components::{soapy_calibration::calibrate_tx_dc, soapy_dev::RxTxDevSoapySdr},
+        components::{soapy_calibration::calibrate_tx, soapy_dev::RxTxDevSoapySdr},
         phy_bs::PhyBs,
     },
     sndcp::sndcp_bs::Sndcp,
@@ -48,10 +48,10 @@ fn load_config_from_toml(cfg_path: &str) -> StackConfig {
     }
 }
 
-fn persist_calibrated_tx_dc(config_path: &str, tx_dc_i: f32, tx_dc_q: f32) -> Result<(), String> {
+fn persist_calibrated_tx(config_path: &str, tx_dc_i: f32, tx_dc_q: f32, tx_iq_gain_db: f32, tx_iq_phase_deg: f32) -> Result<(), String> {
     let path = Path::new(config_path);
     let original = fs::read_to_string(path).map_err(|err| format!("Failed to read config '{}': {err}", path.display()))?;
-    let updated = render_config_with_calibrated_tx_dc(&original, tx_dc_i, tx_dc_q)?;
+    let updated = render_config_with_calibrated_tx(&original, tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg)?;
     if updated == original {
         return Ok(());
     }
@@ -86,7 +86,13 @@ fn persist_calibrated_tx_dc(config_path: &str, tx_dc_i: f32, tx_dc_q: f32) -> Re
     write_result
 }
 
-fn render_config_with_calibrated_tx_dc(original: &str, tx_dc_i: f32, tx_dc_q: f32) -> Result<String, String> {
+fn render_config_with_calibrated_tx(
+    original: &str,
+    tx_dc_i: f32,
+    tx_dc_q: f32,
+    tx_iq_gain_db: f32,
+    tx_iq_phase_deg: f32,
+) -> Result<String, String> {
     let mut document = original
         .parse::<toml_edit::DocumentMut>()
         .map_err(|err| format!("Failed to parse config for calibration update: {err}"))?;
@@ -101,6 +107,8 @@ fn render_config_with_calibrated_tx_dc(original: &str, tx_dc_i: f32, tx_dc_q: f3
         .ok_or_else(|| "Config is missing the [phy_io.soapysdr] table".to_string())?;
     set_toml_float_preserving_decor(soapy, "tx_dc_i", tx_dc_i as f64)?;
     set_toml_float_preserving_decor(soapy, "tx_dc_q", tx_dc_q as f64)?;
+    set_toml_float_preserving_decor(soapy, "tx_iq_gain_db", tx_iq_gain_db as f64)?;
+    set_toml_float_preserving_decor(soapy, "tx_iq_phase_deg", tx_iq_phase_deg as f64)?;
     Ok(document.to_string())
 }
 
@@ -121,7 +129,7 @@ fn set_toml_float_preserving_decor(table: &mut toml_edit::Table, key: &str, numb
 
 #[cfg(test)]
 mod config_persistence_tests {
-    use super::render_config_with_calibrated_tx_dc;
+    use super::render_config_with_calibrated_tx;
 
     #[test]
     fn calibration_update_preserves_comments_and_unrelated_config() {
@@ -132,14 +140,18 @@ backend = "SoapySdr"
 rx_freq = 433025000
 tx_dc_i = 0.0 # retain I note
 tx_dc_q = 0.0 # retain Q note
+tx_iq_gain_db = 0.0 # retain gain note
+tx_iq_phase_deg = 0.0 # retain phase note
 
 [other]
 label = "keep me" # retain section
 "#;
-        let updated = render_config_with_calibrated_tx_dc(original, 0.019, -0.016).expect("valid config updates");
+        let updated = render_config_with_calibrated_tx(original, 0.019, -0.016, -0.03, 0.38).expect("valid config updates");
 
         assert!(updated.contains("# retain I note"), "{updated}");
         assert!(updated.contains("# retain Q note"), "{updated}");
+        assert!(updated.contains("# retain gain note"), "{updated}");
+        assert!(updated.contains("# retain phase note"), "{updated}");
         assert!(updated.contains("label = \"keep me\" # retain section"));
         assert!(updated.contains("rx_freq = 433025000"));
         let parsed = updated
@@ -148,6 +160,8 @@ label = "keep me" # retain section
         let soapy = parsed["phy_io"]["soapysdr"].as_table().expect("Soapy config remains a table");
         assert!((soapy["tx_dc_i"].as_float().expect("I value remains numeric") - 0.019).abs() < 1e-7);
         assert!((soapy["tx_dc_q"].as_float().expect("Q value remains numeric") + 0.016).abs() < 1e-7);
+        assert!((soapy["tx_iq_gain_db"].as_float().expect("gain remains numeric") + 0.03).abs() < 1e-7);
+        assert!((soapy["tx_iq_phase_deg"].as_float().expect("phase remains numeric") - 0.38).abs() < 1e-7);
     }
 }
 
@@ -332,17 +346,19 @@ fn main() {
     if let Some(soapy_cfg) = stack_cfg.phy_io.soapysdr.as_mut()
         && soapy_cfg.tx_dc_calibration_on_startup
     {
-        eprintln!("Starting opt-in SXceiver TX DC calibration before the BS stack");
-        let (tx_dc_i, tx_dc_q) = calibrate_tx_dc(soapy_cfg, stack_mode).unwrap_or_else(|err| {
-            eprintln!("SXceiver startup TX DC calibration failed: {err}");
+        eprintln!("Starting opt-in SXceiver TX DC and I/Q calibration before the BS stack");
+        let (tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg) = calibrate_tx(soapy_cfg, stack_mode).unwrap_or_else(|err| {
+            eprintln!("SXceiver startup TX calibration failed: {err}");
             std::process::exit(1);
         });
-        persist_calibrated_tx_dc(&args.config, tx_dc_i, tx_dc_q).unwrap_or_else(|err| {
-            eprintln!("Failed to save SXceiver TX DC calibration: {err}");
+        persist_calibrated_tx(&args.config, tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg).unwrap_or_else(|err| {
+            eprintln!("Failed to save SXceiver TX calibration: {err}");
             std::process::exit(1);
         });
         soapy_cfg.tx_dc_i = tx_dc_i;
         soapy_cfg.tx_dc_q = tx_dc_q;
+        soapy_cfg.tx_iq_gain_db = tx_iq_gain_db;
+        soapy_cfg.tx_iq_phase_deg = tx_iq_phase_deg;
     }
 
     // Build immutable, cheaply clonable SharedConfig only after applying the
