@@ -159,6 +159,7 @@ dependencies = [
  "tetra-core",
  "tetra-entities",
  "tetra-saps",
+ "toml_edit",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

@@ -110,6 +110,9 @@ impl StackConfig {
             if !soapy_cfg.tx_dc_i.is_finite() || !soapy_cfg.tx_dc_q.is_finite() {
                 return Err("SoapySdr TX DC corrections must be finite");
             }
+            if soapy_cfg.tx_dc_calibration_on_startup && self.stack_mode != StackMode::Bs {
+                return Err("SoapySdr TX DC startup calibration is only supported in BS mode");
+            }
 
             let Ok(freq_info) = FreqInfo::from_components(
                 self.cell.freq_band,

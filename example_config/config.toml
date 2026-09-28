@@ -40,6 +40,11 @@ rx_freq = 433025000
 # tx_dc_i = 0.0
 # tx_dc_q = 0.0
 
+# SXceiver only: measure TX LO leakage through its RF loopback at startup,
+# save the resulting TX DC values above, then start the BS stack.
+# Disabled by default; calibration briefly transmits a low-level pilot.
+tx_dc_calibration_on_startup = false
+
 # Adjust if your SDR has a non-negligible tuning error
 # ppm_err = 0.0
 

@@ -99,7 +99,7 @@ impl SoapyIo {
 
         let mode = cfg.config().stack_mode;
 
-        let (dev, sdr_settings) = open_device(&soapy_cfg, mode)?;
+        let (dev, sdr_settings, _) = open_device(&soapy_cfg, mode)?;
 
         let rx_ch = sdr_settings.rx_ch;
         let tx_ch = sdr_settings.tx_ch;
@@ -231,7 +231,11 @@ impl SoapyIo {
             return Ok(());
         }
         if let Some(tx) = &mut self.tx {
-            if active { tx.activate(None)?; } else { tx.deactivate(None)?; }
+            if active {
+                tx.activate(None)?;
+            } else {
+                tx.deactivate(None)?;
+            }
             self.tx_active = active;
         }
         Ok(())
@@ -462,13 +466,14 @@ fn find_supported_device(filter_args: soapysdr::Args) -> Result<OpenedDevice, so
 
 /// Open a given device if argument string is given,
 /// automatically find the first supported device if not.
-fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::Device, SdrSettings), soapysdr::Error> {
+pub(super) fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::Device, SdrSettings, bool), soapysdr::Error> {
     let mut opened_device = if let Some(arg_string) = &soapy_cfg.device {
         open_given_device(arg_string.as_str().into())
     } else {
         find_supported_device(soapysdr::Args::new())
     }?;
 
+    let is_sxceiver = matches!(&opened_device.detected_device, SupportedDevice::SXceiver);
     let mut sdr_settings = match SdrSettings::get_settings(&soapy_cfg, opened_device.detected_device, mode) {
         Ok(sdr_settings) => sdr_settings,
         Err(soapy_settings::Error::InvalidConfiguration) => {
@@ -523,7 +528,7 @@ fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::De
         }
     }
 
-    Ok((opened_device.dev, sdr_settings))
+    Ok((opened_device.dev, sdr_settings, is_sxceiver))
 }
 
 #[cfg(test)]

@@ -7,8 +7,8 @@ use serde::Deserialize;
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgNetInfo, CfgRua, NetworkBroadcastDto, RandomAccessDto, apply_control_patch,
-    cell_dto_to_cfg, neighbour_cells_dto_to_cfg, network_broadcast_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgNetInfo, CfgRua, NetworkBroadcastDto, RandomAccessDto, apply_control_patch, cell_dto_to_cfg,
+    neighbour_cells_dto_to_cfg, network_broadcast_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -212,17 +212,20 @@ mod tests {
         assert_eq!(soapy.tx_lo_offset_hz, 0);
         assert_eq!(soapy.tx_dc_i, 0.0);
         assert_eq!(soapy.tx_dc_q, 0.0);
+        assert!(!soapy.tx_dc_calibration_on_startup);
 
         let customized = EXAMPLE.replace(
             "rx_freq = 433025000",
             "rx_freq = 433025000\nrx_lo_offset_hz = -45000\ntx_lo_offset_hz = -50000\ntx_dc_i = 0.0015\ntx_dc_q = -0.0025",
         );
-        let cfg = from_toml_str(&customized).expect("LO offset fields are accepted");
+        let customized = customized.replace("tx_dc_calibration_on_startup = false", "tx_dc_calibration_on_startup = true");
+        let cfg = from_toml_str(&customized).expect("LO offset and startup calibration fields are accepted");
         let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
         assert_eq!(soapy.rx_lo_offset_hz, -45_000);
         assert_eq!(soapy.tx_lo_offset_hz, -50_000);
         assert_eq!(soapy.tx_dc_i, 0.0015);
         assert_eq!(soapy.tx_dc_q, -0.0025);
+        assert!(soapy.tx_dc_calibration_on_startup);
     }
 
     #[test]
