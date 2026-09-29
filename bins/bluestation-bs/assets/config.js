@@ -168,17 +168,18 @@
 
   async function load() {
     if (state.loading) return;
-    state.loading = true; $('config-state').textContent = 'Loading…'; $('config-save').disabled = true;
+    state.loading = true; $('config-save').disabled = true;
+    message('Loading configuration…', 'info');
     try {
       const response = await fetch('/api/v1/config', { cache: 'no-store' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
       state.revision = data.revision; state.settings = data.settings;
-      render(data.settings); $('config-save').disabled = false; $('config-state').textContent = 'Ready';
+      render(data.settings); $('config-save').disabled = false;
       message('', 'info');
       return true;
     } catch (error) {
-      $('config-state').textContent = 'Unavailable'; message(`Could not load configuration: ${error.message}`, 'danger');
+      message(`Could not load configuration: ${error.message}`, 'danger');
       return false;
     } finally { state.loading = false; }
   }
@@ -196,14 +197,13 @@
         }
       } catch (_) { /* Expected while the service restarts. */ }
     }
-    $('config-state').textContent = 'Restart pending';
     message('Configuration was saved, but the restart could not be confirmed. Check the service status.', 'warning');
   }
 
   $('config-form').addEventListener('submit', async event => {
     event.preventDefault();
     if (state.saving || !state.revision || !$('config-form').reportValidity()) return;
-    state.saving = true; $('config-save').disabled = true; $('config-state').textContent = 'Saving…'; message('', 'info');
+    state.saving = true; $('config-save').disabled = true; message('Saving configuration…', 'info');
     try {
       const oldRunId = await fetch('/api/v1/snapshot', { cache: 'no-store' }).then(response => response.json()).then(data => data.run_id).catch(() => null);
       const response = await fetch('/api/v1/config', {
@@ -212,10 +212,10 @@
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-      $('config-state').textContent = 'Restarting…'; message('Configuration saved. Base station restarting…', 'info');
+      message('Configuration saved. Base station restarting…', 'info');
       await waitForRestart(oldRunId);
     } catch (error) {
-      $('config-state').textContent = 'Ready'; message(`Could not save configuration: ${error.message}`, 'danger');
+      message(`Could not save configuration: ${error.message}`, 'danger');
     } finally { state.saving = false; $('config-save').disabled = false; }
   });
   $('config-reload').addEventListener('click', load);

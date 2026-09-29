@@ -29,7 +29,6 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .plain-section { min-width: 0; }
 .plain-section.card-body, .plain-section > .card-body { padding: 20px; }
 .section-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--bs-border-color); }
-.section-line > span { color: var(--bs-secondary-color); font-size: .76rem; white-space: nowrap; }
 .chart-wrap { position: relative; height: 245px; }
 .chart-wrap.compact { height: 192px; }
 .chart-wrap.temperature-chart { height: 265px; }

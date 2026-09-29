@@ -193,7 +193,6 @@
     }));
     const raAvailable = !!radio.measured_at_ms;
     const ra = radio.ra;
-    setText('overview-ra-limits', raAvailable ? (ra.dynamic ? 'Dynamic' : 'Static') : 'Awaiting radio');
     setText('overview-ra-imm', fmt(raAvailable ? ra.current.imm : null));
     setText('overview-ra-wt', fmt(raAvailable ? ra.current.wt : null));
     setText('overview-ra-nu', fmt(raAvailable ? ra.current.nu : null));
@@ -245,7 +244,6 @@
     setText('ra-mode', available ? (data.dynamic ? 'Dynamic' : 'Static') : '—'); setText('ra-load', data.load || 'Starting');
     setTone('ra-load', data.load === 'Heavy' ? 'bad' : data.load === 'Contention' ? 'warn' : 'good');
     setText('ra-score', fmt(window?.sample_score)); setText('ra-ewma', fmt(window?.ewma_score, 1));
-    setText('ra-limits-label', !available ? 'Awaiting radio' : data.dynamic ? 'Configured limits' : 'Limits inactive');
     const labels = { imm: 'IMM', wt: 'WT', nu: 'Nu', frame_len: 'Base frame length' };
     replace('ra-parameters', Object.entries(labels).map(([key, label]) => {
       const tr = document.createElement('tr'); cell(tr, label);
@@ -262,7 +260,6 @@
       const item = document.createElement('span'); const name = document.createTextNode(`${label} `);
       const val = document.createElement('b'); val.textContent = value; item.append(name, val); return item;
     }));
-    setText('ra-thresholds', available ? `Low ≤ ${data.low_threshold} · Heavy ≥ ${data.high_threshold}` : '—');
     const metrics = [
       ['First attempts', window?.first_attempts], ['Retries', window?.retry_attempts],
       ['Follow-up accesses', window?.followup_attempts], ['Invalid MAC accesses', window?.invalid_mac_access],

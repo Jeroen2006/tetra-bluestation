@@ -35,26 +35,26 @@
           <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">System</span><strong id="overview-cpu">—</strong><small id="overview-ram">—</small></div></div>
         </div>
         <div class="overview-columns overview-radio-columns">
-          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Random Access</h2><span id="overview-ra-limits">—</span></div><div class="slot-list overview-ra-values"><div class="slot"><span>IMM</span><strong id="overview-ra-imm">—</strong></div><div class="slot"><span>WT</span><strong id="overview-ra-wt">—</strong></div><div class="slot"><span>Nu</span><strong id="overview-ra-nu">—</strong></div><div class="slot"><span>Frame length</span><strong id="overview-ra-frame">—</strong></div></div></div></section>
-          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Radio resources</h2><span>Current allocation</span></div><div class="slot-list" id="overview-slots"></div></div></section>
+          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Random Access</h2></div><div class="slot-list overview-ra-values"><div class="slot"><span>IMM</span><strong id="overview-ra-imm">—</strong></div><div class="slot"><span>WT</span><strong id="overview-ra-wt">—</strong></div><div class="slot"><span>Nu</span><strong id="overview-ra-nu">—</strong></div><div class="slot"><span>Frame length</span><strong id="overview-ra-frame">—</strong></div></div></div></section>
+          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Radio resources</h2></div><div class="slot-list" id="overview-slots"></div></div></section>
         </div>
         <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>Terminals</h2><button id="overview-all-terminals" type="button" class="btn btn-sm btn-outline-primary">View all</button></div><div class="overview-terminal-head" aria-hidden="true"><span>ISSI / status</span><span>RSSI</span><span>Last seen</span><span>Talkgroups</span><span>PDP</span><span></span></div><div id="overview-terminal-list" class="list-group list-group-flush"></div><div id="overview-terminal-empty" class="empty-state" hidden>No registered terminals</div></div></section>
-        <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>System activity</h2><span>Last 15 minutes</span></div><div class="chart-wrap"><canvas id="chart-overview" aria-label="CPU and RAM history" role="img"></canvas></div><div class="inline-values"><span>CPU temperature <b id="overview-temperature">—</b></span><span>Network RX / TX <b id="overview-network">—</b></span></div></div></section>
+        <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>System activity</h2></div><div class="chart-wrap"><canvas id="chart-overview" aria-label="CPU and RAM history, last 15 minutes" role="img"></canvas></div><div class="inline-values"><span>CPU temperature <b id="overview-temperature">—</b></span><span>Network RX / TX <b id="overview-network">—</b></span></div></div></section>
       </section>
 
       <section id="view-system" role="tabpanel" aria-labelledby="tab-system" class="view" hidden>
         <div class="system-columns">
           <div class="system-column">
-          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Usage</h2><span>Host</span></div>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Usage</h2></div>
             <div class="meter-row"><div><span>CPU</span><strong id="system-cpu">—</strong></div><div class="progress" role="progressbar" aria-label="CPU usage"><div id="cpu-bar" class="progress-bar"></div></div></div>
             <div class="meter-row"><div><span>Memory</span><strong id="system-ram">—</strong></div><div class="progress" role="progressbar" aria-label="RAM usage"><div id="ram-bar" class="progress-bar"></div></div></div>
             <div class="property-row"><span>BS process CPU</span><strong id="system-process-cpu">—</strong></div><div class="property-row"><span>BS process RAM</span><strong id="system-process-ram">—</strong></div>
           </section>
-          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>CPU and memory</h2><span>Last 15 minutes</span></div><div class="chart-wrap"><canvas id="chart-system" aria-label="CPU and RAM history" role="img"></canvas></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>CPU and memory</h2></div><div class="chart-wrap"><canvas id="chart-system" aria-label="CPU and RAM history, last 15 minutes" role="img"></canvas></div></section>
           </div>
           <div class="system-column">
           <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Platform</h2></div><div id="platform-properties"></div></section>
-          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Temperatures</h2><span>Last 15 minutes</span></div><div class="chart-wrap temperature-chart"><canvas id="chart-temperature" aria-label="Temperature history by sensor" role="img"></canvas></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Temperatures</h2></div><div class="chart-wrap temperature-chart"><canvas id="chart-temperature" aria-label="Temperature history by sensor, last 15 minutes" role="img"></canvas></div></section>
           </div>
         </div>
         <section class="plain-section card card-body shadow-sm lower-sections"><div class="section-line"><h2>Network</h2><select id="network-select" class="form-select form-select-sm interface-select" aria-label="Network interface"></select></div><div class="chart-wrap compact"><canvas id="chart-network" aria-label="Network receive and transmit history" role="img"></canvas></div><div class="table-responsive"><table class="table table-striped table-hover data-table"><thead><tr><th>Interface</th><th class="text-end">RX / s</th><th class="text-end">TX / s</th><th class="text-end">RX total</th><th class="text-end">TX total</th><th class="text-end">Packets RX / TX</th><th class="text-end">Errors / drops</th></tr></thead><tbody id="network-rows"></tbody></table></div></section>
@@ -63,10 +63,10 @@
       <section id="view-ra" role="tabpanel" aria-labelledby="tab-ra" class="view" hidden>
         <div class="ra-summary"><div class="card card-body shadow-sm"><span class="status-label">Mode</span><strong id="ra-mode">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Load</span><strong id="ra-load" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Window score</span><strong id="ra-score">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">EWMA</span><strong id="ra-ewma">—</strong></div></div>
         <div class="overview-columns">
-          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Parameters on air</h2><span id="ra-limits-label">Configured limits</span></div><div class="table-responsive"><table class="table table-striped data-table"><thead><tr><th>Parameter</th><th class="text-end">Current</th><th class="text-end">Min</th><th class="text-end">Max</th></tr></thead><tbody id="ra-parameters"></tbody></table></div><div id="ra-extra" class="inline-values"></div></section>
-          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Load history</h2><span>Last 15 minutes</span></div><div class="chart-wrap"><canvas id="chart-ra" aria-label="Random Access EWMA score and thresholds" role="img"></canvas></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Parameters on air</h2></div><div class="table-responsive"><table class="table table-striped data-table"><thead><tr><th>Parameter</th><th class="text-end">Current</th><th class="text-end">Min</th><th class="text-end">Max</th></tr></thead><tbody id="ra-parameters"></tbody></table></div><div id="ra-extra" class="inline-values"></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Load history</h2></div><div class="chart-wrap"><canvas id="chart-ra" aria-label="Random Access EWMA score and thresholds, last 15 minutes" role="img"></canvas></div></section>
         </div>
-        <section class="plain-section card card-body shadow-sm lower-sections"><div class="section-line"><h2>Last measurement window</h2><span id="ra-thresholds">—</span></div><div class="measure-grid" id="ra-measures"></div></section>
+        <section class="plain-section card card-body shadow-sm lower-sections"><div class="section-line"><h2>Last measurement window</h2></div><div class="measure-grid" id="ra-measures"></div></section>
       </section>
 
       <section id="view-terminals" role="tabpanel" aria-labelledby="tab-terminals" class="view" hidden>
@@ -78,7 +78,7 @@
 
       <section id="view-swmi" role="tabpanel" aria-labelledby="tab-swmi" class="view" hidden>
         <div class="ra-summary"><div class="card card-body shadow-sm"><span class="status-label">Connection</span><strong id="swmi-phase" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">WebSocket RTT</span><strong id="swmi-rtt">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Central services</span><strong id="swmi-service" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Reconnects</span><strong id="swmi-reconnects">—</strong></div></div>
-        <div class="overview-columns"><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Ping history</h2><span>Last 15 minutes</span></div><div class="chart-wrap"><canvas id="chart-swmi" aria-label="SwMI WebSocket RTT samples" role="img"></canvas></div></section><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Connection details</h2></div><div id="swmi-properties"></div></section></div>
+        <div class="overview-columns"><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Ping history</h2></div><div class="chart-wrap"><canvas id="chart-swmi" aria-label="SwMI WebSocket RTT samples, last 15 minutes" role="img"></canvas></div></section><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Connection details</h2></div><div id="swmi-properties"></div></section></div>
       </section>
 
       <section id="view-config" role="tabpanel" aria-labelledby="tab-config" class="view" hidden>
@@ -88,7 +88,7 @@
             <button type="button" class="nav-link active" data-config-section="ra">Random Access</button>
             <button type="button" class="nav-link" data-config-section="broadcast">Network broadcast</button>
             <button type="button" class="nav-link" data-config-section="cell">Cell</button>
-          </nav><span id="config-state" class="text-body-secondary small">Loading…</span></div>
+          </nav></div>
           <form id="config-form">
             <div id="config-ra" class="config-panel"></div>
             <div id="config-broadcast" class="config-panel" hidden></div>
