@@ -43,8 +43,14 @@
     row.append(key, val); return row;
   };
   const replace = (id, nodes) => { const target = $(id); target.replaceChildren(...nodes); };
+  const setConnectionStatus = message => {
+    const status = $('connection-status');
+    status.hidden = !message;
+    status.textContent = message || '';
+  };
   const terminalModal = new bootstrap.Modal($('terminal-modal'));
   $('terminal-modal').addEventListener('hidden.bs.modal', () => { state.selectedTerminal = null; });
+  const sensorDisplayName = name => name.replace(/[_-]+/g, ' ').replace(/\b(cpu|adc|rp\d+)\b/gi, match => match.toUpperCase());
 
   function selectTab(name, focus = false) {
     state.activeTab = name;
@@ -93,7 +99,9 @@
       options: {
         responsive: true, maintainAspectRatio: false, animation: false, normalized: true,
         interaction: { intersect: false, mode: 'index' },
-        plugins: { legend: { position: 'bottom', align: 'start', labels: { boxWidth: 10, boxHeight: 2, padding: 16 } }, tooltip: { callbacks: { label: context => `${context.dataset.label}: ${fmt(context.parsed.y, 1)}${percent ? '%' : ''}` } } },
+        plugins: { legend: { position: 'bottom', align: 'start', labels: { boxWidth: 10, boxHeight: 2, padding: 16 } }, tooltip: { callbacks: { label: context => id === 'chart-temperature'
+          ? `${sensorDisplayName(context.dataset.sensorName)}: ${fmt(context.parsed.y, 1)} °C`
+          : `${context.dataset.label}: ${fmt(context.parsed.y, 1)}${percent ? '%' : ''}` } } },
         scales: { x: { ticks: { maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } }, y: { beginAtZero: true, suggestedMax: percent ? 100 : undefined, ticks: { maxTicksLimit: 5, callback: percent ? v => `${v}%` : undefined }, border: { display: false } } },
       },
     });
@@ -102,7 +110,7 @@
   }
   lineChart('chart-overview', [{ label: 'CPU', color: '#0d6efd' }, { label: 'RAM', color: '#198754' }], true);
   lineChart('chart-system', [{ label: 'CPU', color: '#0d6efd' }, { label: 'RAM', color: '#198754' }], true);
-  lineChart('chart-temperature', [{ label: 'CPU °C', color: '#fd7e14' }]);
+  lineChart('chart-temperature', []);
   lineChart('chart-network', [{ label: 'RX · KB/s', color: '#0d6efd' }, { label: 'TX · KB/s', color: '#198754' }]);
   lineChart('chart-ra', [{ label: 'EWMA', color: '#0d6efd' }, { label: 'Low', color: '#198754' }, { label: 'High', color: '#ffc107' }]);
   lineChart('chart-swmi', [{ label: 'WebSocket RTT · ms', color: '#0d6efd' }]);
@@ -129,7 +137,26 @@
     };
     const cpu = points.map(p => p.cpu_percent), ram = points.map(p => p.ram_percent);
     update('chart-overview', [cpu, ram]); update('chart-system', [cpu, ram]);
-    update('chart-temperature', [points.map(p => p.cpu_temperature_c)]);
+    const temperatureChart = state.charts['chart-temperature'];
+    const currentTemperatures = new Map((state.snapshot?.system?.temperatures || []).map(sensor => [sensor.label, sensor.celsius]));
+    const sensorNames = [...new Set(points.flatMap(point => (point.temperatures || []).map(sensor => sensor.label)))].slice(0, 32);
+    const sensorColors = ['#0d6efd', '#fd7e14', '#198754', '#6f42c1', '#d63384', '#20c997', '#dc3545', '#0dcaf0'];
+    const previous = new Map(temperatureChart.data.datasets.map(dataset => [dataset.sensorName, dataset]));
+    temperatureChart.data.labels = labels;
+    temperatureChart.data.datasets = sensorNames.map((name, index) => {
+      const old = previous.get(name);
+      const current = currentTemperatures.get(name);
+      return {
+        sensorName: name,
+        label: `${sensorDisplayName(name)} · ${current == null ? '—' : `${fmt(current, 1)} °C`}`,
+        data: points.map(point => point.temperatures?.find(sensor => sensor.label === name)?.celsius ?? null),
+        borderColor: sensorColors[index % sensorColors.length],
+        backgroundColor: sensorColors[index % sensorColors.length],
+        borderWidth: 2, tension: .15, pointRadius: 0, pointHoverRadius: 4,
+        spanGaps: false, fill: false, hidden: old?.hidden ?? false,
+      };
+    });
+    temperatureChart.update('none');
     const interfaceName = $('network-select').value;
     const rates = points.map(p => interfaceName === '__all' ? p : p.interfaces?.find(n => n.name === interfaceName));
     update('chart-network', [rates.map(n => n?.rx_bytes_per_sec == null ? null : n.rx_bytes_per_sec / 1000), rates.map(n => n?.tx_bytes_per_sec == null ? null : n.tx_bytes_per_sec / 1000)]);
@@ -140,9 +167,8 @@
 
   function renderOverview(s) {
     const radio = s.radio, swmi = s.swmi, system = s.system;
-    setText('overview-measured', `Updated ${age(radio.measured_at_ms || system.measured_at_ms)}`);
     setText('overview-swmi', swmi.phase || 'Connecting'); setTone('overview-swmi', radio.network_connected ? 'good' : swmi.connected ? 'warn' : 'bad');
-    setText('overview-ping', swmi.rtt_ms == null || !swmi.connected ? 'Ping unavailable' : `${fmt(swmi.rtt_ms, 1)} ms · ${age(swmi.rtt_measured_at_ms)}`);
+    setText('overview-ping', swmi.rtt_ms == null || !swmi.connected ? 'Ping unavailable' : `${fmt(swmi.rtt_ms, 1)} ms`);
     setText('overview-radio', radio.radio_tx_active ? 'Transmitting' : radio.radio_tx_allowed ? 'Ready' : 'Inactive');
     setTone('overview-radio', radio.radio_tx_active ? 'good' : radio.radio_tx_allowed ? 'warn' : 'muted');
     setText('overview-radio-detail', !radio.network_connected && radio.provisioned_once ? 'Local fallback' : radio.network_connected ? 'Central connection' : 'Awaiting SwMI');
@@ -158,7 +184,9 @@
     const rx = system.network.reduce((sum, n) => sum + (n.rx_bytes_per_sec || 0), 0), tx = system.network.reduce((sum, n) => sum + (n.tx_bytes_per_sec || 0), 0);
     setText('overview-network', `${byte(rx, true)} / ${byte(tx, true)}`);
     replace('overview-slots', radio.timeslots.map((name, i) => {
-      const item = document.createElement('div'); item.className = 'slot';
+      const item = document.createElement('div');
+      const type = { Control: 'control', Free: 'free', Voice: 'voice', 'Packet data': 'packet', Network: 'network' }[name] || 'free';
+      item.className = `slot slot--${type}`;
       const label = document.createElement('span'); label.textContent = `TS${i + 1}`;
       const value = document.createElement('strong'); value.textContent = name;
       item.append(label, value); return item;
@@ -169,7 +197,6 @@
 
   function renderSystem(s) {
     const data = s.system;
-    setText('system-measured', `Updated ${age(data.measured_at_ms)}`);
     setText('system-cpu', pct(data.cpu_percent, 1));
     setText('system-ram', `${byte(data.ram_used_bytes)} / ${byte(data.ram_total_bytes)}`);
     setText('system-process-cpu', pct(data.process_cpu_percent, 1));
@@ -185,11 +212,6 @@
       property('Kernel', data.kernel_version), property('Architecture', data.architecture),
       property('Host uptime', duration(data.host_uptime_sec)), property('BS uptime', duration(data.process_uptime_sec)),
     ]);
-    setText('footer-uptime', `BS uptime ${duration(data.process_uptime_sec)}`);
-    setText('temperature-count', data.temperatures.length ? `${data.temperatures.length} sensors · ${age(data.temperature_measured_at_ms)}` : 'Unavailable');
-    replace('temperature-list', data.temperatures.length
-      ? data.temperatures.map(t => property(t.label || 'Sensor', `${fmt(t.celsius, 1)} °C`))
-      : [property('CPU temperature', 'Unavailable')]);
     const select = $('network-select'); const old = select.value;
     const names = ['__all', ...data.network.map(n => n.name)];
     if (select.options.length !== names.length || names.some((name, i) => select.options[i]?.value !== name)) {
@@ -214,7 +236,6 @@
     const available = s.radio.measured_at_ms > 0;
     const data = available ? s.radio.ra : { current: {}, limits: {}, load: 'Starting', window: null };
     const window = data.window;
-    setText('ra-measured', available ? `Updated ${age(s.radio.measured_at_ms)}` : 'Awaiting radio');
     setText('ra-mode', available ? (data.dynamic ? 'Dynamic' : 'Static') : '—'); setText('ra-load', data.load || 'Starting');
     setTone('ra-load', data.load === 'Heavy' ? 'bad' : data.load === 'Contention' ? 'warn' : 'good');
     setText('ra-score', fmt(window?.sample_score)); setText('ra-ewma', fmt(window?.ewma_score, 1));
@@ -269,7 +290,6 @@
     }));
   }
   function renderTerminals(s) {
-    setText('terminal-measured', `Updated ${age(s.radio.measured_at_ms)}`);
     const query = $('terminal-search').value.trim().toLowerCase(); const filter = $('terminal-filter').value; const sort = $('terminal-sort').value;
     const filtered = s.radio.terminals.filter(t => {
       if (filter === 'pdp' && !t.pdp) return false;
@@ -317,7 +337,6 @@
 
   function renderSwmi(s) {
     const swmi = s.swmi, radio = s.radio;
-    setText('swmi-measured', `Updated ${age(swmi.last_receive_ms || radio.measured_at_ms)}`);
     setText('swmi-phase', swmi.phase || 'Connecting'); setTone('swmi-phase', radio.network_connected ? 'good' : swmi.connected ? 'warn' : 'bad');
     setText('swmi-rtt', swmi.rtt_ms == null || !swmi.connected ? 'Unavailable' : `${fmt(swmi.rtt_ms, 1)} ms`);
     setText('swmi-service', radio.network_connected ? 'Available' : 'Unavailable'); setTone('swmi-service', radio.network_connected ? 'good' : 'bad');
@@ -338,8 +357,7 @@
   function render(s) {
     state.snapshot = s;
     const stale = !s.radio.measured_at_ms ? false : s.server_time_ms - s.radio.measured_at_ms > 5000;
-    $('freshness').dataset.stale = String(stale);
-    setText('freshness', stale ? `Data stale · ${age(s.radio.measured_at_ms)}` : s.radio.measured_at_ms ? `Updated ${age(s.radio.measured_at_ms)}` : 'Awaiting provisioning');
+    setConnectionStatus(stale ? 'Radio data stale' : s.radio.measured_at_ms ? null : 'Awaiting radio');
     renderOverview(s); renderSystem(s); renderRa(s); renderTerminals(s); renderSwmi(s);
     drawCharts();
   }
@@ -367,20 +385,12 @@
       }
       render(data);
     } catch (error) {
-      $('freshness').dataset.stale = 'true'; setText('freshness', `Connection unavailable${state.lastResponse ? ` · ${age(state.lastResponse)}` : ''}`);
+      setConnectionStatus('Connection unavailable');
     } finally { state.fetching = false; }
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadHistory().catch(() => {}); poll(); } });
   setInterval(() => {
-    if (state.lastResponse && Date.now() - state.lastResponse > 5000) {
-      $('freshness').dataset.stale = 'true'; setText('freshness', `Data stale · ${age(state.lastResponse)}`);
-    }
-    if (state.snapshot) {
-      for (const id of ['overview-measured', 'system-measured', 'ra-measured', 'terminal-measured']) {
-        const at = id === 'system-measured' ? state.snapshot.system.measured_at_ms : state.snapshot.radio.measured_at_ms;
-        setText(id, `Updated ${age(at)}`);
-      }
-    }
+    if (state.lastResponse && Date.now() - state.lastResponse > 5000) setConnectionStatus('Connection unavailable');
     poll();
   }, 1000);
   loadHistory().catch(() => {}).finally(poll);

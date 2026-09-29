@@ -75,6 +75,7 @@ struct HistoryPoint {
     cpu_percent: Option<f32>,
     ram_percent: Option<f64>,
     cpu_temperature_c: Option<f32>,
+    temperatures: Vec<Temperature>,
     rx_bytes_per_sec: Option<f64>,
     tx_bytes_per_sec: Option<f64>,
     interfaces: Vec<InterfaceRate>,
@@ -222,8 +223,12 @@ fn sample_loop(app: AppState, running: Arc<AtomicBool>) {
                 label: c.label().to_owned(), celsius: temperature,
             })).filter(|c| c.celsius.is_finite()).collect();
             let fallback = read_thermal_fallback();
+            let sensor_key = |label: &str| {
+                label.chars().filter(char::is_ascii_alphanumeric).collect::<String>()
+                    .to_ascii_lowercase().trim_end_matches("temp1").to_owned()
+            };
             for sensor in fallback {
-                if !temperatures.iter().any(|existing| existing.label == sensor.label) {
+                if !temperatures.iter().any(|existing| sensor_key(&existing.label) == sensor_key(&sensor.label)) {
                     temperatures.push(sensor);
                 }
             }
@@ -271,6 +276,7 @@ fn sample_loop(app: AppState, running: Arc<AtomicBool>) {
             cpu_percent: Some(data.cpu_percent),
             ram_percent: (data.ram_total_bytes > 0).then(|| data.ram_used_bytes as f64 * 100.0 / data.ram_total_bytes as f64),
             cpu_temperature_c: data.cpu_temperature_c,
+            temperatures: data.temperatures.clone(),
             rx_bytes_per_sec: data.network.iter().filter_map(|n| n.rx_bytes_per_sec).reduce(|a, b| a + b),
             tx_bytes_per_sec: data.network.iter().filter_map(|n| n.tx_bytes_per_sec).reduce(|a, b| a + b),
             interfaces: data.network.iter().take(32).map(|n| InterfaceRate {
