@@ -363,6 +363,9 @@ struct ActiveCall {
     brew_uuid: Option<uuid::Uuid>,
     /// Current SwMI-resolved SS-TPI profile for the floor holder.
     talking_party: Option<TalkingPartyProfile>,
+    /// The supplementary group speaker announcement may wait for a usable
+    /// FN18. Cancel it if this floor ends before that frame arrives.
+    pending_group_tpi: Option<TxReporter>,
 }
 
 #[derive(Clone)]
@@ -2087,6 +2090,7 @@ impl CcBsSubentity {
                 tx_active: caller_has_central_floor || another_central_speaker,
                 hangtime_start: None,
                 brew_uuid: None,
+                pending_group_tpi: None,
             },
         );
         self.track_group_call_listeners(circuit.call_id);
@@ -3170,6 +3174,7 @@ impl CcBsSubentity {
             }
             SwmiMessage::FloorReleased { call_id, .. } => {
                 let Ok(call_id) = u16::try_from(call_id) else { return };
+                self.cancel_pending_group_tpi(call_id);
                 self.pending_preemptive_floor_grants.remove(&call_id);
                 // A restored floor holder needed the D-SETUP suppression only
                 // while it retained Granted. Once the central floor is
@@ -4255,6 +4260,7 @@ impl CcBsSubentity {
     }
 
     fn apply_central_floor_grant(&mut self, queue: &mut MessageQueue, call_id: u16, itsi: u32) {
+        self.cancel_pending_group_tpi(call_id);
         let (dest_gssi, ts, usage, speaker_changed) = {
             let Some(call) = self.active_calls.get_mut(&call_id) else { return };
             let speaker_changed = !call.tx_active || call.source_issi != itsi;
@@ -4434,6 +4440,7 @@ impl CcBsSubentity {
                 tx_active: floor_itsi != 0,
                 hangtime_start: None,
                 brew_uuid: None,
+                pending_group_tpi: None,
             },
         );
         self.track_group_call_listeners(call_id);
@@ -4530,6 +4537,7 @@ impl CcBsSubentity {
     /// traffic mode. With no cached D-SETUP there is no D-RELEASE to send, so it tears down
     /// at once.
     fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        self.cancel_pending_group_tpi(call_id);
         self.capacity_observe(
             queue,
             &SwmiMessage::CallRelease {
@@ -5291,6 +5299,8 @@ impl CcBsSubentity {
             tracing::debug!(call_id, "U-TX CEASED: already in hangtime");
             return;
         }
+
+        self.cancel_pending_group_tpi(call_id);
 
         if self.swmi.as_ref().is_some_and(SwmiCmceEndpoint::is_online) {
             let command_id = self.next_swmi_command_id();
@@ -6078,6 +6088,7 @@ impl CcBsSubentity {
                 tx_active: true,
                 hangtime_start: None,
                 brew_uuid: Some(brew_uuid),
+                pending_group_tpi: None,
             },
         );
         self.track_group_call_listeners(call_id);
@@ -6122,6 +6133,7 @@ impl CcBsSubentity {
         let ts = call.ts;
 
         if tx_active {
+            self.cancel_pending_group_tpi(call_id);
             if let Some(active_call) = self.active_calls.get_mut(&call_id) {
                 active_call.tx_active = false;
                 active_call.hangtime_start = Some(self.dltime);
@@ -6166,6 +6178,7 @@ impl CcBsSubentity {
         // subsequent FloorGranted handling and periodic late entry may use
         // the normal group advertisement again.
         self.restore_prepared_calls.remove(&call_id);
+        self.cancel_pending_group_tpi(call_id);
 
         if self.subscriber_groups.contains_key(&previous_itsi) {
             self.send_d_tx_interrupt_individual_facch(queue, call_id, previous_itsi, next_itsi, ts);
@@ -6248,10 +6261,25 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
+    fn cancel_pending_group_tpi(&mut self, call_id: u16) {
+        let Some(reporter) = self.active_calls.get_mut(&call_id).and_then(|call| call.pending_group_tpi.take()) else {
+            return;
+        };
+        if reporter.get_state() == TxState::Pending {
+            reporter.mark_discarded();
+            tracing::info!(call_id, "cancelled unsent group FN18 D-TX GRANTED after floor change");
+        }
+    }
+
     /// Inform every local group member of the current speaker through the
     /// group call's associated SACCH.  UMAC schedules this on FN18 while the
     /// traffic channel is active, leaving speech bursts untouched.
-    fn send_d_tx_granted_group_fn18(&self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8, usage: u8) {
+    fn send_d_tx_granted_group_fn18(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8, usage: u8) {
+        self.cancel_pending_group_tpi(call_id);
+        let reporter = TxReporter::new_unacked();
+        if let Some(call) = self.active_calls.get_mut(&call_id) {
+            call.pending_group_tpi = Some(reporter.clone());
+        }
         let pdu = DTxGranted {
             call_identifier: call_id,
             transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
@@ -6284,7 +6312,7 @@ impl CcBsSubentity {
             None,
             TetraAddress::new(dest_gssi, SsiType::Gssi),
             Layer2Service::Unacknowledged,
-            None,
+            Some(reporter),
             channel,
         ));
     }
@@ -6293,7 +6321,7 @@ impl CcBsSubentity {
     /// half-slot after LLC and MAC headers.  FN18 associated control has the
     /// normal 268-bit control capacity and is received by every listener on
     /// the active traffic channel.
-    fn send_group_tpi_fn18(&self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8, usage: u8) {
+    fn send_group_tpi_fn18(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8, usage: u8) {
         if self.group_tpi_facility(call_id, false).is_some() {
             self.send_d_tx_granted_group_fn18(queue, call_id, source_issi, dest_gssi, ts, usage);
         }
@@ -6483,6 +6511,7 @@ impl CcBsSubentity {
         // call, let the SwMI release the authoritative floor and start its
         // central hangtime; otherwise the target BS would enter only local
         // hangtime after a roaming speaker disappeared.
+        self.cancel_pending_group_tpi(call_id);
         let command_id = self.next_swmi_command_id();
         if let Some(swmi) = self.swmi.as_ref().filter(|endpoint| endpoint.is_online()) {
             if swmi
@@ -6596,6 +6625,77 @@ mod tests {
         cc.subscriber_groups.insert(430_892, HashSet::from([gssi]));
         cc.group_listeners.insert(gssi, 1);
         cc
+    }
+
+    #[test]
+    fn short_group_over_cancels_deferred_speaker_announcement() {
+        let call_id = 151;
+        let speaker = 430_893;
+        let mut cc = test_cc_with_group(1502);
+        let mut queue = MessageQueue::new();
+        cc.start_remote_swmi_call(
+            &mut queue,
+            call_id,
+            speaker,
+            1502,
+            1,
+            speaker,
+            Some(TalkingPartyProfile {
+                issi: speaker,
+                mnemonic_name: Some("Speaker".to_owned()),
+                clir: false,
+            }),
+            false,
+            true,
+        );
+        while queue.pop_front().is_some() {}
+        let call = cc.active_calls.get(&call_id).expect("group call");
+        let (gssi, ts, usage) = (call.dest_gssi, call.ts, call.usage);
+        cc.send_group_tpi_fn18(&mut queue, call_id, speaker, gssi, ts, usage);
+        let reporter = cc.active_calls[&call_id]
+            .pending_group_tpi
+            .clone()
+            .expect("speaker announcement queued for FN18");
+        assert_eq!(reporter.get_state(), TxState::Pending);
+
+        let mut sdu = BitBuffer::new_autoexpand(20);
+        UTxCeased {
+            call_identifier: call_id,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize U-TX CEASED");
+        sdu.seek(0);
+        cc.rx_u_tx_ceased(
+            &mut queue,
+            SapMsg {
+                sap: Sap::LcmcSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+                    sdu,
+                    handle: 0,
+                    endpoint_id: 0,
+                    link_id: 0,
+                    received_tetra_address: TetraAddress::issi(speaker),
+                    chan_change_resp_req: false,
+                    chan_change_handle: None,
+                }),
+            },
+        );
+
+        assert_eq!(reporter.get_state(), TxState::Discarded);
+        assert!(cc.active_calls[&call_id].pending_group_tpi.is_none());
+        assert!(cc.active_calls[&call_id].hangtime_start.is_some());
+        let mut released = false;
+        while let Some(message) = queue.pop_front() {
+            if matches!(message.msg, SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id: id, .. }) if id == call_id) {
+                released = true;
+            }
+        }
+        assert!(released);
     }
 
     #[test]
