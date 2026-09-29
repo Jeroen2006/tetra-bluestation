@@ -191,8 +191,14 @@
       const value = document.createElement('strong'); value.textContent = name;
       item.append(label, value); return item;
     }));
-    setText('overview-score', fmt(radio.ra.window?.sample_score));
-    setText('overview-ewma', fmt(radio.ra.window?.ewma_score, 1));
+    const raAvailable = !!radio.measured_at_ms;
+    const ra = radio.ra;
+    setText('overview-ra-limits', raAvailable ? (ra.dynamic ? 'Dynamic' : 'Static') : 'Awaiting radio');
+    setText('overview-ra-imm', fmt(raAvailable ? ra.current.imm : null));
+    setText('overview-ra-wt', fmt(raAvailable ? ra.current.wt : null));
+    setText('overview-ra-nu', fmt(raAvailable ? ra.current.nu : null));
+    setText('overview-ra-frame', raAvailable ? raValue('frame_len', ra.current.frame_len) : '—');
+    renderOverviewTerminals(radio.terminals, raAvailable);
   }
 
   function renderSystem(s) {
@@ -272,6 +278,44 @@
   }
 
   function pdpLabel(pdp) { return !pdp ? 'None' : !pdp.session ? 'Pending' : pdp.bearer ? 'Active' : 'Standby'; }
+  function terminalDetailButton(t) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'btn btn-sm btn-outline-primary'; button.dataset.issi = t.issi;
+    button.textContent = 'Details';
+    button.addEventListener('click', () => { state.selectedTerminal = t.issi; renderTerminalModal(t); terminalModal.show(); });
+    return button;
+  }
+  function renderOverviewTerminals(terminals, available) {
+    const recent = [...terminals].sort((a, b) => (b.last_seen_ms || 0) - (a.last_seen_ms || 0) || a.issi - b.issi).slice(0, 6);
+    const focused = document.activeElement?.closest('#overview-terminal-list button')?.dataset.issi;
+    const rows = recent.map(t => {
+      const row = document.createElement('div'); row.className = 'list-group-item overview-terminal-row';
+      const identity = document.createElement('div'); identity.className = 'overview-terminal-identity';
+      const issi = document.createElement('strong'); issi.textContent = t.issi;
+      const registration = document.createElement('span'); registration.className = `badge text-bg-${t.registration === 'Active' ? 'success' : t.registration === 'Pending' ? 'warning' : 'secondary'}`;
+      registration.textContent = t.registration;
+      identity.append(issi, registration);
+      const field = (label, value, className = '') => {
+        const el = document.createElement('span'); el.className = `overview-terminal-field ${className}`;
+        el.dataset.label = label; el.setAttribute('aria-label', `${label}: ${value}`); el.textContent = value;
+        return el;
+      };
+      const groups = t.talkgroups || [];
+      const groupLabel = groups.length ? `${groups.slice(0, 3).join(', ')}${groups.length > 3 ? ` +${groups.length - 3}` : ''}` : '—';
+      row.append(identity,
+        field('RSSI', t.rf ? `${fmt(t.rf.rssi_dbfs, 1)} dBFS` : '—'),
+        field('Last seen', age(t.last_seen_ms)),
+        field('Talkgroups', groupLabel, 'overview-terminal-groups'),
+        field('PDP', pdpLabel(t.pdp)),
+        terminalDetailButton(t));
+      return row;
+    });
+    replace('overview-terminal-list', rows);
+    if (focused) document.querySelector(`#overview-terminal-list button[data-issi="${focused}"]`)?.focus({ preventScroll: true });
+    $('overview-terminal-empty').hidden = available && terminals.length > 0;
+    $('overview-terminal-empty').textContent = available ? 'No registered terminals' : 'Awaiting radio';
+    $('overview-all-terminals').textContent = terminals.length > 6 ? `View all ${terminals.length}` : 'View all';
+  }
   function renderTerminalModal(t) {
     setText('terminal-modal-title', `Terminal ${t.issi}`);
     const fields = [
@@ -315,11 +359,8 @@
       cell(row, age(t.last_seen_ms)); cell(row, t.talkgroups.length ? t.talkgroups.join(', ') : '—', 'groups');
       cell(row, t.registration);
       cell(row, pdpLabel(t.pdp));
-      const detailCell = document.createElement('td'); const button = document.createElement('button');
-      button.type = 'button'; button.className = 'btn btn-sm btn-outline-primary'; button.dataset.issi = t.issi;
-      button.textContent = 'Details';
-      button.addEventListener('click', () => { state.selectedTerminal = t.issi; renderTerminalModal(t); terminalModal.show(); });
-      detailCell.appendChild(button); row.appendChild(detailCell); rows.push(row);
+      const detailCell = document.createElement('td'); detailCell.appendChild(terminalDetailButton(t));
+      row.appendChild(detailCell); rows.push(row);
     }
     replace('terminal-rows', rows);
     if (focused) document.querySelector(`#terminal-rows button[data-issi="${focused}"]`)?.focus({ preventScroll: true });
@@ -333,6 +374,7 @@
   });
   $('terminal-prev').addEventListener('click', () => { state.page--; if (state.snapshot) renderTerminals(state.snapshot); });
   $('terminal-next').addEventListener('click', () => { state.page++; if (state.snapshot) renderTerminals(state.snapshot); });
+  $('overview-all-terminals').addEventListener('click', () => selectTab('terminals', true));
   $('network-select').addEventListener('change', drawCharts);
 
   function renderSwmi(s) {

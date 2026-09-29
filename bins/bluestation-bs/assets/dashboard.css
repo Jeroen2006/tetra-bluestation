@@ -23,6 +23,7 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .status-item .badge, .ra-summary .badge { display: inline-block; font-size: .95rem; font-weight: 650; padding: .45em .65em; white-space: normal; text-align: left; }
 .status-item small { display: block; margin-top: auto; padding-top: 10px; color: var(--bs-secondary-color); font-size: .77rem; line-height: 1.3; }
 .overview-columns { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(0,1fr); align-items: start; gap: 16px; margin-top: 16px; }
+.overview-radio-columns { grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); }
 .system-columns { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(0,1fr); align-items: start; gap: 16px; }
 .system-column { display: flex; flex-direction: column; min-width: 0; gap: 16px; }
 .plain-section { min-width: 0; }
@@ -35,6 +36,7 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .inline-values { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 18px; color: var(--bs-secondary-color); font-size: .82rem; }
 .inline-values b { margin-left: 5px; color: var(--bs-body-color); font-weight: 700; font-variant-numeric: tabular-nums; }
 .slot-list { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; margin: 4px 0 22px; }
+.overview-radio-columns .slot-list { margin-bottom: 0; }
 .slot { padding: 13px 11px; border-radius: var(--bs-border-radius); background: var(--slot-bg); }
 .slot span { display: block; margin-bottom: 4px; color: var(--slot-ink); font-size: .7rem; font-weight: 700; }
 .slot strong { color: var(--slot-ink); font-size: .78rem; font-weight: 700; white-space: nowrap; }
@@ -43,6 +45,7 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .slot--voice { --slot-bg: var(--bs-success-bg-subtle); --slot-ink: var(--bs-success-text-emphasis); }
 .slot--packet { --slot-bg: var(--bs-info-bg-subtle); --slot-ink: var(--bs-info-text-emphasis); }
 .slot--network { --slot-bg: var(--bs-warning-bg-subtle); --slot-ink: var(--bs-warning-text-emphasis); }
+.overview-ra-values .slot { --slot-bg: var(--bs-secondary-bg); --slot-ink: var(--bs-body-color); }
 .subsection { padding-top: 16px; border-top: 1px solid var(--bs-border-color); }
 .subsection .inline-values { margin-top: 0; }
 .meter-row { padding: 8px 0 15px; }
@@ -57,6 +60,15 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .data-table { margin: 0; font-size: .82rem; font-variant-numeric: tabular-nums; }
 .data-table th { color: var(--bs-secondary-color); font-size: .74rem; font-weight: 700; white-space: nowrap; }
 .data-table td, .data-table th { padding: 11px 10px; vertical-align: middle; }
+.overview-terminal-head, .overview-terminal-row { display: grid; grid-template-columns: 150px 115px 105px minmax(0,1fr) 90px 75px; align-items: center; gap: 10px; }
+.overview-terminal-head { padding: 0 12px 9px; color: var(--bs-secondary-color); font-size: .74rem; font-weight: 700; }
+.overview-terminal-row { padding: 10px 12px; font-size: .82rem; font-variant-numeric: tabular-nums; }
+.overview-terminal-identity { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.overview-terminal-identity strong { font-size: .88rem; }
+.overview-terminal-identity .badge { font-size: .68rem; }
+.overview-terminal-field { min-width: 0; }
+.overview-terminal-groups { overflow-wrap: anywhere; }
+.overview-terminal-row .btn { justify-self: end; white-space: nowrap; }
 .interface-select { width: min(210px,50%); }
 .ra-summary { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; }
 .ra-summary > div { min-width: 0; min-height: 100px; align-items: flex-start; }
@@ -100,6 +112,10 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
   .terminal-table { min-width: 0; }
   .terminal-table thead th:nth-child(4), .terminal-table thead th:nth-child(5), .terminal-table tbody td:nth-child(4), .terminal-table tbody td:nth-child(5) { display: none; }
   .terminal-detail { grid-template-columns: 1fr; }
+  .overview-terminal-head { display: none; }
+  .overview-terminal-row { grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 10px 16px; }
+  .overview-terminal-row .btn { grid-column: 2; grid-row: 1; }
+  .overview-terminal-field::before { content: attr(data-label); display: block; margin-bottom: 2px; color: var(--bs-secondary-color); font-size: .72rem; }
   .chart-wrap { height: 210px; }
   .chart-wrap.temperature-chart { height: 270px; }
 }
