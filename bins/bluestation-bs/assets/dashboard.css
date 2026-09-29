@@ -91,7 +91,34 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .terminal-detail > div { display: flex; flex-direction: column; gap: 3px; padding: 11px 0; border-bottom: 1px solid var(--bs-border-color); }
 .terminal-detail span { color: var(--bs-secondary-color); font-size: .75rem; }
 .terminal-detail strong { overflow-wrap: anywhere; font-size: .88rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.config-shell { max-width: 1120px; margin: 0 auto; }
+.config-shell > .card-body { padding: 22px; }
+.config-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--bs-border-color); }
+.config-tabs { gap: 5px; }
+.config-tabs .nav-link { padding: 8px 13px; font-size: .85rem; }
+.config-panel[hidden] { display: none !important; }
+.config-group { padding: 22px 0 24px; border-bottom: 1px solid var(--bs-border-color); }
+.config-group:last-child { border-bottom: 0; }
+.config-group h2 { margin-bottom: 17px; }
+.config-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 18px 22px; }
+.config-field { position: relative; min-width: 0; }
+.config-field .form-control, .config-field .form-select { font-variant-numeric: tabular-nums; }
+.config-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; font-size: .83rem; font-weight: 600; }
+.config-label label { min-width: 0; }
+.config-info { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 17px; height: 17px; padding: 0; border: 1px solid var(--bs-secondary-color); border-radius: 50%; background: transparent; color: var(--bs-secondary-color); font-size: .69rem; font-weight: 700; line-height: 1; }
+.config-info:hover, .config-info:focus { color: var(--bs-primary); border-color: var(--bs-primary); }
+.config-help { flex: none; }
+.config-help-text { position: absolute; left: 0; top: 27px; z-index: 6; display: none; width: min(320px,100%); padding: 10px 12px; border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); background: var(--bs-body-bg); box-shadow: var(--bs-box-shadow); color: var(--bs-body-color); font-size: .79rem; font-weight: 400; line-height: 1.4; }
+.config-help:hover .config-help-text, .config-help:focus-within .config-help-text, .config-help.is-open .config-help-text { display: block; }
+.config-unit { position: absolute; right: 14px; bottom: 9px; color: var(--bs-secondary-color); pointer-events: none; }
+.config-field:has(.config-unit) .form-control { padding-right: 34px; }
+.config-switch { position: relative; margin: 14px 0 6px; padding-left: 2.5em; }
+.config-switch .config-label { margin: 0; }
+.config-switch .form-check-input { margin-left: -2.5em; }
+.config-timezone { max-width: 520px; margin-top: 18px; }
+.config-actions { position: sticky; bottom: 0; z-index: 3; display: flex; justify-content: flex-end; gap: 10px; padding: 16px 0 0; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg); }
 @media (max-width: 991px) { .status-grid { grid-template-columns: repeat(3,minmax(0,1fr)); } .overview-columns, .system-columns { grid-template-columns: 1fr; } .measure-grid { grid-template-columns: repeat(3,minmax(0,1fr)); } }
+@media (max-width: 991px) { .config-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 @media (max-width: 767px) {
   .navigation-row { gap: 6px; margin-top: 8px; }
   .nav-tools { gap: 4px; }
@@ -118,6 +145,12 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
   .overview-terminal-field::before { content: attr(data-label); display: block; margin-bottom: 2px; color: var(--bs-secondary-color); font-size: .72rem; }
   .chart-wrap { height: 210px; }
   .chart-wrap.temperature-chart { height: 270px; }
+  .config-shell > .card-body { padding: 15px; }
+  .config-toolbar { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .config-tabs { flex-wrap: nowrap; max-width: 100%; overflow-x: auto; }
+  .config-tabs .nav-link { flex: none; white-space: nowrap; }
+  .config-grid { grid-template-columns: 1fr; gap: 16px; }
+  .config-group { padding: 18px 0; }
 }
 @media (max-width: 400px) { .status-item .badge { font-size: .82rem; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; } }

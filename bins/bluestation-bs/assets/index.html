@@ -20,6 +20,7 @@
       <button role="tab" aria-selected="false" aria-controls="view-ra" id="tab-ra" class="nav-link" data-tab="ra">Random Access</button>
       <button role="tab" aria-selected="false" aria-controls="view-terminals" id="tab-terminals" class="nav-link" data-tab="terminals">Terminals <span id="tab-terminal-count" class="badge text-bg-secondary tab-count">0</span></button>
       <button role="tab" aria-selected="false" aria-controls="view-swmi" id="tab-swmi" class="nav-link" data-tab="swmi">SwMI</button>
+      <button role="tab" aria-selected="false" aria-controls="view-config" id="tab-config" class="nav-link" data-tab="config">Configuration</button>
     </nav>
     <div class="nav-tools"><span id="connection-status" class="badge text-bg-warning" role="status" hidden></span><button id="theme-toggle" class="btn btn-outline-secondary theme-toggle" type="button" aria-label="Switch color mode" title="Switch color mode">◐</button></div>
     </div>
@@ -79,6 +80,23 @@
         <div class="ra-summary"><div class="card card-body shadow-sm"><span class="status-label">Connection</span><strong id="swmi-phase" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">WebSocket RTT</span><strong id="swmi-rtt">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Central services</span><strong id="swmi-service" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Reconnects</span><strong id="swmi-reconnects">—</strong></div></div>
         <div class="overview-columns"><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Ping history</h2><span>Last 15 minutes</span></div><div class="chart-wrap"><canvas id="chart-swmi" aria-label="SwMI WebSocket RTT samples" role="img"></canvas></div></section><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Connection details</h2></div><div id="swmi-properties"></div></section></div>
       </section>
+
+      <section id="view-config" role="tabpanel" aria-labelledby="tab-config" class="view" hidden>
+        <div class="config-shell card shadow-sm"><div class="card-body">
+          <div id="config-message" class="alert" role="status" hidden></div>
+          <div class="config-toolbar"><nav class="nav nav-pills config-tabs" aria-label="Configuration sections">
+            <button type="button" class="nav-link active" data-config-section="ra">Random Access</button>
+            <button type="button" class="nav-link" data-config-section="broadcast">Network broadcast</button>
+            <button type="button" class="nav-link" data-config-section="cell">Cell</button>
+          </nav><span id="config-state" class="text-body-secondary small">Loading…</span></div>
+          <form id="config-form">
+            <div id="config-ra" class="config-panel"></div>
+            <div id="config-broadcast" class="config-panel" hidden></div>
+            <div id="config-cell" class="config-panel" hidden></div>
+            <div class="config-actions"><button type="button" id="config-reload" class="btn btn-outline-secondary">Reload</button><button type="submit" id="config-save" class="btn btn-primary">Save &amp; restart</button></div>
+          </form>
+        </div></div>
+      </section>
     </main>
   </div>
   <div class="modal fade" id="terminal-modal" tabindex="-1" aria-labelledby="terminal-modal-title" aria-hidden="true">
@@ -93,5 +111,6 @@
   <script src="/assets/bootstrap.min.js"></script>
   <script src="/assets/chart.umd.min.js"></script>
   <script src="/assets/dashboard.js"></script>
+  <script src="/assets/config.js"></script>
 </body>
 </html>

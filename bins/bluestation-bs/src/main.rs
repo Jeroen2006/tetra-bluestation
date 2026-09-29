@@ -235,7 +235,7 @@ fn main() {
     let web_server = requested_monitor.as_ref().and_then(|monitor| {
         let settings = cfg.config();
         let swmi = settings.swmi.as_ref().map(|s| (s.host.as_str(), s.port, s.tls));
-        match web::start(&settings.web, swmi, monitor.clone(), is_running.clone()) {
+        match web::start(&settings.web, &args.config, swmi, monitor.clone(), is_running.clone()) {
             Ok(server) => Some(server),
             Err(error) => {
                 tracing::error!(%error, "BS dashboard unavailable");

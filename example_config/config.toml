@@ -138,7 +138,7 @@ tdma_synchronized = false
 # Open-loop power control broadcast parameters.
 # MS_TXPWR_MAX_CELL: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
 # ms_txpwr_max_cell = 4
-# RXLEV_ACCESS_MIN: 0=-116 dBm, 1=-114 dBm, ... 15=-86 dBm
+# RXLEV_ACCESS_MIN: 0=-125 dBm, 1=-120 dBm, ... 15=-50 dBm
 # rxlev_access_min = 3
 # ACCESS_PARAMETER: 0=-53 dBm, 1=-51 dBm, ... 15=-23 dBm
 # access_parameter = 7

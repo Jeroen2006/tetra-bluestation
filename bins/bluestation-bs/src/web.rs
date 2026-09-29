@@ -1,11 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::{Arc, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
@@ -15,10 +17,14 @@ use sysinfo::{Components, Pid, ProcessesToUpdate, System};
 use tetra_config::bluestation::CfgWeb;
 use tetra_entities::monitoring::{RadioSnapshot, SharedMonitor, SwmiSnapshot, unix_ms};
 
+#[path = "web_config.rs"]
+mod config;
+
 const HISTORY_CAPACITY: usize = 900;
 const INDEX: &str = include_str!("../assets/index.html");
 const CSS: &str = include_str!("../assets/dashboard.css");
 const JS: &str = include_str!("../assets/dashboard.js");
+const CONFIG_JS: &str = include_str!("../assets/config.js");
 const BOOTSTRAP: &str = include_str!("../assets/vendor/bootstrap.min.css");
 const BOOTSTRAP_JS: &str = include_str!("../assets/vendor/bootstrap.min.js");
 const CHART: &str = include_str!("../assets/vendor/chart.umd.min.js");
@@ -100,6 +106,10 @@ struct AppData {
     swmi_host: String,
     swmi_port: u16,
     swmi_tls: bool,
+    config_path: PathBuf,
+    config_lock: Mutex<()>,
+    restart_scheduled: AtomicBool,
+    running: Arc<AtomicBool>,
 }
 
 type AppState = Arc<AppData>;
@@ -319,7 +329,7 @@ impl WebServer {
     }
 }
 
-pub fn start(config: &CfgWeb, swmi: Option<(&str, u16, bool)>, monitor: SharedMonitor, running: Arc<AtomicBool>) -> Result<WebServer, String> {
+pub fn start(config: &CfgWeb, config_path: &str, swmi: Option<(&str, u16, bool)>, monitor: SharedMonitor, running: Arc<AtomicBool>) -> Result<WebServer, String> {
     let address = SocketAddr::new(config.bind_address, config.port);
     let listener = TcpListener::bind(address).map_err(|e| format!("cannot bind dashboard at {address}: {e}"))?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -328,6 +338,8 @@ pub fn start(config: &CfgWeb, swmi: Option<(&str, u16, bool)>, monitor: SharedMo
         monitor, system: RwLock::new(SystemSnapshot::default()), history: RwLock::new(VecDeque::with_capacity(HISTORY_CAPACITY)),
         swmi_host: swmi.map_or("".to_owned(), |s| s.0.to_owned()),
         swmi_port: swmi.map_or(0, |s| s.1), swmi_tls: swmi.is_some_and(|s| s.2),
+        config_path: std::fs::canonicalize(config_path).map_err(|e| format!("cannot resolve configuration path: {e}"))?,
+        config_lock: Mutex::new(()), restart_scheduled: AtomicBool::new(false), running: running.clone(),
     });
     let sampler_app = app.clone();
     let sampler_running = running.clone();
@@ -339,13 +351,16 @@ pub fn start(config: &CfgWeb, swmi: Option<(&str, u16, bool)>, monitor: SharedMo
             .route("/", get(|| async { ([(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))], Html(INDEX)) }))
             .route("/api/v1/snapshot", get(snapshot))
             .route("/api/v1/history", get(history))
+            .route("/api/v1/config", get(config::get_config).put(config::put_config))
             .route("/assets/bootstrap.min.css", get(|| async { static_asset(BOOTSTRAP, "text/css; charset=utf-8") }))
             .route("/assets/bootstrap.min.js", get(|| async { static_asset(BOOTSTRAP_JS, "text/javascript; charset=utf-8") }))
             .route("/assets/chart.umd.min.js", get(|| async { static_asset(CHART, "text/javascript; charset=utf-8") }))
             .route("/assets/dashboard.css", get(|| async { static_asset(CSS, "text/css; charset=utf-8") }))
             .route("/assets/dashboard.js", get(|| async { static_asset(JS, "text/javascript; charset=utf-8") }))
+            .route("/assets/config.js", get(|| async { static_asset(CONFIG_JS, "text/javascript; charset=utf-8") }))
             .route("/assets/logo.svg", get(|| async { static_asset(LOGO, "image/svg+xml") }))
             .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(app);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("dashboard runtime");
         runtime.block_on(async move {

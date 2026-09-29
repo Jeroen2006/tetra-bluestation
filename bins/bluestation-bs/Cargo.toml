@@ -23,6 +23,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 serde = { workspace = true }
 sysinfo = "0.33"
+toml_edit = "0.22"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
