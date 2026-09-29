@@ -20,8 +20,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use tetra_config::bluestation::{
     CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm,
-    RuntimeSc3GRolloverEvent,
-    RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
+    RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3GRolloverEvent, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
 };
 use tetra_swmi_protocol::{
     CellConfig, NeighbourCellSnapshot, Sc2RolloverStatus, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
@@ -31,6 +30,7 @@ use crate::network::transports::{
     NetworkTransport,
     websocket::{WebSocketTransport, WebSocketTransportConfig},
 };
+use crate::monitoring::{SharedMonitor, SwmiSnapshot, unix_ms};
 
 pub mod entity;
 
@@ -339,6 +339,10 @@ fn capacity_policy_cache_path() -> std::path::PathBuf {
 }
 
 pub fn start(config: SharedConfig, endpoint: SwmiWorkerEndpoint) -> Option<thread::JoinHandle<()>> {
+    start_with_monitor(config, endpoint, None)
+}
+
+pub fn start_with_monitor(config: SharedConfig, endpoint: SwmiWorkerEndpoint, monitor: Option<SharedMonitor>) -> Option<thread::JoinHandle<()>> {
     if let Ok(bytes) = std::fs::read(capacity_policy_cache_path()) {
         if let Ok(policy) = serde_json::from_slice::<tetra_swmi_protocol::CapacityPolicy>(&bytes) {
             if policy.validate() {
@@ -359,7 +363,7 @@ pub fn start(config: SharedConfig, endpoint: SwmiWorkerEndpoint) -> Option<threa
         }
     };
     Some(thread::spawn(move || {
-        SwmiWorker::new(config, swmi, profile, transport, endpoint).run()
+        SwmiWorker::new(config, swmi, profile, transport, endpoint, monitor).run()
     }))
 }
 
@@ -375,6 +379,7 @@ struct LocalRadioProfile {
     service_flags: u16,
     ms_txpwr_max_cell: u8,
     rxlev_access_min: u8,
+    access_parameter: u8,
     subscriber_class: u16,
     tdma_synchronized: bool,
     tdma_frame_offset: u8,
@@ -409,6 +414,7 @@ impl LocalRadioProfile {
             service_flags,
             ms_txpwr_max_cell: cell.ms_txpwr_max_cell,
             rxlev_access_min: cell.rxlev_access_min,
+            access_parameter: cell.access_parameter,
             subscriber_class: cell.subscriber_class,
             tdma_synchronized: cell.tdma_synchronized,
             tdma_frame_offset: cell.tdma_frame_offset,
@@ -442,6 +448,7 @@ impl LocalRadioProfile {
             service_flags: self.effective_service_flags(network_connected, cell.aie.enabled),
             ms_txpwr_max_cell: self.ms_txpwr_max_cell,
             rxlev_access_min: self.rxlev_access_min,
+            access_parameter: Some(self.access_parameter),
             subscriber_class: self.subscriber_class,
             cell_load_ca: runtime.broadcast.cell_load_ca,
             neighbour_station_ids: runtime.neighbours.ids.clone(),
@@ -464,10 +471,16 @@ struct SwmiWorker<T: NetworkTransport> {
     pending_advertisement_command_id: Option<u64>,
     last_radio_status: bool,
     recovery_request_id: Option<u64>,
+    monitor: Option<SharedMonitor>,
+    monitor_connected_at_ms: Option<u64>,
+    monitor_last_receive_ms: Option<u64>,
+    monitor_reconnects: u64,
+    monitor_last_error: Option<String>,
+    monitor_last_publish: Instant,
 }
 
 impl<T: NetworkTransport> SwmiWorker<T> {
-    fn new(stack_config: SharedConfig, config: CfgSwmi, profile: LocalRadioProfile, transport: T, endpoint: SwmiWorkerEndpoint) -> Self {
+    fn new(stack_config: SharedConfig, config: CfgSwmi, profile: LocalRadioProfile, transport: T, endpoint: SwmiWorkerEndpoint, monitor: Option<SharedMonitor>) -> Self {
         Self {
             stack_config,
             config,
@@ -481,19 +494,62 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             pending_advertisement_command_id: None,
             last_radio_status: false,
             recovery_request_id: None,
+            monitor,
+            monitor_connected_at_ms: None,
+            monitor_last_receive_ms: None,
+            monitor_reconnects: 0,
+            monitor_last_error: None,
+            monitor_last_publish: Instant::now(),
         }
+    }
+
+    fn publish_monitor(&mut self, force: bool) {
+        let Some(monitor) = self.monitor.as_ref() else { return; };
+        if !force && self.monitor_last_publish.elapsed() < std::time::Duration::from_secs(1) { return; }
+        self.monitor_last_publish = Instant::now();
+        let connected = self.transport.is_connected();
+        let state = self.stack_config.state_read();
+        let phase = if !connected { "Disconnected" }
+            else if state.network_connected { "Online" }
+            else if state.station_provisioning.is_some() { "Recovering" }
+            else { "Provisioning" };
+        let rtt = if connected { self.transport.rtt_sample() } else { None };
+        let current = SwmiSnapshot {
+            phase: phase.to_owned(), connected,
+            rtt_ms: rtt.map(|(duration, _)| duration.as_secs_f64() * 1000.0),
+            rtt_measured_at_ms: rtt.map(|(_, at)| unix_ms().saturating_sub(at.elapsed().as_millis() as u64)),
+            connected_at_ms: self.monitor_connected_at_ms,
+            last_receive_ms: self.monitor_last_receive_ms,
+            reconnects: self.monitor_reconnects,
+            last_error: self.monitor_last_error.clone(),
+        };
+        drop(state);
+        if let Ok(mut slot) = monitor.swmi.try_write() { *slot = current; }
     }
 
     fn run(&mut self) {
         loop {
             if let Err(error) = self.transport.connect() {
+                self.monitor_reconnects = self.monitor_reconnects.saturating_add(1);
+                let cause = error.to_string().to_ascii_lowercase();
+                let label = if cause.contains("certificate") || cause.contains("tls") { "TLS validation failed" }
+                    else if cause.contains("dns") || cause.contains("resolve") { "DNS resolution failed" }
+                    else if cause.contains("401") || cause.contains("authentication") { "Authentication rejected" }
+                    else if cause.contains("refused") { "Connection refused" }
+                    else if cause.contains("timeout") || cause.contains("timed out") { "Connection timed out" }
+                    else { "Connection failed; see BS logs" };
+                self.monitor_last_error = Some(label.to_owned());
                 self.endpoint.online.store(false, Ordering::Release);
                 self.stack_config.state_write().network_connected = false;
+                self.publish_monitor(true);
                 tracing::warn!(error = %error, "SwMI connection failed; retrying");
                 thread::sleep(self.config.reconnect_delay);
                 continue;
             }
             tracing::info!(host = %self.config.host, "SwMI control connection established");
+            self.monitor_connected_at_ms = Some(unix_ms());
+            self.monitor_last_error = None;
+            self.publish_monitor(true);
             self.recovery_request_id = None;
             if let Some(sc3) = self.stack_config.state_write().aie.sc3.as_mut() {
                 sc3.retry_pending_dck_requests();
@@ -510,6 +566,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             let mut last_heartbeat = Instant::now();
             while self.transport.is_connected() {
                 for incoming in self.transport.receive_reliable() {
+                    self.monitor_last_receive_ms = Some(unix_ms());
                     match SwmiMessage::decode(&incoming.payload) {
                         Ok(SwmiMessage::StationProvisioning { command_id, provisioning }) => {
                             let cell = provisioning.cell;
@@ -555,8 +612,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                             let identity_changed = {
                                 let mut state = self.stack_config.state_write();
                                 let identity_changed = state.station_provisioning.as_ref().is_some_and(|old| {
-                                    (old.cell.mcc, old.cell.mnc, old.cell.location_area)
-                                        != (cell.mcc, cell.mnc, cell.location_area)
+                                    (old.cell.mcc, old.cell.mnc, old.cell.location_area) != (cell.mcc, cell.mnc, cell.location_area)
                                 });
                                 let keep_lst = self.config.allow_lst
                                     && state.provisioned_once
@@ -606,7 +662,11 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         }
                         Ok(SwmiMessage::CellConfig { command_id, .. }) => {
                             tracing::warn!(command_id, "legacy CellConfig cannot provision a v41 base station");
-                            let _ = self.send(SwmiMessage::Receipt { command_id, accepted: false, code: 2 });
+                            let _ = self.send(SwmiMessage::Receipt {
+                                command_id,
+                                accepted: false,
+                                code: 2,
+                            });
                         }
                         Ok(SwmiMessage::Sc2RolloverPrepare {
                             command_id,
@@ -1004,12 +1064,8 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                         detail: None,
                     });
                 }
-                let sc3g_rollover_events: Vec<RuntimeSc3GRolloverEvent> = self
-                    .stack_config
-                    .state_write()
-                    .sc3g_rollover_events
-                    .drain(..)
-                    .collect();
+                let sc3g_rollover_events: Vec<RuntimeSc3GRolloverEvent> =
+                    self.stack_config.state_write().sc3g_rollover_events.drain(..).collect();
                 for event in sc3g_rollover_events {
                     let command_id = self.next_command_id();
                     let _ = self.send(SwmiMessage::Sc3GRolloverStatus {
@@ -1029,6 +1085,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                     let _ = self.report_current_advertisement();
                 }
                 self.refresh_radio_permission();
+                self.publish_monitor(false);
                 if last_heartbeat.elapsed() >= self.config.heartbeat_interval {
                     self.heartbeat_sequence += 1;
                     if !self.send(SwmiMessage::Heartbeat {
@@ -1050,6 +1107,9 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                     state.radio_tx_allowed = false;
                 }
             }
+            self.monitor_reconnects = self.monitor_reconnects.saturating_add(1);
+            self.monitor_last_error = Some("Connection lost; reconnecting".to_owned());
+            self.publish_monitor(true);
             thread::sleep(self.config.reconnect_delay);
         }
     }
@@ -1081,7 +1141,10 @@ impl<T: NetworkTransport> SwmiWorker<T> {
         if transmitting != self.last_radio_status {
             self.last_radio_status = transmitting;
             tracing::info!(config_version, transmitting, "radio transmission permission changed");
-            let _ = self.send(SwmiMessage::RadioStatus { config_version, transmitting });
+            let _ = self.send(SwmiMessage::RadioStatus {
+                config_version,
+                transmitting,
+            });
         }
     }
     fn report_current_advertisement(&mut self) -> bool {
@@ -1194,6 +1257,7 @@ mod tests {
             system_code: 0,
             ms_txpwr_max_cell: 0,
             rxlev_access_min: 0,
+            access_parameter: 0,
             subscriber_class: 0,
             tdma_synchronized: false,
             tdma_frame_offset: 0,

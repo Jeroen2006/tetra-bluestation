@@ -34,7 +34,7 @@ use tetra_pdus::{
     },
 };
 
-use crate::umac::subcomp::random_access::RandomAccessParameters;
+use crate::umac::subcomp::random_access::{RandomAccessParameters, RandomAccessUpdate};
 
 /// We submit this many TX timeslots ahead of the current time
 pub const MACSCHED_TX_AHEAD: usize = 1;
@@ -3376,6 +3376,23 @@ impl BsChannelScheduler {
             parameters.frame_len_factor,
             self.random_access_frame_len
         );
+    }
+
+    /// Exactly the access-code A values currently prepared for transmission.
+    pub fn random_access_definition(&self) -> RandomAccessUpdate {
+        let a = self.precomps.access_define.as_ref();
+        let d = self.precomps.mac_sysinfo1.default_access_code.as_ref();
+        RandomAccessUpdate {
+            parameters: RandomAccessParameters {
+                imm: a.map(|v| v.imm).or_else(|| d.map(|v| v.imm)).unwrap_or(8),
+                wt: a.map(|v| v.wt).or_else(|| d.map(|v| v.wt)).unwrap_or(5),
+                nu: a.map(|v| v.nu).or_else(|| d.map(|v| v.nu)).unwrap_or(5),
+                frame_len_factor: a.map(|v| v.frame_len_factor).or_else(|| d.map(|v| v.fl_factor)).unwrap_or(false),
+                ts_pointer: a.map(|v| v.ts_pointer).or_else(|| d.map(|v| v.ts_ptr)).unwrap_or(0),
+                min_pdu_prio: a.map(|v| v.min_pdu_prio).or_else(|| d.map(|v| v.min_pdu_prio)).unwrap_or(0),
+            },
+            frame_len: self.random_access_frame_len,
+        }
     }
 
     fn should_emit_access_define(&self, ts: TdmaTime) -> bool {

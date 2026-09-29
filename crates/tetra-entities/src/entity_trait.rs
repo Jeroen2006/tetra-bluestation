@@ -24,4 +24,9 @@ pub trait TetraEntityTrait: Send + AsAny {
     fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         false
     }
+
+    /// Optional, bounded status copy for the local dashboard.
+    fn monitoring_snapshot(&mut self) -> Option<crate::monitoring::EntitySnapshot> {
+        None
+    }
 }

@@ -6,6 +6,7 @@ pub mod entity_trait;
 pub mod llc;
 pub mod lmac;
 pub mod messagerouter;
+pub mod monitoring;
 pub mod mle;
 pub mod mm;
 pub mod phy;

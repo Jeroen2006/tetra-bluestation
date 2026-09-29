@@ -19,3 +19,10 @@ rustls = { version = "0.23", default-features = false }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "net", "time"] }
+serde = { workspace = true }
+sysinfo = "0.33"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

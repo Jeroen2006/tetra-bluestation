@@ -26,6 +26,7 @@ use tetra_swmi_protocol::{
 };
 
 use crate::{MessageQueue, TetraEntityTrait, net_swmi::SwmiPacketEndpoint};
+use crate::monitoring::{EntitySnapshot, PdpSnapshot};
 
 const DEFAULT_NSAPI: u8 = 1;
 const PACKET_USAGE_BASE: u8 = 48;
@@ -144,6 +145,8 @@ pub struct Sndcp {
     next_command_id: u64,
     next_packet_id: u64,
     contexts: HashMap<u32, RadioContext>,
+    monitor_ipv4: HashMap<u32, u32>,
+    monitor_context_created: HashMap<u32, u64>,
     pending_commands: HashMap<u64, u32>,
     pending_ms_deactivations: HashMap<u64, PendingMsDeactivation>,
     // An MS can finish AL disconnection and send a PDP deactivation just as
@@ -167,6 +170,8 @@ impl Sndcp {
             next_command_id: 1,
             next_packet_id: 1,
             contexts: HashMap::new(),
+            monitor_ipv4: HashMap::new(),
+            monitor_context_created: HashMap::new(),
             pending_commands: HashMap::new(),
             pending_ms_deactivations: HashMap::new(),
             pending_recovery_deactivations: HashMap::new(),
@@ -250,11 +255,15 @@ impl Sndcp {
 
     fn insert_context(&mut self, context: RadioContext) {
         self.publish_delivery_routes(&context);
+        self.monitor_ipv4.remove(&context.issi);
+        self.monitor_context_created.insert(context.issi, crate::monitoring::unix_ms());
         self.contexts.insert(context.issi, context);
     }
 
     fn remove_context(&mut self, issi: u32) -> Option<RadioContext> {
         self.config.state_write().subscriber_packet_delivery_routes.remove(&issi);
+        self.monitor_ipv4.remove(&issi);
+        self.monitor_context_created.remove(&issi);
         self.contexts.remove(&issi)
     }
 
@@ -472,7 +481,7 @@ impl Sndcp {
                 chan_alloc: Some(Self::channel_allocation(timeslot_bitmap, usage, ChanAllocType::Replace)),
                 associated_channel: self.route_for(context),
                 assigned_channel_frame18_broadcast: false,
-                    frame18_rollover_activation: None,
+                frame18_rollover_activation: None,
                 tx_reporter: Some(reporter.clone()),
             }),
         ));
@@ -1465,6 +1474,7 @@ impl Sndcp {
                     context.session_id = Some(session_id);
                     context.session_generation = Some(session_generation);
                     context.snei = snei;
+                    if let Some(address) = ipv4 { self.monitor_ipv4.insert(issi, address); }
                 }
                 let context = context.clone();
                 let pdu = if accepted {
@@ -2139,6 +2149,21 @@ impl Sndcp {
 impl TetraEntityTrait for Sndcp {
     fn entity(&self) -> TetraEntity {
         TetraEntity::Sndcp
+    }
+
+    fn monitoring_snapshot(&mut self) -> Option<EntitySnapshot> {
+        if !self.config.config().web.enabled { return None; }
+        Some(EntitySnapshot::Sndcp(self.contexts.iter().map(|(&issi, c)| {
+            let timeslots = (2..=4).filter(|ts| c.timeslot_bitmap & (1 << (ts - 1)) != 0).collect();
+            (issi, PdpSnapshot {
+                created_at_ms: self.monitor_context_created.get(&issi).copied().unwrap_or(0),
+                nsapi: c.nsapi,
+                session: c.session_id.is_some(),
+                bearer: c.bearer_id.is_some(),
+                timeslots,
+                ipv4: self.monitor_ipv4.get(&issi).map(|ip| std::net::Ipv4Addr::from(*ip).to_string()),
+            })
+        }).collect()))
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

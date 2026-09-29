@@ -45,6 +45,11 @@ pub trait NetworkTransport: Send {
     fn is_connected(&self) -> bool {
         true
     }
+
+    /// Last matched WebSocket Ping/Pong sample, if this transport supports it.
+    fn rtt_sample(&self) -> Option<(std::time::Duration, Instant)> {
+        None
+    }
 }
 
 /// Factory trait for creating transport instances

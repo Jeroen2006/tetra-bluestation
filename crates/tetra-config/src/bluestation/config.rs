@@ -10,6 +10,7 @@ use crate::bluestation::{
 use super::sec_brew::CfgBrew;
 use super::sec_swmi::CfgSwmi;
 use super::sec_telemetry::CfgTelemetry;
+use super::sec_web::CfgWeb;
 
 /// Wrapper for a string that should be treated as a secret. Display and Debug will redact the actual value,
 /// to prevent accidental logging of secrets.
@@ -81,6 +82,8 @@ pub struct StackConfig {
 
     /// Control endpoint configuration
     pub control: Option<CfgControl>,
+    /// Embedded, read-only BS dashboard.
+    pub web: CfgWeb,
 }
 
 impl StackConfig {

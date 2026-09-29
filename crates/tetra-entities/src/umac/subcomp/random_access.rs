@@ -34,6 +34,27 @@ pub struct RandomAccessWindowStats {
     pub ewma_score_hundredths: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RandomAccessLoad {
+    Starting,
+    Low,
+    Normal,
+    Contention,
+    Heavy,
+}
+
+impl RandomAccessLoad {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::Contention => "Contention",
+            Self::Heavy => "Heavy",
+        }
+    }
+}
+
 pub struct RandomAccessController {
     config: CfgRandomAccess,
     current: RandomAccessUpdate,
@@ -53,6 +74,7 @@ pub struct RandomAccessController {
     frame_factor_release_progress: u8,
     pending_registrations: u16,
     registration_delivery_failures: u16,
+    last_load: RandomAccessLoad,
 }
 
 const NOMINAL_IMM: u8 = 8;
@@ -98,6 +120,7 @@ impl RandomAccessController {
             frame_factor_release_progress: 0,
             pending_registrations: 0,
             registration_delivery_failures: 0,
+            last_load: RandomAccessLoad::Starting,
         };
         controller.current = controller.clamp_update(current);
         controller
@@ -109,6 +132,10 @@ impl RandomAccessController {
 
     pub fn last_window_stats(&self) -> Option<RandomAccessWindowStats> {
         self.last_window_stats
+    }
+
+    pub fn load(&self) -> RandomAccessLoad {
+        self.last_load
     }
 
     pub fn observe_access(&mut self, issi: Option<u32>, ts: TdmaTime, active: bool, registration_pending: bool) {
@@ -154,7 +181,7 @@ impl RandomAccessController {
 
     /// Evaluate at one stable MCCH broadcast position per configured interval.
     pub fn maybe_update(&mut self, ts: TdmaTime) -> Option<RandomAccessUpdate> {
-        if !self.config.enabled || ts.t != 1 || ts.f != 2 {
+        if ts.t != 1 || ts.f != 2 {
             return None;
         }
         let interval = self.config.update_interval_multiframes.max(1);
@@ -168,7 +195,7 @@ impl RandomAccessController {
             .saturating_add(self.invalid_mac_access)
             .saturating_add(self.crc_failures);
         let urgent_contention = collision_indications >= 2 || self.pending_registrations >= 2 || self.registration_delivery_failures > 0;
-        if self.startup_grace_updates_remaining > 0 && !urgent_contention {
+        if self.config.enabled && self.startup_grace_updates_remaining > 0 && !urgent_contention {
             self.startup_grace_updates_remaining -= 1;
             return None;
         }
@@ -213,6 +240,25 @@ impl RandomAccessController {
             || stats.crc_failures > 0
             || stats.registration_delivery_failures > 0;
         let low_load = !contention && !registration_backlog && sample_score <= low && self.ewma_score_hundredths <= low * 100;
+        self.last_load = if heavy_load {
+            RandomAccessLoad::Heavy
+        } else if contention {
+            RandomAccessLoad::Contention
+        } else if low_load {
+            RandomAccessLoad::Low
+        } else {
+            RandomAccessLoad::Normal
+        };
+
+        if !self.config.enabled {
+            self.first_attempts = 0;
+            self.retry_attempts = 0;
+            self.followup_attempts = 0;
+            self.invalid_mac_access = 0;
+            self.crc_failures = 0;
+            self.registration_delivery_failures = 0;
+            return None;
+        }
 
         let previous = self.current;
         if heavy_load {
@@ -311,6 +357,20 @@ mod tests {
 
     fn time(m: u8) -> TdmaTime {
         TdmaTime { h: 0, m, f: 2, t: 1 }
+    }
+
+    #[test]
+    fn static_access_keeps_broadcast_values_but_measures_load() {
+        let mut config = CfgRandomAccess::default();
+        config.enabled = false;
+        config.high_load_threshold = 1;
+        let mut controller = RandomAccessController::new(config);
+        let advertised = controller.current();
+        controller.observe_access(Some(123), time(1), false, false);
+        assert_eq!(controller.maybe_update(time(1)), None);
+        assert_eq!(controller.current(), advertised);
+        assert_eq!(controller.load(), RandomAccessLoad::Heavy);
+        assert_eq!(controller.last_window_stats().unwrap().first_attempts, 1);
     }
 
     #[test]

@@ -48,6 +48,7 @@ use crate::net_swmi::SwmiRfEndpoint;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, MACSCHED_TX_AHEAD, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::random_access::RandomAccessController;
+use crate::monitoring::{EntitySnapshot, RaLimits, RaParameters, RaSnapshot, RaWindow, RfSnapshot, unix_ms};
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
@@ -121,6 +122,8 @@ pub struct UmacBs {
     swmi_rf: Option<SwmiRfEndpoint>,
     rf_windows: HashMap<u32, RfWindow>,
     pending_rf_reports: HashMap<u32, UplinkRfStats>,
+    monitor_rf_reports: HashMap<u32, UplinkRfStats>,
+    monitor_last_seen: HashMap<u32, u64>,
 }
 
 struct RfWindow {
@@ -335,6 +338,11 @@ impl UmacBs {
         let aie_provider = BsAieKeyProvider::new(config.clone());
         let random_access = RandomAccessController::new(c.cell.random_access.clone());
         let precomps = Self::generate_precomps(&config);
+        let mut channel_scheduler = BsChannelScheduler::new_with_aie_provider(scrambling_code, precomps, aie_provider.clone());
+        if c.cell.random_access.enabled {
+            let initial = random_access.current();
+            channel_scheduler.set_random_access_definition(initial.parameters, initial.frame_len);
+        }
         Self {
             self_component: TetraEntity::Umac,
             config,
@@ -347,7 +355,7 @@ impl UmacBs {
             defrag: BsDefrag::new(),
             pending_stch: None,
             event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new_with_aie_provider(scrambling_code, precomps, aie_provider.clone()),
+            channel_scheduler,
             aie_provider,
             uplink_traffic_aie: [None; 4],
             traffic_call_owner: [None; 4],
@@ -362,10 +370,15 @@ impl UmacBs {
             swmi_rf,
             rf_windows: HashMap::new(),
             pending_rf_reports: HashMap::new(),
+            monitor_rf_reports: HashMap::new(),
+            monitor_last_seen: HashMap::new(),
         }
     }
 
     fn observe_terminal_rf(&mut self, issi: u32, ul_time: TdmaTime, observation: Option<tetra_core::UplinkRfObservation>, block_ok: bool) {
+        if block_ok && self.config.config().web.enabled {
+            self.monitor_last_seen.insert(issi, unix_ms());
+        }
         let Some(observation) = observation.filter(|observation| {
             observation.received_power_linear.is_finite()
                 && observation.received_power_linear > 0.0
@@ -412,6 +425,9 @@ impl UmacBs {
             .collect::<Vec<_>>();
         for issi in expired {
             if let Some(report) = self.rf_windows.remove(&issi).and_then(|window| window.finish(issi)) {
+                if self.config.config().web.enabled {
+                    self.monitor_rf_reports.insert(issi, report);
+                }
                 self.pending_rf_reports.insert(issi, report);
             }
         }
@@ -3348,6 +3364,48 @@ impl UmacBs {
 impl TetraEntityTrait for UmacBs {
     fn entity(&self) -> TetraEntity {
         TetraEntity::Umac
+    }
+
+    fn monitoring_snapshot(&mut self) -> Option<EntitySnapshot> {
+        if !self.config.config().web.enabled { return None; }
+        let active = self.config.state_read().subscribers.active_issis().into_iter().collect::<HashSet<_>>();
+        let cutoff = unix_ms().saturating_sub(120_000);
+        self.monitor_last_seen.retain(|issi, seen| active.contains(issi) || *seen >= cutoff);
+        self.monitor_rf_reports.retain(|issi, report| active.contains(issi) || report.measured_at_unix_ms >= cutoff);
+        let cfg = &self.config.config().cell.random_access;
+        let current = self.channel_scheduler.random_access_definition();
+        let stats = self.random_access.last_window_stats();
+        let ra = RaSnapshot {
+            dynamic: cfg.enabled,
+            load: self.random_access.load().label().to_owned(),
+            current: RaParameters {
+                imm: current.parameters.imm, wt: current.parameters.wt, nu: current.parameters.nu,
+                frame_len: current.frame_len, frame_len_factor: current.parameters.frame_len_factor,
+                ts_pointer: current.parameters.ts_pointer, min_pdu_prio: current.parameters.min_pdu_prio,
+            },
+            limits: RaLimits {
+                imm: [cfg.imm_min, cfg.imm_max], wt: [cfg.wt_min, cfg.wt_max],
+                nu: [cfg.nu_min, cfg.nu_max], frame_len: [cfg.frame_len_min, cfg.frame_len_max],
+            },
+            low_threshold: cfg.low_load_threshold,
+            high_threshold: cfg.high_load_threshold,
+            window: stats.map(|s| RaWindow {
+                first_attempts: s.first_attempts, retry_attempts: s.retry_attempts,
+                followup_attempts: s.followup_attempts, invalid_mac_access: s.invalid_mac_access,
+                crc_failures: s.crc_failures, pending_registrations: s.pending_registrations,
+                registration_delivery_failures: s.registration_delivery_failures,
+                sample_score: s.sample_score, ewma_score: s.ewma_score_hundredths as f64 / 100.0,
+            }),
+        };
+        let rf = self.monitor_rf_reports.iter().map(|(&issi, r)| (issi, RfSnapshot {
+            measured_at_ms: r.measured_at_unix_ms,
+            rssi_dbfs: f64::from(r.received_power_dbfs_x100) / 100.0,
+            frequency_offset_hz: f64::from(r.frequency_offset_hz_x100) / 100.0,
+            evm_percent: f64::from(r.training_evm_percent_x100) / 100.0,
+            block_errors: r.block_error_count,
+            block_count: r.block_count,
+        })).collect();
+        Some(EntitySnapshot::Umac { ra, rf, last_seen: self.monitor_last_seen.clone() })
     }
 
     fn set_config(&mut self, config: SharedConfig) {

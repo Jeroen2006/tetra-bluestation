@@ -15,6 +15,7 @@ use super::config::{StackConfig, StackMode};
 use super::sec_brew::CfgBrewDto;
 use super::sec_swmi::{CfgSwmiDto, apply_swmi_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
+use super::sec_web::{CfgWeb, CfgWebDto};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
 /// Build `StackConfig` from a TOML configuration file
@@ -119,6 +120,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         swmi: None,
         telemetry: None,
         control: None,
+        web: CfgWeb::default(),
     };
 
     cfg.swmi = Some(apply_swmi_patch(root.swmi.ok_or("[swmi] is required")?)?);
@@ -130,6 +132,8 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
     if let Some(command) = root.command {
         cfg.control = Some(apply_control_patch(command)?);
     }
+
+    cfg.web = root.web.unwrap_or_default().try_into()?;
 
     Ok(cfg)
 }
@@ -175,6 +179,7 @@ struct TomlConfigRoot {
     swmi: Option<CfgSwmiDto>,
     telemetry: Option<CfgTelemetryDto>,
     command: Option<CfgControlDto>,
+    web: Option<CfgWebDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -202,5 +207,19 @@ mod tests {
         cfg.network_broadcast.time_enabled = true;
         cfg.network_broadcast.timezone = Some("Europe/Amsterdam".to_owned());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn web_settings_are_optional_and_validated() {
+        let without = EXAMPLE.split("# Optional local, read-only monitoring dashboard.").next().unwrap();
+        let cfg = from_toml_str(without).unwrap();
+        assert!(!cfg.web.enabled);
+        assert_eq!(cfg.web.port, 8080);
+        let enabled = from_toml_str(&format!("{without}\n[web]\nenabled = true\nbind_address = \"127.0.0.1\"\nport = 9090\n")).unwrap();
+        assert!(enabled.web.enabled);
+        assert_eq!(enabled.web.port, 9090);
+        assert!(from_toml_str(&format!("{without}\n[web]\nport = 0\n")).is_err());
+        assert!(from_toml_str(&format!("{without}\n[web]\nbind_address = \"bad\"\n")).is_err());
+        assert!(from_toml_str(&format!("{without}\n[web]\nunknown = true\n")).is_err());
     }
 }

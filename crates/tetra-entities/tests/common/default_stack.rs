@@ -25,6 +25,7 @@ pub fn default_test_config_bs() -> StackConfig {
         swmi: None,
         telemetry: None,
         control: None,
+        web: Default::default(),
     }
 }
 
