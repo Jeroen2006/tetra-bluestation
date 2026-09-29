@@ -111,9 +111,9 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .config-help:hover .config-help-text, .config-help:focus-within .config-help-text, .config-help.is-open .config-help-text { display: block; }
 .config-unit { position: absolute; right: 14px; bottom: 9px; color: var(--bs-secondary-color); pointer-events: none; }
 .config-field:has(.config-unit) .form-control { padding-right: 34px; }
-.config-switch { position: relative; margin: 14px 0 6px; padding-left: 2.5em; }
+.config-switch { position: relative; display: flex; align-items: center; gap: 9px; min-height: 1.5rem; margin: 14px 0 6px; padding-left: 0; }
 .config-switch .config-label { margin: 0; }
-.config-switch .form-check-input { margin-left: -2.5em; }
+.config-switch .form-check-input { flex: none; float: none; margin: 0; }
 .config-timezone { max-width: 520px; margin-top: 18px; }
 .config-actions { position: sticky; bottom: 0; z-index: 3; display: flex; justify-content: flex-end; gap: 10px; padding: 16px 0 0; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg); }
 @media (max-width: 991px) { .status-grid { grid-template-columns: repeat(3,minmax(0,1fr)); } .overview-columns, .system-columns { grid-template-columns: 1fr; } .measure-grid { grid-template-columns: repeat(3,minmax(0,1fr)); } }
