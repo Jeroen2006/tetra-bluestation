@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
 use sysinfo::{Components, Pid, ProcessesToUpdate, System};
-use tetra_config::bluestation::CfgWeb;
+use tetra_config::bluestation::{CfgWeb, SharedConfig};
 use tetra_entities::monitoring::{RadioSnapshot, SharedMonitor, SwmiSnapshot, unix_ms};
 
 #[path = "web_config.rs"]
@@ -108,8 +108,7 @@ struct AppData {
     swmi_tls: bool,
     config_path: PathBuf,
     config_lock: Mutex<()>,
-    restart_scheduled: AtomicBool,
-    running: Arc<AtomicBool>,
+    config: SharedConfig,
 }
 
 type AppState = Arc<AppData>;
@@ -329,7 +328,14 @@ impl WebServer {
     }
 }
 
-pub fn start(config: &CfgWeb, config_path: &str, swmi: Option<(&str, u16, bool)>, monitor: SharedMonitor, running: Arc<AtomicBool>) -> Result<WebServer, String> {
+pub fn start(
+    config: &CfgWeb,
+    config_path: &str,
+    swmi: Option<(&str, u16, bool)>,
+    monitor: SharedMonitor,
+    stack_config: SharedConfig,
+    running: Arc<AtomicBool>,
+) -> Result<WebServer, String> {
     let address = SocketAddr::new(config.bind_address, config.port);
     let listener = TcpListener::bind(address).map_err(|e| format!("cannot bind dashboard at {address}: {e}"))?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -339,7 +345,7 @@ pub fn start(config: &CfgWeb, config_path: &str, swmi: Option<(&str, u16, bool)>
         swmi_host: swmi.map_or("".to_owned(), |s| s.0.to_owned()),
         swmi_port: swmi.map_or(0, |s| s.1), swmi_tls: swmi.is_some_and(|s| s.2),
         config_path: std::fs::canonicalize(config_path).map_err(|e| format!("cannot resolve configuration path: {e}"))?,
-        config_lock: Mutex::new(()), restart_scheduled: AtomicBool::new(false), running: running.clone(),
+        config_lock: Mutex::new(()), config: stack_config,
     });
     let sampler_app = app.clone();
     let sampler_running = running.clone();

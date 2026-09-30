@@ -3,8 +3,6 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -94,7 +92,8 @@ pub(super) struct ConfigUpdate {
 
 #[derive(Serialize)]
 pub(super) struct SaveResponse {
-    restarting: bool,
+    applied: bool,
+    changed: bool,
 }
 
 fn revision(contents: &str) -> String {
@@ -123,9 +122,6 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
         .config_lock
         .lock()
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Configuration lock unavailable"))?;
-    if app.restart_scheduled.load(Ordering::SeqCst) {
-        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "Restart already scheduled"));
-    }
     let current =
         fs::read_to_string(&app.config_path).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not read configuration"))?;
     if revision(&current) != update.revision {
@@ -137,6 +133,8 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
     let mut document = current
         .parse::<DocumentMut>()
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not parse configuration"))?;
+    let previous = parsing::from_toml_str(&current)
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not parse current configuration"))?;
     apply_settings(&mut document, &update.settings).map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
     let candidate = document.to_string();
     let parsed =
@@ -152,13 +150,8 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save configuration backup"))?;
     atomic_write(&app.config_path, candidate.as_bytes(), permissions)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save configuration"))?;
-    app.restart_scheduled.store(true, Ordering::SeqCst);
-    let running = app.running.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(800));
-        running.store(false, Ordering::SeqCst);
-    });
-    Ok(no_store(SaveResponse { restarting: true }))
+    let changed = app.config.apply_live_editable_settings(&previous, &parsed);
+    Ok(no_store(SaveResponse { applied: true, changed }))
 }
 
 fn table_mut<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut Table, String> {

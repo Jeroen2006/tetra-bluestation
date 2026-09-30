@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
 use crate::bluestation::{
-    CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, CfgRua, PhyBackend, RuntimeNetworkBroadcast,
-    StackState,
+    CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, CfgRandomAccess, CfgRua, PhyBackend,
+    RuntimeNetworkBroadcast, StackState,
 };
 
 use super::sec_brew::CfgBrew;
@@ -226,7 +226,31 @@ impl StackConfig {
     }
 }
 
-/// Global shared configuration: immutable config + mutable state.
+/// The operator-editable fields consumed by the running radio and SwMI worker.
+#[derive(Debug, Clone)]
+pub struct RuntimeOperatorSettings {
+    pub version: u64,
+    pub random_access: CfgRandomAccess,
+    pub ms_txpwr_max_cell: u8,
+    pub rxlev_access_min: u8,
+    pub access_parameter: u8,
+    pub allow_lst: bool,
+}
+
+impl Default for RuntimeOperatorSettings {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            random_access: CfgRandomAccess::default(),
+            ms_txpwr_max_cell: 4,
+            rxlev_access_min: 3,
+            access_parameter: 7,
+            allow_lst: false,
+        }
+    }
+}
+
+/// Global shared configuration: immutable startup config + mutable state.
 #[derive(Clone)]
 pub struct SharedConfig {
     /// Read-only configuration (immutable after construction).
@@ -251,6 +275,14 @@ impl SharedConfig {
             neighbours: cfg.neighbour_cells.clone(),
             broadcast: cfg.network_broadcast.clone(),
         };
+        state.operator_settings = RuntimeOperatorSettings {
+            version: 1,
+            random_access: cfg.cell.random_access.clone(),
+            ms_txpwr_max_cell: cfg.cell.ms_txpwr_max_cell,
+            rxlev_access_min: cfg.cell.rxlev_access_min,
+            access_parameter: cfg.cell.access_parameter,
+            allow_lst: cfg.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst),
+        };
 
         Self {
             cfg: Arc::new(cfg),
@@ -271,5 +303,135 @@ impl SharedConfig {
     /// Write guard for mutable state.
     pub fn state_write(&self) -> std::sync::RwLockWriteGuard<'_, StackState> {
         self.state.write().expect("StackState RwLock blocked")
+    }
+
+    /// Publish validated web-editable settings without replacing startup-only
+    /// radio or network configuration. One version change is observed at the
+    /// next UMAC tick; advertisement changes are reported to the SwMI.
+    pub fn apply_live_editable_settings(&self, previous: &StackConfig, next: &StackConfig) -> bool {
+        let previous_lst = previous.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
+        let next_lst = next.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
+        let operator_requested = previous.cell.random_access != next.cell.random_access
+            || previous.cell.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
+            || previous.cell.rxlev_access_min != next.cell.rxlev_access_min
+            || previous.cell.access_parameter != next.cell.access_parameter
+            || previous_lst != next_lst;
+        let broadcast_requested = previous.neighbour_cells.ids != next.neighbour_cells.ids
+            || previous.network_broadcast.cell_reselect_parameters != next.network_broadcast.cell_reselect_parameters
+            || previous.network_broadcast.time_enabled != next.network_broadcast.time_enabled
+            || previous.network_broadcast.timezone != next.network_broadcast.timezone;
+        if !operator_requested && !broadcast_requested {
+            return false;
+        }
+        let mut state = self.state_write();
+        let cell_changed = operator_requested && (state.operator_settings.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
+            || state.operator_settings.rxlev_access_min != next.cell.rxlev_access_min
+            || state.operator_settings.access_parameter != next.cell.access_parameter);
+        let operator_changed = operator_requested && (cell_changed
+            || state.operator_settings.random_access != next.cell.random_access
+            || state.operator_settings.allow_lst != next_lst);
+        let lst_changed = state.operator_settings.allow_lst != next_lst;
+        let broadcast_changed = broadcast_requested && (state.network_broadcast.neighbours.ids != next.neighbour_cells.ids
+            || state.network_broadcast.broadcast.cell_reselect_parameters != next.network_broadcast.cell_reselect_parameters
+            || state.network_broadcast.broadcast.time_enabled != next.network_broadcast.time_enabled
+            || state.network_broadcast.broadcast.timezone != next.network_broadcast.timezone);
+        if operator_changed {
+            state.operator_settings.version = state.operator_settings.version.saturating_add(1);
+            state.operator_settings.random_access = next.cell.random_access.clone();
+            state.operator_settings.ms_txpwr_max_cell = next.cell.ms_txpwr_max_cell;
+            state.operator_settings.rxlev_access_min = next.cell.rxlev_access_min;
+            state.operator_settings.access_parameter = next.cell.access_parameter;
+            state.operator_settings.allow_lst = next_lst;
+            if lst_changed {
+                let ready = state.station_provisioning.is_some()
+                    && state.advertisement_accepted
+                    && state.neighbours_ready
+                    && state.recovery_ready
+                    && state.sc3g_ready
+                    && state.network_connected;
+                state.radio_tx_allowed = ready || (next_lst && state.provisioned_once);
+            }
+        }
+        if broadcast_changed {
+            state.network_broadcast.neighbours = next.neighbour_cells.clone();
+            state.network_broadcast.broadcast.cell_reselect_parameters = next.network_broadcast.cell_reselect_parameters;
+            state.network_broadcast.broadcast.time_enabled = next.network_broadcast.time_enabled;
+            state.network_broadcast.broadcast.timezone = next.network_broadcast.timezone.clone();
+        }
+        if broadcast_changed || cell_changed {
+            state.network_broadcast.version = state.network_broadcast.version.saturating_add(1);
+        }
+        operator_changed || broadcast_changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_editable_settings_update_runtime_without_replacing_startup_config() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = crate::bluestation::parsing::from_toml_str(source).unwrap();
+        let shared = SharedConfig::from_parts(original.clone(), None);
+        let mut edited = original.clone();
+        edited.cell.random_access.high_load_threshold += 1;
+        edited.cell.ms_txpwr_max_cell = 5;
+        edited.cell.rxlev_access_min = 4;
+        edited.cell.access_parameter = 8;
+        edited.network_broadcast.cell_reselect_parameters = 0x1234;
+        edited.network_broadcast.time_enabled = true;
+        edited.network_broadcast.timezone = Some("Europe/Amsterdam".to_owned());
+        edited.neighbour_cells.ids = vec!["other-bs".to_owned()];
+        edited.swmi.as_mut().unwrap().allow_lst = false;
+        edited.validate().unwrap();
+
+        assert!(shared.apply_live_editable_settings(&original, &edited));
+        let state = shared.state_read();
+        assert_eq!(state.operator_settings.version, 2);
+        assert_eq!(state.operator_settings.random_access.high_load_threshold, edited.cell.random_access.high_load_threshold);
+        assert_eq!(state.operator_settings.ms_txpwr_max_cell, 5);
+        assert_eq!(state.operator_settings.rxlev_access_min, 4);
+        assert_eq!(state.operator_settings.access_parameter, 8);
+        assert!(!state.operator_settings.allow_lst);
+        assert_eq!(state.network_broadcast.version, 2);
+        assert_eq!(state.network_broadcast.neighbours.ids, vec!["other-bs".to_owned()]);
+        assert_eq!(state.network_broadcast.broadcast.cell_reselect_parameters, 0x1234);
+        assert_eq!(state.network_broadcast.broadcast.timezone.as_deref(), Some("Europe/Amsterdam"));
+        drop(state);
+        assert_eq!(shared.config().cell.ms_txpwr_max_cell, original.cell.ms_txpwr_max_cell);
+        assert!(!shared.apply_live_editable_settings(&edited, &edited));
+        assert_eq!(shared.state_read().operator_settings.version, 2);
+    }
+
+    #[test]
+    fn allow_lst_takes_effect_while_swmi_is_disconnected() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = crate::bluestation::parsing::from_toml_str(source).unwrap();
+        let shared = SharedConfig::from_parts(original.clone(), None);
+        {
+            let mut state = shared.state_write();
+            state.provisioned_once = true;
+            state.network_connected = false;
+            state.radio_tx_allowed = true;
+        }
+        let mut edited = original.clone();
+        edited.swmi.as_mut().unwrap().allow_lst = false;
+        assert!(shared.apply_live_editable_settings(&original, &edited));
+        assert!(!shared.state_read().radio_tx_allowed);
+        assert!(shared.apply_live_editable_settings(&edited, &original));
+        assert!(shared.state_read().radio_tx_allowed);
+    }
+
+    #[test]
+    fn random_access_edit_preserves_swmi_broadcast_update() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = crate::bluestation::parsing::from_toml_str(source).unwrap();
+        let shared = SharedConfig::from_parts(original.clone(), None);
+        shared.state_write().network_broadcast.neighbours.ids = vec!["swmi-neighbour".to_owned()];
+        let mut edited = original.clone();
+        edited.cell.random_access.high_load_threshold += 1;
+        assert!(shared.apply_live_editable_settings(&original, &edited));
+        assert_eq!(shared.state_read().network_broadcast.neighbours.ids, vec!["swmi-neighbour".to_owned()]);
     }
 }

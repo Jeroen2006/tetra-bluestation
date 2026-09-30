@@ -1,4 +1,4 @@
-use crate::bluestation::{RuntimeNetworkBroadcast, SharedConfig};
+use crate::bluestation::{RuntimeNetworkBroadcast, RuntimeOperatorSettings, SharedConfig};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
@@ -2020,6 +2020,8 @@ pub struct StackState {
     /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
     /// API. The worker reports each version to the SwMI.
     pub network_broadcast: RuntimeNetworkBroadcast,
+    /// Operator-edited radio access, cell advertisement and LST settings.
+    pub operator_settings: RuntimeOperatorSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2899,6 +2901,7 @@ impl Default for StackState {
                 neighbours: Default::default(),
                 broadcast: Default::default(),
             },
+            operator_settings: RuntimeOperatorSettings::default(),
         }
     }
 }

@@ -130,6 +130,24 @@ impl RandomAccessController {
         self.current
     }
 
+    /// Keep the current load measurement while replacing the controller
+    /// policy. A newly enabled controller starts from nominal access values.
+    pub fn reconfigure(&mut self, config: CfgRandomAccess) -> RandomAccessUpdate {
+        let enabling = !self.config.enabled && config.enabled;
+        self.config = config;
+        if enabling {
+            self.startup_grace_updates_remaining = self.config.startup_grace_multiframes;
+            self.low_load_recovery_progress = 0;
+            self.high_load_progress = 0;
+            self.frame_factor_release_progress = 0;
+            self.current = self.nominal_update();
+        } else {
+            self.current = self.clamp_update(self.current);
+        }
+        self.last_update = None;
+        self.current
+    }
+
     pub fn last_window_stats(&self) -> Option<RandomAccessWindowStats> {
         self.last_window_stats
     }
@@ -371,6 +389,21 @@ mod tests {
         assert_eq!(controller.current(), advertised);
         assert_eq!(controller.load(), RandomAccessLoad::Heavy);
         assert_eq!(controller.last_window_stats().unwrap().first_attempts, 1);
+    }
+
+    #[test]
+    fn live_reconfigure_clamps_current_access_and_can_enable_dynamic_mode() {
+        let mut config = CfgRandomAccess::default();
+        config.enabled = false;
+        let mut controller = RandomAccessController::new(config.clone());
+        config.enabled = true;
+        config.imm_min = 9;
+        config.imm_max = 12;
+        config.update_interval_multiframes = 2;
+        let current = controller.reconfigure(config);
+        assert_eq!(current.parameters.imm, 9);
+        assert_eq!(controller.current(), current);
+        assert_eq!(controller.maybe_update(time(1)), None); // Startup grace still applies.
     }
 
     #[test]

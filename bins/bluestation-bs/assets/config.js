@@ -103,7 +103,7 @@
 
   function render(settings) {
     const ra = $('config-ra'); ra.replaceChildren();
-    ra.append(toggle('random_access.enabled', 'Dynamic random access', 'Adapt IMM, WT, Nu and frame length to measured access load. Changes take effect after restart.', settings));
+    ra.append(toggle('random_access.enabled', 'Dynamic random access', 'Adapt IMM, WT, Nu and frame length to measured access load.', settings));
     group(ra, 'Timing & load', numberSpecs.slice(0, 5), settings);
     group(ra, 'On-air limits', numberSpecs.slice(5, 13), settings);
     group(ra, 'Measurement', numberSpecs.slice(13, 18), settings);
@@ -184,36 +184,20 @@
     } finally { state.loading = false; }
   }
 
-  async function waitForRestart(oldRunId) {
-    for (let attempt = 0; attempt < 60; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      try {
-        const response = await fetch('/api/v1/snapshot', { cache: 'no-store' });
-        if (!response.ok) continue;
-        const snapshot = await response.json();
-        if (!oldRunId || snapshot.run_id !== oldRunId) {
-          if (await load()) message('Configuration saved. Base station restarted.', 'success');
-          return;
-        }
-      } catch (_) { /* Expected while the service restarts. */ }
-    }
-    message('Configuration was saved, but the restart could not be confirmed. Check the service status.', 'warning');
-  }
-
   $('config-form').addEventListener('submit', async event => {
     event.preventDefault();
     if (state.saving || !state.revision || !$('config-form').reportValidity()) return;
     state.saving = true; $('config-save').disabled = true; message('Saving configuration…', 'info');
     try {
-      const oldRunId = await fetch('/api/v1/snapshot', { cache: 'no-store' }).then(response => response.json()).then(data => data.run_id).catch(() => null);
       const response = await fetch('/api/v1/config', {
         method: 'PUT', cache: 'no-store', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ revision: state.revision, settings: readForm() }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-      message('Configuration saved. Base station restarting…', 'info');
-      await waitForRestart(oldRunId);
+      if (!data.applied) throw new Error('The base station did not confirm the live update');
+      if (await load()) message(data.changed ? 'Configuration saved and applied live.' : 'Configuration already up to date.', 'success');
+      else message('Configuration was applied, but could not be reloaded. Refresh this page before editing again.', 'warning');
     } catch (error) {
       message(`Could not save configuration: ${error.message}`, 'danger');
     } finally { state.saving = false; $('config-save').disabled = false; }

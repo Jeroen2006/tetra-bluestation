@@ -19,8 +19,9 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use tetra_config::bluestation::{
-    CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeSc2Aie, RuntimeSc2Binding, RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm,
-    RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3GRolloverEvent, RuntimeSc3Gck, RuntimeSc3TeaAlgorithm, SharedConfig,
+    CfgSwmi, RuntimeAieConfig, RuntimeNetworkBroadcast, RuntimeOperatorSettings, RuntimeSc2Aie, RuntimeSc2Binding,
+    RuntimeSc2RolloverEvent, RuntimeSc2TeaAlgorithm, RuntimeSc3Aie, RuntimeSc3Dck, RuntimeSc3GRolloverEvent, RuntimeSc3Gck,
+    RuntimeSc3TeaAlgorithm, SharedConfig,
 };
 use tetra_swmi_protocol::{
     CellConfig, NeighbourCellSnapshot, Sc2RolloverStatus, Sc2TeaAlgorithm, SwmiMessage, SystemInfoReport, WEBSOCKET_CONTROL_SUBPROTOCOL,
@@ -377,9 +378,6 @@ struct LocalRadioProfile {
     colour_code: u8,
     system_code: u8,
     service_flags: u16,
-    ms_txpwr_max_cell: u8,
-    rxlev_access_min: u8,
-    access_parameter: u8,
     subscriber_class: u16,
     tdma_synchronized: bool,
     tdma_frame_offset: u8,
@@ -412,9 +410,6 @@ impl LocalRadioProfile {
             colour_code: cell.colour_code,
             system_code: cell.system_code,
             service_flags,
-            ms_txpwr_max_cell: cell.ms_txpwr_max_cell,
-            rxlev_access_min: cell.rxlev_access_min,
-            access_parameter: cell.access_parameter,
             subscriber_class: cell.subscriber_class,
             tdma_synchronized: cell.tdma_synchronized,
             tdma_frame_offset: cell.tdma_frame_offset,
@@ -434,7 +429,13 @@ impl LocalRadioProfile {
             | (u16::from(aie_enabled) << 9)
     }
 
-    fn report(&self, cell: CellConfig, runtime: &RuntimeNetworkBroadcast, network_connected: bool) -> SystemInfoReport {
+    fn report(
+        &self,
+        cell: CellConfig,
+        runtime: &RuntimeNetworkBroadcast,
+        operator: &RuntimeOperatorSettings,
+        network_connected: bool,
+    ) -> SystemInfoReport {
         SystemInfoReport {
             report_version: cell.config_version,
             cell,
@@ -446,9 +447,9 @@ impl LocalRadioProfile {
             colour_code: self.colour_code,
             system_code: self.system_code,
             service_flags: self.effective_service_flags(network_connected, cell.aie.enabled),
-            ms_txpwr_max_cell: self.ms_txpwr_max_cell,
-            rxlev_access_min: self.rxlev_access_min,
-            access_parameter: Some(self.access_parameter),
+            ms_txpwr_max_cell: operator.ms_txpwr_max_cell,
+            rxlev_access_min: operator.rxlev_access_min,
+            access_parameter: Some(operator.access_parameter),
             subscriber_class: self.subscriber_class,
             cell_load_ca: runtime.broadcast.cell_load_ca,
             neighbour_station_ids: runtime.neighbours.ids.clone(),
@@ -614,7 +615,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
                                 let identity_changed = state.station_provisioning.as_ref().is_some_and(|old| {
                                     (old.cell.mcc, old.cell.mnc, old.cell.location_area) != (cell.mcc, cell.mnc, cell.location_area)
                                 });
-                                let keep_lst = self.config.allow_lst
+                                let keep_lst = state.operator_settings.allow_lst
                                     && state.provisioned_once
                                     && state.station_provisioning.as_ref() == Some(&provisioning);
                                 state.radio_tx_allowed = keep_lst;
@@ -1103,7 +1104,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             {
                 let mut state = self.stack_config.state_write();
                 state.network_connected = false;
-                if !self.config.allow_lst {
+                if !state.operator_settings.allow_lst {
                     state.radio_tx_allowed = false;
                 }
             }
@@ -1131,7 +1132,7 @@ impl<T: NetworkTransport> SwmiWorker<T> {
             if ready {
                 state.provisioned_once = true;
             }
-            let allowed = ready || (self.config.allow_lst && state.provisioned_once);
+            let allowed = ready || (state.operator_settings.allow_lst && state.provisioned_once);
             state.radio_tx_allowed = allowed;
         }
         let state = self.stack_config.state_read();
@@ -1151,12 +1152,14 @@ impl<T: NetworkTransport> SwmiWorker<T> {
         let Some(cell) = self.current_cell_config.clone() else {
             return false;
         };
-        let runtime = self.stack_config.state_read().network_broadcast.clone();
-        let network_connected = self.stack_config.state_read().network_connected;
+        let (runtime, operator, network_connected) = {
+            let state = self.stack_config.state_read();
+            (state.network_broadcast.clone(), state.operator_settings.clone(), state.network_connected)
+        };
         let command_id = self.next_command_id();
         let accepted = self.send(SwmiMessage::SystemInfoReport {
             command_id,
-            report: self.profile.report(cell, &runtime, network_connected),
+            report: self.profile.report(cell, &runtime, &operator, network_connected),
         });
         if accepted {
             self.last_advertisement_version = runtime.version;
@@ -1255,9 +1258,6 @@ mod tests {
             reverse_operation: false,
             colour_code: 0,
             system_code: 0,
-            ms_txpwr_max_cell: 0,
-            rxlev_access_min: 0,
-            access_parameter: 0,
             subscriber_class: 0,
             tdma_synchronized: false,
             tdma_frame_offset: 0,

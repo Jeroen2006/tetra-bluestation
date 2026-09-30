@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeSc3Aie};
+use tetra_config::bluestation::{AieContextError, BsAieKeyProvider, RuntimeAieConfig, RuntimeOperatorSettings, RuntimeSc3Aie};
 use tetra_core::{
     AieCipherRegion, AieContext, AieDirection, AieRequest, AieScope, AieSubject, BitBuffer, Direction, PhyBlockNum, PhysicalChannel,
     SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
@@ -3378,6 +3378,36 @@ impl BsChannelScheduler {
         );
     }
 
+    /// Refresh the on-air SYSINFO and ACCESS-DEFINE fields at a radio tick.
+    /// Other precomputed PDUs, including SwMI-owned AIE state, stay intact.
+    pub fn apply_live_operator_settings(&mut self, settings: &RuntimeOperatorSettings, current: RandomAccessUpdate) {
+        for sysinfo in [&mut self.precomps.mac_sysinfo1, &mut self.precomps.mac_sysinfo2] {
+            sysinfo.ms_txpwr_max_cell = settings.ms_txpwr_max_cell;
+            sysinfo.rxlev_access_min = settings.rxlev_access_min;
+            sysinfo.access_parameter = settings.access_parameter;
+        }
+        self.precomps.access_define_interval_multiframes = settings.random_access.update_interval_multiframes;
+        if settings.random_access.enabled {
+            self.precomps.access_define = Some(AccessDefine {
+                common_or_assigned_control: false,
+                access_code: 0,
+                imm: current.parameters.imm,
+                wt: current.parameters.wt,
+                nu: current.parameters.nu,
+                frame_len_factor: current.parameters.frame_len_factor,
+                ts_pointer: current.parameters.ts_pointer,
+                min_pdu_prio: current.parameters.min_pdu_prio,
+                opt_field_flag: 0,
+                subscriber_class: None,
+                gssi: None,
+            });
+            self.random_access_frame_len = current.frame_len;
+        } else {
+            self.precomps.access_define = None;
+            self.random_access_frame_len = 4;
+        }
+    }
+
     /// Exactly the access-code A values currently prepared for transmission.
     pub fn random_access_definition(&self) -> RandomAccessUpdate {
         let a = self.precomps.access_define.as_ref();
@@ -4210,6 +4240,32 @@ mod tests {
             )),
             rollover: None,
         });
+    }
+
+    #[test]
+    fn live_operator_settings_update_both_sysinfo_variants_and_access_define() {
+        let mut sched = get_testing_slotter();
+        let mut settings = RuntimeOperatorSettings::default();
+        settings.ms_txpwr_max_cell = 6;
+        settings.rxlev_access_min = 5;
+        settings.access_parameter = 9;
+        settings.random_access.enabled = true;
+        settings.random_access.update_interval_multiframes = 3;
+        let mut current = sched.random_access_definition();
+        current.parameters.imm = 4;
+        current.frame_len = 6;
+        sched.apply_live_operator_settings(&settings, current);
+        assert_eq!(sched.precomps.mac_sysinfo1.ms_txpwr_max_cell, 6);
+        assert_eq!(sched.precomps.mac_sysinfo2.rxlev_access_min, 5);
+        assert_eq!(sched.precomps.mac_sysinfo1.access_parameter, 9);
+        assert_eq!(sched.precomps.access_define_interval_multiframes, 3);
+        assert_eq!(sched.precomps.access_define.as_ref().unwrap().imm, 4);
+        assert_eq!(sched.random_access_definition().frame_len, 6);
+
+        settings.random_access.enabled = false;
+        sched.apply_live_operator_settings(&settings, current);
+        assert!(sched.precomps.access_define.is_none());
+        assert_eq!(sched.random_access_definition().frame_len, 4);
     }
 
     #[test]
