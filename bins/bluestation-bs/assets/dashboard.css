@@ -41,9 +41,21 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .slot strong { color: var(--slot-ink); font-size: .78rem; font-weight: 700; white-space: nowrap; }
 .slot--control { --slot-bg: var(--bs-primary-bg-subtle); --slot-ink: var(--bs-primary-text-emphasis); }
 .slot--free { --slot-bg: var(--bs-secondary-bg); --slot-ink: var(--bs-secondary-color); }
-.slot--voice { --slot-bg: var(--bs-success-bg-subtle); --slot-ink: var(--bs-success-text-emphasis); }
-.slot--packet { --slot-bg: var(--bs-info-bg-subtle); --slot-ink: var(--bs-info-text-emphasis); }
-.slot--network { --slot-bg: var(--bs-warning-bg-subtle); --slot-ink: var(--bs-warning-text-emphasis); }
+.slot--voice { --slot-bg: #ffe5d0; --slot-ink: #7e390a; }
+.slot--packet { --slot-bg: #e2d9f3; --slot-ink: #432874; }
+.slot--network { --slot-bg: #f7d6e6; --slot-ink: #801f4f; }
+[data-bs-theme="dark"] .slot--voice { --slot-bg: #503019; --slot-ink: #ffb77d; }
+[data-bs-theme="dark"] .slot--packet { --slot-bg: #382454; --slot-ink: #c5a9ef; }
+[data-bs-theme="dark"] .slot--network { --slot-bg: #4e2036; --slot-ink: #ee9fc7; }
+.cell-columns { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.cell-identity, .tdma-counters { display: grid; gap: 12px; margin-bottom: 16px; font-variant-numeric: tabular-nums; }
+.cell-identity { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.tdma-counters { grid-template-columns: repeat(4,minmax(0,1fr)); margin-bottom: 0; }
+.cell-identity span, .tdma-counters span { display: block; color: var(--bs-secondary-color); font-size: .76rem; margin-bottom: 6px; }
+.cell-identity strong, .tdma-counters strong { font-size: 1.5rem; font-weight: 700; }
+.cell-services { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+.cell-services .badge { text-align: left; white-space: normal; line-height: 1.5; font-weight: 500; padding: 8px 10px; }
+@media (max-width: 575px) { .tdma-counters { grid-template-columns: repeat(2,minmax(0,1fr)); } .cell-services { grid-template-columns: 1fr; } }
 .overview-ra-values .slot { --slot-bg: var(--bs-secondary-bg); --slot-ink: var(--bs-body-color); }
 .subsection { padding-top: 16px; border-top: 1px solid var(--bs-border-color); }
 .subsection .inline-values { margin-top: 0; }

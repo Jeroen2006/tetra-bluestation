@@ -2,6 +2,13 @@
   'use strict';
   const $ = id => document.getElementById(id);
   const state = { snapshot: null, history: [], runId: null, lastResponse: 0, activeTab: 'overview', page: 0, selectedTerminal: null, fetching: false, charts: {} };
+  const slotTypes = [
+    { key: 'control', label: 'Control', color: '#0d6efd' },
+    { key: 'voice', label: 'Voice', color: '#fd7e14' },
+    { key: 'packet', label: 'Packet data', color: '#9561e2' },
+    { key: 'network', label: 'Network', color: '#d63384' },
+    { key: 'free', label: 'Free', color: '#8a9097' },
+  ];
   const frameSubslots = { 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 8, 10: 10, 11: 12, 12: 16, 13: 20, 14: 24, 15: 32 };
   const fmt = (v, digits = 0) => v == null || !Number.isFinite(Number(v)) ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits });
   const pct = (v, digits = 0) => v == null ? '—' : `${fmt(v, digits)}%`;
@@ -114,6 +121,12 @@
   lineChart('chart-network', [{ label: 'RX · KB/s', color: '#0d6efd' }, { label: 'TX · KB/s', color: '#198754' }]);
   lineChart('chart-ra', [{ label: 'EWMA', color: '#0d6efd' }, { label: 'Low', color: '#198754' }, { label: 'High', color: '#ffc107' }]);
   lineChart('chart-swmi', [{ label: 'WebSocket RTT · ms', color: '#0d6efd' }]);
+  const slotChart = lineChart('chart-cell-slots', slotTypes);
+  slotChart.data.datasets.forEach(dataset => { dataset.stepped = true; dataset.tension = 0; });
+  slotChart.options.scales.y.max = 4;
+  slotChart.options.scales.y.ticks.stepSize = 1;
+  slotChart.options.scales.y.title = { display: true, text: 'Timeslots' };
+  slotChart.options.plugins.tooltip.callbacks.label = context => `${context.dataset.label}: ${fmt(context.parsed.y)}`;
 
   function styleCharts() {
     const styles = getComputedStyle(document.documentElement);
@@ -122,6 +135,7 @@
     for (const chart of Object.values(state.charts)) {
       chart.options.scales.x.ticks.color = text; chart.options.scales.y.ticks.color = text;
       chart.options.scales.y.grid.color = grid; chart.options.plugins.legend.labels.color = text;
+      if (chart.options.scales.y.title) chart.options.scales.y.title.color = text;
       chart.update('none');
     }
   }
@@ -163,6 +177,59 @@
     const ra = state.snapshot?.radio?.ra;
     update('chart-ra', [points.map(p => p.ra_score), points.map(() => ra?.low_threshold ?? null), points.map(() => ra?.high_threshold ?? null)]);
     update('chart-swmi', [points.map(p => p.rtt_ms)]);
+    update('chart-cell-slots', slotTypes.map(type => points.map(p => p.slots?.[type.key] ?? null)));
+  }
+
+  function renderSlots(id, radio) {
+    replace(id, radio.timeslots.map((name, i) => {
+      const item = document.createElement('div');
+      const type = slotTypes.find(type => type.label === name)?.key || 'free';
+      item.className = `slot slot--${type}`;
+      const label = document.createElement('span'); label.textContent = `TS${i + 1}`;
+      const value = document.createElement('strong'); value.textContent = radio.measured_at_ms ? name : '—';
+      item.append(label, value); return item;
+    }));
+  }
+
+  function renderCell(s) {
+    const c = s.radio.cell;
+    const yes = value => value == null ? '—' : value ? 'Yes' : 'No';
+    const mhz = value => value == null ? '—' : `${fmt(value / 1000000, 6)} MHz`;
+    for (const [id, value] of Object.entries({ mcc: c?.mcc, mnc: c?.mnc, la: c?.location_area, hf: c?.time.h, mf: c?.time.m, frame: c?.time.f, ts: c?.time.t })) setText(`cell-${id}`, value ?? '—');
+    setText('cell-radio', s.radio.radio_tx_active ? 'Transmitting' : 'Inactive');
+    setTone('cell-radio', s.radio.radio_tx_active ? 'good' : 'muted');
+    replace('cell-identity-properties', [
+      property('Colour code', fmt(c?.colour_code)),
+      property('System code', c ? ['TETRA V+D · ed. 1, no security', 'TETRA V+D · ed. 1 + security', 'TETRA V+D · v2', 'TETRA V+D · v3'][c.system_code] || `Reserved (${c.system_code})` : '—'),
+      property('Subscriber classes', !c ? '—' : c.subscriber_class === 65535 ? 'All classes' : c.subscriber_class === 0 ? 'None' : Array.from({ length: 16 }, (_, i) => i + 1).filter(cls => c.subscriber_class & (1 << (16 - cls))).join(', ')),
+    ]);
+    const frequencies = c?.frequencies_hz;
+    replace('cell-carrier-properties', [
+      property('Downlink', mhz(frequencies?.[0])), property('Uplink', mhz(frequencies?.[1])),
+      property('Frequency band', c ? `${c.frequency_band * 100} MHz base` : '—'),
+      property('Main carrier', fmt(c?.main_carrier)),
+      property('Carrier offset', c ? `${c.offset_hz > 0 ? '+' : ''}${fmt(c.offset_hz / 1000, 2)} kHz` : '—'),
+      property('Duplex spacing', frequencies ? `${fmt(Math.abs(frequencies[0] - frequencies[1]) / 1000000, 4)} MHz` : '—'),
+      property('Uplink direction', c ? c.reverse_operation ? 'Above downlink (reverse)' : 'Below downlink (normal)' : '—'),
+      property('Sharing mode', c ? ['Continuous transmission', 'Carrier sharing', 'MCCH sharing', 'Traffic carrier sharing'][c.sharing_mode] : '—'),
+    ]);
+    const timeoutSlots = c ? 144 * c.radio_dl_timeout : null;
+    replace('cell-sysinfo-properties', [
+      property('Maximum MS transmit power', !c ? '—' : c.ms_txpwr_max_cell ? `${10 + c.ms_txpwr_max_cell * 5} dBm` : 'Reserved'),
+      property('Minimum RX access level', c ? `${-125 + 5 * c.rxlev_access_min} dBm` : '—'),
+      property('Access parameter', c ? `${-53 + 2 * c.access_parameter} dBm` : '—'),
+      property('Radio downlink timeout', !c ? '—' : !timeoutSlots ? 'Disabled' : `${timeoutSlots} timeslots · ${fmt(timeoutSlots / 4 * 17 / 300, 2)} s`),
+      property('Secondary control channels', fmt(c?.secondary_control_channels)),
+      property('Dynamic random access', c ? yes(s.radio.ra.dynamic) : '—'),
+    ]);
+    renderSlots('cell-slots', s.radio);
+    setText('cell-slots-used', c ? `${s.radio.timeslots.filter(slot => slot !== 'Free').length} / 4 in use` : '—');
+    replace('cell-services', (c?.services || []).map(([label, enabled]) => {
+      const badge = document.createElement('span');
+      badge.className = `badge ${enabled ? 'text-bg-success' : 'text-bg-secondary'}`;
+      badge.textContent = `${label} · ${enabled ? 'Yes' : 'No'}`;
+      return badge;
+    }));
   }
 
   function renderOverview(s) {
@@ -183,14 +250,7 @@
     setText('overview-temperature', system.cpu_temperature_c == null ? 'Unavailable' : `${fmt(system.cpu_temperature_c, 1)} °C`);
     const rx = system.network.reduce((sum, n) => sum + (n.rx_bytes_per_sec || 0), 0), tx = system.network.reduce((sum, n) => sum + (n.tx_bytes_per_sec || 0), 0);
     setText('overview-network', `${byte(rx, true)} / ${byte(tx, true)}`);
-    replace('overview-slots', radio.timeslots.map((name, i) => {
-      const item = document.createElement('div');
-      const type = { Control: 'control', Free: 'free', Voice: 'voice', 'Packet data': 'packet', Network: 'network' }[name] || 'free';
-      item.className = `slot slot--${type}`;
-      const label = document.createElement('span'); label.textContent = `TS${i + 1}`;
-      const value = document.createElement('strong'); value.textContent = name;
-      item.append(label, value); return item;
-    }));
+    renderSlots('overview-slots', radio);
     const raAvailable = !!radio.measured_at_ms;
     const ra = radio.ra;
     setText('overview-ra-imm', fmt(raAvailable ? ra.current.imm : null));
@@ -397,7 +457,7 @@
     state.snapshot = s;
     const stale = !s.radio.measured_at_ms ? false : s.server_time_ms - s.radio.measured_at_ms > 5000;
     setConnectionStatus(stale ? 'Radio data stale' : s.radio.measured_at_ms ? null : 'Awaiting radio');
-    renderOverview(s); renderSystem(s); renderRa(s); renderTerminals(s); renderSwmi(s);
+    renderOverview(s); renderCell(s); renderSystem(s); renderRa(s); renderTerminals(s); renderSwmi(s);
     drawCharts();
   }
 

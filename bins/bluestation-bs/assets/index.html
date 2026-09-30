@@ -16,6 +16,7 @@
     <div class="navigation-row">
     <nav class="tab-nav nav nav-tabs" role="tablist" aria-label="Dashboard sections">
       <button role="tab" aria-selected="true" aria-controls="view-overview" id="tab-overview" class="nav-link active" data-tab="overview">Overview</button>
+      <button role="tab" aria-selected="false" aria-controls="view-cell" id="tab-cell" class="nav-link" data-tab="cell">Cell</button>
       <button role="tab" aria-selected="false" aria-controls="view-system" id="tab-system" class="nav-link" data-tab="system">System</button>
       <button role="tab" aria-selected="false" aria-controls="view-ra" id="tab-ra" class="nav-link" data-tab="ra">Random Access</button>
       <button role="tab" aria-selected="false" aria-controls="view-terminals" id="tab-terminals" class="nav-link" data-tab="terminals">Terminals <span id="tab-terminal-count" class="badge text-bg-secondary tab-count">0</span></button>
@@ -40,6 +41,21 @@
         </div>
         <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>Terminals</h2><button id="overview-all-terminals" type="button" class="btn btn-sm btn-outline-primary">View all</button></div><div class="overview-terminal-head" aria-hidden="true"><span>ISSI / status</span><span>RSSI</span><span>Last seen</span><span>Talkgroups</span><span>PDP</span><span></span></div><div id="overview-terminal-list" class="list-group list-group-flush"></div><div id="overview-terminal-empty" class="empty-state" hidden>No registered terminals</div></div></section>
         <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>System activity</h2></div><div class="chart-wrap"><canvas id="chart-overview" aria-label="CPU and RAM history, last 15 minutes" role="img"></canvas></div><div class="inline-values"><span>CPU temperature <b id="overview-temperature">—</b></span><span>Network RX / TX <b id="overview-network">—</b></span></div></div></section>
+      </section>
+
+      <section id="view-cell" role="tabpanel" aria-labelledby="tab-cell" class="view" hidden>
+        <div class="system-columns cell-columns">
+          <div class="system-column">
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Cell identity</h2><span id="cell-radio" class="badge text-bg-secondary">—</span></div><div class="cell-identity"><div><span>MCC</span><strong id="cell-mcc">—</strong></div><div><span>MNC</span><strong id="cell-mnc">—</strong></div><div><span>Location area</span><strong id="cell-la">—</strong></div></div><div id="cell-identity-properties"></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Carrier</h2></div><div id="cell-carrier-properties"></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>SYSINFO</h2></div><div id="cell-sysinfo-properties"></div></section>
+          </div>
+          <div class="system-column">
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>TDMA counters</h2><span class="badge text-bg-secondary" title="Snapshot of the downlink TDMA clock, sampled once per second">1 s sample</span></div><div class="tdma-counters"><div><span>Hyperframe</span><strong id="cell-hf">—</strong></div><div><span>Multiframe</span><strong id="cell-mf">—</strong></div><div><span>Frame</span><strong id="cell-frame">—</strong></div><div><span>Timeslot</span><strong id="cell-ts">—</strong></div></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Timeslot allocation</h2><span id="cell-slots-used" class="badge text-bg-secondary">—</span></div><div class="slot-list" id="cell-slots"></div><div class="chart-wrap"><canvas id="chart-cell-slots" aria-label="Allocated timeslots per type, last 15 minutes, sampled once per second" role="img"></canvas></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Broadcast services</h2></div><div id="cell-services" class="cell-services"></div></section>
+          </div>
+        </div>
       </section>
 
       <section id="view-system" role="tabpanel" aria-labelledby="tab-system" class="view" hidden>

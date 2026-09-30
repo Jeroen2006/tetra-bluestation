@@ -104,12 +104,14 @@ impl MessageRouter {
         if self.last_monitor_sample.elapsed() < Duration::from_secs(1) { return; }
         self.last_monitor_sample = Instant::now();
         let mut ra = None;
+        let mut cell = None;
         let mut rf = HashMap::new();
         let mut last_seen = HashMap::new();
         let mut pdp = HashMap::new();
         for entity in self.entities.values_mut() {
             match entity.monitoring_snapshot() {
-                Some(EntitySnapshot::Umac { ra: current, rf: signals, last_seen: seen }) => {
+                Some(EntitySnapshot::Umac { cell: current_cell, ra: current, rf: signals, last_seen: seen }) => {
+                    cell = Some(current_cell);
                     ra = Some(current);
                     rf = signals;
                     last_seen = seen;
@@ -139,6 +141,7 @@ impl MessageRouter {
         }
         let snapshot = RadioSnapshot {
             measured_at_ms: unix_ms(),
+            cell,
             ra: ra.unwrap_or_default(), terminals, timeslots,
             network_connected: state.network_connected,
             radio_tx_allowed: state.radio_tx_allowed,

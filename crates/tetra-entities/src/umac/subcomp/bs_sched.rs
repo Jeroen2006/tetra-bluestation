@@ -579,6 +579,10 @@ impl BsChannelScheduler {
     //     unimplemented!("need to refresh some msgs possibly");
     // }
 
+    pub fn broadcast_parameters(&self) -> &PrecomputedUmacPdus {
+        &self.precomps
+    }
+
     // pub fn set_precomputed_msgs(&mut self, precomps: PrecomputedUmacPdus) {
     //     self.precomps = precomps;
     //     unimplemented!("need to refresh some msgs possibly");
@@ -4240,6 +4244,37 @@ mod tests {
             )),
             rollover: None,
         });
+    }
+
+    #[test]
+    fn cell_monitor_uses_effective_broadcast_parameters_and_tdma_time() {
+        use crate::monitoring::CellSnapshot;
+        let mut sched = get_testing_slotter();
+        let time = TdmaTime { h: 65535, m: 60, f: 18, t: 4 };
+        let mut settings = RuntimeOperatorSettings::default();
+        settings.ms_txpwr_max_cell = 6;
+        settings.rxlev_access_min = 5;
+        settings.access_parameter = 9;
+        sched.apply_live_operator_settings(&settings, sched.random_access_definition());
+        sched.set_system_wide_services_state(false);
+        enable_test_sc3(&mut sched);
+        sched.precomps.mle_sync.mcc = 310;
+        sched.precomps.mle_sync.mnc = 1234;
+        sched.precomps.mle_sysinfo.location_area = 102;
+        sched.precomps.mac_sysinfo1.freq_band = 4;
+        sched.precomps.mac_sysinfo1.main_carrier = 864;
+        sched.precomps.mac_sysinfo1.freq_offset_index = 1;
+        let snapshot = CellSnapshot::from_broadcast(sched.broadcast_parameters(), time, None);
+        assert_eq!(snapshot.time, time);
+        assert_eq!((snapshot.mcc, snapshot.mnc, snapshot.location_area), (310, 1234, 102));
+        assert_eq!((snapshot.ms_txpwr_max_cell, snapshot.rxlev_access_min, snapshot.access_parameter), (6, 5, 9));
+        assert_eq!(snapshot.frequencies_hz, Some((421_606_250, 411_606_250)));
+        assert!(snapshot.services.contains(&("System-wide services".into(), false)));
+        assert!(snapshot.services.contains(&("Security class 3".into(), true)));
+        sched.precomps.mac_sysinfo1.reverse_operation = true;
+        sched.precomps.mac_sysinfo1.duplex_spacing = 7;
+        let snapshot = CellSnapshot::from_broadcast(sched.broadcast_parameters(), time, Some(7_600_000));
+        assert_eq!(snapshot.frequencies_hz, Some((421_606_250, 429_206_250)));
     }
 
     #[test]

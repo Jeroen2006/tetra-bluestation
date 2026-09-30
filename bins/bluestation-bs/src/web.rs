@@ -90,6 +90,7 @@ struct HistoryPoint {
     ra_load: Option<String>,
     rtt_ms: Option<f64>,
     terminal_count: Option<usize>,
+    slots: Option<tetra_entities::monitoring::SlotCounts>,
 }
 
 #[derive(Clone, Serialize)]
@@ -298,6 +299,7 @@ fn sample_loop(app: AppState, running: Arc<AtomicBool>) {
             ra_load: radio_fresh.then(|| radio.ra.load.clone()),
             rtt_ms: rtt_changed.then_some(swmi.rtt_ms).flatten(),
             terminal_count: radio_fresh.then_some(radio.terminals.len()),
+            slots: radio_fresh.then(|| radio.slot_counts()),
         };
         history.push_back(point);
         if history.len() > HISTORY_CAPACITY { history.pop_front(); }

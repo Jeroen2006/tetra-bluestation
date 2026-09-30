@@ -3422,7 +3422,10 @@ impl TetraEntityTrait for UmacBs {
             block_errors: r.block_error_count,
             block_count: r.block_count,
         })).collect();
-        Some(EntitySnapshot::Umac { ra, rf, last_seen: self.monitor_last_seen.clone() })
+        let cell = crate::monitoring::CellSnapshot::from_broadcast(
+            self.channel_scheduler.broadcast_parameters(), self.dltime, self.config.config().cell.custom_duplex_spacing,
+        );
+        Some(EntitySnapshot::Umac { cell, ra, rf, last_seen: self.monitor_last_seen.clone() })
     }
 
     fn set_config(&mut self, config: SharedConfig) {
