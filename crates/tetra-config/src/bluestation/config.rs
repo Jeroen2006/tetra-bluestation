@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::sync::{Arc, RwLock};
-use tetra_core::freqs::FreqInfo;
+use tetra_core::freqs::checked_freq_info;
 
 use crate::bluestation::{
     CfgCellInfo, CfgControl, CfgNeighbourCells, CfgNetInfo, CfgNetworkBroadcast, CfgPhyIo, CfgRandomAccess, CfgRua, PhyBackend,
@@ -102,6 +102,11 @@ impl StackConfig {
             }
         };
 
+        // Validate air-interface frequency fields even for the test backend.
+        let freq_info = checked_freq_info(
+            self.cell.freq_band, self.cell.main_carrier, self.cell.freq_offset_hz,
+            self.cell.reverse_operation, self.cell.duplex_spacing_id, self.cell.custom_duplex_spacing,
+        ).map_err(|_| "Invalid cell info frequency settings")?;
         // Sanity check on main carrier property fields in SYSINFO
         if self.phy_io.backend == PhyBackend::SoapySdr {
             let soapy_cfg = self
@@ -109,17 +114,6 @@ impl StackConfig {
                 .soapysdr
                 .as_ref()
                 .expect("SoapySdr config must be set for SoapySdr PhyIo");
-
-            let Ok(freq_info) = FreqInfo::from_components(
-                self.cell.freq_band,
-                self.cell.main_carrier,
-                self.cell.freq_offset_hz,
-                self.cell.reverse_operation,
-                self.cell.duplex_spacing_id,
-                self.cell.custom_duplex_spacing,
-            ) else {
-                return Err("Invalid cell info frequency settings");
-            };
 
             let (dlfreq, ulfreq) = freq_info.get_freqs();
 

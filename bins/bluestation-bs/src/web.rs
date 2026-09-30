@@ -25,6 +25,7 @@ const INDEX: &str = include_str!("../assets/index.html");
 const CSS: &str = include_str!("../assets/dashboard.css");
 const JS: &str = include_str!("../assets/dashboard.js");
 const CONFIG_JS: &str = include_str!("../assets/config.js");
+const FREQUENCY_JS: &str = include_str!("../assets/frequency.js");
 const BOOTSTRAP: &str = include_str!("../assets/vendor/bootstrap.min.css");
 const BOOTSTRAP_JS: &str = include_str!("../assets/vendor/bootstrap.min.js");
 const CHART: &str = include_str!("../assets/vendor/chart.umd.min.js");
@@ -109,6 +110,8 @@ struct AppData {
     config_path: PathBuf,
     config_lock: Mutex<()>,
     config: SharedConfig,
+    restart_scheduled: AtomicBool,
+    running: Arc<AtomicBool>,
 }
 
 type AppState = Arc<AppData>;
@@ -346,6 +349,7 @@ pub fn start(
         swmi_port: swmi.map_or(0, |s| s.1), swmi_tls: swmi.is_some_and(|s| s.2),
         config_path: std::fs::canonicalize(config_path).map_err(|e| format!("cannot resolve configuration path: {e}"))?,
         config_lock: Mutex::new(()), config: stack_config,
+        restart_scheduled: AtomicBool::new(false), running: running.clone(),
     });
     let sampler_app = app.clone();
     let sampler_running = running.clone();
@@ -364,6 +368,7 @@ pub fn start(
             .route("/assets/dashboard.css", get(|| async { static_asset(CSS, "text/css; charset=utf-8") }))
             .route("/assets/dashboard.js", get(|| async { static_asset(JS, "text/javascript; charset=utf-8") }))
             .route("/assets/config.js", get(|| async { static_asset(CONFIG_JS, "text/javascript; charset=utf-8") }))
+            .route("/assets/frequency.js", get(|| async { static_asset(FREQUENCY_JS, "text/javascript; charset=utf-8") }))
             .route("/assets/logo.svg", get(|| async { static_asset(LOGO, "image/svg+xml") }))
             .fallback(|| async { StatusCode::NOT_FOUND })
             .layer(DefaultBodyLimit::max(64 * 1024))

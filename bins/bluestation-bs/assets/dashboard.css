@@ -100,6 +100,8 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .config-group:last-child { border-bottom: 0; }
 .config-group h2 { margin-bottom: 17px; }
 .config-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 18px 22px; }
+.config-frequency-pair { grid-template-columns: repeat(2,minmax(0,1fr)); }
+.config-field[hidden], .config-field [hidden] { display: none !important; }
 .config-field { position: relative; min-width: 0; }
 .config-field .form-control, .config-field .form-select { font-variant-numeric: tabular-nums; }
 .config-label { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; font-size: .83rem; font-weight: 600; }

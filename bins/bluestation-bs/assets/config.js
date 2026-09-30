@@ -1,7 +1,8 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { revision: null, settings: null, loading: false, saving: false };
+  const state = { revision: null, settings: null, loading: false, saving: false, frequencyBands: [], customDuplexEntry: 7 };
+  const frequencyMath = globalThis.BlueStationFrequency;
   let nextHelpId = 0;
   const info = (text, label) => {
     const wrapper = document.createElement('span'); wrapper.className = 'config-help';
@@ -101,6 +102,111 @@
     wrapper.append(select); return wrapper;
   }
 
+  function frequencyInput(name, label, help, value, unit, readOnly = false) {
+    const id = fieldId(`frequency.${name}`), wrapper = document.createElement('div'); wrapper.className = 'config-field';
+    wrapper.append(labelFor(id, label, help));
+    const input = document.createElement('input'); input.id = id; input.type = readOnly ? 'text' : 'number';
+    input.className = 'form-control'; input.readOnly = readOnly; input.value = value ?? '';
+    if (!readOnly) { input.required = true; input.step = '0.000001'; input.min = '0'; input.max = '4294.967295'; }
+    const group = document.createElement('div'); group.className = 'input-group';
+    const suffix = document.createElement('span'); suffix.className = 'input-group-text'; suffix.textContent = unit;
+    group.append(input, suffix); wrapper.append(group); return wrapper;
+  }
+
+  function readFrequency() {
+    const custom = $('config-frequency-duplex_spacing').value === 'custom';
+    return {
+      frequency_band: Number($('config-frequency-frequency_band').value),
+      main_carrier: $('config-frequency-main_carrier').valueAsNumber,
+      offset_hz: Number($('config-frequency-offset_hz').value),
+      duplex_spacing: custom ? state.customDuplexEntry : Number($('config-frequency-duplex_spacing').value),
+      custom_split_mhz: custom ? $('config-frequency-custom_split_mhz').valueAsNumber : null,
+      reverse_operation: $('config-frequency-reverse_operation').value === 'true',
+    };
+  }
+
+  function refreshDuplexOptions(selected) {
+    const select = $('config-frequency-duplex_spacing');
+    const band = state.frequencyBands.find(item => item.value === Number($('config-frequency-frequency_band').value));
+    select.replaceChildren();
+    for (const entry of band?.duplex_spacings || []) {
+      const option = document.createElement('option'); option.value = entry.value;
+      option.textContent = entry.spacing_mhz === 0 ? '0 MHz — no split' : `${entry.spacing_mhz} MHz`;
+      select.append(option);
+    }
+    const custom = document.createElement('option'); custom.value = 'custom'; custom.textContent = 'Custom split'; select.append(custom);
+    select.value = String(selected);
+    if (!select.value) select.value = String(band?.duplex_spacings.find(entry => entry.spacing_mhz > 0)?.value ?? 2);
+  }
+
+  function updateFrequencyPreview(preserveDownlink = false) {
+    const frequency = readFrequency(), customInput = $('config-frequency-custom_split_mhz');
+    const custom = frequency.custom_split_mhz !== null;
+    customInput.closest('.config-field').hidden = !custom; customInput.disabled = !custom;
+    customInput.required = custom; customInput.setCustomValidity('');
+    const valid = frequencyMath.validComponents(frequency);
+    const uplink = valid ? frequencyMath.uplinkHz(frequency, state.frequencyBands) : null;
+    if (!preserveDownlink && valid) $('config-frequency-downlink_mhz').value = (frequencyMath.componentsToHz(frequency) / 1000000).toFixed(6);
+    $('config-frequency-uplink_mhz').value = uplink == null ? '—' : (uplink / 1000000).toFixed(6);
+    const invalidSplit = custom && (!Number.isFinite(frequency.custom_split_mhz) || uplink == null);
+    if (invalidSplit) customInput.setCustomValidity('Enter a split that produces a valid uplink frequency.');
+    const dirty = !frequencyMath.sameSettings(frequency, state.settings.frequency);
+    $('config-frequency-restart-note').hidden = !dirty;
+    $('config-save').textContent = dirty ? 'Save & restart' : 'Save & apply';
+  }
+
+  function renderFrequency(cell, settings) {
+    if (!settings.frequency) return;
+    const frequency = settings.frequency;
+    state.customDuplexEntry = frequency.custom_split_mhz != null ? frequency.duplex_spacing : 7;
+    const section = document.createElement('section'); section.className = 'config-group';
+    const heading = document.createElement('h2'); heading.textContent = 'Radio frequencies'; section.append(heading);
+    const pair = document.createElement('div'); pair.className = 'config-grid config-frequency-pair';
+    pair.append(frequencyInput('downlink_mhz', 'Downlink frequency', 'BS transmit frequency. Enter MHz on the TETRA 6.25 kHz raster; band, carrier and offset update automatically.', (frequencyMath.componentsToHz(frequency) / 1000000).toFixed(6), 'MHz'));
+    pair.append(frequencyInput('uplink_mhz', 'Uplink frequency', 'BS receive frequency, calculated from the downlink, duplex spacing and uplink direction.', '', 'MHz', true));
+    const downlink = pair.querySelector('input'); downlink.step = '0.00625'; downlink.min = '99.99375'; downlink.max = '999.9875';
+    const invalid = document.createElement('div'); invalid.id = 'config-frequency-error'; invalid.className = 'invalid-feedback d-block'; invalid.hidden = true; pair.firstChild.append(invalid);
+    section.append(pair);
+    const components = document.createElement('div'); components.className = 'config-grid mt-3';
+    components.append(selectField('frequency.frequency_band', 'Frequency band', 'The base/reference frequency in the TETRA carrier formula; not the lower edge of an allocated radio band.', state.frequencyBands.map(band => [String(band.value), `${band.base_mhz} MHz base`]), settings));
+    components.append(numericField(['frequency.main_carrier', 'Main carrier', 0, 3999, 'Carrier number in 25 kHz steps above the band base. This is the air-interface carrier number, not the radio channel name.'], settings));
+    components.append(selectField('frequency.offset_hz', 'Carrier offset', 'Adjustment to the 25 kHz carrier raster.', [['-6250', '−6.25 kHz'], ['0', '0 kHz'], ['6250', '+6.25 kHz'], ['12500', '+12.5 kHz']], settings));
+    section.append(components);
+    const duplex = document.createElement('div'); duplex.className = 'config-grid mt-3';
+    duplex.append(selectField('frequency.duplex_spacing', 'Duplex spacing', 'ETSI table values depend on the frequency band. Custom split uses an externally defined duplex entry; terminals must know that split before transmitting.', [], settings));
+    duplex.append(selectField('frequency.reverse_operation', 'Uplink direction', 'Normal operation subtracts the split from the downlink. Reverse operation adds it.', [['false', 'Below downlink (normal)'], ['true', 'Above downlink (reverse)']], settings));
+    const standard = frequencyMath.splitHz(frequency, state.frequencyBands);
+    duplex.append(frequencyInput('custom_split_mhz', 'Custom split', 'The split in MHz is stored in Hz. Custom entry 7 is not sent as a numeric spacing over the air; configure the same split in the terminals.', frequency.custom_split_mhz ?? (standard == null ? '' : standard / 1000000), 'MHz'));
+    section.append(duplex);
+    const note = document.createElement('div'); note.id = 'config-frequency-restart-note'; note.className = 'alert alert-warning mt-3 mb-0'; note.textContent = 'Frequency or duplex changes restart the BS when saved.'; note.hidden = true; section.append(note);
+    cell.append(section);
+    refreshDuplexOptions(frequency.custom_split_mhz != null ? 'custom' : frequency.duplex_spacing);
+    downlink.addEventListener('input', () => {
+      downlink.setCustomValidity('');
+      const next = downlink.value === '' ? null : frequencyMath.mhzToComponents(downlink.valueAsNumber, readFrequency());
+      invalid.hidden = !!next;
+      if (!next) {
+        invalid.textContent = 'Use a supported TETRA frequency in 6.25 kHz steps.';
+        downlink.setCustomValidity(invalid.textContent); $('config-frequency-uplink_mhz').value = '—'; return;
+      }
+      const previousBand = $('config-frequency-frequency_band').value;
+      for (const key of ['frequency_band', 'main_carrier', 'offset_hz']) $(fieldId(`frequency.${key}`)).value = next[key];
+      if (previousBand !== String(next.frequency_band)) refreshDuplexOptions($('config-frequency-duplex_spacing').value);
+      updateFrequencyPreview(true);
+    });
+    downlink.addEventListener('change', () => { if (downlink.checkValidity()) updateFrequencyPreview(); });
+    for (const input of components.querySelectorAll('input, select')) input.addEventListener('input', () => {
+      downlink.setCustomValidity(''); invalid.hidden = true;
+      if (input.id === 'config-frequency-frequency_band') refreshDuplexOptions($('config-frequency-duplex_spacing').value);
+      updateFrequencyPreview();
+    });
+    for (const input of duplex.querySelectorAll('input, select')) input.addEventListener('input', () => {
+      if (input.id === 'config-frequency-duplex_spacing' && input.value === 'custom' && frequency.custom_split_mhz == null) state.customDuplexEntry = 7;
+      updateFrequencyPreview(true);
+    });
+    updateFrequencyPreview();
+  }
+
   function render(settings) {
     const ra = $('config-ra'); ra.replaceChildren();
     ra.append(toggle('random_access.enabled', 'Dynamic random access', 'Adapt IMM, WT, Nu and frame length to measured access load.', settings));
@@ -127,6 +233,7 @@
     timeField.append(timezone); time.append(timeField); broadcast.append(time);
 
     const cell = $('config-cell'); cell.replaceChildren();
+    renderFrequency(cell, settings);
     const cellGroup = document.createElement('section'); cellGroup.className = 'config-group';
     const cellTitle = document.createElement('h2'); cellTitle.textContent = 'Cell access & power'; cellGroup.append(cellTitle);
     const cellGrid = document.createElement('div'); cellGrid.className = 'config-grid';
@@ -148,6 +255,7 @@
 
   function readForm() {
     const settings = structuredClone(state.settings);
+    if (settings.frequency) settings.frequency = readFrequency();
     for (const [path] of numberSpecs) {
       const keys = path.split('.'); settings[keys[0]][keys[1]] = Number($(fieldId(path)).value);
     }
@@ -174,7 +282,7 @@
       const response = await fetch('/api/v1/config', { cache: 'no-store' });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-      state.revision = data.revision; state.settings = data.settings;
+      state.revision = data.revision; state.settings = data.settings; state.frequencyBands = data.frequency_bands || [];
       render(data.settings); $('config-save').disabled = false;
       message('', 'info');
       return true;
@@ -182,6 +290,22 @@
       message(`Could not load configuration: ${error.message}`, 'danger');
       return false;
     } finally { state.loading = false; }
+  }
+
+  async function waitForRestart(oldRunId) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      try {
+        const response = await fetch('/api/v1/snapshot', { cache: 'no-store' });
+        if (!response.ok) continue;
+        const snapshot = await response.json();
+        if (snapshot.run_id !== oldRunId) {
+          if (await load()) message('Configuration saved. Radio settings applied after restart.', 'success');
+          return;
+        }
+      } catch (_) { /* The radio is restarting. */ }
+    }
+    message('Configuration saved, but the radio restart could not be confirmed. Check the service status.', 'warning');
   }
 
   $('config-form').addEventListener('submit', async event => {
@@ -195,6 +319,10 @@
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      if (data.restarting) {
+        message('Configuration saved. Radio restarting…', 'info');
+        await waitForRestart(data.run_id); return;
+      }
       if (!data.applied) throw new Error('The base station did not confirm the live update');
       if (await load()) message(data.changed ? 'Configuration saved and applied live.' : 'Configuration already up to date.', 'success');
       else message('Configuration was applied, but could not be reloaded. Refresh this page before editing again.', 'warning');

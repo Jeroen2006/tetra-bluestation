@@ -13,9 +13,13 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use super::AppState;
 
+#[path = "web_frequency.rs"]
+mod frequency;
+use frequency::{FrequencyBandOption, FrequencySettings};
+
 type ApiResult<T> = Result<([(header::HeaderName, HeaderValue); 1], Json<T>), (StatusCode, Json<ApiError>)>;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(super) struct ApiError {
     error: String,
 }
@@ -45,6 +49,8 @@ struct CellSettings {
 
 #[derive(Serialize, Deserialize)]
 struct EditableSettings {
+    #[serde(default)]
+    frequency: Option<FrequencySettings>,
     random_access: CfgRandomAccess,
     neighbour_cells: Vec<String>,
     cell_reselect: CellReselectSettings,
@@ -58,6 +64,7 @@ impl EditableSettings {
     fn from_config(config: &StackConfig) -> Self {
         let packed = config.network_broadcast.cell_reselect_parameters;
         Self {
+            frequency: Some(FrequencySettings::from_config(config)),
             random_access: config.cell.random_access.clone(),
             neighbour_cells: config.neighbour_cells.ids.clone(),
             cell_reselect: CellReselectSettings {
@@ -82,6 +89,7 @@ impl EditableSettings {
 pub(super) struct ConfigResponse {
     revision: String,
     settings: EditableSettings,
+    frequency_bands: Vec<FrequencyBandOption>,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +102,8 @@ pub(super) struct ConfigUpdate {
 pub(super) struct SaveResponse {
     applied: bool,
     changed: bool,
+    restarting: bool,
+    run_id: String,
 }
 
 fn revision(contents: &str) -> String {
@@ -114,6 +124,7 @@ pub(super) async fn get_config(State(app): State<AppState>) -> ApiResult<ConfigR
     Ok(no_store(ConfigResponse {
         revision: revision(&contents),
         settings: EditableSettings::from_config(&config),
+        frequency_bands: frequency::band_options(),
     }))
 }
 
@@ -122,6 +133,9 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
         .config_lock
         .lock()
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Configuration lock unavailable"))?;
+    if app.restart_scheduled.load(Ordering::SeqCst) {
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "Radio restart already scheduled"));
+    }
     let current =
         fs::read_to_string(&app.config_path).map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not read configuration"))?;
     if revision(&current) != update.revision {
@@ -140,6 +154,7 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
     let parsed =
         parsing::from_toml_str(&candidate).map_err(|_| error(StatusCode::BAD_REQUEST, "Resulting configuration could not be parsed"))?;
     parsed.validate().map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
+    let restarting = FrequencySettings::from_config(&previous) != FrequencySettings::from_config(&parsed);
     let permissions = fs::metadata(&app.config_path)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not inspect configuration permissions"))?
         .permissions();
@@ -150,8 +165,20 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save configuration backup"))?;
     atomic_write(&app.config_path, candidate.as_bytes(), permissions)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not save configuration"))?;
-    let changed = app.config.apply_live_editable_settings(&previous, &parsed);
-    Ok(no_store(SaveResponse { applied: true, changed }))
+    if restarting {
+        app.restart_scheduled.store(true, Ordering::SeqCst);
+        let running = app.running.clone();
+        std::thread::spawn(move || {
+            // Allow the response to reach the browser before the normal stack
+            // shutdown closes the SDR. The service manager starts the new config.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            running.store(false, Ordering::SeqCst);
+        });
+        Ok(no_store(SaveResponse { applied: false, changed: true, restarting: true, run_id: app.run_id.clone() }))
+    } else {
+        let changed = app.config.apply_live_editable_settings(&previous, &parsed);
+        Ok(no_store(SaveResponse { applied: true, changed, restarting: false, run_id: app.run_id.clone() }))
+    }
 }
 
 fn table_mut<'a>(document: &'a mut DocumentMut, path: &[&str]) -> Result<&'a mut Table, String> {
@@ -176,6 +203,9 @@ fn encoded_dbm(value: i16, first: i16, last: i16, step: i16, label: &str) -> Res
 }
 
 fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Result<(), String> {
+    if let Some(frequency) = &settings.frequency {
+        frequency.apply(document)?;
+    }
     let tx_power = match settings.cell_info.ms_txpwr_max_cell_dbm {
         None => 0,
         Some(dbm) => encoded_dbm(dbm, 15, 45, 5, "Maximum MS transmit power")? + 1,
@@ -289,8 +319,63 @@ fn atomic_write(path: &Path, bytes: &[u8], permissions: Permissions) -> std::io:
 mod tests {
     use super::*;
 
+    #[test]
+    fn save_only_restarts_for_radio_changes_and_blocks_a_second_save() {
+        use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
+        use tetra_config::bluestation::SharedConfig;
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = parsing::from_toml_str(source).unwrap();
+        let folder = std::env::temp_dir().join(format!("bs-radio-save-{}-{}", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("test.toml");
+        fs::write(&path, source).unwrap();
+        let app = Arc::new(super::super::AppData {
+            run_id: "test-run".to_owned(), monitor: Default::default(),
+            system: RwLock::new(Default::default()), history: RwLock::new(Default::default()),
+            swmi_host: String::new(), swmi_port: 0, swmi_tls: false,
+            config_path: path.clone(), config_lock: Mutex::new(()),
+            config: SharedConfig::from_parts(original.clone(), None),
+            restart_scheduled: AtomicBool::new(false), running: Arc::new(AtomicBool::new(true)),
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let update = ConfigUpdate { revision: revision(source), settings: EditableSettings::from_config(&original) };
+        let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
+        assert!(saved.applied);
+        assert!(!saved.changed);
+        assert!(!saved.restarting);
+        assert!(app.running.load(Ordering::SeqCst));
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut settings = EditableSettings::from_config(&original);
+        settings.frequency.as_mut().unwrap().main_carrier += 1;
+        let update = ConfigUpdate { revision: revision(&contents), settings };
+        let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
+        assert!(!saved.applied);
+        assert!(saved.changed && saved.restarting);
+        assert_eq!(saved.run_id, "test-run");
+        let candidate = fs::read_to_string(&path).unwrap();
+        let parsed = parsing::from_toml_str(&candidate).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.cell.main_carrier, original.cell.main_carrier + 1);
+        assert_eq!(app.config.config().cell.main_carrier, original.cell.main_carrier);
+        let second = ConfigUpdate { revision: revision(&candidate), settings: EditableSettings::from_config(&parsed) };
+        let rejected = runtime.block_on(put_config(State(app.clone()), Json(second))).err().unwrap();
+        assert_eq!(rejected.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fs::read_to_string(&path).unwrap(), candidate);
+        // This exercises the normal stop signal, without starting a radio or BS.
+        for _ in 0..30 {
+            if !app.running.load(Ordering::SeqCst) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!app.running.load(Ordering::SeqCst));
+        fs::remove_file(path).unwrap();
+        fs::remove_file(folder.join("test.toml.web-backup")).unwrap();
+        fs::remove_dir(folder).unwrap();
+    }
+
     fn settings() -> EditableSettings {
         EditableSettings {
+            frequency: None,
             random_access: CfgRandomAccess::default(),
             neighbour_cells: vec!["bs-neighbour".into()],
             cell_reselect: CellReselectSettings {
