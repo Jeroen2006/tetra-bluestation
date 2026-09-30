@@ -91,6 +91,7 @@ pub struct RadioSnapshot {
     pub timeslots: [String; 4],
     pub network_connected: bool,
     pub radio_tx_allowed: bool,
+    pub radio_tx_enabled: bool,
     pub radio_tx_active: bool,
     pub provisioned_once: bool,
     pub advertisement_accepted: bool,

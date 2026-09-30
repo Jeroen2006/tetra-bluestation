@@ -58,7 +58,11 @@ struct EditableSettings {
     time_enabled: bool,
     cell_info: CellSettings,
     allow_lst: bool,
+    #[serde(default = "default_tx_enabled")]
+    tx_enabled: bool,
 }
+
+fn default_tx_enabled() -> bool { true }
 
 impl EditableSettings {
     fn from_config(config: &StackConfig) -> Self {
@@ -81,6 +85,7 @@ impl EditableSettings {
                 access_parameter_dbm: -53 + i16::from(config.cell.access_parameter) * 2,
             },
             allow_lst: config.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst),
+            tx_enabled: config.phy_io.tx_enabled,
         }
     }
 }
@@ -282,6 +287,7 @@ fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Re
     cell.insert("rxlev_access_min", value(rx_min));
     cell.insert("access_parameter", value(access));
     table_mut(document, &["swmi"])?.insert("allow_lst", value(settings.allow_lst));
+    table_mut(document, &["phy_io"])?.insert("tx_enabled", value(settings.tx_enabled));
     Ok(())
 }
 
@@ -347,6 +353,17 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         let mut settings = EditableSettings::from_config(&original);
+        settings.tx_enabled = false;
+        let update = ConfigUpdate { revision: revision(&contents), settings };
+        let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
+        assert!(saved.applied && saved.changed && !saved.restarting);
+        assert!(app.running.load(Ordering::SeqCst));
+        assert!(!app.config.state_read().operator_tx_enabled);
+        let saved_config = parsing::from_toml_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!saved_config.phy_io.tx_enabled);
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut settings = EditableSettings::from_config(&original);
         settings.frequency.as_mut().unwrap().main_carrier += 1;
         let update = ConfigUpdate { revision: revision(&contents), settings };
         let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
@@ -392,6 +409,7 @@ mod tests {
                 access_parameter_dbm: -39,
             },
             allow_lst: true,
+            tx_enabled: true,
         }
     }
 

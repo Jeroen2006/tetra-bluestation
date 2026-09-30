@@ -9,6 +9,7 @@
     { key: 'network', label: 'Network', color: '#d63384' },
     { key: 'free', label: 'Free', color: '#8a9097' },
   ];
+  const slotChartTypes = slotTypes.filter(type => type.key !== 'free');
   const frameSubslots = { 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 8, 10: 10, 11: 12, 12: 16, 13: 20, 14: 24, 15: 32 };
   const fmt = (v, digits = 0) => v == null || !Number.isFinite(Number(v)) ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: digits });
   const pct = (v, digits = 0) => v == null ? '—' : `${fmt(v, digits)}%`;
@@ -121,8 +122,15 @@
   lineChart('chart-network', [{ label: 'RX · KB/s', color: '#0d6efd' }, { label: 'TX · KB/s', color: '#198754' }]);
   lineChart('chart-ra', [{ label: 'EWMA', color: '#0d6efd' }, { label: 'Low', color: '#198754' }, { label: 'High', color: '#ffc107' }]);
   lineChart('chart-swmi', [{ label: 'WebSocket RTT · ms', color: '#0d6efd' }]);
-  const slotChart = lineChart('chart-cell-slots', slotTypes);
-  slotChart.data.datasets.forEach(dataset => { dataset.stepped = true; dataset.tension = 0; });
+  const slotChart = lineChart('chart-cell-slots', slotChartTypes);
+  slotChart.data.datasets.forEach((dataset, index) => {
+    const hex = slotChartTypes[index].color;
+    const rgb = [1, 3, 5].map(start => parseInt(hex.slice(start, start + 2), 16));
+    dataset.borderColor = dataset.backgroundColor = `rgba(${rgb.join(',')},0.65)`;
+    dataset.borderDash = [[], [7, 3], [2, 3], [9, 3, 2, 3]][index];
+    dataset.borderWidth = 2;
+    dataset.stepped = true; dataset.tension = 0;
+  });
   slotChart.options.scales.y.max = 4;
   slotChart.options.scales.y.ticks.stepSize = 1;
   slotChart.options.scales.y.title = { display: true, text: 'Timeslots' };
@@ -177,7 +185,7 @@
     const ra = state.snapshot?.radio?.ra;
     update('chart-ra', [points.map(p => p.ra_score), points.map(() => ra?.low_threshold ?? null), points.map(() => ra?.high_threshold ?? null)]);
     update('chart-swmi', [points.map(p => p.rtt_ms)]);
-    update('chart-cell-slots', slotTypes.map(type => points.map(p => p.slots?.[type.key] ?? null)));
+    update('chart-cell-slots', slotChartTypes.map(type => points.map(p => p.slots?.[type.key] ?? null)));
   }
 
   function renderSlots(id, radio) {
@@ -196,7 +204,7 @@
     const yes = value => value == null ? '—' : value ? 'Yes' : 'No';
     const mhz = value => value == null ? '—' : `${fmt(value / 1000000, 6)} MHz`;
     for (const [id, value] of Object.entries({ mcc: c?.mcc, mnc: c?.mnc, la: c?.location_area, hf: c?.time.h, mf: c?.time.m, frame: c?.time.f, ts: c?.time.t })) setText(`cell-${id}`, value ?? '—');
-    setText('cell-radio', s.radio.radio_tx_active ? 'Transmitting' : 'Inactive');
+    setText('cell-radio', s.radio.radio_tx_enabled === false ? 'TX disabled' : s.radio.radio_tx_active ? 'Transmitting' : 'Inactive');
     setTone('cell-radio', s.radio.radio_tx_active ? 'good' : 'muted');
     replace('cell-identity-properties', [
       property('Colour code', fmt(c?.colour_code)),
@@ -236,7 +244,7 @@
     const radio = s.radio, swmi = s.swmi, system = s.system;
     setText('overview-swmi', swmi.phase || 'Connecting'); setTone('overview-swmi', radio.network_connected ? 'good' : swmi.connected ? 'warn' : 'bad');
     setText('overview-ping', swmi.rtt_ms == null || !swmi.connected ? 'Ping unavailable' : `${fmt(swmi.rtt_ms, 1)} ms`);
-    setText('overview-radio', radio.radio_tx_active ? 'Transmitting' : radio.radio_tx_allowed ? 'Ready' : 'Inactive');
+    setText('overview-radio', radio.radio_tx_enabled === false ? 'TX disabled' : radio.radio_tx_active ? 'Transmitting' : radio.radio_tx_allowed ? 'Ready' : 'Inactive');
     setTone('overview-radio', radio.radio_tx_active ? 'good' : radio.radio_tx_allowed ? 'warn' : 'muted');
     setText('overview-radio-detail', !radio.network_connected && radio.provisioned_once ? 'Local fallback' : radio.network_connected ? 'Central connection' : 'Awaiting SwMI');
     setText('overview-ra', radio.ra.load || 'Starting'); setTone('overview-ra', radio.ra.load === 'Heavy' ? 'bad' : radio.ra.load === 'Contention' ? 'warn' : 'good');

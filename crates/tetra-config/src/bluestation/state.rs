@@ -1989,6 +1989,8 @@ pub struct StackState {
     pub recovery_ready: bool,
     pub sc3g_ready: bool,
     pub radio_tx_allowed: bool,
+    /// Persistent local operator TX switch, independent of SwMI permission.
+    pub operator_tx_enabled: bool,
     pub radio_tx_active: bool,
     pub provisioned_once: bool,
     /// Authentication policy advertised by the currently connected SwMI cell.
@@ -2874,6 +2876,12 @@ mod tests {
     }
 }
 
+impl StackState {
+    pub fn radio_transmit_enabled(&self) -> bool {
+        self.operator_tx_enabled && self.radio_tx_allowed
+    }
+}
+
 impl Default for StackState {
     fn default() -> Self {
         Self {
@@ -2885,6 +2893,7 @@ impl Default for StackState {
             recovery_ready: false,
             sc3g_ready: false,
             radio_tx_allowed: false,
+            operator_tx_enabled: true,
             radio_tx_active: false,
             provisioned_once: false,
             authentication_required: false,

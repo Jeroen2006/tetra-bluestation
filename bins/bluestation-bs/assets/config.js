@@ -233,6 +233,10 @@
     timeField.append(timezone); time.append(timeField); broadcast.append(time);
 
     const cell = $('config-cell'); cell.replaceChildren();
+    const radio = document.createElement('section'); radio.className = 'config-group';
+    const radioTitle = document.createElement('h2'); radioTitle.textContent = 'Transmitter'; radio.append(radioTitle);
+    radio.append(toggle('tx_enabled', 'Enable TX', 'Switch the transmitter on or off live when saved. Reception and the SwMI connection remain active. TX also requires permission from the network.', settings));
+    cell.append(radio);
     renderFrequency(cell, settings);
     const cellGroup = document.createElement('section'); cellGroup.className = 'config-group';
     const cellTitle = document.createElement('h2'); cellTitle.textContent = 'Cell access & power'; cellGroup.append(cellTitle);
@@ -266,6 +270,7 @@
     settings.cell_info.ms_txpwr_max_cell_dbm = $('config-cell_info-ms_txpwr_max_cell_dbm').value === '' ? null : Number($('config-cell_info-ms_txpwr_max_cell_dbm').value);
     for (const [path] of dbSpecs) settings.cell_info[path.split('.')[1]] = Number($(fieldId(path)).value);
     settings.allow_lst = $('config-allow_lst').checked;
+    settings.tx_enabled = $('config-tx_enabled').checked;
     return settings;
   }
 

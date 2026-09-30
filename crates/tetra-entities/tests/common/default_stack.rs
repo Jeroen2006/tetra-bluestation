@@ -31,6 +31,7 @@ pub fn default_test_config_bs() -> StackConfig {
 
 pub fn default_phy_io() -> CfgPhyIo {
     CfgPhyIo {
+        tx_enabled: true,
         backend: PhyBackend::None,
         dl_tx_file: None,
         ul_rx_file: None,

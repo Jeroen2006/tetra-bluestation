@@ -17,6 +17,8 @@ pub enum PhyBackend {
 /// PHY layer I/O configuration
 #[derive(Debug, Clone)]
 pub struct CfgPhyIo {
+    /// Local operator switch; central radio permission is still required.
+    pub tx_enabled: bool,
     /// Backend type: Soapysdr, File, or None
     pub backend: PhyBackend,
 
@@ -31,6 +33,7 @@ pub struct CfgPhyIo {
 
 #[derive(Deserialize)]
 pub struct PhyIoDto {
+    pub tx_enabled: Option<bool>,
     pub backend: PhyBackend,
 
     pub dl_tx_file: Option<String>,
@@ -94,6 +97,7 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
     });
 
     CfgPhyIo {
+        tx_enabled: src.tx_enabled.unwrap_or(true),
         backend: src.backend,
         dl_tx_file: src.dl_tx_file,
         ul_rx_file: src.ul_rx_file,

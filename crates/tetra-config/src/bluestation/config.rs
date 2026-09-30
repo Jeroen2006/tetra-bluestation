@@ -262,6 +262,7 @@ impl SharedConfig {
         }
 
         let mut state = state.unwrap_or_default();
+        state.operator_tx_enabled = cfg.phy_io.tx_enabled;
         // Central provisioning supplies this before the radio can transmit.
         state.authentication_required = false;
         state.network_broadcast = RuntimeNetworkBroadcast {
@@ -303,6 +304,7 @@ impl SharedConfig {
     /// radio or network configuration. One version change is observed at the
     /// next UMAC tick; advertisement changes are reported to the SwMI.
     pub fn apply_live_editable_settings(&self, previous: &StackConfig, next: &StackConfig) -> bool {
+        let tx_requested = previous.phy_io.tx_enabled != next.phy_io.tx_enabled;
         let previous_lst = previous.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
         let next_lst = next.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
         let operator_requested = previous.cell.random_access != next.cell.random_access
@@ -314,10 +316,12 @@ impl SharedConfig {
             || previous.network_broadcast.cell_reselect_parameters != next.network_broadcast.cell_reselect_parameters
             || previous.network_broadcast.time_enabled != next.network_broadcast.time_enabled
             || previous.network_broadcast.timezone != next.network_broadcast.timezone;
-        if !operator_requested && !broadcast_requested {
+        if !operator_requested && !broadcast_requested && !tx_requested {
             return false;
         }
         let mut state = self.state_write();
+        let tx_changed = tx_requested && state.operator_tx_enabled != next.phy_io.tx_enabled;
+        if tx_changed { state.operator_tx_enabled = next.phy_io.tx_enabled; }
         let cell_changed = operator_requested && (state.operator_settings.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
             || state.operator_settings.rxlev_access_min != next.cell.rxlev_access_min
             || state.operator_settings.access_parameter != next.cell.access_parameter);
@@ -355,13 +359,39 @@ impl SharedConfig {
         if broadcast_changed || cell_changed {
             state.network_broadcast.version = state.network_broadcast.version.saturating_add(1);
         }
-        operator_changed || broadcast_changed
+        operator_changed || broadcast_changed || tx_changed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_tx_switch_preserves_radio_permission_and_broadcast_versions() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = crate::bluestation::parsing::from_toml_str(source).unwrap();
+        assert!(original.phy_io.tx_enabled); // Existing configurations default to TX enabled.
+        let shared = SharedConfig::from_parts(original.clone(), None);
+        let mut disabled = original.clone();
+        disabled.phy_io.tx_enabled = false;
+        shared.state_write().radio_tx_allowed = true;
+        assert!(shared.state_read().radio_transmit_enabled());
+        assert!(shared.apply_live_editable_settings(&original, &disabled));
+        assert!(!shared.state_read().radio_transmit_enabled());
+        // A SwMI permission refresh must never override the operator switch.
+        shared.state_write().radio_tx_allowed = true;
+        assert!(!shared.state_read().radio_transmit_enabled());
+        assert_eq!(shared.state_read().operator_settings.version, 1);
+        assert_eq!(shared.state_read().network_broadcast.version, 1);
+        assert!(shared.apply_live_editable_settings(&disabled, &original));
+        assert!(shared.state_read().radio_transmit_enabled());
+        shared.state_write().radio_tx_allowed = false;
+        assert!(!shared.state_read().radio_transmit_enabled());
+        let restarted = SharedConfig::from_parts(disabled, None);
+        restarted.state_write().radio_tx_allowed = true;
+        assert!(!restarted.state_read().radio_transmit_enabled());
+    }
 
     #[test]
     fn live_editable_settings_update_runtime_without_replacing_startup_config() {

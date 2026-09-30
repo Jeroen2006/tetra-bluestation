@@ -21,7 +21,9 @@ Open `http://<bs-address>:8080/`. The dashboard is disabled when `[web]` is abse
 
 The JSON status is available at `/api/v1/snapshot` and `/api/v1/history`. Unknown measurements are `null` rather than zero. `--check-config` validates the web settings without opening a listener.
 
-The Cell tab shows the effective broadcast identity, carrier, SYSINFO and service flags, plus a one-second snapshot of the downlink hyperframe/multiframe/frame/timeslot counters. Its chart counts allocated slots per type (control, voice, packet data, network and free), not individual transmitted bursts. The same colours are used for slots throughout the dashboard: blue control, orange voice, purple packet data, pink network and grey free.
+The Cell tab shows the effective broadcast identity, carrier, SYSINFO and service flags, plus a one-second snapshot of the downlink hyperframe/multiframe/frame/timeslot counters. Its chart counts allocated slots per type (control, voice, packet data and network), not individual transmitted bursts, on a fixed 0–4 axis. The same colours are used for slots throughout the dashboard: blue control, orange voice, purple packet data, pink network and grey free.
+
+Configuration → Cell includes a live Enable TX switch, persisted as `[phy_io].tx_enabled` (default `true`). Disabling it stops transmission while reception and SwMI stay active. Enabling it still requires the usual network radio permission; it does not override provisioning or recovery gates.
 
 ## Documentation
 
