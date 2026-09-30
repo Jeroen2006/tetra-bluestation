@@ -150,9 +150,15 @@
     $('config-frequency-uplink_mhz').value = uplink == null ? '—' : (uplink / 1000000).toFixed(6);
     const invalidSplit = custom && (!Number.isFinite(frequency.custom_split_mhz) || uplink == null);
     if (invalidSplit) customInput.setCustomValidity('Enter a split that produces a valid uplink frequency.');
-    const dirty = !frequencyMath.sameSettings(frequency, state.settings.frequency);
-    $('config-frequency-restart-note').hidden = !dirty;
-    $('config-save').textContent = dirty ? 'Save & restart' : 'Save & apply';
+    updateRestartPreview();
+  }
+
+  function updateRestartPreview() {
+    const frequencyChanged = state.settings.frequency && !frequencyMath.sameSettings(readFrequency(), state.settings.frequency);
+    const colourChanged = $('config-cell_info-colour_code').valueAsNumber !== state.settings.cell_info.colour_code;
+    if ($('config-frequency-restart-note')) $('config-frequency-restart-note').hidden = !frequencyChanged;
+    $('config-colour-code-restart-note').hidden = !colourChanged;
+    $('config-save').textContent = frequencyChanged || colourChanged ? 'Save & restart' : 'Save & apply';
   }
 
   function renderFrequency(cell, settings) {
@@ -237,6 +243,11 @@
     const radioTitle = document.createElement('h2'); radioTitle.textContent = 'Transmitter'; radio.append(radioTitle);
     radio.append(toggle('tx_enabled', 'Enable TX', 'Switch the transmitter on or off live when saved. Reception and the SwMI connection remain active. TX also requires permission from the network.', settings));
     cell.append(radio);
+    group(cell, 'Cell identity', [['cell_info.colour_code', 'Colour code (CC)', 0, 63, 'Identifies the cell and determines radio scrambling. 0 uses the predefined scrambling sequence; 1–63 select an operator-defined colour code. Changing this restarts the BS when saved.']], settings);
+    const colourNote = document.createElement('div'); colourNote.id = 'config-colour-code-restart-note';
+    colourNote.className = 'alert alert-warning mt-3 mb-0'; colourNote.textContent = 'Colour code changes restart the BS when saved.';
+    colourNote.hidden = true; cell.lastChild.append(colourNote);
+    $('config-cell_info-colour_code').addEventListener('input', updateRestartPreview);
     renderFrequency(cell, settings);
     const cellGroup = document.createElement('section'); cellGroup.className = 'config-group';
     const cellTitle = document.createElement('h2'); cellTitle.textContent = 'Cell access & power'; cellGroup.append(cellTitle);
@@ -255,6 +266,7 @@
     const lstTitle = document.createElement('h2'); lstTitle.textContent = 'Local site trunking'; lst.append(lstTitle);
     lst.append(toggle('allow_lst', 'Allow local site trunking', 'After a SwMI connection is lost, keep transmitting with the last accepted cell configuration.', settings));
     cell.append(lst);
+    updateRestartPreview();
   }
 
   function readForm() {
@@ -267,6 +279,7 @@
     settings.neighbour_cells = $('config-neighbours').value.split(/\r?\n/).map(id => id.trim()).filter(Boolean);
     settings.time_enabled = $('config-time_enabled').checked;
     settings.timezone = $('config-timezone').value.trim() || null;
+    settings.cell_info.colour_code = $('config-cell_info-colour_code').valueAsNumber;
     settings.cell_info.ms_txpwr_max_cell_dbm = $('config-cell_info-ms_txpwr_max_cell_dbm').value === '' ? null : Number($('config-cell_info-ms_txpwr_max_cell_dbm').value);
     for (const [path] of dbSpecs) settings.cell_info[path.split('.')[1]] = Number($(fieldId(path)).value);
     settings.allow_lst = $('config-allow_lst').checked;

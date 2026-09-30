@@ -128,6 +128,9 @@ impl StackConfig {
             };
         }
 
+        if self.cell.colour_code > 63 {
+            return Err("colour_code must be 0-63 (6 bits)");
+        }
         if self.cell.ms_txpwr_max_cell > 7 {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
         }
@@ -366,6 +369,18 @@ impl SharedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colour_code_is_a_six_bit_value() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let mut config = crate::bluestation::parsing::from_toml_str(source).unwrap();
+        for code in [0, 63] {
+            config.cell.colour_code = code;
+            config.validate().unwrap();
+        }
+        config.cell.colour_code = 64;
+        assert_eq!(config.validate(), Err("colour_code must be 0-63 (6 bits)"));
+    }
 
     #[test]
     fn live_tx_switch_preserves_radio_permission_and_broadcast_versions() {

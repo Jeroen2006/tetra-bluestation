@@ -42,6 +42,8 @@ struct CellReselectSettings {
 
 #[derive(Serialize, Deserialize)]
 struct CellSettings {
+    #[serde(default)]
+    colour_code: Option<u8>,
     ms_txpwr_max_cell_dbm: Option<i16>,
     rxlev_access_min_dbm: i16,
     access_parameter_dbm: i16,
@@ -80,6 +82,7 @@ impl EditableSettings {
             timezone: config.network_broadcast.timezone.clone(),
             time_enabled: config.network_broadcast.time_enabled,
             cell_info: CellSettings {
+                colour_code: Some(config.cell.colour_code),
                 ms_txpwr_max_cell_dbm: (config.cell.ms_txpwr_max_cell != 0).then(|| 10 + i16::from(config.cell.ms_txpwr_max_cell) * 5),
                 rxlev_access_min_dbm: -125 + i16::from(config.cell.rxlev_access_min) * 5,
                 access_parameter_dbm: -53 + i16::from(config.cell.access_parameter) * 2,
@@ -159,7 +162,8 @@ pub(super) async fn put_config(State(app): State<AppState>, Json(update): Json<C
     let parsed =
         parsing::from_toml_str(&candidate).map_err(|_| error(StatusCode::BAD_REQUEST, "Resulting configuration could not be parsed"))?;
     parsed.validate().map_err(|message| error(StatusCode::BAD_REQUEST, message))?;
-    let restarting = FrequencySettings::from_config(&previous) != FrequencySettings::from_config(&parsed);
+    let restarting = FrequencySettings::from_config(&previous) != FrequencySettings::from_config(&parsed)
+        || previous.cell.colour_code != parsed.cell.colour_code;
     let permissions = fs::metadata(&app.config_path)
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Could not inspect configuration permissions"))?
         .permissions();
@@ -208,6 +212,9 @@ fn encoded_dbm(value: i16, first: i16, last: i16, step: i16, label: &str) -> Res
 }
 
 fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Result<(), String> {
+    if settings.cell_info.colour_code.is_some_and(|code| code > 63) {
+        return Err("Colour code must be 0-63 (6 bits)".to_owned());
+    }
     if let Some(frequency) = &settings.frequency {
         frequency.apply(document)?;
     }
@@ -282,6 +289,9 @@ fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Re
         value(i64::from(reselect.fast_reselect_hysteresis_db)),
     );
     let cell = table_mut(document, &["cell_info"])?;
+    if let Some(code) = settings.cell_info.colour_code {
+        cell.insert("colour_code", value(i64::from(code)));
+    }
     cell.remove("timezone"); // Migrate the legacy location before writing network_broadcast.timezone.
     cell.insert("ms_txpwr_max_cell", value(tx_power));
     cell.insert("rxlev_access_min", value(rx_min));
@@ -327,6 +337,11 @@ mod tests {
 
     #[test]
     fn save_only_restarts_for_radio_changes_and_blocks_a_second_save() {
+        check_radio_restart(false);
+        check_radio_restart(true);
+    }
+
+    fn check_radio_restart(change_colour_code: bool) {
         use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
         use tetra_config::bluestation::SharedConfig;
         let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
@@ -344,12 +359,16 @@ mod tests {
             restart_scheduled: AtomicBool::new(false), running: Arc::new(AtomicBool::new(true)),
         });
         let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let update = ConfigUpdate { revision: revision(source), settings: EditableSettings::from_config(&original) };
+        let mut settings = EditableSettings::from_config(&original);
+        // Older clients omit CC; saving must preserve it without a restart.
+        settings.cell_info.colour_code = None;
+        let update = ConfigUpdate { revision: revision(source), settings };
         let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
         assert!(saved.applied);
         assert!(!saved.changed);
         assert!(!saved.restarting);
         assert!(app.running.load(Ordering::SeqCst));
+        assert_eq!(parsing::from_toml_str(&fs::read_to_string(&path).unwrap()).unwrap().cell.colour_code, original.cell.colour_code);
 
         let contents = fs::read_to_string(&path).unwrap();
         let mut settings = EditableSettings::from_config(&original);
@@ -364,7 +383,11 @@ mod tests {
 
         let contents = fs::read_to_string(&path).unwrap();
         let mut settings = EditableSettings::from_config(&original);
-        settings.frequency.as_mut().unwrap().main_carrier += 1;
+        if change_colour_code {
+            settings.cell_info.colour_code = Some(original.cell.colour_code + 1);
+        } else {
+            settings.frequency.as_mut().unwrap().main_carrier += 1;
+        }
         let update = ConfigUpdate { revision: revision(&contents), settings };
         let (_, Json(saved)) = runtime.block_on(put_config(State(app.clone()), Json(update))).unwrap();
         assert!(!saved.applied);
@@ -373,7 +396,13 @@ mod tests {
         let candidate = fs::read_to_string(&path).unwrap();
         let parsed = parsing::from_toml_str(&candidate).unwrap();
         parsed.validate().unwrap();
-        assert_eq!(parsed.cell.main_carrier, original.cell.main_carrier + 1);
+        if change_colour_code {
+            assert_eq!(parsed.cell.colour_code, original.cell.colour_code + 1);
+            assert_eq!(parsed.cell.main_carrier, original.cell.main_carrier);
+            assert_eq!(app.config.config().cell.colour_code, original.cell.colour_code);
+        } else {
+            assert_eq!(parsed.cell.main_carrier, original.cell.main_carrier + 1);
+        }
         assert_eq!(app.config.config().cell.main_carrier, original.cell.main_carrier);
         let second = ConfigUpdate { revision: revision(&candidate), settings: EditableSettings::from_config(&parsed) };
         let rejected = runtime.block_on(put_config(State(app.clone()), Json(second))).err().unwrap();
@@ -404,6 +433,7 @@ mod tests {
             timezone: Some("Europe/Amsterdam".into()),
             time_enabled: true,
             cell_info: CellSettings {
+                colour_code: Some(2),
                 ms_txpwr_max_cell_dbm: Some(30),
                 rxlev_access_min_dbm: -110,
                 access_parameter_dbm: -39,
@@ -426,6 +456,28 @@ mod tests {
         assert!(output.contains("ms_txpwr_max_cell = 4"));
         assert!(!output.contains("cell_reselect_parameters"));
         assert!(output.contains("slow_reselect_threshold_above_fast_db = 6"));
+    }
+
+    #[test]
+    fn colour_code_boundaries_and_older_clients() {
+        let source = "[cell_info]\ncolour_code = 17\n";
+        let mut input = settings();
+        let older = serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("rxlev_access_min_dbm", -110_i16), ("access_parameter_dbm", -39)].into_iter(),
+        );
+        input.cell_info = CellSettings::deserialize(older).unwrap();
+        let mut document = source.parse::<DocumentMut>().unwrap();
+        apply_settings(&mut document, &input).unwrap();
+        assert_eq!(document["cell_info"]["colour_code"].as_integer(), Some(17));
+        for code in [0, 63] {
+            input.cell_info.colour_code = Some(code);
+            apply_settings(&mut document, &input).unwrap();
+            assert_eq!(document["cell_info"]["colour_code"].as_integer(), Some(i64::from(code)));
+        }
+        let before = document.to_string();
+        input.cell_info.colour_code = Some(64);
+        assert!(apply_settings(&mut document, &input).is_err());
+        assert_eq!(document.to_string(), before);
     }
 
     #[test]
