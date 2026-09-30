@@ -43,10 +43,8 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .slot--free { --slot-bg: var(--bs-secondary-bg); --slot-ink: var(--bs-secondary-color); }
 .slot--voice { --slot-bg: #ffe5d0; --slot-ink: #7e390a; }
 .slot--packet { --slot-bg: #e2d9f3; --slot-ink: #432874; }
-.slot--network { --slot-bg: #f7d6e6; --slot-ink: #801f4f; }
 [data-bs-theme="dark"] .slot--voice { --slot-bg: #503019; --slot-ink: #ffb77d; }
 [data-bs-theme="dark"] .slot--packet { --slot-bg: #382454; --slot-ink: #c5a9ef; }
-[data-bs-theme="dark"] .slot--network { --slot-bg: #4e2036; --slot-ink: #ee9fc7; }
 .cell-columns { grid-template-columns: repeat(2,minmax(0,1fr)); }
 .cell-identity, .tdma-counters { display: grid; gap: 12px; margin-bottom: 16px; font-variant-numeric: tabular-nums; }
 .cell-identity { grid-template-columns: repeat(3,minmax(0,1fr)); }

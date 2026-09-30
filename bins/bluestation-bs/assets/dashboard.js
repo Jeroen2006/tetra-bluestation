@@ -6,7 +6,6 @@
     { key: 'control', label: 'Control', color: '#0d6efd' },
     { key: 'voice', label: 'Voice', color: '#fd7e14' },
     { key: 'packet', label: 'Packet data', color: '#9561e2' },
-    { key: 'network', label: 'Network', color: '#d63384' },
     { key: 'free', label: 'Free', color: '#8a9097' },
   ];
   const slotChartTypes = slotTypes.filter(type => type.key !== 'free');
@@ -127,7 +126,7 @@
     const hex = slotChartTypes[index].color;
     const rgb = [1, 3, 5].map(start => parseInt(hex.slice(start, start + 2), 16));
     dataset.borderColor = dataset.backgroundColor = `rgba(${rgb.join(',')},0.65)`;
-    dataset.borderDash = [[], [7, 3], [2, 3], [9, 3, 2, 3]][index];
+    dataset.borderDash = [[], [7, 3], [2, 3]][index];
     dataset.borderWidth = 2;
     dataset.stepped = true; dataset.tension = 0;
   });
