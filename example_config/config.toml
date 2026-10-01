@@ -31,6 +31,28 @@ backend = "SoapySdr"
 tx_freq = 438025000
 rx_freq = 433025000
 
+# Local-oscillator offsets from the configured RF carrier, in Hz.
+# Positive values put the LO above the carrier; negative values put it below.
+# Defaults preserve the existing tuning: TX on the carrier, RX 20 kHz below.
+# tx_lo_offset_hz = 0
+# rx_lo_offset_hz = -20000
+
+# Optional TX baseband DC correction, in normalized I/Q sample units.
+# Corrections are added only to non-zero TX samples, so digital silence stays silent.
+# tx_dc_i = 0.0
+# tx_dc_q = 0.0
+
+# Optional TX image correction. Gain adjusts the Q path relative to I; phase
+# corrects the quadrature angle. Allowed range: +/-1 dB and +/-5 degrees.
+# tx_iq_gain_db = 0.0
+# tx_iq_phase_deg = 0.0
+
+# SXceiver (driver "sx") and MuCell (driver "mucell") only: measure TX LO
+# leakage and I/Q image through the SX1255 RF loopback, save the resulting TX
+# DC and I/Q values above, then start the BS stack.
+# Disabled by default; calibration briefly transmits a low-level pilot.
+tx_dc_calibration_on_startup = false
+
 # Adjust if your SDR has a non-negligible tuning error
 # ppm_err = 0.0
 

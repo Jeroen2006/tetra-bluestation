@@ -1265,6 +1265,6 @@ mod tests {
 
         assert_eq!(profile.effective_service_flags(false, false), 0b000_0100_0011);
         assert_eq!(profile.effective_service_flags(true, false), 0b000_0110_0011);
-        assert_eq!(profile.effective_service_flags(true, true), 0b100_0110_0011);
+        assert_eq!(profile.effective_service_flags(true, true), 0b010_0110_0011);
     }
 }

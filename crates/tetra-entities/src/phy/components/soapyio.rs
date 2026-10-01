@@ -9,7 +9,57 @@ use super::soapy_settings::{SdrSettings, SupportedDevice};
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
 
 type StreamType = ComplexSample;
-const SOAPY_FREQ_OFFSET: f64 = 20000.0;
+const CHANNEL_HALF_BANDWIDTH_GUARD_HZ: f64 = 20_000.0;
+
+fn validate_lo_offset(offset_hz: i64, sample_rate: f64, direction: &str) -> Result<(), soapysdr::Error> {
+    let half_bandwidth = (offset_hz as f64).abs() + CHANNEL_HALF_BANDWIDTH_GUARD_HZ;
+    if !sample_rate.is_finite() || sample_rate <= 0.0 || half_bandwidth >= sample_rate / 2.0 {
+        return Err(soapysdr::Error {
+            code: soapysdr::ErrorCode::Other,
+            message: format!("{direction} LO offset {offset_hz} Hz exceeds the available baseband range at {sample_rate} S/s"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TxIqCorrection {
+    q_gain: f32,
+    phase_tangent: f32,
+    phase_inverse_cosine: f32,
+}
+
+impl TxIqCorrection {
+    pub(super) fn new(gain_db: f32, phase_deg: f32) -> Self {
+        let phase = phase_deg.to_radians();
+        Self {
+            q_gain: 10.0_f32.powf(gain_db / 20.0),
+            phase_tangent: phase.tan(),
+            phase_inverse_cosine: 1.0 / phase.cos(),
+        }
+    }
+
+    pub(super) fn apply(self, sample: ComplexSample) -> ComplexSample {
+        ComplexSample::new(
+            sample.re + sample.im * self.phase_tangent,
+            sample.im * self.q_gain * self.phase_inverse_cosine,
+        )
+    }
+}
+
+fn apply_tx_corrections(samples: &[StreamType], dc_i: f32, dc_q: f32, iq_correction: TxIqCorrection) -> Vec<StreamType> {
+    let dc_correction = ComplexSample::new(dc_i, dc_q);
+    samples
+        .iter()
+        .map(|sample| {
+            if *sample == ComplexSample::ZERO {
+                *sample
+            } else {
+                iq_correction.apply(*sample) + dc_correction
+            }
+        })
+        .collect()
+}
 
 pub struct RxResult {
     /// Number of samples read
@@ -23,6 +73,9 @@ pub struct SoapyIo {
     tx_ch: usize,
     rx_fs: f64,
     tx_fs: f64,
+    tx_dc_i: f32,
+    tx_dc_q: f32,
+    tx_iq_correction: TxIqCorrection,
     /// Timestamp for the first sample read from SDR.
     /// This is subtracted from all following timestamps,
     /// so that sample counter startsB210 from 0 even if timestamp does not.
@@ -72,7 +125,7 @@ impl SoapyIo {
 
         let mode = cfg.config().stack_mode;
 
-        let (dev, sdr_settings) = open_device(&soapy_cfg, mode)?;
+        let (dev, sdr_settings, _) = open_device(&soapy_cfg, mode)?;
 
         let rx_ch = sdr_settings.rx_ch;
         let tx_ch = sdr_settings.tx_ch;
@@ -83,12 +136,12 @@ impl SoapyIo {
 
         let (rx_freq, tx_freq) = match mode {
             StackMode::Bs => (
-                Some(ul_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                Some(dl_corrected),
+                Some(ul_corrected + soapy_cfg.rx_lo_offset_hz as f64),
+                Some(dl_corrected + soapy_cfg.tx_lo_offset_hz as f64),
             ),
             StackMode::Ms => (
-                Some(dl_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                Some(ul_corrected),
+                Some(dl_corrected + soapy_cfg.rx_lo_offset_hz as f64),
+                Some(ul_corrected + soapy_cfg.tx_lo_offset_hz as f64),
             ),
             StackMode::Mon => {
                 unimplemented!("Monitor mode not implemented yet");
@@ -107,6 +160,7 @@ impl SoapyIo {
             // Read the actual sample rate obtained and store it
             // to avoid having to read it again every time it is needed.
             rx_fs = soapycheck!("get RX sample rate", dev.sample_rate(soapysdr::Direction::Rx, rx_ch));
+            validate_lo_offset(soapy_cfg.rx_lo_offset_hz, rx_fs, "RX")?;
         }
         let mut tx_fs: f64 = 0.0;
         if tx_enabled {
@@ -115,6 +169,7 @@ impl SoapyIo {
                 dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, sdr_settings.fs)
             );
             tx_fs = soapycheck!("get TX sample rate", dev.sample_rate(soapysdr::Direction::Tx, tx_ch));
+            validate_lo_offset(soapy_cfg.tx_lo_offset_hz, tx_fs, "TX")?;
         }
 
         if rx_enabled {
@@ -183,6 +238,9 @@ impl SoapyIo {
             tx_ch,
             rx_fs,
             tx_fs,
+            tx_dc_i: soapy_cfg.tx_dc_i,
+            tx_dc_q: soapy_cfg.tx_dc_q,
+            tx_iq_correction: TxIqCorrection::new(soapy_cfg.tx_iq_gain_db, soapy_cfg.tx_iq_phase_deg),
             initial_time: None,
             rx_next_count: 0,
             prev_time_ns: -1,
@@ -200,7 +258,11 @@ impl SoapyIo {
             return Ok(());
         }
         if let Some(tx) = &mut self.tx {
-            if active { tx.activate(None)?; } else { tx.deactivate(None)?; }
+            if active {
+                tx.activate(None)?;
+            } else {
+                tx.deactivate(None)?;
+            }
             self.tx_active = active;
         }
         Ok(())
@@ -269,10 +331,19 @@ impl SoapyIo {
         if !self.tx_active {
             return Err(RxTxDevError::RxReadError);
         }
+        let correction_is_identity = self.tx_iq_correction.q_gain == 1.0
+            && self.tx_iq_correction.phase_tangent == 0.0
+            && self.tx_iq_correction.phase_inverse_cosine == 1.0;
+        let corrected_buffer = if self.tx_dc_i == 0.0 && self.tx_dc_q == 0.0 && correction_is_identity {
+            None
+        } else {
+            Some(apply_tx_corrections(buffer, self.tx_dc_i, self.tx_dc_q, self.tx_iq_correction))
+        };
+        let samples = corrected_buffer.as_deref().unwrap_or(buffer);
         if let Some(tx) = &mut self.tx {
             if let Some(initial_time) = self.initial_time {
                 tx.write_all(
-                    &[buffer],
+                    &[samples],
                     count.map(|count| initial_time + ticks_to_time_ns(count, self.tx_fs)),
                     false,
                     1000000,
@@ -425,13 +496,17 @@ fn find_supported_device(filter_args: soapysdr::Args) -> Result<OpenedDevice, so
 
 /// Open a given device if argument string is given,
 /// automatically find the first supported device if not.
-fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::Device, SdrSettings), soapysdr::Error> {
+pub(super) fn open_device(
+    soapy_cfg: &CfgSoapySdr,
+    mode: StackMode,
+) -> Result<(soapysdr::Device, SdrSettings, bool), soapysdr::Error> {
     let mut opened_device = if let Some(arg_string) = &soapy_cfg.device {
         open_given_device(arg_string.as_str().into())
     } else {
         find_supported_device(soapysdr::Args::new())
     }?;
 
+    let supports_tx_loopback_calibration = opened_device.detected_device.supports_tx_loopback_calibration();
     let mut sdr_settings = match SdrSettings::get_settings(&soapy_cfg, opened_device.detected_device, mode) {
         Ok(sdr_settings) => sdr_settings,
         Err(soapy_settings::Error::InvalidConfiguration) => {
@@ -486,5 +561,45 @@ fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::De
         }
     }
 
-    Ok((opened_device.dev, sdr_settings))
+    Ok((opened_device.dev, sdr_settings, supports_tx_loopback_calibration))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TxIqCorrection, apply_tx_corrections, validate_lo_offset};
+    use crate::phy::components::dsp_types::ComplexSample;
+
+    #[test]
+    fn tx_corrections_change_signal_samples_and_preserve_silence() {
+        let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5), ComplexSample::ZERO];
+
+        let output = apply_tx_corrections(&input, 0.01, -0.02, TxIqCorrection::new(0.0, 0.0));
+
+        assert_eq!(output[0], ComplexSample::ZERO);
+        assert_eq!(output[1], ComplexSample::new(0.26, -0.52));
+        assert_eq!(output[2], ComplexSample::ZERO);
+    }
+
+    #[test]
+    fn zero_tx_dc_offset_preserves_samples() {
+        let input = [ComplexSample::ZERO, ComplexSample::new(0.25, -0.5)];
+        assert_eq!(apply_tx_corrections(&input, 0.0, 0.0, TxIqCorrection::new(0.0, 0.0)), input);
+    }
+
+    #[test]
+    fn tx_iq_correction_adjusts_q_gain_and_phase() {
+        let sample = ComplexSample::new(0.25, 0.5);
+        let correction = TxIqCorrection::new(20.0 * 0.01_f32.log10(), 45.0);
+        let corrected = correction.apply(sample);
+
+        assert!((corrected.re - 0.75).abs() < 1e-6);
+        assert!((corrected.im - 0.5 * 10.0_f32.powf((20.0 * 0.01_f32.log10()) / 20.0) * 2.0_f32.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lo_offset_must_leave_room_for_the_tetra_channel() {
+        assert!(validate_lo_offset(-50_000, 600_000.0, "TX").is_ok());
+        assert!(validate_lo_offset(-280_000, 600_000.0, "TX").is_err());
+        assert!(validate_lo_offset(-20_000, f64::NAN, "RX").is_err());
+    }
 }

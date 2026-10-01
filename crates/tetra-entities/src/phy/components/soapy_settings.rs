@@ -58,6 +58,11 @@ impl SupportedDevice {
             _ => None,
         }
     }
+
+    /// Whether the SX1255 RF loopback needed by startup TX calibration is available.
+    pub fn supports_tx_loopback_calibration(&self) -> bool {
+        matches!(self, Self::SXceiver | Self::MuCell)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,4 +340,28 @@ pub fn block_size(fs: f64) -> usize {
     // It is a bit bug prone to have it here in case
     // FCFB parameters are changed, but it makes things simpler for now.
     (fs * 1.5e-3).round() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SupportedDevice;
+
+    #[test]
+    fn startup_tx_calibration_is_limited_to_sx1255_drivers() {
+        for (driver, hardware) in [("sx", "SXceiver"), ("mucell", "mucell")] {
+            assert!(
+                SupportedDevice::detect(driver, hardware)
+                    .is_some_and(|device| device.supports_tx_loopback_calibration()),
+                "{driver}/{hardware} should support TX calibration"
+            );
+        }
+
+        for (driver, hardware) in [("PlutoSDR", "ADALM-PLUTO"), ("b200", "B210"), ("FX3", "LimeSDR-USB")] {
+            assert!(
+                SupportedDevice::detect(driver, hardware)
+                    .is_some_and(|device| !device.supports_tx_loopback_calibration()),
+                "{driver}/{hardware} must not support TX calibration"
+            );
+        }
+    }
 }

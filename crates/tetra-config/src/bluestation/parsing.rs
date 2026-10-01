@@ -7,8 +7,8 @@ use serde::Deserialize;
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgNetInfo, CfgRua, NetworkBroadcastDto, RandomAccessDto, apply_control_patch,
-    cell_dto_to_cfg, neighbour_cells_dto_to_cfg, network_broadcast_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgNetInfo, CfgRua, NetworkBroadcastDto, RandomAccessDto, apply_control_patch, cell_dto_to_cfg,
+    neighbour_cells_dto_to_cfg, network_broadcast_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -221,5 +221,51 @@ mod tests {
         assert!(from_toml_str(&format!("{without}\n[web]\nport = 0\n")).is_err());
         assert!(from_toml_str(&format!("{without}\n[web]\nbind_address = \"bad\"\n")).is_err());
         assert!(from_toml_str(&format!("{without}\n[web]\nunknown = true\n")).is_err());
+    }
+
+    #[test]
+    fn soapy_lo_offsets_default_to_existing_tuning_and_accept_overrides() {
+        let cfg = from_toml_str(EXAMPLE).expect("example config is valid");
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
+        assert_eq!(soapy.rx_lo_offset_hz, -20_000);
+        assert_eq!(soapy.tx_lo_offset_hz, 0);
+        assert_eq!(soapy.tx_dc_i, 0.0);
+        assert_eq!(soapy.tx_dc_q, 0.0);
+        assert_eq!(soapy.tx_iq_gain_db, 0.0);
+        assert_eq!(soapy.tx_iq_phase_deg, 0.0);
+        assert!(!soapy.tx_dc_calibration_on_startup);
+
+        let customized = EXAMPLE.replace(
+            "rx_freq = 433025000",
+            "rx_freq = 433025000\nrx_lo_offset_hz = -45000\ntx_lo_offset_hz = -50000\ntx_dc_i = 0.0015\ntx_dc_q = -0.0025\ntx_iq_gain_db = -0.03\ntx_iq_phase_deg = 0.38",
+        );
+        let customized = customized.replace("tx_dc_calibration_on_startup = false", "tx_dc_calibration_on_startup = true");
+        let cfg = from_toml_str(&customized).expect("LO offset and startup calibration fields are accepted");
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("Soapy config exists");
+        assert_eq!(soapy.rx_lo_offset_hz, -45_000);
+        assert_eq!(soapy.tx_lo_offset_hz, -50_000);
+        assert_eq!(soapy.tx_dc_i, 0.0015);
+        assert_eq!(soapy.tx_dc_q, -0.0025);
+        assert_eq!(soapy.tx_iq_gain_db, -0.03);
+        assert_eq!(soapy.tx_iq_phase_deg, 0.38);
+        assert!(soapy.tx_dc_calibration_on_startup);
+    }
+
+    #[test]
+    fn soapy_tx_dc_corrections_must_be_finite() {
+        let customized = EXAMPLE.replace("rx_freq = 433025000", "rx_freq = 433025000\ntx_dc_i = nan");
+        let cfg = from_toml_str(&customized).expect("TOML supports NaN values");
+        assert_eq!(cfg.validate(), Err("SoapySdr TX DC corrections must be finite"));
+    }
+
+    #[test]
+    fn soapy_tx_iq_corrections_must_be_finite_and_bounded() {
+        let customized = EXAMPLE.replace("rx_freq = 433025000", "rx_freq = 433025000\ntx_iq_gain_db = nan");
+        let cfg = from_toml_str(&customized).expect("TOML supports NaN values");
+        assert!(cfg.validate().unwrap_err().contains("TX I/Q corrections"));
+
+        let customized = EXAMPLE.replace("rx_freq = 433025000", "rx_freq = 433025000\ntx_iq_phase_deg = 5.1");
+        let cfg = from_toml_str(&customized).expect("TOML accepts numeric phase");
+        assert!(cfg.validate().unwrap_err().contains("TX I/Q corrections"));
     }
 }

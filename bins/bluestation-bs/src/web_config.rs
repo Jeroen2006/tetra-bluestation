@@ -336,6 +336,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_edits_preserve_startup_calibration_and_corrections() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let source = source
+            .replace("# tx_lo_offset_hz = 0", "tx_lo_offset_hz = 50000")
+            .replace("# rx_lo_offset_hz = -20000", "rx_lo_offset_hz = -45000")
+            .replace("tx_dc_calibration_on_startup = false", "tx_dc_calibration_on_startup = true");
+        let calibrated = crate::render_config_with_calibrated_tx(&source, 0.019, -0.016, -0.03, 0.38).unwrap();
+        let original = parsing::from_toml_str(&calibrated).unwrap();
+        let mut settings = EditableSettings::from_config(&original);
+        settings.frequency.as_mut().unwrap().main_carrier += 1;
+        settings.tx_enabled = false;
+        let mut document = calibrated.parse::<DocumentMut>().unwrap();
+        apply_settings(&mut document, &settings).unwrap();
+        let saved = parsing::from_toml_str(&document.to_string()).unwrap();
+        saved.validate().unwrap();
+        assert_eq!(saved.cell.main_carrier, original.cell.main_carrier + 1);
+        assert!(!saved.phy_io.tx_enabled);
+        assert_eq!(saved.web.enabled, original.web.enabled);
+        assert_eq!(saved.web.port, original.web.port);
+        let soapy = saved.phy_io.soapysdr.unwrap();
+        assert_eq!(soapy.tx_lo_offset_hz, 50000);
+        assert_eq!(soapy.rx_lo_offset_hz, -45000);
+        assert_eq!(soapy.tx_dc_i, 0.019);
+        assert_eq!(soapy.tx_dc_q, -0.016);
+        assert_eq!(soapy.tx_iq_gain_db, -0.03);
+        assert_eq!(soapy.tx_iq_phase_deg, 0.38);
+        assert!(soapy.tx_dc_calibration_on_startup);
+    }
+
+    #[test]
     fn save_only_restarts_for_radio_changes_and_blocks_a_second_save() {
         check_radio_restart(false);
         check_radio_restart(true);

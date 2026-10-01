@@ -1,8 +1,12 @@
 use clap::Parser;
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::net_control::channel::build_all_control_links;
 use tetra_entities::net_control::{
@@ -25,7 +29,10 @@ use tetra_entities::{
     lmac::lmac_bs::LmacBs,
     mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
-    phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
+    phy::{
+        components::{soapy_calibration::calibrate_tx, soapy_dev::RxTxDevSoapySdr},
+        phy_bs::PhyBs,
+    },
     sndcp::sndcp_bs::Sndcp,
     umac::umac_bs::UmacBs,
 };
@@ -40,6 +47,123 @@ fn load_config_from_toml(cfg_path: &str) -> StackConfig {
             println!("Failed to load configuration from {}: {}", cfg_path, e);
             std::process::exit(1);
         }
+    }
+}
+
+fn persist_calibrated_tx(config_path: &str, tx_dc_i: f32, tx_dc_q: f32, tx_iq_gain_db: f32, tx_iq_phase_deg: f32) -> Result<(), String> {
+    let path = Path::new(config_path);
+    let original = fs::read_to_string(path).map_err(|err| format!("Failed to read config '{}': {err}", path.display()))?;
+    let updated = render_config_with_calibrated_tx(&original, tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg)?;
+    if updated == original {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(path).map_err(|err| format!("Failed to inspect config '{}': {err}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("Config path '{}' has no file name", path.display()))?
+        .to_string_lossy();
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|err| format!("Failed to create temporary config '{}': {err}", temp_path.display()))?;
+        temp_file
+            .write_all(updated.as_bytes())
+            .map_err(|err| format!("Failed to write temporary config '{}': {err}", temp_path.display()))?;
+        temp_file
+            .sync_all()
+            .map_err(|err| format!("Failed to sync temporary config '{}': {err}", temp_path.display()))?;
+        fs::set_permissions(&temp_path, metadata.permissions()).map_err(|err| format!("Failed to preserve config permissions: {err}"))?;
+        fs::rename(&temp_path, path).map_err(|err| format!("Failed to replace config '{}': {err}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn render_config_with_calibrated_tx(
+    original: &str,
+    tx_dc_i: f32,
+    tx_dc_q: f32,
+    tx_iq_gain_db: f32,
+    tx_iq_phase_deg: f32,
+) -> Result<String, String> {
+    let mut document = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|err| format!("Failed to parse config for calibration update: {err}"))?;
+
+    let phy_io = document
+        .get_mut("phy_io")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| "Config is missing the [phy_io] table".to_string())?;
+    let soapy = phy_io
+        .get_mut("soapysdr")
+        .and_then(toml_edit::Item::as_table_mut)
+        .ok_or_else(|| "Config is missing the [phy_io.soapysdr] table".to_string())?;
+    set_toml_float_preserving_decor(soapy, "tx_dc_i", tx_dc_i as f64)?;
+    set_toml_float_preserving_decor(soapy, "tx_dc_q", tx_dc_q as f64)?;
+    set_toml_float_preserving_decor(soapy, "tx_iq_gain_db", tx_iq_gain_db as f64)?;
+    set_toml_float_preserving_decor(soapy, "tx_iq_phase_deg", tx_iq_phase_deg as f64)?;
+    Ok(document.to_string())
+}
+
+fn set_toml_float_preserving_decor(table: &mut toml_edit::Table, key: &str, number: f64) -> Result<(), String> {
+    if let Some(item) = table.get_mut(key) {
+        let Some(value) = item.as_value_mut() else {
+            return Err(format!("Config field '{key}' must be a number"));
+        };
+        let decor = value.decor().clone();
+        let mut replacement = toml_edit::Value::from(number);
+        *replacement.decor_mut() = decor;
+        *value = replacement;
+    } else {
+        table.insert(key, toml_edit::value(number));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod config_persistence_tests {
+    use super::render_config_with_calibrated_tx;
+
+    #[test]
+    fn calibration_update_preserves_comments_and_unrelated_config() {
+        let original = r#"[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+rx_freq = 433025000
+tx_dc_i = 0.0 # retain I note
+tx_dc_q = 0.0 # retain Q note
+tx_iq_gain_db = 0.0 # retain gain note
+tx_iq_phase_deg = 0.0 # retain phase note
+
+[other]
+label = "keep me" # retain section
+"#;
+        let updated = render_config_with_calibrated_tx(original, 0.019, -0.016, -0.03, 0.38).expect("valid config updates");
+
+        assert!(updated.contains("# retain I note"), "{updated}");
+        assert!(updated.contains("# retain Q note"), "{updated}");
+        assert!(updated.contains("# retain gain note"), "{updated}");
+        assert!(updated.contains("# retain phase note"), "{updated}");
+        assert!(updated.contains("label = \"keep me\" # retain section"));
+        assert!(updated.contains("rx_freq = 433025000"));
+        let parsed = updated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("updated config remains valid TOML");
+        let soapy = parsed["phy_io"]["soapysdr"].as_table().expect("Soapy config remains a table");
+        assert!((soapy["tx_dc_i"].as_float().expect("I value remains numeric") - 0.019).abs() < 1e-7);
+        assert!((soapy["tx_dc_q"].as_float().expect("Q value remains numeric") + 0.016).abs() < 1e-7);
+        assert!((soapy["tx_iq_gain_db"].as_float().expect("gain remains numeric") + 0.03).abs() < 1e-7);
+        assert!((soapy["tx_iq_phase_deg"].as_float().expect("phase remains numeric") - 0.38).abs() < 1e-7);
     }
 }
 
@@ -209,15 +333,39 @@ fn main() {
     // Parse command-line arguments
     let args = Args::parse();
 
-    // Build immutable, cheaply clonable SharedConfig and build the base station stack
-    let stack_cfg = load_config_from_toml(&args.config);
-    let mut cfg = SharedConfig::from_parts(stack_cfg, None);
+    let mut stack_cfg = load_config_from_toml(&args.config);
+    if let Err(err) = stack_cfg.validate() {
+        eprintln!("Invalid configuration: {err}");
+        std::process::exit(1);
+    }
     if args.check_config {
         println!("Configuration valid");
         return;
     }
 
-    let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
+    let _log_guards = debug::setup_logging_default(stack_cfg.debug_log.clone());
+    let stack_mode = stack_cfg.stack_mode;
+    if let Some(soapy_cfg) = stack_cfg.phy_io.soapysdr.as_mut()
+        && soapy_cfg.tx_dc_calibration_on_startup
+    {
+        eprintln!("Starting opt-in SX1255 TX DC and I/Q calibration for SXceiver/MuCell before the BS stack");
+        let (tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg) = calibrate_tx(soapy_cfg, stack_mode).unwrap_or_else(|err| {
+            eprintln!("SX1255 startup TX calibration failed: {err}");
+            std::process::exit(1);
+        });
+        persist_calibrated_tx(&args.config, tx_dc_i, tx_dc_q, tx_iq_gain_db, tx_iq_phase_deg).unwrap_or_else(|err| {
+            eprintln!("Failed to save SX1255 TX calibration: {err}");
+            std::process::exit(1);
+        });
+        soapy_cfg.tx_dc_i = tx_dc_i;
+        soapy_cfg.tx_dc_q = tx_dc_q;
+        soapy_cfg.tx_iq_gain_db = tx_iq_gain_db;
+        soapy_cfg.tx_iq_phase_deg = tx_iq_phase_deg;
+    }
+
+    // Build immutable, cheaply clonable SharedConfig only after applying the
+    // calibration values that this run will use.
+    let mut cfg = SharedConfig::from_parts(stack_cfg, None);
     let (swmi_worker, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf, swmi_packet) = if cfg.config().swmi.is_some() {
         let (worker, mm, cmce, mle, media, rf, packet) = net_swmi::channel();
         (Some(worker), Some(mm), Some(cmce), Some(mle), Some(media), Some(rf), Some(packet))

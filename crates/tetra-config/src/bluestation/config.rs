@@ -115,6 +115,20 @@ impl StackConfig {
                 .as_ref()
                 .expect("SoapySdr config must be set for SoapySdr PhyIo");
 
+            if !soapy_cfg.tx_dc_i.is_finite() || !soapy_cfg.tx_dc_q.is_finite() {
+                return Err("SoapySdr TX DC corrections must be finite");
+            }
+            if !soapy_cfg.tx_iq_gain_db.is_finite()
+                || !soapy_cfg.tx_iq_phase_deg.is_finite()
+                || soapy_cfg.tx_iq_gain_db.abs() > 1.0
+                || soapy_cfg.tx_iq_phase_deg.abs() > 5.0
+            {
+                return Err("SoapySdr TX I/Q corrections must be finite and within +/-1 dB and +/-5 degrees");
+            }
+            if soapy_cfg.tx_dc_calibration_on_startup && self.stack_mode != StackMode::Bs {
+                return Err("SoapySdr TX DC startup calibration is only supported in BS mode");
+            }
+
             let (dlfreq, ulfreq) = freq_info.get_freqs();
 
             println!("    {:?}", freq_info);
