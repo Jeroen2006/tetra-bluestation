@@ -362,6 +362,7 @@ pub struct MmBs {
     client_mgr: MmClientMgr,
     swmi: Option<SwmiMmEndpoint>,
     next_swmi_command_id: u64,
+    common_capability_requested: HashSet<u32>,
     pending_registrations: HashMap<u64, PendingRegistration>,
     registration_deadlines: HashMap<u64, TdmaTime>,
     pending_attachments: HashMap<u64, PendingAttachment>,
@@ -802,7 +803,20 @@ impl MmBs {
             };
             let state = pending.tx_reporter.get_state();
             if delivered {
-                self.config.state_write().subscribers.mark_active(issi);
+                {
+                    let mut state = self.config.state_write();
+                    state.subscribers.mark_active(issi);
+                    state.subscribers.finish_common_registration(issi);
+                }
+                if let Some(swmi) = &self.swmi {
+                    let state = self.config.state_read();
+                    let assignment = state.subscribers.common_control(issi);
+                    let _ = swmi.submit(SwmiMessage::CommonControlReport {
+                        itsi: u64::from(issi), registration_generation: pending.command_id.unwrap_or(0),
+                        common_scch: assignment.supported, ms_scch: assignment.ms_scch,
+                        common_scch_count: state.common_control.advertised_count,
+                    });
+                }
                 self.group_security_not_before
                     .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
                 // TTR 001-01 6.4/8.3: ordinary roaming retains existing
@@ -1085,6 +1099,7 @@ impl MmBs {
             client_mgr,
             swmi,
             next_swmi_command_id: 1,
+            common_capability_requested: HashSet::new(),
             pending_registrations: HashMap::new(),
             registration_deadlines: HashMap::new(),
             pending_attachments: HashMap::new(),
@@ -1804,6 +1819,7 @@ impl MmBs {
     /// central anchor has already moved, and a stale-cell deregistration must
     /// not be allowed to deregister the new serving cell.
     fn remove_local_subscriber(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
+        self.common_capability_requested.remove(&issi);
         let client = self.client_mgr.remove_client(issi);
         self.security_information_protocol_supported.remove(&issi);
         self.registration_generations.remove(&issi);
@@ -2174,6 +2190,12 @@ impl MmBs {
         // registration decision; they must never make the registration itself
         // silently fall back to LST.
         let issi = prim.received_address.ssi;
+        {
+            let mut state = self.config.state_write();
+            let ingress = state.subscribers.common_control(issi).last_uplink_slot.unwrap_or(1);
+            let count = state.common_control.advertised_count;
+            state.subscribers.select_common_control(issi, pdu.class_of_ms.as_ref().map(|class| class.common_scch), count, ingress);
+        }
         // TS 100 392-2 clause 16.8.6: registration overrides a colliding
         // attachment transaction. Its current desired associations are folded
         // into the ensuing D-LOCATION UPDATE ACCEPT instead.
@@ -2229,6 +2251,7 @@ impl MmBs {
                 });
             let ciphering_parameters = pdu.ciphering_parameters.map(|value| value as u16);
             let request = SwmiMessage::RegistrationAttempt {
+                common_scch: pdu.class_of_ms.as_ref().map(|class| class.common_scch),
                 command_id,
                 itsi: issi as u64,
                 air_handle: prim.handle,
@@ -2388,7 +2411,7 @@ impl MmBs {
             address_extension: None,
             subscriber_class: None,
             energy_saving_information: esi,
-            scch_information_and_distribution_on_18th_frame: None,
+            scch_information_and_distribution_on_18th_frame: self.config.state_read().subscribers.common_control(issi).ms_scch.map(|value| u64::from(value) << 2),
             new_registered_area: None,
             security_downlink: None,
             group_identity_location_accept: gila,
@@ -4854,7 +4877,7 @@ impl MmBs {
             address_extension: None,
             subscriber_class: None,
             energy_saving_information,
-            scch_information_and_distribution_on_18th_frame: None,
+            scch_information_and_distribution_on_18th_frame: self.config.state_read().subscribers.common_control(issi).ms_scch.map(|value| u64::from(value) << 2),
             new_registered_area: None,
             security_downlink: information_via_security.then(SecurityDownlink::terminal_information_request),
             group_identity_location_accept,
@@ -5353,6 +5376,20 @@ impl TetraEntityTrait for MmBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.current_time = ts;
         self.update_registration_delivery_statuses(queue);
+        let missing_capabilities = {
+            let state = self.config.state_read();
+            if state.common_control.advertised_count == 0 { Vec::new() }
+            else { state.subscribers.active_issis().into_iter().filter(|issi|
+                state.subscribers.common_control(*issi).supported.is_none()).collect::<Vec<_>>() }
+        };
+        self.common_capability_requested.retain(|issi| missing_capabilities.contains(issi));
+        for issi in missing_capabilities {
+            if self.common_capability_requested.insert(issi) {
+                // TTR 001-01 6.4: obtain an absent Class of MS. This is only
+                // needed for unknown capability, not redistribution of known MSs.
+                self.send_d_location_update_command(queue, issi, 0, false);
+            }
+        }
         self.update_group_security_association_statuses(queue);
         self.update_liveliness_probe_statuses();
         self.update_terminal_control_statuses();
@@ -5490,7 +5527,18 @@ impl TetraEntityTrait for MmBs {
                     });
                     tracing::debug!(issi, "queued SwMI liveliness check for CMCE call-state gating");
                 }
+                SwmiMessage::CommonControlReport { itsi, registration_generation, common_scch, ms_scch, common_scch_count: _ } => {
+                    let mut state = self.config.state_write();
+                    if !state.subscribers.is_registration_pending(itsi as u32)
+                        && state.subscribers.registration_generation(itsi as u32).is_none_or(|generation| generation == registration_generation) {
+                        let previous = state.subscribers.common_control(itsi as u32);
+                        state.subscribers.set_common_control(itsi as u32, tetra_config::bluestation::CommonControlAssignment {
+                            supported: common_scch, ms_scch, ..previous
+                        });
+                    }
+                }
                 SwmiMessage::RegistrationDecision {
+                    common_scch,
                     command_id,
                     itsi,
                     air_handle,
@@ -5501,7 +5549,14 @@ impl TetraEntityTrait for MmBs {
                     rua_requested,
                     handover_allocation,
                     aie,
-                } => self.apply_swmi_registration_decision(
+                } => {
+                    if self.pending_registrations.get(&command_id).is_some_and(|pending| pending.itsi as u64 == itsi && pending.air_handle == air_handle) {
+                        let mut state = self.config.state_write();
+                        let ingress = state.subscribers.common_control(itsi as u32).registration_slot.unwrap_or(1);
+                        let count = state.common_control.advertised_count;
+                        state.subscribers.select_common_control(itsi as u32, common_scch, count, ingress);
+                    }
+                    self.apply_swmi_registration_decision(
                     queue,
                     command_id,
                     itsi,
@@ -5512,7 +5567,8 @@ impl TetraEntityTrait for MmBs {
                     rua_requested,
                     handover_allocation,
                     aie,
-                ),
+                )
+                },
                 SwmiMessage::AuthenticationChallenge {
                     command_id,
                     itsi,
@@ -6963,6 +7019,9 @@ mod tests {
         let issi = 77_492;
         let expected_groups = vec![1202];
         let mm = test_sc3g_mm(issi, &[1202, 1203, 1204]);
+        mm.config.state_write().subscribers.set_common_control(issi, tetra_config::bluestation::CommonControlAssignment {
+            supported: Some(true), ms_scch: Some(11), registration_slot: Some(2), last_uplink_slot: Some(2),
+        });
         let security_groups = mm.registration_group_security_gssis(issi, [1202]);
         let mut queue = MessageQueue::new();
 
@@ -6986,6 +7045,7 @@ mod tests {
             panic!("registration accept must be an LMM downlink")
         };
         let pdu = DLocationUpdateAccept::from_bitbuf(&mut request.sdu).expect("valid D-LOCATION UPDATE ACCEPT");
+        assert_eq!(pdu.scch_information_and_distribution_on_18th_frame, Some(11 << 2));
         let associations = pdu
             .group_identity_security_related_information
             .expect("registration must embed the requested association")[0]

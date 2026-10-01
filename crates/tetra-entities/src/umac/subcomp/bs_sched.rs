@@ -184,6 +184,9 @@ struct FinalGckRolloverImmediate {
 pub struct BsChannelScheduler {
     pub cur_dltime: TdmaTime,
     scrambling_code: u32,
+    common_scch_count: u8,
+    configured_no_minimum_mode: bool,
+    force_common_sysinfo: bool,
     precomps: PrecomputedUmacPdus,
     /// Collect dltx traffic here that can't be sent this slot.
     /// Swapped back into the dltx_queues method at the end of the tick.
@@ -223,6 +226,7 @@ pub struct BsChannelScheduler {
     pending_ra_acks: [Vec<u32>; 4],
     /// Raw base-frame-length encoding for unreserved common access fields.
     random_access_frame_len: u8,
+    secondary_access: [Option<RandomAccessUpdate>; 2],
     aie_provider: Option<BsAieKeyProvider>,
     /// Key-free policy for the downlink speech portion of an active traffic
     /// circuit. A missing policy is deliberately not converted to clear.
@@ -318,6 +322,9 @@ impl BsChannelScheduler {
         BsChannelScheduler {
             cur_dltime: TdmaTime { t: 0, f: 0, m: 0, h: 0 }, // Intentionally invalid, updated in tick function
             scrambling_code,
+            common_scch_count: 0,
+            configured_no_minimum_mode: precomps.mle_sysinfo.bs_service_details.no_minimum_mode,
+            force_common_sysinfo: false,
             precomps,
             dltx_next_slot_queue: Vec::new(),
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
@@ -330,6 +337,7 @@ impl BsChannelScheduler {
             circuits: CircuitMgr::new(),
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            secondary_access: [None; 2],
             random_access_frame_len: 4,
             aie_provider,
             traffic_aie: [None; 4],
@@ -1861,6 +1869,40 @@ impl BsChannelScheduler {
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
+    pub fn is_common_control(&self, slot: u8) -> bool { (1..=self.common_scch_count + 1).contains(&slot) }
+
+    pub fn set_common_control_channels(&mut self, physical: u8, advertised: u8, transition: bool) {
+        self.common_scch_count = physical;
+        self.force_common_sysinfo = transition;
+        self.precomps.mac_sysinfo1.num_of_csch = advertised;
+        self.precomps.mac_sysinfo2.num_of_csch = advertised;
+        // TIP Core excludes minimum mode with common SCCH operation. Do not
+        // advertise minimum-mode entry while the physical SCCHs are present.
+        self.precomps.mle_sysinfo.bs_service_details.no_minimum_mode = self.configured_no_minimum_mode || physical > 0;
+    }
+
+    pub fn common_slot_is_drained(&self, slot: u8) -> bool {
+        let i = usize::from(slot - 1);
+        self.dltx_queues[i].is_empty() && self.dltx_half_duplex_queues[i].is_empty()
+            && self.assoc_dltx_queues[i].is_empty() && self.assoc_best_effort_queues[i].is_empty()
+            && self.pending_ra_acks[i].is_empty()
+            && !self.circuits.is_active(Direction::Dl, slot) && !self.circuits.is_active(Direction::Ul, slot)
+            && !self.packet_bearer_is_active(slot)
+            && self.ulsched[i].iter().all(|reservation| reservation.ul1.is_none() && reservation.ul2.is_none())
+    }
+
+    pub fn retire_common_control_slot(&mut self, slot: u8, target: u8) {
+        let old = usize::from(slot - 1);
+        let target = usize::from(target - 1);
+        let moved = std::mem::take(&mut self.dltx_queues[old]);
+        self.dltx_queues[target].extend(moved);
+    }
+
+    pub fn dl_enqueue_common_tma(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, reporter: Option<TxReporter>, aie: AieRequest) {
+        let ts = if self.is_common_control(ts) { ts } else { 1 };
+        self.dltx_queues[usize::from(ts - 1)].push(DlSchedElem::Resource(pdu, sdu, reporter, aie, None));
+    }
+
     pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>, aie_request: AieRequest) {
         // Get all timeslots on which a relevant MS is listening
         // let timeslots: [u8; NUM_TIMESLOTS] = self.identify_timeslots_for_ssi(pdu.addr);
@@ -1903,7 +1945,12 @@ impl BsChannelScheduler {
     /// precedence over ordinary queued MCCH resources. In-progress MAC
     /// fragments and announced uplink grants retain their scheduler priority.
     pub fn dl_enqueue_ee_mcch_tma(&mut self, pdu: MacResource, sdu: BitBuffer, reporter: TxReporter, aie_request: AieRequest) {
-        self.dltx_queues[0].insert(0, DlSchedElem::Resource(pdu, sdu, Some(reporter), aie_request, None));
+        self.dl_enqueue_ee_common_tma(1, pdu, sdu, reporter, aie_request);
+    }
+
+    pub fn dl_enqueue_ee_common_tma(&mut self, slot: u8, pdu: MacResource, sdu: BitBuffer, reporter: TxReporter, aie_request: AieRequest) {
+        let slot = if self.is_common_control(slot) { slot } else { 1 };
+        self.dltx_queues[usize::from(slot - 1)].insert(0, DlSchedElem::Resource(pdu, sdu, Some(reporter), aie_request, None));
     }
 
     /// Queue ordinary signalling on a currently allocated, non-traffic
@@ -3362,6 +3409,15 @@ impl BsChannelScheduler {
         );
     }
 
+    pub fn set_secondary_random_access_definition(&mut self, slot: u8, update: RandomAccessUpdate) {
+        if (2..=3).contains(&slot) { self.secondary_access[usize::from(slot - 2)] = Some(update); }
+    }
+
+    fn access_definition_for_slot(&self, slot: u8) -> RandomAccessUpdate {
+        if (2..=3).contains(&slot) { self.secondary_access[usize::from(slot - 2)].unwrap_or_else(|| self.random_access_definition()) }
+        else { self.random_access_definition() }
+    }
+
     pub fn set_random_access_definition(&mut self, parameters: RandomAccessParameters, frame_len: u8) {
         if let Some(access_define) = self.precomps.access_define.as_mut() {
             access_define.imm = parameters.imm;
@@ -3431,11 +3487,11 @@ impl BsChannelScheduler {
 
     fn should_emit_access_define(&self, ts: TdmaTime) -> bool {
         let interval = self.precomps.access_define_interval_multiframes.max(1);
-        self.precomps.access_define.is_some() && ts.t == 1 && ts.f == 2 && (ts.m - 1) % interval == 0
+        self.precomps.access_define.is_some() && self.is_common_control(ts.t) && ts.f == 2 && (ts.m - 1) % interval == 0
     }
 
-    fn common_access_frame_len(&self) -> BaseFrameLength {
-        BaseFrameLength::try_from(self.random_access_frame_len as u64).unwrap_or(DEFAULT_ACCESS_FRAME_MARKER)
+    fn common_access_frame_len(&self, slot: u8) -> BaseFrameLength {
+        BaseFrameLength::try_from(self.access_definition_for_slot(slot).frame_len as u64).unwrap_or(DEFAULT_ACCESS_FRAME_MARKER)
     }
 
     /// Prepares a scheduled FUTURE timeslot for transfer to lmac and transmission
@@ -3511,6 +3567,8 @@ impl BsChannelScheduler {
                 "transmitting final SC3G GCK rollover Immediate on FN18"
             );
             self.build_final_gck_rollover_slot(item, ts)
+        } else if self.force_common_sysinfo && ts.f == 18 {
+            TmvUnitdataReqSlot { ts, blk1: None, blk2: None, bbk: None, ul_phy_chan: ul_phy }
         } else if ts.f == 18
             && ts.t != 1
             && !frame18_broadcast_slot
@@ -3719,7 +3777,16 @@ impl BsChannelScheduler {
             // SYSINFO variant scheduling is independent of the timeslot on
             // which table 9.33 maps this BNCH occurrence.
             if use_default_access_sysinfo(ts) {
-                self.precomps.mac_sysinfo1.to_bitbuf(&mut buf);
+                let mut sysinfo = self.precomps.mac_sysinfo1.clone();
+                if self.is_common_control(ts.t) {
+                    if let Some(default) = sysinfo.default_access_code.as_mut() {
+                        let definition = self.access_definition_for_slot(ts.t).parameters;
+                        default.imm = definition.imm; default.wt = definition.wt; default.nu = definition.nu;
+                        default.fl_factor = definition.frame_len_factor;
+                        default.ts_ptr = definition.ts_pointer; default.min_pdu_prio = definition.min_pdu_prio;
+                    }
+                }
+                sysinfo.to_bitbuf(&mut buf);
             } else {
                 self.precomps.mac_sysinfo2.to_bitbuf(&mut buf);
             }
@@ -3794,7 +3861,7 @@ impl BsChannelScheduler {
         if ts.f != 18 {
             let aach = match ts.t {
                 // MCCH (TS1)
-                1 => {
+                slot if self.is_common_control(slot) => {
                     // 23.3.1.1.2
                     // "During normal mode operation, it shall always be assumed that slot 1 on the
                     // downlink is for common control as part of the MCCH."
@@ -3816,7 +3883,7 @@ impl BsChannelScheduler {
                             base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block1).is_some() {
                                 BaseFrameLength::ReservedSubslot
                             } else {
-                                self.common_access_frame_len()
+                                self.common_access_frame_len(ts.t)
                             },
                         },
                         access_field_2: AccessField {
@@ -3824,7 +3891,7 @@ impl BsChannelScheduler {
                             base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
                                 BaseFrameLength::ReservedSubslot
                             } else {
-                                self.common_access_frame_len()
+                                self.common_access_frame_len(ts.t)
                             },
                         },
                     }
@@ -3914,7 +3981,7 @@ impl BsChannelScheduler {
                     // It remains unavailable for ordinary reserved access.
                     BaseFrameLength::CLCHSubslot
                 } else {
-                    self.common_access_frame_len()
+                    self.common_access_frame_len(ts.t)
                 },
             };
             let access_field_2 = AccessField {
@@ -3922,7 +3989,7 @@ impl BsChannelScheduler {
                 base_frame_len: if self.ul_get_slot_owner(ts, PhyBlockNum::Block2).is_some() {
                     BaseFrameLength::ReservedSubslot
                 } else {
-                    self.common_access_frame_len()
+                    self.common_access_frame_len(ts.t)
                 },
             };
             let aach = if assigned_channel {
@@ -3961,16 +4028,21 @@ impl BsChannelScheduler {
 
     fn generate_default_blks(&self, ts: TdmaTime) -> TmvUnitdataReq {
         match (ts.f, ts.t) {
-            (1..=17, 1) => {
+            (1..=17, slot) if self.is_common_control(slot) => {
                 // Two options: [Blk1: SCH/HD Null | Blk2: BNCH SYSINFO] or [Both: SCH/F Null]
                 // Alternate every frame
-                match ts.f % 2 {
+                match if self.force_common_sysinfo { 0 } else { ts.f % 2 } {
                     0 => {
                         // ACCESS-DEFINE shares the SCH/HD half-slot with the normal
                         // SYSINFO BNCH block at the stable MCCH position.
                         let mut buf1 = BitBuffer::new(SCH_HD_CAP);
                         if self.should_emit_access_define(ts) {
-                            self.precomps.access_define.as_ref().expect("checked above").to_bitbuf(&mut buf1);
+                            let mut access = self.precomps.access_define.as_ref().expect("checked above").clone();
+                            let definition = self.access_definition_for_slot(ts.t).parameters;
+                            access.imm = definition.imm; access.wt = definition.wt; access.nu = definition.nu;
+                            access.frame_len_factor = definition.frame_len_factor;
+                            access.ts_pointer = definition.ts_pointer; access.min_pdu_prio = definition.min_pdu_prio;
+                            access.to_bitbuf(&mut buf1);
                         } else {
                             MacResource::null_pdu().to_bitbuf(&mut buf1);
                         }
@@ -4244,6 +4316,50 @@ mod tests {
             )),
             rollover: None,
         });
+    }
+
+    #[test]
+    fn common_scch_has_common_aach_independent_access_and_sysinfo() {
+        let mut sched = get_testing_slotter();
+        sched.set_common_control_channels(2, 2, false);
+        let mut access = sched.random_access_definition();
+        access.frame_len = 6;
+        access.parameters.imm = 3;
+        sched.set_secondary_random_access_definition(2, access);
+        for slot in 1..=3 {
+            let time = TdmaTime { t: slot, f: 2, m: 1, h: 0 };
+            let mut aach = sched.generate_bbk_block(time).mac_block;
+            aach.seek(0);
+            let aach = AccessAssign::from_bitbuf(&mut aach).unwrap();
+            let AccessAssign::DownlinkCommonControlUplinkCommonOnly { access_field_1, .. } = aach else { panic!("common AACH") };
+            assert_eq!(access_field_1.base_frame_len, sched.common_access_frame_len(slot));
+            sched.cur_dltime = time.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
+            let result = sched.finalize_ts_for_tick();
+            assert_eq!(result.blk1.as_ref().unwrap().logical_channel, LogicalChannel::SchHd);
+            let mut bnch = result.blk2.unwrap().mac_block;
+            bnch.seek(0);
+            let sysinfo = MacSysinfo::from_bitbuf(&mut bnch).unwrap();
+            assert_eq!(sysinfo.num_of_csch, 2);
+            assert_eq!(sysinfo.default_access_code.unwrap().imm, if slot == 2 { 3 } else { 8 });
+        }
+    }
+
+    #[test]
+    fn scch_decrease_broadcasts_new_configuration_on_every_frame18_slot() {
+        let mut sched = get_testing_slotter();
+        sched.set_common_control_channels(2, 0, true);
+        let time = TdmaTime { t: 2, f: 18, m: 1, h: 0 };
+        let index = sched.ul_ts_to_sched_index(&time);
+        sched.ulsched[1][index].ul1 = Some(77468);
+        assert!(!sched.common_slot_is_drained(2));
+        for slot in 1..=4 {
+            sched.cur_dltime = TdmaTime { t: slot, ..time }.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
+            let result = sched.finalize_ts_for_tick();
+            assert_eq!(result.blk1.unwrap().logical_channel, LogicalChannel::Bsch);
+            let mut bnch = result.blk2.unwrap().mac_block;
+            bnch.seek(0);
+            assert_eq!(MacSysinfo::from_bitbuf(&mut bnch).unwrap().num_of_csch, 0);
+        }
     }
 
     #[test]

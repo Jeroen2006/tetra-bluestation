@@ -76,6 +76,9 @@ pub struct PdpSnapshot {
 pub struct TerminalSnapshot {
     pub issi: u32,
     pub registration: String,
+    pub common_scch_supported: Option<bool>,
+    pub ms_scch: Option<u8>,
+    pub control_timeslot: u8,
     pub talkgroups: Vec<u32>,
     pub last_seen_ms: Option<u64>,
     pub rf: Option<RfSnapshot>,
@@ -89,6 +92,10 @@ pub struct RadioSnapshot {
     pub ra: RaSnapshot,
     pub terminals: Vec<TerminalSnapshot>,
     pub timeslots: [String; 4],
+    pub common_scch_requested: u8,
+    pub common_scch_active: u8,
+    pub common_scch_transition: bool,
+    pub control_channel_loads: [u32; 3],
     pub network_connected: bool,
     pub radio_tx_allowed: bool,
     pub radio_tx_enabled: bool,
@@ -198,7 +205,7 @@ impl RadioSnapshot {
         let mut counts = SlotCounts::default();
         for slot in &self.timeslots {
             match slot.as_str() {
-                "Control" => counts.control += 1,
+                "Control" | "Common SCCH" => counts.control += 1,
                 "Voice" => counts.voice += 1,
                 "Packet data" => counts.packet += 1,
                 "Network" => counts.network += 1,

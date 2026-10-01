@@ -34,5 +34,8 @@ pub use sec_web::*;
 pub mod sec_rua;
 pub use sec_rua::*;
 
+pub mod common_control;
+pub use common_control::*;
+
 pub mod state;
 pub use state::*;

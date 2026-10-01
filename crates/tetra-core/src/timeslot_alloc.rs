@@ -3,6 +3,7 @@ pub enum TimeslotOwner {
     Brew,
     Cmce,
     PacketData,
+    CommonControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub struct TimeslotAllocator {
     // Index 0 = TS2, 1 = TS3, 2 = TS4
     owners: [Option<TimeslotOwner>; 3],
     packet_preemption_requested: bool,
+    common_control_pending: [bool; 3],
 }
 
 impl Default for TimeslotAllocator {
@@ -34,6 +36,7 @@ impl Default for TimeslotAllocator {
         Self {
             owners: [None, None, None],
             packet_preemption_requested: false,
+            common_control_pending: [false; 3],
         }
     }
 }
@@ -47,9 +50,13 @@ impl TimeslotAllocator {
         }
     }
 
+    pub fn set_common_control_target(&mut self, count: u8) {
+        self.common_control_pending = std::array::from_fn(|index| index < usize::from(count.min(2)));
+    }
+
     pub fn allocate_any(&mut self, owner: TimeslotOwner) -> Option<u8> {
         for (i, slot) in self.owners.iter_mut().enumerate() {
-            if slot.is_none() {
+            if slot.is_none() && !self.common_control_pending[i] {
                 *slot = Some(owner);
                 return Some(i as u8 + 2);
             }
@@ -87,11 +94,12 @@ impl TimeslotAllocator {
     pub fn reserve(&mut self, owner: TimeslotOwner, ts: u8) -> Result<(), TimeslotAllocErr> {
         let idx = Self::idx(ts)?;
         match self.owners[idx] {
-            None => {
+            None if !self.common_control_pending[idx] || owner == TimeslotOwner::CommonControl => {
                 self.owners[idx] = Some(owner);
                 Ok(())
             }
             Some(existing) => Err(TimeslotAllocErr::InUse { ts, owner: existing }),
+            None => Err(TimeslotAllocErr::InUse { ts, owner: TimeslotOwner::CommonControl }),
         }
     }
 
@@ -116,13 +124,31 @@ impl TimeslotAllocator {
     }
 
     pub fn is_free(&self, ts: u8) -> bool {
-        self.owner(ts).is_none()
+        Self::idx(ts).is_ok_and(|idx| self.owners[idx].is_none() && !self.common_control_pending[idx])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_scch_waits_for_occupant_and_fences_new_allocations() {
+        let mut allocator = TimeslotAllocator::default();
+        allocator.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        allocator.set_common_control_target(2);
+        assert_eq!(allocator.owner(2), Some(TimeslotOwner::Cmce));
+        assert!(allocator.reserve(TimeslotOwner::CommonControl, 2).is_err());
+        assert_eq!(allocator.allocate_any(TimeslotOwner::PacketData), Some(4));
+        assert!(allocator.reserve(TimeslotOwner::PacketData, 3).is_err());
+        allocator.release(TimeslotOwner::Cmce, 2).unwrap();
+        assert!(!allocator.is_free(2));
+        allocator.reserve(TimeslotOwner::CommonControl, 2).unwrap();
+        allocator.set_common_control_target(0);
+        assert!(!allocator.is_free(2));
+        allocator.release(TimeslotOwner::CommonControl, 2).unwrap();
+        assert!(allocator.is_free(2)); assert!(allocator.is_free(3));
+    }
 
     #[test]
     fn voice_requests_preemption_only_when_packet_data_blocks_capacity() {

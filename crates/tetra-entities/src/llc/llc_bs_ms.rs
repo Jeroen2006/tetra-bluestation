@@ -110,6 +110,7 @@ pub struct ExpectedInAck {
     /// Physical bearer for each entry in `attempt_reporters`; TS1 denotes the
     /// MCCH and TS2..4 denote associated traffic-channel control.
     attempt_timeslots: Vec<u8>,
+    attempt_assigned: bool,
     /// Number of route copies whose complete over-air transmission has already
     /// been observed. A later copy completing restarts T.251 for that copy.
     observed_transmitted_copies: usize,
@@ -619,6 +620,48 @@ impl Llc {
             routes.insert(0, route);
         }
 
+        if config.state_read().common_control.physical_count > 0 {
+            let state = config.state_read();
+            let assignment = state.subscribers.common_control(ack.addr.ssi);
+            let common_slot = tetra_config::bluestation::common_control_slot(assignment.ms_scch, state.common_control.advertised_count);
+            let ingress = assignment.registration_slot.or_else(||
+                ack.force_common_channel.then_some(assignment.last_uplink_slot).flatten());
+            let explicit_common = match &ack.retransmission_buf.msg {
+                SapMsgInner::TmaUnitdataReq(req) => u8::try_from(req.endpoint_id).ok().filter(|slot| state.common_control.is_common(*slot)),
+                _ => None,
+            };
+            let fixed = ingress.or(explicit_common);
+            let mut candidates: Vec<(u8, Option<tetra_saps::tma::AssociatedChannel>)> = Vec::new();
+            if packet_associated_route {
+                candidates.extend(routes.iter().copied().map(|route| (route.timeslot, Some(route))));
+            } else if let Some(slot) = fixed {
+                candidates.push((slot, None));
+            } else {
+                candidates.push((common_slot, None));
+                candidates.extend(routes.iter().copied().map(|route| (route.timeslot, Some(route))));
+                for slot in state.common_control.advertised_slots() {
+                    if !candidates.iter().any(|candidate| candidate.0 == slot) { candidates.push((slot, None)); }
+                }
+            }
+            let chosen = candidates[usize::from(ack.retransmit_count) % candidates.len()];
+            drop(state);
+            ack.t_submitted_to_umac = Some(dltime);
+            ack.t_umac_done = None;
+            Self::cancel_pending_attempt_copies(ack);
+            ack.attempt_reporters.clear(); ack.attempt_timeslots.clear(); ack.observed_transmitted_copies = 0;
+            let reporter = TxReporter::new();
+            let mut sapmsg = ack.retransmission_buf.clone();
+            if let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg {
+                req.associated_channel = chosen.1;
+                req.endpoint_id = if chosen.1.is_none() { u32::from(chosen.0) } else { 0 };
+                req.tx_reporter = Some(reporter.clone());
+            }
+            ack.ts = chosen.0; ack.attempt_assigned = chosen.1.is_some();
+            ack.attempt_reporters.push(reporter); ack.attempt_timeslots.push(chosen.0);
+            tracing::info!(issi = ack.addr.ssi, timeslot = chosen.0, retry = ack.retransmit_count, assigned = ack.attempt_assigned, "queued ordered signalling delivery attempt");
+            queue.push_back(sapmsg);
+            return;
+        }
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
         Self::cancel_pending_attempt_copies(ack);
@@ -631,6 +674,7 @@ impl Llc {
             traffic_copies = routes.len(),
             "sending acknowledged downlink on every plausible active bearer"
         );
+        ack.attempt_assigned = !routes.is_empty();
         for route in routes {
             let mut sapmsg = ack.retransmission_buf.clone();
             let reporter = TxReporter::new();
@@ -680,7 +724,7 @@ impl Llc {
             return false;
         };
 
-        ack.ts != 1
+        ack.attempt_assigned
             || req.associated_channel.is_some()
             || req
                 .chan_alloc
@@ -720,7 +764,7 @@ impl Llc {
                     // TETRA defines EG1..EG7. Treat a corrupt persisted value
                     // as the longest valid period instead of allowing an
                     // unchecked shift to panic the scheduler.
-                    1_u32 << u32::from(mode.min(7) - 1)
+                    tetra_config::bluestation::ee_period_frames(mode.min(7)).div_ceil(18)
                 }
             })
             .unwrap_or(0);
@@ -730,7 +774,7 @@ impl Llc {
             .zip(&ack.attempt_timeslots)
             .filter(|(reporter, _)| reporter.get_state() == tetra_core::TxState::Pending)
             .map(|(_, timeslot)| {
-                if *timeslot == 1 {
+                if config.state_read().common_control.is_common(*timeslot) {
                     // An EE-gated MCCH copy first waits for its monitoring
                     // occasion, then uses ordinary consecutive signalling
                     // frames for any MAC fragments.
@@ -2013,7 +2057,13 @@ impl Llc {
                 AieScope::MacResource,
             )
         });
-        let delivery_timeslot = prim
+        let delivery_timeslot = if self.config.state_read().common_control.physical_count > 0 && prim.associated_channel.is_none() {
+            let state = self.config.state_read();
+            let assignment = state.subscribers.common_control(prim.main_address.ssi);
+            u8::try_from(prim.endpoint_id).ok().filter(|slot| state.common_control.is_common(*slot))
+                .or(assignment.registration_slot)
+                .unwrap_or_else(|| tetra_config::bluestation::common_control_slot(assignment.ms_scch, state.common_control.advertised_count))
+        } else { prim
             .associated_channel
             .as_ref()
             .map(|channel| channel.timeslot)
@@ -2022,7 +2072,7 @@ impl Llc {
                     .first()
                     .map(|channel| channel.timeslot)
             })
-            .unwrap_or(1);
+            .unwrap_or(1) };
         let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, delivery_timeslot, outgoing_aie_request);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
@@ -2106,6 +2156,7 @@ impl Llc {
             tx_reporter,
             attempt_reporters: Vec::new(),
             attempt_timeslots: Vec::new(),
+            attempt_assigned: false,
             observed_transmitted_copies: 0,
             t_first: self.dltime,
             t_submitted_to_umac: None,
@@ -2562,7 +2613,8 @@ impl Llc {
             // uplink SDS and blocks packet traffic. Preserve the live packet
             // route and reserve stealing for an actual traffic channel.
             let packet_route = Self::packet_route(&self.config, ack.addr.ssi, ack.ts);
-            let steal = matches!(ack.ts, 2..=4) && packet_route.is_none();
+            let steal = matches!(ack.ts, 2..=4) && packet_route.is_none()
+                && !self.config.state_read().common_control.is_common(ack.ts);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
                 has_fcs: false,
@@ -2598,7 +2650,7 @@ impl Llc {
                     req_handle: 0, // TODO FIXME
                     pdu: pdu_buf,
                     main_address: ack.addr,
-                    endpoint_id: 0, // todo fixme
+                    endpoint_id: u32::from(ack.ts),
                     stealing_permission: steal,
                     subscriber_class: 0, // TODO FIXME
                     air_interface_encryption: Some(ack.aie_request.with_scope(AieScope::MacResource)),
@@ -2764,6 +2816,97 @@ mod tests {
                 chan_info: None,
             }),
         )
+    }
+
+    fn queue_common_scch_test_sdu(llc: &mut Llc, queue: &mut MessageQueue, issi: u32) {
+        llc.rx_tla_tldata_req_bl(queue, SapMsg::new(Sap::TlaSap, TetraEntity::Mle, TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                main_address: TetraAddress::issi(issi), link_id: 0, endpoint_id: 0,
+                tl_sdu: BitBuffer::from_bitstr("1010"), stealing_permission: false, subscriber_class: 0,
+                fcs_flag: false, packet_data_flag: false,
+                air_interface_encryption: Some(AieRequest::clear(AieSubject::Individual { issi }, AieScope::MacResource)),
+                stealing_repeats_flag: None, data_class_info: None, req_handle: 0, graceful_degradation: None,
+                chan_alloc: None, associated_channel: None, tx_reporter: None,
+            })));
+    }
+
+    #[test]
+    fn common_scch_fallback_tries_assigned_then_traffic_then_other_control_channels() {
+        let config = test_config();
+        let issi = 77480;
+        {
+            let mut state = config.state_write();
+            state.common_control.physical_count = 2;
+            state.common_control.advertised_count = 2;
+            state.subscribers.set_common_control(issi, tetra_config::bluestation::CommonControlAssignment {
+                supported: Some(true), ms_scch: Some(1), ..Default::default()
+            });
+            state.subscriber_delivery_routes.insert(issi, vec![tetra_config::bluestation::SubscriberDeliveryRoute {
+                call_id: 7, timeslot: 4, usage: 10,
+            }]);
+        }
+        let mut llc = Llc::new(config.clone());
+        let mut queue = MessageQueue::new();
+        queue_common_scch_test_sdu(&mut llc, &mut queue, issi);
+        for (retry, (slot, assigned)) in [(2, false), (4, true), (1, false), (3, false)].into_iter().enumerate() {
+            let ack = &mut llc.outbound_messages[0];
+            ack.retransmit_count = retry as u8;
+            Llc::submit_for_acknowledged_transmission(&config, &mut queue, ack, TdmaTime::default());
+            assert_eq!(ack.ts, slot);
+            assert_eq!(ack.attempt_assigned, assigned);
+            assert_eq!(ack.attempt_reporters.len(), 1);
+            let SapMsgInner::TmaUnitdataReq(req) = queue.pop_front().unwrap().msg else { panic!("TMA") };
+            assert_eq!(req.associated_channel.is_some(), assigned);
+            if !assigned { assert_eq!(req.endpoint_id, u32::from(slot)); }
+            assert!(queue.pop_front().is_none());
+        }
+    }
+
+    #[test]
+    fn common_scch_registration_stays_on_ingress_until_accept_is_acknowledged() {
+        let config = test_config();
+        let issi = 77480;
+        {
+            let mut state = config.state_write();
+            state.common_control.physical_count = 2;
+            state.common_control.advertised_count = 2;
+            state.subscribers.set_common_control(issi, tetra_config::bluestation::CommonControlAssignment {
+                supported: Some(true), ms_scch: Some(2), registration_slot: Some(2), last_uplink_slot: Some(2),
+            });
+        }
+        let mut llc = Llc::new(config.clone());
+        let mut queue = MessageQueue::new();
+        queue_common_scch_test_sdu(&mut llc, &mut queue, issi);
+        for retry in 0..=3 {
+            let ack = &mut llc.outbound_messages[0];
+            ack.retransmit_count = retry;
+            Llc::submit_for_acknowledged_transmission(&config, &mut queue, ack, TdmaTime::default());
+            assert_eq!(ack.ts, 2);
+            assert!(!Llc::has_assigned_channel_context(ack));
+            queue.pop_front().unwrap();
+        }
+        config.state_write().subscribers.finish_common_registration(issi);
+        llc.outbound_messages[0].retransmit_count = 0;
+        Llc::submit_for_acknowledged_transmission(&config, &mut queue, &mut llc.outbound_messages[0], TdmaTime::default());
+        assert_eq!(llc.outbound_messages[0].ts, 3);
+        assert!(!Llc::has_assigned_channel_context(&llc.outbound_messages[0]));
+    }
+
+    #[test]
+    fn common_scch_uplink_ack_returns_on_ingress_without_facch() {
+        let config = test_config();
+        config.state_write().common_control.physical_count = 2;
+        let mut llc = Llc::new(config);
+        llc.dltime = TdmaTime { t: 2, f: 3, m: 1, h: 0 };
+        llc.schedule_outgoing_ack(llc.dltime, TetraAddress::issi(77480), 0,
+            AieRequest::clear(AieSubject::Individual { issi: 77480 }, AieScope::MacData));
+        llc.dltime = llc.dltime.add_timeslots(72);
+        let mut queue = MessageQueue::new();
+        llc.submit_ack_replies_to_umac(&mut queue);
+        let SapMsgInner::TmaUnitdataReq(req) = queue.pop_front().unwrap().msg else { panic!("ACK") };
+        assert_eq!(req.endpoint_id, 2);
+        assert!(!req.stealing_permission);
+        assert!(req.chan_alloc.is_none());
     }
 
     fn establish_advanced_link(llc: &mut Llc, queue: &mut MessageQueue, issi: u32) {

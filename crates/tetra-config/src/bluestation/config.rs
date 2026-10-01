@@ -142,6 +142,9 @@ impl StackConfig {
             };
         }
 
+        if self.cell.common_scch_count > 2 {
+            return Err("common_scch_count must be 0-2");
+        }
         if self.cell.colour_code > 63 {
             return Err("colour_code must be 0-63 (6 bits)");
         }
@@ -240,6 +243,7 @@ impl StackConfig {
 /// The operator-editable fields consumed by the running radio and SwMI worker.
 #[derive(Debug, Clone)]
 pub struct RuntimeOperatorSettings {
+    pub common_scch_count: u8,
     pub version: u64,
     pub random_access: CfgRandomAccess,
     pub ms_txpwr_max_cell: u8,
@@ -251,6 +255,7 @@ pub struct RuntimeOperatorSettings {
 impl Default for RuntimeOperatorSettings {
     fn default() -> Self {
         Self {
+            common_scch_count: 0,
             version: 0,
             random_access: CfgRandomAccess::default(),
             ms_txpwr_max_cell: 4,
@@ -288,6 +293,7 @@ impl SharedConfig {
             broadcast: cfg.network_broadcast.clone(),
         };
         state.operator_settings = RuntimeOperatorSettings {
+            common_scch_count: cfg.cell.common_scch_count,
             version: 1,
             random_access: cfg.cell.random_access.clone(),
             ms_txpwr_max_cell: cfg.cell.ms_txpwr_max_cell,
@@ -295,6 +301,9 @@ impl SharedConfig {
             access_parameter: cfg.cell.access_parameter,
             allow_lst: cfg.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst),
         };
+        // Fence the configured resources before the first entity tick (voice
+        // and SNDCP may otherwise allocate them during startup recovery).
+        state.timeslot_alloc.set_common_control_target(cfg.cell.common_scch_count);
 
         Self {
             cfg: Arc::new(cfg),
@@ -324,7 +333,8 @@ impl SharedConfig {
         let tx_requested = previous.phy_io.tx_enabled != next.phy_io.tx_enabled;
         let previous_lst = previous.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
         let next_lst = next.swmi.as_ref().is_some_and(|swmi| swmi.allow_lst);
-        let operator_requested = previous.cell.random_access != next.cell.random_access
+        let operator_requested = previous.cell.common_scch_count != next.cell.common_scch_count
+            || previous.cell.random_access != next.cell.random_access
             || previous.cell.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
             || previous.cell.rxlev_access_min != next.cell.rxlev_access_min
             || previous.cell.access_parameter != next.cell.access_parameter
@@ -339,7 +349,8 @@ impl SharedConfig {
         let mut state = self.state_write();
         let tx_changed = tx_requested && state.operator_tx_enabled != next.phy_io.tx_enabled;
         if tx_changed { state.operator_tx_enabled = next.phy_io.tx_enabled; }
-        let cell_changed = operator_requested && (state.operator_settings.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
+        let cell_changed = operator_requested && (state.operator_settings.common_scch_count != next.cell.common_scch_count
+            || state.operator_settings.ms_txpwr_max_cell != next.cell.ms_txpwr_max_cell
             || state.operator_settings.rxlev_access_min != next.cell.rxlev_access_min
             || state.operator_settings.access_parameter != next.cell.access_parameter);
         let operator_changed = operator_requested && (cell_changed
@@ -354,6 +365,8 @@ impl SharedConfig {
             state.operator_settings.version = state.operator_settings.version.saturating_add(1);
             state.operator_settings.random_access = next.cell.random_access.clone();
             state.operator_settings.ms_txpwr_max_cell = next.cell.ms_txpwr_max_cell;
+            state.operator_settings.common_scch_count = next.cell.common_scch_count;
+            state.timeslot_alloc.set_common_control_target(next.cell.common_scch_count);
             state.operator_settings.rxlev_access_min = next.cell.rxlev_access_min;
             state.operator_settings.access_parameter = next.cell.access_parameter;
             state.operator_settings.allow_lst = next_lst;

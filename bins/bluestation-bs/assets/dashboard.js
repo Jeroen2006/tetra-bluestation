@@ -190,10 +190,11 @@
   function renderSlots(id, radio) {
     replace(id, radio.timeslots.map((name, i) => {
       const item = document.createElement('div');
-      const type = slotTypes.find(type => type.label === name)?.key || 'free';
+      const type = name === 'Common SCCH' ? 'control' : slotTypes.find(type => type.label === name)?.key || 'free';
       item.className = `slot slot--${type}`;
       const label = document.createElement('span'); label.textContent = `TS${i + 1}`;
       const value = document.createElement('strong'); value.textContent = radio.measured_at_ms ? name : '—';
+      if (i <= (radio.common_scch_active ?? 0)) value.textContent += ` · ${radio.control_channel_loads?.[i] ?? 0} terminals`;
       item.append(label, value); return item;
     }));
   }
@@ -226,7 +227,7 @@
       property('Minimum RX access level', c ? `${-125 + 5 * c.rxlev_access_min} dBm` : '—'),
       property('Access parameter', c ? `${-53 + 2 * c.access_parameter} dBm` : '—'),
       property('Radio downlink timeout', !c ? '—' : !timeoutSlots ? 'Disabled' : `${timeoutSlots} timeslots · ${fmt(timeoutSlots / 4 * 17 / 300, 2)} s`),
-      property('Secondary control channels', fmt(c?.secondary_control_channels)),
+      property('Common SCCHs', `${fmt(s.radio.common_scch_active)} active / ${fmt(s.radio.common_scch_requested)} requested${s.radio.common_scch_transition ? ' · waiting for channel transition' : ''}`),
       property('Dynamic random access', c ? yes(s.radio.ra.dynamic) : '—'),
     ]);
     renderSlots('cell-slots', s.radio);
@@ -390,6 +391,7 @@
       ['Training EVM', t.rf ? `${fmt(t.rf.evm_percent, 1)}%` : 'Unavailable'],
       ['Block errors', t.rf ? `${t.rf.block_errors} / ${t.rf.block_count}` : 'Unavailable'],
       ['PDP context', pdpLabel(t.pdp)], ['NSAPI', t.pdp ? String(t.pdp.nsapi) : '—'],
+      ['Control channel', `TS${t.control_timeslot ?? 1}`], ['MS_SCCH', t.ms_scch ?? '—'], ['Common SCCH supported', t.common_scch_supported == null ? 'Unknown' : t.common_scch_supported ? 'Yes' : 'No'],
       ['IP address', t.pdp?.ipv4 || '—'], ['Packet timeslots', t.pdp?.timeslots?.length ? t.pdp.timeslots.map(n => `TS${n}`).join(', ') : '—'],
     ];
     replace('terminal-modal-details', fields.map(([label, value]) => {
