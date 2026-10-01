@@ -1869,7 +1869,9 @@ impl BsChannelScheduler {
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
-    pub fn is_common_control(&self, slot: u8) -> bool { (1..=self.common_scch_count + 1).contains(&slot) }
+    pub fn is_common_control(&self, slot: u8) -> bool {
+        (1..=self.common_scch_count + 1).contains(&slot)
+    }
 
     pub fn set_common_control_channels(&mut self, physical: u8, advertised: u8, transition: bool) {
         self.common_scch_count = physical;
@@ -1883,12 +1885,88 @@ impl BsChannelScheduler {
 
     pub fn common_slot_is_drained(&self, slot: u8) -> bool {
         let i = usize::from(slot - 1);
-        self.dltx_queues[i].is_empty() && self.dltx_half_duplex_queues[i].is_empty()
-            && self.assoc_dltx_queues[i].is_empty() && self.assoc_best_effort_queues[i].is_empty()
+        self.dltx_queues[i].is_empty()
+            && self.dltx_half_duplex_queues[i].is_empty()
+            && self.assoc_dltx_queues[i].is_empty()
+            && self.assoc_best_effort_queues[i].is_empty()
             && self.pending_ra_acks[i].is_empty()
-            && !self.circuits.is_active(Direction::Dl, slot) && !self.circuits.is_active(Direction::Ul, slot)
+            && !self.circuits.is_active(Direction::Dl, slot)
+            && !self.circuits.is_active(Direction::Ul, slot)
             && !self.packet_bearer_is_active(slot)
-            && self.ulsched[i].iter().all(|reservation| reservation.ul1.is_none() && reservation.ul2.is_none())
+            && self.ulsched[i]
+                .iter()
+                .all(|reservation| reservation.ul1.is_none() && reservation.ul2.is_none())
+    }
+
+    pub fn trace_common_control_wait(&self, slot: u8) {
+        let i = usize::from(slot - 1);
+        tracing::debug!(
+            slot,
+            downlink = self.dltx_queues[i].len(),
+            half_duplex = self.dltx_half_duplex_queues[i].len(),
+            associated = self.assoc_dltx_queues[i].len(),
+            best_effort = self.assoc_best_effort_queues[i].len(),
+            random_access_acks = self.pending_ra_acks[i].len(),
+            downlink_circuit = self.circuits.is_active(Direction::Dl, slot),
+            uplink_circuit = self.circuits.is_active(Direction::Ul, slot),
+            packet_bearer = self.packet_bearer_is_active(slot),
+            reservations = self.ulsched[i].iter().filter(|r| r.ul1.is_some() || r.ul2.is_some()).count(),
+            "waiting for common SCCH resource drain"
+        );
+    }
+
+    /// An unallocated slot cannot drain ordinary signalling by itself. Move
+    /// unstarted basic-link resources to MCCH before making it an SCCH. MAC
+    /// fragments and packet resources belong to the old physical link: drop
+    /// them with their reporters so LLC retries instead of migrating a partial
+    /// transfer. Never withdraw an already announced uplink reservation.
+    pub fn prepare_free_common_control_slot(&mut self, slot: u8) -> bool {
+        let i = usize::from(slot - 1);
+        if self.assigned_channel_is_active(slot)
+            || self.ulsched[i].iter().any(|r| r.ul1.is_some() || r.ul2.is_some())
+            || self
+                .associated_ulsched
+                .iter()
+                .any(|(time, _)| time.t == slot && time.age(self.cur_dltime) <= 16)
+        {
+            return false;
+        }
+        self.dl_drop_associated_control(slot);
+        let mut queued = std::mem::take(&mut self.dltx_queues[i]);
+        queued.append(&mut self.dltx_half_duplex_queues[i]);
+        let count = queued.len();
+        for elem in queued {
+            match elem {
+                DlSchedElem::Resource(_, sdu, None, _, None) if sdu.get_len() == 0 => {
+                    // An old MAC-only grant/RA response has no higher-layer
+                    // payload to recover after its physical resource drained.
+                }
+                DlSchedElem::Resource(mut pdu, sdu, reporter, aie, None) => {
+                    // Grants are relative to the channel on which they are
+                    // sent. MCCH will reserve a fresh ACK grant when needed.
+                    pdu.slot_granting_element = None;
+                    pdu.update_len_and_fill_ind(sdu.get_len());
+                    self.dltx_queues[0].push(DlSchedElem::Resource(pdu, sdu, reporter, aie, None));
+                }
+                DlSchedElem::Resource(_, _, Some(reporter), _, Some(_)) | DlSchedElem::Stealing(_, Some(reporter), ..) => {
+                    if reporter.get_state() == tetra_core::TxState::Pending {
+                        reporter.mark_discarded();
+                    }
+                }
+                // Dropping a fragger notifies its reporter. Unsent old-link
+                // grant/RA metadata is no longer applicable to the free slot.
+                _ => {}
+            }
+        }
+        self.pending_ra_acks[i].clear();
+        if count > 0 {
+            tracing::info!(
+                slot,
+                count,
+                "recovered queued signalling from free slot before common SCCH allocation"
+            );
+        }
+        self.common_slot_is_drained(slot)
     }
 
     pub fn retire_common_control_slot(&mut self, slot: u8, target: u8) {
@@ -2095,7 +2173,10 @@ impl BsChannelScheduler {
 
     #[cfg(test)]
     pub(crate) fn pending_final_gck_rollover_count(&self) -> usize {
-        self.final_gck_rollover_immediate.iter().filter(|reservation| reservation.is_some()).count()
+        self.final_gck_rollover_immediate
+            .iter()
+            .filter(|reservation| reservation.is_some())
+            .count()
     }
 
     fn build_final_gck_rollover_resource(&mut self, item: FinalGckRolloverImmediate, ts: TdmaTime, capacity: usize) -> BitBuffer {
@@ -3410,12 +3491,17 @@ impl BsChannelScheduler {
     }
 
     pub fn set_secondary_random_access_definition(&mut self, slot: u8, update: RandomAccessUpdate) {
-        if (2..=3).contains(&slot) { self.secondary_access[usize::from(slot - 2)] = Some(update); }
+        if (2..=3).contains(&slot) {
+            self.secondary_access[usize::from(slot - 2)] = Some(update);
+        }
     }
 
     fn access_definition_for_slot(&self, slot: u8) -> RandomAccessUpdate {
-        if (2..=3).contains(&slot) { self.secondary_access[usize::from(slot - 2)].unwrap_or_else(|| self.random_access_definition()) }
-        else { self.random_access_definition() }
+        if (2..=3).contains(&slot) {
+            self.secondary_access[usize::from(slot - 2)].unwrap_or_else(|| self.random_access_definition())
+        } else {
+            self.random_access_definition()
+        }
     }
 
     pub fn set_random_access_definition(&mut self, parameters: RandomAccessParameters, frame_len: u8) {
@@ -3568,7 +3654,13 @@ impl BsChannelScheduler {
             );
             self.build_final_gck_rollover_slot(item, ts)
         } else if self.force_common_sysinfo && ts.f == 18 {
-            TmvUnitdataReqSlot { ts, blk1: None, blk2: None, bbk: None, ul_phy_chan: ul_phy }
+            TmvUnitdataReqSlot {
+                ts,
+                blk1: None,
+                blk2: None,
+                bbk: None,
+                ul_phy_chan: ul_phy,
+            }
         } else if ts.f == 18
             && ts.t != 1
             && !frame18_broadcast_slot
@@ -3781,9 +3873,12 @@ impl BsChannelScheduler {
                 if self.is_common_control(ts.t) {
                     if let Some(default) = sysinfo.default_access_code.as_mut() {
                         let definition = self.access_definition_for_slot(ts.t).parameters;
-                        default.imm = definition.imm; default.wt = definition.wt; default.nu = definition.nu;
+                        default.imm = definition.imm;
+                        default.wt = definition.wt;
+                        default.nu = definition.nu;
                         default.fl_factor = definition.frame_len_factor;
-                        default.ts_ptr = definition.ts_pointer; default.min_pdu_prio = definition.min_pdu_prio;
+                        default.ts_ptr = definition.ts_pointer;
+                        default.min_pdu_prio = definition.min_pdu_prio;
                     }
                 }
                 sysinfo.to_bitbuf(&mut buf);
@@ -4039,9 +4134,12 @@ impl BsChannelScheduler {
                         if self.should_emit_access_define(ts) {
                             let mut access = self.precomps.access_define.as_ref().expect("checked above").clone();
                             let definition = self.access_definition_for_slot(ts.t).parameters;
-                            access.imm = definition.imm; access.wt = definition.wt; access.nu = definition.nu;
+                            access.imm = definition.imm;
+                            access.wt = definition.wt;
+                            access.nu = definition.nu;
                             access.frame_len_factor = definition.frame_len_factor;
-                            access.ts_pointer = definition.ts_pointer; access.min_pdu_prio = definition.min_pdu_prio;
+                            access.ts_pointer = definition.ts_pointer;
+                            access.min_pdu_prio = definition.min_pdu_prio;
                             access.to_bitbuf(&mut buf1);
                         } else {
                             MacResource::null_pdu().to_bitbuf(&mut buf1);
@@ -4319,6 +4417,44 @@ mod tests {
     }
 
     #[test]
+    fn scch_expansion_recovers_free_slot_signalling_after_uplink_grants_drain() {
+        let mut sched = get_testing_slotter();
+        sched.cur_dltime = TdmaTime::default();
+        let addr = TetraAddress::issi(77468);
+        let aie = AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacResource);
+        let grant = sched.ul_process_cap_req(3, addr, &ReservationRequirement::Req1Slot).unwrap();
+        let resource = BsChannelScheduler::dl_make_minimal_resource(&addr, Some(grant), false);
+        let reporter = TxReporter::new();
+        let fragmented = TxReporter::new();
+        sched.dltx_queues[2].push(DlSchedElem::Resource(
+            resource.clone(),
+            BitBuffer::from_bitstr("1010"),
+            Some(reporter.clone()),
+            aie,
+            None,
+        ));
+        sched.dltx_queues[2].push(DlSchedElem::FragBuf(
+            BsFragger::new_with_aie(resource, BitBuffer::from_bitstr("1010"), Some(fragmented.clone()), aie),
+            None,
+        ));
+        assert!(!sched.prepare_free_common_control_slot(3));
+        assert_eq!(sched.dltx_queues[2].len(), 2);
+        assert_eq!(fragmented.get_state(), tetra_core::TxState::Pending);
+        for reservation in &mut sched.ulsched[2] {
+            reservation.ul1 = None;
+            reservation.ul2 = None;
+        }
+        assert!(sched.prepare_free_common_control_slot(3));
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Pending);
+        assert_eq!(fragmented.get_state(), tetra_core::TxState::Discarded);
+        let DlSchedElem::Resource(pdu, _, _, _, _) = &sched.dltx_queues[0][0] else {
+            panic!("MCCH resource")
+        };
+        assert!(pdu.slot_granting_element.is_none());
+        assert!(sched.common_slot_is_drained(3));
+    }
+
+    #[test]
     fn common_scch_has_common_aach_independent_access_and_sysinfo() {
         let mut sched = get_testing_slotter();
         sched.set_common_control_channels(2, 2, false);
@@ -4331,7 +4467,9 @@ mod tests {
             let mut aach = sched.generate_bbk_block(time).mac_block;
             aach.seek(0);
             let aach = AccessAssign::from_bitbuf(&mut aach).unwrap();
-            let AccessAssign::DownlinkCommonControlUplinkCommonOnly { access_field_1, .. } = aach else { panic!("common AACH") };
+            let AccessAssign::DownlinkCommonControlUplinkCommonOnly { access_field_1, .. } = aach else {
+                panic!("common AACH")
+            };
             assert_eq!(access_field_1.base_frame_len, sched.common_access_frame_len(slot));
             sched.cur_dltime = time.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
             let result = sched.finalize_ts_for_tick();
@@ -4366,7 +4504,12 @@ mod tests {
     fn cell_monitor_uses_effective_broadcast_parameters_and_tdma_time() {
         use crate::monitoring::CellSnapshot;
         let mut sched = get_testing_slotter();
-        let time = TdmaTime { h: 65535, m: 60, f: 18, t: 4 };
+        let time = TdmaTime {
+            h: 65535,
+            m: 60,
+            f: 18,
+            t: 4,
+        };
         let mut settings = RuntimeOperatorSettings::default();
         settings.ms_txpwr_max_cell = 6;
         settings.rxlev_access_min = 5;
@@ -4383,7 +4526,10 @@ mod tests {
         let snapshot = CellSnapshot::from_broadcast(sched.broadcast_parameters(), time, None);
         assert_eq!(snapshot.time, time);
         assert_eq!((snapshot.mcc, snapshot.mnc, snapshot.location_area), (310, 1234, 102));
-        assert_eq!((snapshot.ms_txpwr_max_cell, snapshot.rxlev_access_min, snapshot.access_parameter), (6, 5, 9));
+        assert_eq!(
+            (snapshot.ms_txpwr_max_cell, snapshot.rxlev_access_min, snapshot.access_parameter),
+            (6, 5, 9)
+        );
         assert_eq!(snapshot.frequencies_hz, Some((421_606_250, 411_606_250)));
         assert!(snapshot.services.contains(&("System-wide services".into(), false)));
         assert!(snapshot.services.contains(&("Security class 3".into(), true)));
@@ -4543,7 +4689,6 @@ mod tests {
         assert!(sched.dl_take_prioritized_sched_item(TdmaTime { t: 1, f: 2, m: 2, h: 0 }).is_none());
         assert!(sched.dltx_queues[0].is_empty());
     }
-
 
     #[test]
     fn all_ms_gck_notice_uses_cck_and_precedes_ordinary_mcch() {
@@ -7184,7 +7329,10 @@ mod tests {
             vec![(gssi, 4)],
         )
         .expect("current and future group keys");
-        assert_eq!(sc3.schedule_gck_rollover(1, activation.add_timeslots(-4)).map(|(_, at)| at), Some(activation));
+        assert_eq!(
+            sc3.schedule_gck_rollover(1, activation.add_timeslots(-4)).map(|(_, at)| at),
+            Some(activation)
+        );
         config.state_write().aie = RuntimeAieConfig {
             enabled: true,
             sc1_allowed: false,
