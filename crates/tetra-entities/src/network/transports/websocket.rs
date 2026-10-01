@@ -282,6 +282,7 @@ pub struct WebSocketTransport {
     last_ping_sent_at: Option<Instant>,
     last_ping_id: Option<u64>,
     ping_seq: u64,
+    last_rtt: Option<(Duration, Instant)>,
 }
 
 impl WebSocketTransport {
@@ -295,6 +296,7 @@ impl WebSocketTransport {
             last_ping_sent_at: None,
             last_ping_id: None,
             ping_seq: 0,
+            last_rtt: None,
         }
     }
 
@@ -522,6 +524,7 @@ impl NetworkTransport for WebSocketTransport {
         self.ping_seq = 0;
         self.last_ping_id = None;
         self.last_ping_sent_at = None;
+        self.last_rtt = None;
 
         Ok(())
     }
@@ -596,6 +599,7 @@ impl NetworkTransport for WebSocketTransport {
                         if Some(pong_id) == self.last_ping_id {
                             if let Some(sent_at) = self.last_ping_sent_at {
                                 let rtt = rx_at.duration_since(sent_at);
+                                self.last_rtt = Some((rtt, rx_at));
                                 tracing::trace!("WebSocketTransport: ping rtt_ms={:.1}", rtt.as_secs_f64() * 1000.0);
                             }
                         }
@@ -675,5 +679,9 @@ impl NetworkTransport for WebSocketTransport {
 
     fn is_connected(&self) -> bool {
         self.ws.is_some()
+    }
+
+    fn rtt_sample(&self) -> Option<(Duration, Instant)> {
+        self.last_rtt
     }
 }

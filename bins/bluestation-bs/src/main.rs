@@ -30,6 +30,8 @@ use tetra_entities::{
     umac::umac_bs::UmacBs,
 };
 
+mod web;
+
 /// Load configuration file
 fn load_config_from_toml(cfg_path: &str) -> StackConfig {
     match parsing::from_file(cfg_path) {
@@ -229,16 +231,32 @@ fn main() {
     })
     .expect("failed to set Ctrl+C handler");
 
+    let requested_monitor = cfg.config().web.enabled.then(|| Arc::new(tetra_entities::monitoring::MonitorState::default()));
+    let web_server = requested_monitor.as_ref().and_then(|monitor| {
+        let settings = cfg.config();
+        let swmi = settings.swmi.as_ref().map(|s| (s.host.as_str(), s.port, s.tls));
+        match web::start(&settings.web, &args.config, swmi, monitor.clone(), cfg.clone(), is_running.clone()) {
+            Ok(server) => Some(server),
+            Err(error) => {
+                tracing::error!(%error, "BS dashboard unavailable");
+                None
+            }
+        }
+    });
+    let monitor = requested_monitor.filter(|_| web_server.is_some());
+
     if let Some(swmi_worker) = swmi_worker {
-        net_swmi::start(cfg.clone(), swmi_worker);
+        net_swmi::start_with_monitor(cfg.clone(), swmi_worker, monitor.clone());
         while is_running.load(Ordering::Relaxed) && cfg.state_read().station_provisioning.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if !is_running.load(Ordering::Relaxed) {
+            if let Some(server) = web_server { server.join(); }
             return;
         }
     }
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, swmi_mm, _swmi_cmce, swmi_mle, swmi_media, swmi_rf, swmi_packet);
+    if let Some(monitor) = monitor { router.set_monitor(monitor); }
 
     // Start Telemetry and Control threads, if enabled
     if let Some(telemetry_source) = tsource {
@@ -249,6 +267,7 @@ fn main() {
     };
     // Start the stack
     router.run_stack(None, Some(is_running));
+    if let Some(server) = web_server { server.join(); }
 
     // router drops here → entities are dropped, networked entities disconnect.
 }

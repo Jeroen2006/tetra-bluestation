@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BlueStation · Base station</title>
+  <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/bootstrap.min.css">
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script>
+    try { const saved = localStorage.getItem('bs-theme'); document.documentElement.dataset.bsTheme = saved || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); } catch (_) {}
+  </script>
+</head>
+<body>
+  <div class="app-shell container-xxl">
+    <div class="navigation-row">
+    <nav class="tab-nav nav nav-tabs" role="tablist" aria-label="Dashboard sections">
+      <button role="tab" aria-selected="true" aria-controls="view-overview" id="tab-overview" class="nav-link active" data-tab="overview">Overview</button>
+      <button role="tab" aria-selected="false" aria-controls="view-cell" id="tab-cell" class="nav-link" data-tab="cell">Cell</button>
+      <button role="tab" aria-selected="false" aria-controls="view-system" id="tab-system" class="nav-link" data-tab="system">System</button>
+      <button role="tab" aria-selected="false" aria-controls="view-ra" id="tab-ra" class="nav-link" data-tab="ra">Random Access</button>
+      <button role="tab" aria-selected="false" aria-controls="view-terminals" id="tab-terminals" class="nav-link" data-tab="terminals">Terminals <span id="tab-terminal-count" class="badge text-bg-secondary tab-count">0</span></button>
+      <button role="tab" aria-selected="false" aria-controls="view-swmi" id="tab-swmi" class="nav-link" data-tab="swmi">SwMI</button>
+      <button role="tab" aria-selected="false" aria-controls="view-config" id="tab-config" class="nav-link" data-tab="config">Configuration</button>
+    </nav>
+    <div class="nav-tools"><span id="connection-status" class="badge text-bg-warning" role="status" hidden></span><button id="theme-toggle" class="btn btn-outline-secondary theme-toggle" type="button" aria-label="Switch color mode" title="Switch color mode">◐</button></div>
+    </div>
+
+    <main>
+      <section id="view-overview" role="tabpanel" aria-labelledby="tab-overview" class="view active">
+        <div class="status-grid" aria-label="Current state">
+          <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">SwMI</span><strong id="overview-swmi" class="badge text-bg-secondary">—</strong><small id="overview-ping">—</small></div></div>
+          <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">Radio</span><strong id="overview-radio" class="badge text-bg-secondary">—</strong><small id="overview-radio-detail">—</small></div></div>
+          <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">Random Access</span><strong id="overview-ra" class="badge text-bg-secondary">—</strong><small id="overview-ra-mode">—</small></div></div>
+          <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">Terminals</span><strong id="overview-terminals">—</strong><small id="overview-pdp">—</small></div></div>
+          <div class="status-item card shadow-sm"><div class="card-body"><span class="status-label">System</span><strong id="overview-cpu">—</strong><small id="overview-ram">—</small></div></div>
+        </div>
+        <div class="overview-columns overview-radio-columns">
+          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Random Access</h2></div><div class="slot-list overview-ra-values"><div class="slot"><span>IMM</span><strong id="overview-ra-imm">—</strong></div><div class="slot"><span>WT</span><strong id="overview-ra-wt">—</strong></div><div class="slot"><span>Nu</span><strong id="overview-ra-nu">—</strong></div><div class="slot"><span>Frame length</span><strong id="overview-ra-frame">—</strong></div></div></div></section>
+          <section class="plain-section card shadow-sm"><div class="card-body"><div class="section-line"><h2>Radio resources</h2></div><div class="slot-list" id="overview-slots"></div></div></section>
+        </div>
+        <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>Terminals</h2><button id="overview-all-terminals" type="button" class="btn btn-sm btn-outline-primary">View all</button></div><div class="overview-terminal-head" aria-hidden="true"><span>ISSI / status</span><span>RSSI</span><span>Last seen</span><span>Talkgroups</span><span>PDP</span><span></span></div><div id="overview-terminal-list" class="list-group list-group-flush"></div><div id="overview-terminal-empty" class="empty-state" hidden>No registered terminals</div></div></section>
+        <section class="plain-section card shadow-sm lower-sections"><div class="card-body"><div class="section-line"><h2>System activity</h2></div><div class="chart-wrap"><canvas id="chart-overview" aria-label="CPU and RAM history, last 15 minutes" role="img"></canvas></div><div class="inline-values"><span>CPU temperature <b id="overview-temperature">—</b></span><span>Network RX / TX <b id="overview-network">—</b></span></div></div></section>
+      </section>
+
+      <section id="view-cell" role="tabpanel" aria-labelledby="tab-cell" class="view" hidden>
+        <div class="system-columns cell-columns">
+          <div class="system-column">
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Cell identity</h2><span id="cell-radio" class="badge text-bg-secondary">—</span></div><div class="cell-identity"><div><span>MCC</span><strong id="cell-mcc">—</strong></div><div><span>MNC</span><strong id="cell-mnc">—</strong></div><div><span>Location area</span><strong id="cell-la">—</strong></div></div><div id="cell-identity-properties"></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Carrier</h2></div><div id="cell-carrier-properties"></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>SYSINFO</h2></div><div id="cell-sysinfo-properties"></div></section>
+          </div>
+          <div class="system-column">
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>TDMA counters</h2><span class="badge text-bg-secondary" title="Snapshot of the downlink TDMA clock, sampled once per second">1 s sample</span></div><div class="tdma-counters"><div><span>Hyperframe</span><strong id="cell-hf">—</strong></div><div><span>Multiframe</span><strong id="cell-mf">—</strong></div><div><span>Frame</span><strong id="cell-frame">—</strong></div><div><span>Timeslot</span><strong id="cell-ts">—</strong></div></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Timeslot allocation</h2><span id="cell-slots-used" class="badge text-bg-secondary">—</span></div><div class="slot-list" id="cell-slots"></div><div class="chart-wrap"><canvas id="chart-cell-slots" aria-label="Allocated timeslots per type, last 15 minutes, sampled once per second" role="img"></canvas></div></section>
+            <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Broadcast services</h2></div><div id="cell-services" class="cell-services"></div></section>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-system" role="tabpanel" aria-labelledby="tab-system" class="view" hidden>
+        <div class="system-columns">
+          <div class="system-column">
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Usage</h2></div>
+            <div class="meter-row"><div><span>CPU</span><strong id="system-cpu">—</strong></div><div class="progress" role="progressbar" aria-label="CPU usage"><div id="cpu-bar" class="progress-bar"></div></div></div>
+            <div class="meter-row"><div><span>Memory</span><strong id="system-ram">—</strong></div><div class="progress" role="progressbar" aria-label="RAM usage"><div id="ram-bar" class="progress-bar"></div></div></div>
+            <div class="property-row"><span>BS process CPU</span><strong id="system-process-cpu">—</strong></div><div class="property-row"><span>BS process RAM</span><strong id="system-process-ram">—</strong></div>
+          </section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>CPU and memory</h2></div><div class="chart-wrap"><canvas id="chart-system" aria-label="CPU and RAM history, last 15 minutes" role="img"></canvas></div></section>
+          </div>
+          <div class="system-column">
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Platform</h2></div><div id="platform-properties"></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Temperatures</h2></div><div class="chart-wrap temperature-chart"><canvas id="chart-temperature" aria-label="Temperature history by sensor, last 15 minutes" role="img"></canvas></div></section>
+          </div>
+        </div>
+        <section class="plain-section card card-body shadow-sm lower-sections"><div class="section-line"><h2>Network</h2><select id="network-select" class="form-select form-select-sm interface-select" aria-label="Network interface"></select></div><div class="chart-wrap compact"><canvas id="chart-network" aria-label="Network receive and transmit history" role="img"></canvas></div><div class="table-responsive"><table class="table table-striped table-hover data-table"><thead><tr><th>Interface</th><th class="text-end">RX / s</th><th class="text-end">TX / s</th><th class="text-end">RX total</th><th class="text-end">TX total</th><th class="text-end">Packets RX / TX</th><th class="text-end">Errors / drops</th></tr></thead><tbody id="network-rows"></tbody></table></div></section>
+      </section>
+
+      <section id="view-ra" role="tabpanel" aria-labelledby="tab-ra" class="view" hidden>
+        <div class="ra-summary"><div class="card card-body shadow-sm"><span class="status-label">Mode</span><strong id="ra-mode">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Load</span><strong id="ra-load" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Window score</span><strong id="ra-score">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">EWMA</span><strong id="ra-ewma">—</strong></div></div>
+        <div class="overview-columns">
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Parameters on air</h2></div><div class="table-responsive"><table class="table table-striped data-table"><thead><tr><th>Parameter</th><th class="text-end">Current</th><th class="text-end">Min</th><th class="text-end">Max</th></tr></thead><tbody id="ra-parameters"></tbody></table></div><div id="ra-extra" class="inline-values"></div></section>
+          <section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Load history</h2></div><div class="chart-wrap"><canvas id="chart-ra" aria-label="Random Access EWMA score and thresholds, last 15 minutes" role="img"></canvas></div></section>
+        </div>
+        <section class="plain-section card card-body shadow-sm lower-sections"><div class="section-line"><h2>Last measurement window</h2></div><div class="measure-grid" id="ra-measures"></div></section>
+      </section>
+
+      <section id="view-terminals" role="tabpanel" aria-labelledby="tab-terminals" class="view" hidden>
+        <div class="table-tools"><input id="terminal-search" type="search" class="form-control form-control-sm" placeholder="Search ISSI or talkgroup" aria-label="Search terminals"><select id="terminal-filter" class="form-select form-select-sm" aria-label="Filter terminals"><option value="all">All terminals</option><option value="active">Active</option><option value="pending">Pending</option><option value="pdp">PDP context</option><option value="no-pdp">No PDP context</option></select><select id="terminal-sort" class="form-select form-select-sm" aria-label="Sort terminals"><option value="issi">ISSI</option><option value="last-seen">Last seen</option><option value="rssi">RSSI</option></select><span id="terminal-results" class="time-label"></span></div>
+        <div class="terminal-table-wrap card shadow-sm"><div class="table-responsive"><table class="table table-striped table-hover data-table terminal-table"><thead><tr><th>ISSI</th><th class="text-end">RSSI · dBFS</th><th>Last seen</th><th>Talkgroups</th><th>Status</th><th>PDP</th><th><span class="visually-hidden">Details</span></th></tr></thead><tbody id="terminal-rows"></tbody></table></div></div>
+        <div id="terminal-empty" class="empty-state" hidden>No registered terminals</div>
+        <div class="pager"><button id="terminal-prev" type="button" class="btn btn-sm btn-outline-secondary">Previous</button><span id="terminal-page">—</span><button id="terminal-next" type="button" class="btn btn-sm btn-outline-secondary">Next</button></div>
+      </section>
+
+      <section id="view-swmi" role="tabpanel" aria-labelledby="tab-swmi" class="view" hidden>
+        <div class="ra-summary"><div class="card card-body shadow-sm"><span class="status-label">Connection</span><strong id="swmi-phase" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">WebSocket RTT</span><strong id="swmi-rtt">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Central services</span><strong id="swmi-service" class="badge text-bg-secondary">—</strong></div><div class="card card-body shadow-sm"><span class="status-label">Reconnects</span><strong id="swmi-reconnects">—</strong></div></div>
+        <div class="overview-columns"><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Ping history</h2></div><div class="chart-wrap"><canvas id="chart-swmi" aria-label="SwMI WebSocket RTT samples, last 15 minutes" role="img"></canvas></div></section><section class="plain-section card card-body shadow-sm"><div class="section-line"><h2>Connection details</h2></div><div id="swmi-properties"></div></section></div>
+      </section>
+
+      <section id="view-config" role="tabpanel" aria-labelledby="tab-config" class="view" hidden>
+        <div class="config-shell card shadow-sm"><div class="card-body">
+          <div id="config-message" class="alert" role="status" hidden></div>
+          <div class="config-toolbar"><nav class="nav nav-pills config-tabs" aria-label="Configuration sections">
+            <button type="button" class="nav-link active" data-config-section="ra">Random Access</button>
+            <button type="button" class="nav-link" data-config-section="broadcast">Network broadcast</button>
+            <button type="button" class="nav-link" data-config-section="cell">Cell</button>
+          </nav></div>
+          <form id="config-form">
+            <div id="config-ra" class="config-panel"></div>
+            <div id="config-broadcast" class="config-panel" hidden></div>
+            <div id="config-cell" class="config-panel" hidden></div>
+            <div class="config-actions"><button type="button" id="config-reload" class="btn btn-outline-secondary">Reload</button><button type="submit" id="config-save" class="btn btn-primary">Save &amp; apply</button></div>
+          </form>
+        </div></div>
+      </section>
+    </main>
+  </div>
+  <div class="modal fade" id="terminal-modal" tabindex="-1" aria-labelledby="terminal-modal-title" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable modal-dialog-centered">
+      <div class="modal-content">
+        <div class="modal-header"><h2 class="modal-title fs-5" id="terminal-modal-title">Terminal</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body"><div id="terminal-modal-details" class="terminal-detail"></div></div>
+        <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+      </div>
+    </div>
+  </div>
+  <script src="/assets/bootstrap.min.js"></script>
+  <script src="/assets/chart.umd.min.js"></script>
+  <script src="/assets/dashboard.js"></script>
+  <script src="/assets/frequency.js"></script>
+  <script src="/assets/config.js"></script>
+</body>
+</html>

@@ -6,6 +6,27 @@
 
 This is a FOSS TETRA stack aimed at providing an extensible basis for TETRA experimentation and research. At this point, it's alpha code. The stack serves a downlink base station signal, and a properly configured MS is able to receive the emitted downlink signal, connect to it, and attach to talkgroups. Voice calls are partially supported. Connectivity through Brew with the larger BrandMeister network is also optionally available. Lots of other functionality is currently not implemented, although parsing code for most TETRA protocol messages is already present. 
 
+## Local BS dashboard
+
+`bluestation-bs` includes a dashboard for system, radio, terminal, Random Access and SwMI status, with an editable Configuration page. Add this section to the BS TOML configuration, then restart the BS:
+
+```toml
+[web]
+enabled = true
+bind_address = "0.0.0.0"
+port = 8080
+```
+
+Open `http://<bs-address>:8080/`. The dashboard is disabled when `[web]` is absent or `enabled = false`. Its assets are included in the BS binary; no separate web server or internet connection is needed. The most recent 15 minutes of charts are held in memory and restart with the BS. The page has no authentication; choose an appropriate interface or network for the listener.
+
+The JSON status is available at `/api/v1/snapshot` and `/api/v1/history`. Unknown measurements are `null` rather than zero. `--check-config` validates the web settings without opening a listener.
+
+The Cell tab shows the effective broadcast identity, carrier, SYSINFO and service flags, plus a one-second snapshot of the downlink hyperframe/multiframe/frame/timeslot counters. Its chart counts allocated slots per type (control, voice and packet data), not individual transmitted bursts, on a fixed 0–4 axis. The same colours are used for slots throughout the dashboard: blue control, orange voice, purple packet data and grey free.
+
+Configuration → Cell includes a live Enable TX switch, persisted as `[phy_io].tx_enabled` (default `true`). Disabling it stops transmission while reception and SwMI stay active. Enabling it still requires the usual network radio permission; it does not override provisioning or recovery gates.
+
+The same page lets you edit the colour code (CC, 0–63), persisted as `[cell_info].colour_code`. Code 0 uses the predefined scrambling sequence. Colour-code and frequency changes restart the BS on save so the broadcast, radio scrambling and encryption use consistent settings; the page shows when a restart is required.
+
 ## Documentation
 
 Project documentation for tetra-bluestation is maintained in a separate repository, as a wiki.

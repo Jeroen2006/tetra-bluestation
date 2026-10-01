@@ -28,6 +28,9 @@ pub use sec_telemetry::*;
 pub mod sec_control;
 pub use sec_control::*;
 
+pub mod sec_web;
+pub use sec_web::*;
+
 pub mod sec_rua;
 pub use sec_rua::*;
 

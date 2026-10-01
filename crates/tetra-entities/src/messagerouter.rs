@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::{TdmaTime, tetra_entities::TetraEntity};
 use tetra_saps::SapMsg;
 
 use crate::TetraEntityTrait;
+use crate::monitoring::{EntitySnapshot, RadioSnapshot, SharedMonitor, TerminalSnapshot, unix_ms};
 
 #[derive(Default)]
 pub enum MessagePrio {
@@ -64,6 +66,8 @@ pub struct MessageRouter {
     /// For Bs mode, this is always available
     /// For Ms/Mon mode, it is recovered from a received SYNC frame and communicated in a different way
     ts: TdmaTime,
+    monitor: Option<SharedMonitor>,
+    last_monitor_sample: Instant,
 }
 
 impl MessageRouter {
@@ -73,6 +77,8 @@ impl MessageRouter {
             msg_queue: MessageQueue { messages: VecDeque::new() },
             _config: config,
             ts: TdmaTime::default(),
+            monitor: None,
+            last_monitor_sample: Instant::now(),
         }
     }
 
@@ -86,6 +92,67 @@ impl MessageRouter {
         let comp_type = entity.entity();
         tracing::debug!("register_entity {:?}", comp_type);
         self.entities.insert(comp_type, entity);
+    }
+
+    pub fn set_monitor(&mut self, monitor: SharedMonitor) {
+        self.monitor = Some(monitor);
+        self.last_monitor_sample = Instant::now() - Duration::from_secs(1);
+    }
+
+    fn publish_monitor_snapshot(&mut self) {
+        let Some(monitor) = self.monitor.as_ref() else { return };
+        if self.last_monitor_sample.elapsed() < Duration::from_secs(1) { return; }
+        self.last_monitor_sample = Instant::now();
+        let mut ra = None;
+        let mut cell = None;
+        let mut rf = HashMap::new();
+        let mut last_seen = HashMap::new();
+        let mut pdp = HashMap::new();
+        for entity in self.entities.values_mut() {
+            match entity.monitoring_snapshot() {
+                Some(EntitySnapshot::Umac { cell: current_cell, ra: current, rf: signals, last_seen: seen }) => {
+                    cell = Some(current_cell);
+                    ra = Some(current);
+                    rf = signals;
+                    last_seen = seen;
+                }
+                Some(EntitySnapshot::Sndcp(contexts)) => pdp = contexts,
+                None => {}
+            }
+        }
+        let state = self._config.state_read();
+        let terminals = state.subscribers.monitor_subscribers().into_iter().map(|(issi, registered_at, active, pending, talkgroups)| TerminalSnapshot {
+            issi,
+            registration: if active { "Active" } else if pending { "Pending" } else { "Registered" }.to_owned(),
+            talkgroups,
+            last_seen_ms: last_seen.get(&issi).copied().filter(|seen| *seen >= registered_at),
+            rf: rf.get(&issi).filter(|sample| sample.measured_at_ms >= registered_at).cloned(),
+            pdp: pdp.get(&issi).filter(|context| context.created_at_ms >= registered_at).cloned(),
+        }).collect();
+        let mut timeslots = ["Control".to_owned(), "Free".to_owned(), "Free".to_owned(), "Free".to_owned()];
+        for (index, slot) in (2..=4).enumerate() {
+            if let Some(owner) = state.timeslot_alloc.owner(slot) {
+                timeslots[index + 1] = match owner {
+                    tetra_core::timeslot_alloc::TimeslotOwner::PacketData => "Packet data",
+                    tetra_core::timeslot_alloc::TimeslotOwner::Cmce => "Voice",
+                    tetra_core::timeslot_alloc::TimeslotOwner::Brew => "Network",
+                }.to_owned();
+            }
+        }
+        let snapshot = RadioSnapshot {
+            measured_at_ms: unix_ms(),
+            cell,
+            ra: ra.unwrap_or_default(), terminals, timeslots,
+            network_connected: state.network_connected,
+            radio_tx_allowed: state.radio_transmit_enabled(),
+            radio_tx_enabled: state.operator_tx_enabled,
+            radio_tx_active: state.radio_tx_active,
+            provisioned_once: state.provisioned_once,
+            advertisement_accepted: state.advertisement_accepted,
+            recovery_ready: state.recovery_ready,
+        };
+        drop(state);
+        if let Ok(mut slot) = monitor.radio.try_write() { *slot = snapshot; }
     }
 
     /// Returns a mut ref to a component of the requested type
@@ -214,6 +281,8 @@ impl MessageRouter {
 
             // Send tick_end event and process final messages
             self.tick_end();
+
+            self.publish_monitor_snapshot();
 
             // Check if we should stop
             ticks += 1;

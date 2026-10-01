@@ -15,6 +15,8 @@ stack_mode = "Bs"
 # PHY layer i/o configuration
 
 [phy_io]
+# Local TX switch; applies live from the web UI. SwMI permission is still required.
+# tx_enabled = true
 
 # Input type: set to SoapySdr. May allow for future non-soapy RF backends.
 backend = "SoapySdr"
@@ -138,7 +140,7 @@ tdma_synchronized = false
 # Open-loop power control broadcast parameters.
 # MS_TXPWR_MAX_CELL: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
 # ms_txpwr_max_cell = 4
-# RXLEV_ACCESS_MIN: 0=-116 dBm, 1=-114 dBm, ... 15=-86 dBm
+# RXLEV_ACCESS_MIN: 0=-125 dBm, 1=-120 dBm, ... 15=-50 dBm
 # rxlev_access_min = 3
 # ACCESS_PARAMETER: 0=-53 dBm, 1=-51 dBm, ... 15=-23 dBm
 # access_parameter = 7
@@ -222,3 +224,9 @@ reconnect_delay_secs = 5
 heartbeat_interval_secs = 2
 heartbeat_timeout_secs = 10
 allow_lst = true
+
+# Optional local, read-only monitoring dashboard.
+[web]
+enabled = false
+bind_address = "0.0.0.0"
+port = 8080

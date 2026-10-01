@@ -275,12 +275,12 @@ impl<D: RxTxDev> PhyBs<D> {
         // Prepare the TX slot for the tx device
         let tx_slot: [TxSlotBits; 1] = [TxSlotBits {
             time: self.dltime.add_timeslots(MACSCHED_TX_AHEAD as i32),
-            slot: self.config.state_read().radio_tx_allowed.then_some(&dl_burst),
+            slot: self.config.state_read().radio_transmit_enabled().then_some(&dl_burst),
             ..Default::default()
         }];
 
         // Code for testing mode, when capturing all DL output to file
-        if let Some(dl_tx_sender) = &self.dl_tx_sender && self.config.state_read().radio_tx_allowed {
+        if let Some(dl_tx_sender) = &self.dl_tx_sender && self.config.state_read().radio_transmit_enabled() {
             let _ = dl_tx_sender.try_send(FileWriteMsg::WriteBlock(dl_burst.to_vec()));
         }
 
@@ -368,7 +368,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyBs<D> {
 
     fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
-        let allowed = self.config.state_read().radio_tx_allowed;
+        let allowed = self.config.state_read().radio_transmit_enabled();
         let was_active = self.config.state_read().radio_tx_active;
         if let Err(error) = self.rxtxdev.set_transmit_enabled(allowed) {
             tracing::error!(?error, "cannot switch physical transmitter");

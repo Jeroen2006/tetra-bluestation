@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use tetra_core::ranges::{SortedDisjointSsiRanges, SsiRange};
@@ -84,7 +84,7 @@ pub struct RuntimeNetworkBroadcast {
 }
 
 /// Dynamic common-channel random-access control for access code A.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CfgRandomAccess {
     pub enabled: bool,
     pub update_interval_multiframes: u8,

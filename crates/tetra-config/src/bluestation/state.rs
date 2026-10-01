@@ -1,4 +1,4 @@
-use crate::bluestation::{RuntimeNetworkBroadcast, SharedConfig};
+use crate::bluestation::{RuntimeNetworkBroadcast, RuntimeOperatorSettings, SharedConfig};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
@@ -1525,6 +1525,8 @@ const DIRECT_RESPONSE_WINDOW_TIMESLOTS: i32 = 2 * 18 * 4;
 #[derive(Debug, Clone)]
 pub struct Subscriber {
     pub issi: u32,
+    /// Local registration time, used to fence older monitor observations.
+    pub registered_at_unix_ms: u64,
     /// SwMI registration command that established the current serving-cell
     /// anchor. Packet-data messages use it as a roaming generation fence.
     pub registration_generation: Option<u64>,
@@ -1736,6 +1738,21 @@ impl SubscriberRegistry {
         self.active_subscribers.iter().copied().collect()
     }
 
+    /// Current local registrations and their group affiliations for monitoring.
+    pub fn monitor_subscribers(&self) -> Vec<(u32, u64, bool, bool, Vec<u32>)> {
+        let mut rows = self.subscribers.values()
+            .map(|subscriber| {
+                let mut groups = subscriber.attached_groups.iter().copied().collect::<Vec<_>>();
+                groups.sort_unstable();
+                (subscriber.issi, subscriber.registered_at_unix_ms,
+                    self.active_subscribers.contains(&subscriber.issi),
+                    self.pending_registration_deliveries.contains(&subscriber.issi), groups)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|row| row.0);
+        rows
+    }
+
     pub fn mark_active(&mut self, issi: u32) {
         self.active_subscribers.insert(issi);
         self.pending_registration_deliveries.remove(&issi);
@@ -1793,6 +1810,7 @@ impl SubscriberRegistry {
             issi,
             Subscriber {
                 issi,
+                registered_at_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                 registration_generation: None,
                 attached_groups: HashSet::new(),
                 energy_economy_mode: 0,
@@ -1809,6 +1827,7 @@ impl SubscriberRegistry {
     pub fn get_subscriber_mut(&mut self, issi: u32) -> &mut Subscriber {
         self.subscribers.entry(issi).or_insert_with(|| Subscriber {
             issi,
+            registered_at_unix_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             registration_generation: None,
             attached_groups: HashSet::new(),
             energy_economy_mode: 0,
@@ -1970,6 +1989,8 @@ pub struct StackState {
     pub recovery_ready: bool,
     pub sc3g_ready: bool,
     pub radio_tx_allowed: bool,
+    /// Persistent local operator TX switch, independent of SwMI permission.
+    pub operator_tx_enabled: bool,
     pub radio_tx_active: bool,
     pub provisioned_once: bool,
     /// Authentication policy advertised by the currently connected SwMI cell.
@@ -2001,6 +2022,8 @@ pub struct StackState {
     /// Mutable D-NWRK-BROADCAST configuration controlled by the local control
     /// API. The worker reports each version to the SwMI.
     pub network_broadcast: RuntimeNetworkBroadcast,
+    /// Operator-edited radio access, cell advertisement and LST settings.
+    pub operator_settings: RuntimeOperatorSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2133,7 +2156,7 @@ mod tests {
         // The cancel was missed while this BS was disconnected. The new
         // preparation repeats the real active identity and must recover the
         // local staged state rather than reject the new rollover ID.
-        aie.stage_rollover(11, active, test_sc2(5, 17), 2)
+        aie.stage_rollover(11, active, test_sc2(5, 5), 2)
             .expect("replace stale unactivated rollover");
         assert_eq!(aie.staged_rollover_id(), Some(11));
     }
@@ -2149,7 +2172,7 @@ mod tests {
             .expect("activate rollover");
 
         let new_active = RuntimeSc2Binding::from_sc2(aie.sc2.as_ref().expect("active SC2"));
-        aie.stage_rollover(11, new_active, test_sc2(5, 16), 2 << 24)
+        aie.stage_rollover(11, new_active, test_sc2(5, 6), 2 << 24)
             .expect("a later rollover may follow an activated rollover");
         assert_eq!(aie.staged_rollover_id(), Some(11));
     }
@@ -2599,6 +2622,22 @@ mod tests {
     }
 
     #[test]
+    fn monitor_subscribers_includes_pending_and_active_with_sorted_groups() {
+        let mut registry = SubscriberRegistry::new();
+        registry.register(1002);
+        registry.set_registration_delivery_pending(1002, true);
+        registry.register(1001);
+        registry.affiliate(1001, 91);
+        registry.affiliate(1001, 3);
+        registry.mark_active(1001);
+        let rows = registry.monitor_subscribers();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].0, rows[0].2, rows[0].3, rows[0].4.as_slice()), (1001, true, false, [3, 91].as_slice()));
+        assert_eq!((rows[1].0, rows[1].2, rows[1].3), (1002, false, true));
+        assert!(rows[0].1 > 0 && rows[1].1 > 0);
+    }
+
+    #[test]
     fn direct_response_window_expires() {
         let mut reg = SubscriberRegistry::new();
         let now = TdmaTime::default();
@@ -2837,6 +2876,12 @@ mod tests {
     }
 }
 
+impl StackState {
+    pub fn radio_transmit_enabled(&self) -> bool {
+        self.operator_tx_enabled && self.radio_tx_allowed
+    }
+}
+
 impl Default for StackState {
     fn default() -> Self {
         Self {
@@ -2848,6 +2893,7 @@ impl Default for StackState {
             recovery_ready: false,
             sc3g_ready: false,
             radio_tx_allowed: false,
+            operator_tx_enabled: true,
             radio_tx_active: false,
             provisioned_once: false,
             authentication_required: false,
@@ -2864,6 +2910,7 @@ impl Default for StackState {
                 neighbours: Default::default(),
                 broadcast: Default::default(),
             },
+            operator_settings: RuntimeOperatorSettings::default(),
         }
     }
 }
