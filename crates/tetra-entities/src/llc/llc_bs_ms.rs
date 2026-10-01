@@ -840,7 +840,7 @@ impl Llc {
                 chan_alloc,
                 associated_channel: route,
                 assigned_channel_frame18_broadcast: false,
-                    frame18_rollover_activation: None,
+                frame18_rollover_activation: None,
                 tx_reporter,
             }),
         ));
@@ -2087,7 +2087,7 @@ impl Llc {
                 chan_alloc: prim.chan_alloc,
                 associated_channel: prim.associated_channel,
                 assigned_channel_frame18_broadcast: false,
-                    frame18_rollover_activation: None,
+                frame18_rollover_activation: None,
                 tx_reporter: Some(tx_reporter.clone()),
             }),
         };

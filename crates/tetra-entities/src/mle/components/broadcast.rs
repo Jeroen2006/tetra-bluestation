@@ -149,7 +149,7 @@ impl MleBroadcast {
                 chan_alloc: None,
                 associated_channel: None,
                 assigned_channel_frame18_broadcast: true,
-                    frame18_rollover_activation: None,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
             }),
         });

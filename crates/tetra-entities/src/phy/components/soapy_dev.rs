@@ -138,7 +138,10 @@ impl RxTxDev for RxTxDevSoapySdr {
             let c = self.config.config();
             let dl_freq = c.phy_io.soapysdr.as_ref().expect("Soapy settings").dl_freq_corrected().0;
             let frequencies = [dl_freq];
-            let phy_config = PhyConfig { bs_dl_frequencies: &frequencies, ..Default::default() };
+            let phy_config = PhyConfig {
+                bs_dl_frequencies: &frequencies,
+                ..Default::default()
+            };
             self.tx_dsp = Some(TxDsp::new(&mut FftPlanner::new(), &mut self.sdr, &phy_config));
         }
         self.sdr.set_tx_active(true).map_err(|_| RxTxDevError::RxReadError)

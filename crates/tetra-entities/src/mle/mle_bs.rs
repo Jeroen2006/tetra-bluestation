@@ -4,8 +4,8 @@ use crate::mle::components::{broadcast::MleBroadcast, network_time};
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::net_swmi::SwmiMleEndpoint;
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::{RuntimeSc2RolloverEvent, RuntimeSc3GRolloverEvent, pack_sc3g_absolute_iv};
 use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{RuntimeSc2RolloverEvent, RuntimeSc3GRolloverEvent, pack_sc3g_absolute_iv};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     AieRequest, AieScope, AieSubject, BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log,
@@ -331,7 +331,7 @@ impl MleBs {
                 chan_alloc,
                 associated_channel: None,
                 assigned_channel_frame18_broadcast: false,
-                    frame18_rollover_activation: None,
+                frame18_rollover_activation: None,
                 tx_reporter: None,
             }),
             _ => SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
@@ -1001,10 +1001,7 @@ impl TetraEntityTrait for MleBs {
             .unwrap_or(0);
         let mut state = self.config.state_write();
         let (scheduled_sc3g_rollover, activated_sc3g_rollover) = if let Some(sc3) = state.aie.sc3.as_mut() {
-            (
-                sc3.schedule_gck_rollover(unix_now, ts),
-                sc3.activate_gck_rollover_if_due(ts),
-            )
+            (sc3.schedule_gck_rollover(unix_now, ts), sc3.activate_gck_rollover_if_due(ts))
         } else {
             (None, None)
         };
