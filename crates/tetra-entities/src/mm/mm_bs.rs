@@ -811,11 +811,16 @@ impl MmBs {
                 if let Some(swmi) = &self.swmi {
                     let state = self.config.state_read();
                     let assignment = state.subscribers.common_control(issi);
-                    let _ = swmi.submit(SwmiMessage::CommonControlReport {
-                        itsi: u64::from(issi), registration_generation: pending.command_id.unwrap_or(0),
-                        common_scch: assignment.supported, ms_scch: assignment.ms_scch,
-                        common_scch_count: state.common_control.advertised_count,
-                    });
+                    // Group attachments may complete the LU acceptance under
+                    // their own command ID. The serving registration still
+                    // belongs to the original RegistrationAttempt command.
+                    if let Some(registration_generation) = state.subscribers.registration_generation(issi) {
+                        let _ = swmi.submit(SwmiMessage::CommonControlReport {
+                            itsi: u64::from(issi), registration_generation,
+                            common_scch: assignment.supported, ms_scch: assignment.ms_scch,
+                            common_scch_count: state.common_control.advertised_count,
+                        });
+                    }
                 }
                 self.group_security_not_before
                     .insert(issi, self.current_time.add_timeslots(GROUP_SECURITY_REGISTRATION_GUARD_TIMESLOTS));
@@ -7558,6 +7563,30 @@ mod tests {
         );
         assert!(!mm.queued_group_security_associations.contains_key(&issi));
         assert!(!mm.pending_group_security_associations.contains_key(&issi));
+    }
+
+    #[test]
+    fn scch_report_uses_registration_generation_after_location_group_attachment() {
+        let issi = 77_480;
+        let config = test_config();
+        {
+            let mut state = config.state_write();
+            state.subscribers.register(issi);
+            state.subscribers.set_registration_generation(issi, 15);
+            state.common_control.physical_count = 1;
+            state.common_control.advertised_count = 1;
+            state.subscribers.select_common_control(issi, Some(true), 1, 1);
+        }
+        let (worker, endpoint, _, _, _, _, _) = crate::net_swmi::channel();
+        let mut mm = MmBs::new(config, None, None, Some(endpoint));
+        let reporter = TxReporter::new();
+        mm.track_registration_delivery(Some(17), issi, false, Vec::new(), reporter.clone());
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        mm.update_registration_delivery_statuses(&mut MessageQueue::new());
+        assert!(matches!(worker.try_recv_outgoing(), Some(tetra_swmi_protocol::SwmiMessage::CommonControlReport {
+            itsi: 77_480, registration_generation: 15, common_scch: Some(true), common_scch_count: 1, ..
+        })));
     }
 
     #[test]
