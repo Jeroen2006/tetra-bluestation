@@ -3807,7 +3807,9 @@ mod tests {
             let mut buffer = result.blk1.unwrap().mac_block;
             buffer.seek(0);
             let decoded = MacResource::from_bitbuf(&mut buffer).unwrap().addr.unwrap();
-            assert_eq!((decoded.ssi, decoded.ssi_type), (address.ssi, address.ssi_type));
+            assert_eq!(decoded.ssi, address.ssi);
+            // MAC-RESOURCE carries an SSI, not the MLE individual/group type.
+            assert_eq!(decoded.ssi_type, SsiType::Ssi);
         }
     }
 
