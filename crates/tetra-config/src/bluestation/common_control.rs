@@ -12,7 +12,7 @@ pub struct CommonControlAssignment {
 }
 
 pub fn common_control_slot(ms_scch: Option<u8>, count: u8) -> u8 {
-    1 + ms_scch.filter(|value| *value < 12).unwrap_or(0) % (count.min(2) + 1)
+    1 + ms_scch.filter(|value| *value < 12).unwrap_or(0) % (count.min(3) + 1)
 }
 
 pub fn ee_period_frames(mode: u8) -> u32 {
@@ -40,8 +40,8 @@ mod tests {
     use super::*;
     #[test]
     fn population_mapping_follows_the_air_interface_formula() {
-        for count in 0..=2 {
-            let mut loads = [0; 3];
+        for count in 0..=3 {
+            let mut loads = [0; 4];
             for value in 0..12 { loads[(common_control_slot(Some(value), count) - 1) as usize] += 1; }
             for slot in 0..=count as usize { assert_eq!(loads[slot], 12 / (count + 1)); }
         }

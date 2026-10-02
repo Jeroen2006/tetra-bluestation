@@ -249,7 +249,7 @@
     colourNote.hidden = true; cell.lastChild.append(colourNote);
     $('config-cell_info-colour_code').addEventListener('input', updateRestartPreview);
     settings.cell_info.common_scch_count ??= 0;
-    group(cell, 'Control channels', [['cell_info.common_scch_count', 'Common SCCH count', 0, 2, 'Extra control channels on TS2 and TS3. Applies live when those slots become free. Two SCCHs leave one slot for voice or packet data.']], settings);
+    group(cell, 'Control channels', [['cell_info.common_scch_count', 'Common SCCH count', 0, 3, 'Extra control channels on TS2, TS3 and TS4. Applies live when those slots become free. Three SCCHs use all slots for control, leaving no traffic slots for voice or packet data.']], settings);
     renderFrequency(cell, settings);
     const cellGroup = document.createElement('section'); cellGroup.className = 'config-group';
     const cellTitle = document.createElement('h2'); cellTitle.textContent = 'Cell access & power'; cellGroup.append(cellTitle);

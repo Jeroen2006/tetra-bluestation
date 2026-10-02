@@ -3909,9 +3909,11 @@ mod tests {
         .unwrap();
         let config = SharedConfig::from_parts(config, None);
         let mut umac = UmacBs::new(config.clone());
-        config.state_write().operator_settings.common_scch_count = 2;
+        config.state_write().operator_settings.common_scch_count = 3;
         umac.refresh_common_control_channels(TdmaTime::default());
         umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(1));
+        umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(2));
+        assert_eq!(config.state_read().common_control.advertised_count, 3);
         let address = TetraAddress::new(1502, SsiType::Gssi);
         let aie = AieRequest::clear(AieSubject::Group { gssi: 1502 }, AieScope::MacResource);
         let req = tetra_saps::tma::TmaUnitdataReq {
@@ -3939,7 +3941,7 @@ mod tests {
             req.pdu.clone(),
             aie,
         );
-        for slot in 1..=3 {
+        for slot in 1..=4 {
             umac.channel_scheduler.cur_dltime = TdmaTime { t: slot, f: 5, m: 1, h: 0 }.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
             let result = umac.channel_scheduler.finalize_ts_for_tick();
             assert_eq!(result.blk1.as_ref().unwrap().logical_channel, LogicalChannel::SchF);

@@ -1,9 +1,10 @@
 # Common secondary control channels
 
-Configure `common_scch_count = 0`, `1` or `2` in `[cell_info]`, or change
+Configure `common_scch_count = 0`, `1`, `2` or `3` in `[cell_info]`, or change
 **Cell configuration → Control channels → Common SCCH count** in the BS UI.
-The default is zero. MCCH remains on TS1; SCCH1 uses TS2 and SCCH2 uses TS3.
-With two SCCHs there is one remaining slot for voice/packet data. Minimum
+The default is zero. MCCH remains on TS1; SCCH1 uses TS2, SCCH2 uses TS3
+and SCCH3 uses TS4. With two SCCHs there is one remaining traffic slot.
+With three SCCHs there are no traffic slots for voice/packet data. Minimum
 mode is not advertised while common SCCH resources are present.
 
 The dashboard shows requested/advertised counts, transition status and the

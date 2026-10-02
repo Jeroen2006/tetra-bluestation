@@ -95,7 +95,7 @@ pub struct RadioSnapshot {
     pub common_scch_requested: u8,
     pub common_scch_active: u8,
     pub common_scch_transition: bool,
-    pub control_channel_loads: [u32; 3],
+    pub control_channel_loads: [u32; 4],
     pub network_connected: bool,
     pub radio_tx_allowed: bool,
     pub radio_tx_enabled: bool,

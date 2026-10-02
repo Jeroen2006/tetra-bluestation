@@ -215,8 +215,8 @@ fn encoded_dbm(value: i16, first: i16, last: i16, step: i16, label: &str) -> Res
 }
 
 fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Result<(), String> {
-    if settings.cell_info.common_scch_count.is_some_and(|count| count > 2) {
-        return Err("Common SCCH count must be 0-2".into());
+    if settings.cell_info.common_scch_count.is_some_and(|count| count > 3) {
+        return Err("Common SCCH count must be 0-3".into());
     }
     if settings.cell_info.colour_code.is_some_and(|code| code > 63) {
         return Err("Colour code must be 0-63 (6 bits)".to_owned());
@@ -350,7 +350,7 @@ mod tests {
         let original = parsing::from_toml_str(source).unwrap();
         let mut settings = EditableSettings::from_config(&original);
         let shared = tetra_config::bluestation::SharedConfig::from_parts(original.clone(), None);
-        for count in 0..=2 {
+        for count in 0..=3 {
             settings.cell_info.common_scch_count = Some(count);
             let mut document = source.parse::<DocumentMut>().unwrap();
             apply_settings(&mut document, &settings).unwrap();
@@ -361,7 +361,7 @@ mod tests {
             assert_eq!(shared.state_read().operator_settings.common_scch_count, count);
             assert_eq!(FrequencySettings::from_config(&original), FrequencySettings::from_config(&next));
         }
-        settings.cell_info.common_scch_count = Some(3);
+        settings.cell_info.common_scch_count = Some(4);
         assert!(apply_settings(&mut source.parse::<DocumentMut>().unwrap(), &settings).is_err());
     }
 

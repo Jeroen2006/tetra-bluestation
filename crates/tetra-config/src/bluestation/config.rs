@@ -142,8 +142,8 @@ impl StackConfig {
             };
         }
 
-        if self.cell.common_scch_count > 2 {
-            return Err("common_scch_count must be 0-2");
+        if self.cell.common_scch_count > 3 {
+            return Err("common_scch_count must be 0-3");
         }
         if self.cell.colour_code > 63 {
             return Err("colour_code must be 0-63 (6 bits)");

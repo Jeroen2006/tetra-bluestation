@@ -63,7 +63,7 @@
          let mut out = Vec::with_capacity(64);
          match self {
 +            Self::CommonControlReport { itsi, registration_generation, common_scch, ms_scch, common_scch_count } => {
-+                if *common_scch_count > 2 || ms_scch.is_some_and(|value| value >= 12) {
++                if *common_scch_count > 3 || ms_scch.is_some_and(|value| value >= 12) {
 +                    return Err(ProtocolError::InvalidField("common SCCH assignment"));
 +                }
 +                out.extend_from_slice(&[CLASS_DOMAIN, 0x7c, PROTOCOL_VERSION]);
@@ -156,7 +156,7 @@
 +                let ms_scch = if value == 255 { None } else if value < 12 { Some(value) }
 +                    else { return Err(ProtocolError::InvalidField("MS_SCCH")); };
 +                let common_scch_count = r.u8()?;
-+                if common_scch_count > 2 { return Err(ProtocolError::InvalidField("N_SCCH")); }
++                if common_scch_count > 3 { return Err(ProtocolError::InvalidField("N_SCCH")); }
 +                Self::CommonControlReport { itsi, registration_generation, common_scch, ms_scch, common_scch_count }
              }
              (CLASS_DOMAIN, TYPE_REGISTRATION_ATTEMPT) => {
@@ -225,7 +225,7 @@
              command_id: 17,
              itsi: 1001,
              air_handle: 44,
-@@ -6159,6 +6225,22 @@
+@@ -6159,6 +6225,29 @@
              SwmiMessage::decode(&message.encode().expect("encode")).expect("decode"),
              message
          );
@@ -238,17 +238,24 @@
 +    fn common_control_report_validates_and_roundtrips() {
 +        for common_scch in [None, Some(false), Some(true)] {
 +            let message = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
-+                common_scch, ms_scch: Some(11), common_scch_count: 2 };
++                common_scch, ms_scch: Some(11), common_scch_count: 3 };
 +            assert_eq!(SwmiMessage::decode(&message.encode().unwrap()).unwrap(), message);
 +            assert!(message.encode_for_version(V42_PROTOCOL_VERSION).is_err());
 +        }
 +        let invalid = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
 +            common_scch: Some(true), ms_scch: Some(12), common_scch_count: 2 };
 +        assert!(invalid.encode().is_err());
++        let invalid_count = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++            common_scch: Some(true), ms_scch: Some(11), common_scch_count: 4 };
++        assert!(invalid_count.encode().is_err());
++        let mut wire = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++            common_scch: Some(true), ms_scch: Some(11), common_scch_count: 3 }.encode().unwrap();
++        *wire.last_mut().unwrap() = 4;
++        assert!(SwmiMessage::decode(&wire).is_err());
      }
  
      #[test]
-@@ -6249,6 +6331,7 @@
+@@ -6249,6 +6338,7 @@
          };
          for message in [
              SwmiMessage::RegistrationDecision {
@@ -256,7 +263,7 @@
                  command_id: 17,
                  itsi: 1001,
                  air_handle: 44,
-@@ -6335,6 +6418,7 @@
+@@ -6335,6 +6425,7 @@
      #[test]
      fn control_versions_before_v33_cannot_erase_sc1_fallback_decisions() {
          let decision = SwmiMessage::RegistrationDecision {
@@ -264,7 +271,7 @@
              command_id: 17,
              itsi: 1001,
              air_handle: 44,
-@@ -6968,3 +7052,8 @@
+@@ -6968,3 +7059,8 @@
          }
      }
  }

@@ -1736,8 +1736,8 @@ impl SubscriberRegistry {
         self.common_control.insert(issi, assignment);
     }
 
-    pub fn common_control_loads(&self, count: u8) -> [u32; 3] {
-        let mut loads = [0; 3];
+    pub fn common_control_loads(&self, count: u8) -> [u32; 4] {
+        let mut loads = [0; 4];
         for &issi in self.active_subscribers.union(&self.pending_registration_deliveries) {
             loads[usize::from(super::common_control_slot(self.common_control(issi).ms_scch, count) - 1)] += 1;
         }
@@ -1757,7 +1757,7 @@ impl SubscriberRegistry {
                     loads[slot] = loads[slot].saturating_sub(1);
                 }
                 let old_slot = super::common_control_slot(previous.ms_scch, count);
-                let slot = (1..=count.min(2) + 1).min_by_key(|slot| (loads[usize::from(*slot - 1)], *slot != old_slot, *slot)).unwrap();
+                let slot = (1..=count.min(3) + 1).min_by_key(|slot| (loads[usize::from(*slot - 1)], *slot != old_slot, *slot)).unwrap();
                 (0..12).filter(|value| super::common_control_slot(Some(*value), count) == slot)
                     .min_by_key(|value| (self.common_control.iter().filter(|(other, a)| **other != issi && a.ms_scch == Some(*value)).count(), *value))
             }
@@ -2681,15 +2681,15 @@ mod tests {
             registry.mark_active(issi);
             registry.finish_common_registration(issi);
         }
-        assert_eq!(registry.common_control_loads(2), [2, 2, 2]);
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
         let departed = (1..=6).find(|issi| super::super::common_control_slot(registry.common_control(*issi).ms_scch, 2) == 2).unwrap();
         registry.deregister(departed);
         let allocation = registry.select_common_control(7, Some(true), 2, 1);
         assert_eq!(super::super::common_control_slot(allocation, 2), 2);
         registry.set_registration_delivery_pending(7, true);
-        assert_eq!(registry.common_control_loads(2), [2, 2, 2]);
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
         assert_eq!(registry.select_common_control(7, Some(true), 2, 1), allocation);
-        assert_eq!(registry.common_control_loads(2), [2, 2, 2]);
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
     }
 
     #[test]
@@ -2701,11 +2701,29 @@ mod tests {
         }
         registry.select_common_control(4, Some(true), 2, 1);
         registry.register(4); registry.set_registration_delivery_pending(4, true);
-        assert_eq!(registry.common_control_loads(2), [3, 1, 0]);
+        assert_eq!(registry.common_control_loads(2), [3, 1, 0, 0]);
         let value = registry.select_common_control(5, Some(true), 2, 1);
         assert_eq!(super::super::common_control_slot(value, 2), 3);
         registry.set_registration_delivery_pending(5, true);
-        assert_eq!(registry.common_control_loads(2), [3, 1, 1]);
+        assert_eq!(registry.common_control_loads(2), [3, 1, 1, 0]);
+    }
+
+    #[test]
+    fn three_scch_assignments_refill_the_departed_ts4_population() {
+        let mut registry = SubscriberRegistry::new();
+        for issi in 1..=8 {
+            registry.select_common_control(issi, Some(true), 3, 1);
+            registry.register(issi);
+            registry.mark_active(issi);
+            registry.finish_common_registration(issi);
+        }
+        assert_eq!(registry.common_control_loads(3), [2, 2, 2, 2]);
+        let departed = (1..=8).find(|issi| super::super::common_control_slot(registry.common_control(*issi).ms_scch, 3) == 4).unwrap();
+        registry.deregister(departed);
+        let assignment = registry.select_common_control(9, Some(true), 3, 1);
+        registry.set_registration_delivery_pending(9, true);
+        assert_eq!(super::super::common_control_slot(assignment, 3), 4);
+        assert_eq!(registry.common_control_loads(3), [2, 2, 2, 2]);
     }
 
     #[test]
@@ -2715,9 +2733,10 @@ mod tests {
             registry.select_common_control(issi, Some(true), 0, 1);
             registry.register(issi); registry.mark_active(issi); registry.finish_common_registration(issi);
         }
-        assert_eq!(registry.common_control_loads(0), [12,0,0]);
-        assert_eq!(registry.common_control_loads(1), [6,6,0]);
-        assert_eq!(registry.common_control_loads(2), [4,4,4]);
+        assert_eq!(registry.common_control_loads(0), [12,0,0,0]);
+        assert_eq!(registry.common_control_loads(1), [6,6,0,0]);
+        assert_eq!(registry.common_control_loads(2), [4,4,4,0]);
+        assert_eq!(registry.common_control_loads(3), [3,3,3,3]);
         assert_eq!(registry.common_control(1).supported, Some(true));
         registry.select_common_control(1, None, 2, 2);
         assert_eq!(registry.common_control(1).supported, Some(true));

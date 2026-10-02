@@ -51,7 +51,7 @@ impl TimeslotAllocator {
     }
 
     pub fn set_common_control_target(&mut self, count: u8) {
-        self.common_control_pending = std::array::from_fn(|index| index < usize::from(count.min(2)));
+        self.common_control_pending = std::array::from_fn(|index| index < usize::from(count.min(3)));
     }
 
     pub fn allocate_any(&mut self, owner: TimeslotOwner) -> Option<u8> {
@@ -148,6 +148,22 @@ mod tests {
         assert!(!allocator.is_free(2));
         allocator.release(TimeslotOwner::CommonControl, 2).unwrap();
         assert!(allocator.is_free(2)); assert!(allocator.is_free(3));
+    }
+
+    #[test]
+    fn three_scch_reserve_all_traffic_slots() {
+        let mut allocator = TimeslotAllocator::default();
+        allocator.set_common_control_target(3);
+        assert_eq!(allocator.allocate_any(TimeslotOwner::Cmce), None);
+        assert_eq!(allocator.allocate_any(TimeslotOwner::PacketData), None);
+        for slot in 2..=4 {
+            assert!(!allocator.is_free(slot));
+            allocator.reserve(TimeslotOwner::CommonControl, slot).unwrap();
+        }
+        allocator.set_common_control_target(2);
+        assert!(!allocator.is_free(4));
+        allocator.release(TimeslotOwner::CommonControl, 4).unwrap();
+        assert_eq!(allocator.allocate_any(TimeslotOwner::Cmce), Some(4));
     }
 
     #[test]
