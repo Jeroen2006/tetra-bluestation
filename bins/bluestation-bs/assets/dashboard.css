@@ -36,15 +36,18 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .inline-values b { margin-left: 5px; color: var(--bs-body-color); font-weight: 700; font-variant-numeric: tabular-nums; }
 .slot-list { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; margin: 4px 0 22px; }
 .overview-radio-columns .slot-list { margin-bottom: 0; }
-.slot { padding: 13px 11px; border-radius: var(--bs-border-radius); background: var(--slot-bg); }
+.slot { min-width: 0; padding: 13px 11px; border-radius: var(--bs-border-radius); background: var(--slot-bg); }
 .slot span { display: block; margin-bottom: 4px; color: var(--slot-ink); font-size: .7rem; font-weight: 700; }
-.slot strong { color: var(--slot-ink); font-size: .78rem; font-weight: 700; white-space: nowrap; }
+.slot strong { display: block; color: var(--slot-ink); font-size: .78rem; font-weight: 700; white-space: normal; overflow-wrap: anywhere; }
+.slot small { display: block; margin-top: 5px; color: var(--slot-ink); font-size: .72rem; }
 .slot--control { --slot-bg: var(--bs-primary-bg-subtle); --slot-ink: var(--bs-primary-text-emphasis); }
+.slot--scch { --slot-bg: #d5efeb; --slot-ink: #16645c; }
 .slot--free { --slot-bg: var(--bs-secondary-bg); --slot-ink: var(--bs-secondary-color); }
 .slot--voice { --slot-bg: #ffe5d0; --slot-ink: #7e390a; }
 .slot--packet { --slot-bg: #e2d9f3; --slot-ink: #432874; }
 [data-bs-theme="dark"] .slot--voice { --slot-bg: #503019; --slot-ink: #ffb77d; }
 [data-bs-theme="dark"] .slot--packet { --slot-bg: #382454; --slot-ink: #c5a9ef; }
+[data-bs-theme="dark"] .slot--scch { --slot-bg: #153c39; --slot-ink: #8ad6cc; }
 .cell-columns { grid-template-columns: repeat(2,minmax(0,1fr)); }
 .cell-identity, .tdma-counters { display: grid; gap: 12px; margin-bottom: 16px; font-variant-numeric: tabular-nums; }
 .cell-identity { grid-template-columns: repeat(3,minmax(0,1fr)); }
@@ -69,7 +72,7 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .data-table { margin: 0; font-size: .82rem; font-variant-numeric: tabular-nums; }
 .data-table th { color: var(--bs-secondary-color); font-size: .74rem; font-weight: 700; white-space: nowrap; }
 .data-table td, .data-table th { padding: 11px 10px; vertical-align: middle; }
-.overview-terminal-head, .overview-terminal-row { display: grid; grid-template-columns: 150px 115px 105px minmax(0,1fr) 90px 75px; align-items: center; gap: 10px; }
+.overview-terminal-head, .overview-terminal-row { display: grid; grid-template-columns: 150px 115px 105px 75px minmax(0,1fr) 90px 75px; align-items: center; gap: 10px; }
 .overview-terminal-head { padding: 0 12px 9px; color: var(--bs-secondary-color); font-size: .74rem; font-weight: 700; }
 .overview-terminal-row { padding: 10px 12px; font-size: .82rem; font-variant-numeric: tabular-nums; }
 .overview-terminal-identity { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
@@ -92,6 +95,7 @@ h3 { margin: 0 0 12px; font-size: .9rem; font-weight: 700; }
 .terminal-table-wrap { overflow: hidden; }
 .terminal-table { min-width: 660px; }
 .terminal-table .issi { font-weight: 700; }
+.terminal-table .control-timeslot { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .terminal-table .groups { max-width: 390px; overflow-wrap: anywhere; }
 .terminal-table .btn { white-space: nowrap; }
 .empty-state { padding: 45px 12px; color: var(--bs-secondary-color); text-align: center; font-size: .9rem; }

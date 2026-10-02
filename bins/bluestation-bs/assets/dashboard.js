@@ -190,12 +190,18 @@
   function renderSlots(id, radio) {
     replace(id, radio.timeslots.map((name, i) => {
       const item = document.createElement('div');
-      const type = name === 'Common SCCH' ? 'control' : slotTypes.find(type => type.label === name)?.key || 'free';
+      const type = name === 'Common SCCH' ? 'scch' : slotTypes.find(type => type.label === name)?.key || 'free';
       item.className = `slot slot--${type}`;
       const label = document.createElement('span'); label.textContent = `TS${i + 1}`;
-      const value = document.createElement('strong'); value.textContent = radio.measured_at_ms ? name : '—';
-      if (i <= (radio.common_scch_active ?? 0)) value.textContent += ` · ${radio.control_channel_loads?.[i] ?? 0} terminals`;
-      item.append(label, value); return item;
+      const value = document.createElement('strong'); value.textContent = radio.measured_at_ms ? name === 'Control' ? 'MCCH' : name : '—';
+      item.append(label, value);
+      if (radio.measured_at_ms && (name === 'Control' || name === 'Common SCCH')) {
+        const count = radio.control_channel_loads?.[i] ?? 0;
+        const load = document.createElement('small');
+        load.textContent = `${count} ${count === 1 ? 'terminal' : 'terminals'}`;
+        item.appendChild(load);
+      }
+      return item;
     }));
   }
 
@@ -370,6 +376,7 @@
       row.append(identity,
         field('RSSI', t.rf ? `${fmt(t.rf.rssi_dbfs, 1)} dBFS` : '—'),
         field('Last seen', age(t.last_seen_ms)),
+        field('Control TS', `TS${t.control_timeslot ?? 1}`),
         field('Talkgroups', groupLabel, 'overview-terminal-groups'),
         field('PDP', pdpLabel(t.pdp)),
         terminalDetailButton(t));
@@ -424,6 +431,7 @@
       cell(row, t.issi, 'issi'); cell(row, t.rf ? fmt(t.rf.rssi_dbfs, 1) : '—', 'text-end');
       cell(row, age(t.last_seen_ms)); cell(row, t.talkgroups.length ? t.talkgroups.join(', ') : '—', 'groups');
       cell(row, t.registration);
+      cell(row, `TS${t.control_timeslot ?? 1}`, 'control-timeslot');
       cell(row, pdpLabel(t.pdp));
       const detailCell = document.createElement('td'); detailCell.appendChild(terminalDetailButton(t));
       row.appendChild(detailCell); rows.push(row);
