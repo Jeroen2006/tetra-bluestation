@@ -82,7 +82,7 @@ pub struct UmacBs {
     /// boundary instead of forwarding a synthetic SSI 0.
     traffic_floor_holder: [Option<u32>; 4],
     random_access: RandomAccessController,
-    secondary_random_access: [RandomAccessController; 2],
+    secondary_random_access: [RandomAccessController; 3],
     operator_settings_version: u64,
 
     /// This MAC's endpoint ID, for addressing by the higher layers
@@ -826,7 +826,7 @@ impl UmacBs {
     }
 
     fn random_access_for_slot(&mut self, slot: u8) -> &mut RandomAccessController {
-        if (2..=3).contains(&slot) {
+        if (2..=4).contains(&slot) {
             &mut self.secondary_random_access[usize::from(slot - 2)]
         } else {
             &mut self.random_access
@@ -3914,6 +3914,9 @@ mod tests {
         umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(1));
         umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(2));
         assert_eq!(config.state_read().common_control.advertised_count, 3);
+        umac.refresh_random_access_control(TdmaTime::default().add_timeslots(3));
+        let ts4_controller = umac.random_access_for_slot(4) as *const RandomAccessController;
+        assert_eq!(ts4_controller, &umac.secondary_random_access[2] as *const RandomAccessController);
         let address = TetraAddress::new(1502, SsiType::Gssi);
         let aie = AieRequest::clear(AieSubject::Group { gssi: 1502 }, AieScope::MacResource);
         let req = tetra_saps::tma::TmaUnitdataReq {

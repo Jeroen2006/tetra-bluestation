@@ -226,7 +226,7 @@ pub struct BsChannelScheduler {
     pending_ra_acks: [Vec<u32>; 4],
     /// Raw base-frame-length encoding for unreserved common access fields.
     random_access_frame_len: u8,
-    secondary_access: [Option<RandomAccessUpdate>; 2],
+    secondary_access: [Option<RandomAccessUpdate>; 3],
     aie_provider: Option<BsAieKeyProvider>,
     /// Key-free policy for the downlink speech portion of an active traffic
     /// circuit. A missing policy is deliberately not converted to clear.
@@ -337,7 +337,7 @@ impl BsChannelScheduler {
             circuits: CircuitMgr::new(),
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            secondary_access: [None; 2],
+            secondary_access: [None; 3],
             random_access_frame_len: 4,
             aie_provider,
             traffic_aie: [None; 4],
@@ -3491,13 +3491,13 @@ impl BsChannelScheduler {
     }
 
     pub fn set_secondary_random_access_definition(&mut self, slot: u8, update: RandomAccessUpdate) {
-        if (2..=3).contains(&slot) {
+        if (2..=4).contains(&slot) {
             self.secondary_access[usize::from(slot - 2)] = Some(update);
         }
     }
 
     fn access_definition_for_slot(&self, slot: u8) -> RandomAccessUpdate {
-        if (2..=3).contains(&slot) {
+        if (2..=4).contains(&slot) {
             self.secondary_access[usize::from(slot - 2)].unwrap_or_else(|| self.random_access_definition())
         } else {
             self.random_access_definition()
@@ -4457,12 +4457,16 @@ mod tests {
     #[test]
     fn common_scch_has_common_aach_independent_access_and_sysinfo() {
         let mut sched = get_testing_slotter();
-        sched.set_common_control_channels(2, 2, false);
+        sched.set_common_control_channels(3, 3, false);
         let mut access = sched.random_access_definition();
         access.frame_len = 6;
         access.parameters.imm = 3;
         sched.set_secondary_random_access_definition(2, access);
-        for slot in 1..=3 {
+        let mut ts4_access = sched.random_access_definition();
+        ts4_access.frame_len = 8;
+        ts4_access.parameters.imm = 5;
+        sched.set_secondary_random_access_definition(4, ts4_access);
+        for slot in 1..=4 {
             let time = TdmaTime { t: slot, f: 2, m: 1, h: 0 };
             let mut aach = sched.generate_bbk_block(time).mac_block;
             aach.seek(0);
@@ -4477,8 +4481,8 @@ mod tests {
             let mut bnch = result.blk2.unwrap().mac_block;
             bnch.seek(0);
             let sysinfo = MacSysinfo::from_bitbuf(&mut bnch).unwrap();
-            assert_eq!(sysinfo.num_of_csch, 2);
-            assert_eq!(sysinfo.default_access_code.unwrap().imm, if slot == 2 { 3 } else { 8 });
+            assert_eq!(sysinfo.num_of_csch, 3);
+            assert_eq!(sysinfo.default_access_code.unwrap().imm, match slot { 2 => 3, 4 => 5, _ => 8 });
         }
     }
 
