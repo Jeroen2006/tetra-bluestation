@@ -134,3 +134,23 @@ count 3 returned HTTP 400, and the configured count of one was restored.
 SwMI confirmed and persisted MS_SCCH 0 for 77480 and MS_SCCH 1 for 77479
 using the original registration generations after their acceptance ACKs.
 LA102 and SwMI remained connected, with no automatic BS service restarts.
+
+### Three-SCCH extension (2026-10-02)
+
+The supported maximum is three, matching TS 100 392-2 23.3.1.2.1.2 and the
+two-bit SYSINFO field. Configuration, least-load assignment, reservations,
+four-slot population reporting and the BS/SwMI protocol accept counts 0–3.
+Both the UMAC access controllers and scheduler retain independent access
+state for all three SCCHs. The first live attempt exposed their previous
+two-element arrays; the fix adds TS4 state and extends regression coverage
+to access-control refresh, channel selection, AACH and SYSINFO on TS4.
+
+All 73 core/configuration tests, the SCCH-focused BS tests, 37 protocol tests
+and 196 SwMI tests passed. The final release was built on LA101 and deployed
+to LA102; its SHA256 is
+`858700a5bff014185ff8525dced3e904fb264d75f2f0df8e4ea1638b59b4a64a`.
+The live 1→2→3→1 transition then passed without a process restart or loss
+of connection/transmit permission; TS4 was activated and released again.
+Count 4 returned HTTP 400. The original setting of one SCCH was restored.
+No live terminal was assigned to TS4 during this test; its population
+allocation, group downlink and independent access have automated coverage.
