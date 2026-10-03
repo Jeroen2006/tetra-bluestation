@@ -248,6 +248,8 @@
     colourNote.className = 'alert alert-warning mt-3 mb-0'; colourNote.textContent = 'Colour code changes restart the BS when saved.';
     colourNote.hidden = true; cell.lastChild.append(colourNote);
     $('config-cell_info-colour_code').addEventListener('input', updateRestartPreview);
+    settings.cell_info.common_scch_count ??= 0;
+    group(cell, 'Control channels', [['cell_info.common_scch_count', 'Common SCCH count', 0, 3, 'Extra control channels on TS2, TS3 and TS4. Applies live when those slots become free. Three SCCHs use all slots for control, leaving no traffic slots for voice or packet data.']], settings);
     renderFrequency(cell, settings);
     const cellGroup = document.createElement('section'); cellGroup.className = 'config-group';
     const cellTitle = document.createElement('h2'); cellTitle.textContent = 'Cell access & power'; cellGroup.append(cellTitle);
@@ -279,6 +281,7 @@
     settings.neighbour_cells = $('config-neighbours').value.split(/\r?\n/).map(id => id.trim()).filter(Boolean);
     settings.time_enabled = $('config-time_enabled').checked;
     settings.timezone = $('config-timezone').value.trim() || null;
+    settings.cell_info.common_scch_count = $('config-cell_info-common_scch_count').valueAsNumber;
     settings.cell_info.colour_code = $('config-cell_info-colour_code').valueAsNumber;
     settings.cell_info.ms_txpwr_max_cell_dbm = $('config-cell_info-ms_txpwr_max_cell_dbm').value === '' ? null : Number($('config-cell_info-ms_txpwr_max_cell_dbm').value);
     for (const [path] of dbSpecs) settings.cell_info[path.split('.')[1]] = Number($(fieldId(path)).value);

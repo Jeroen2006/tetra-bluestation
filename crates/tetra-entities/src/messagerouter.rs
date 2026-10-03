@@ -123,6 +123,9 @@ impl MessageRouter {
         let state = self._config.state_read();
         let terminals = state.subscribers.monitor_subscribers().into_iter().map(|(issi, registered_at, active, pending, talkgroups)| TerminalSnapshot {
             issi,
+            common_scch_supported: state.subscribers.common_control(issi).supported,
+            ms_scch: state.subscribers.common_control(issi).ms_scch,
+            control_timeslot: tetra_config::bluestation::common_control_slot(state.subscribers.common_control(issi).ms_scch, state.common_control.advertised_count),
             registration: if active { "Active" } else if pending { "Pending" } else { "Registered" }.to_owned(),
             talkgroups,
             last_seen_ms: last_seen.get(&issi).copied().filter(|seen| *seen >= registered_at),
@@ -136,11 +139,16 @@ impl MessageRouter {
                     tetra_core::timeslot_alloc::TimeslotOwner::PacketData => "Packet data",
                     tetra_core::timeslot_alloc::TimeslotOwner::Cmce => "Voice",
                     tetra_core::timeslot_alloc::TimeslotOwner::Brew => "Network",
+                    tetra_core::timeslot_alloc::TimeslotOwner::CommonControl => "Common SCCH",
                 }.to_owned();
             }
         }
         let snapshot = RadioSnapshot {
             measured_at_ms: unix_ms(),
+            common_scch_requested: state.operator_settings.common_scch_count,
+            common_scch_active: state.common_control.advertised_count,
+            common_scch_transition: state.common_control.drain_until.is_some() || state.operator_settings.common_scch_count != state.common_control.advertised_count,
+            control_channel_loads: state.subscribers.common_control_loads(state.common_control.advertised_count),
             cell,
             ra: ra.unwrap_or_default(), terminals, timeslots,
             network_connected: state.network_connected,

@@ -43,6 +43,8 @@ struct CellReselectSettings {
 #[derive(Serialize, Deserialize)]
 struct CellSettings {
     #[serde(default)]
+    common_scch_count: Option<u8>,
+    #[serde(default)]
     colour_code: Option<u8>,
     ms_txpwr_max_cell_dbm: Option<i16>,
     rxlev_access_min_dbm: i16,
@@ -82,6 +84,7 @@ impl EditableSettings {
             timezone: config.network_broadcast.timezone.clone(),
             time_enabled: config.network_broadcast.time_enabled,
             cell_info: CellSettings {
+                common_scch_count: Some(config.cell.common_scch_count),
                 colour_code: Some(config.cell.colour_code),
                 ms_txpwr_max_cell_dbm: (config.cell.ms_txpwr_max_cell != 0).then(|| 10 + i16::from(config.cell.ms_txpwr_max_cell) * 5),
                 rxlev_access_min_dbm: -125 + i16::from(config.cell.rxlev_access_min) * 5,
@@ -212,6 +215,9 @@ fn encoded_dbm(value: i16, first: i16, last: i16, step: i16, label: &str) -> Res
 }
 
 fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Result<(), String> {
+    if settings.cell_info.common_scch_count.is_some_and(|count| count > 3) {
+        return Err("Common SCCH count must be 0-3".into());
+    }
     if settings.cell_info.colour_code.is_some_and(|code| code > 63) {
         return Err("Colour code must be 0-63 (6 bits)".to_owned());
     }
@@ -289,6 +295,9 @@ fn apply_settings(document: &mut DocumentMut, settings: &EditableSettings) -> Re
         value(i64::from(reselect.fast_reselect_hysteresis_db)),
     );
     let cell = table_mut(document, &["cell_info"])?;
+    if let Some(count) = settings.cell_info.common_scch_count {
+        cell.insert("common_scch_count", value(i64::from(count)));
+    }
     if let Some(code) = settings.cell_info.colour_code {
         cell.insert("colour_code", value(i64::from(code)));
     }
@@ -334,6 +343,27 @@ fn atomic_write(path: &Path, bytes: &[u8], permissions: Permissions) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_scch_configuration_roundtrips_and_rejects_over_capacity() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"));
+        let original = parsing::from_toml_str(source).unwrap();
+        let mut settings = EditableSettings::from_config(&original);
+        let shared = tetra_config::bluestation::SharedConfig::from_parts(original.clone(), None);
+        for count in 0..=3 {
+            settings.cell_info.common_scch_count = Some(count);
+            let mut document = source.parse::<DocumentMut>().unwrap();
+            apply_settings(&mut document, &settings).unwrap();
+            let next = parsing::from_toml_str(&document.to_string()).unwrap();
+            next.validate().unwrap();
+            assert_eq!(next.cell.common_scch_count, count);
+            shared.apply_live_editable_settings(&original, &next);
+            assert_eq!(shared.state_read().operator_settings.common_scch_count, count);
+            assert_eq!(FrequencySettings::from_config(&original), FrequencySettings::from_config(&next));
+        }
+        settings.cell_info.common_scch_count = Some(4);
+        assert!(apply_settings(&mut source.parse::<DocumentMut>().unwrap(), &settings).is_err());
+    }
 
     #[test]
     fn web_edits_preserve_startup_calibration_and_corrections() {
@@ -463,6 +493,7 @@ mod tests {
             timezone: Some("Europe/Amsterdam".into()),
             time_enabled: true,
             cell_info: CellSettings {
+                common_scch_count: None,
                 colour_code: Some(2),
                 ms_txpwr_max_cell_dbm: Some(30),
                 rxlev_access_min_dbm: -110,

@@ -135,6 +135,7 @@ impl Default for CfgRandomAccess {
 
 #[derive(Debug, Clone)]
 pub struct CfgCellInfo {
+    pub common_scch_count: u8,
     // 2 bits, from 18.4.2.1 D-MLE-SYNC
     pub neighbor_cell_broadcast: u8,
     // 2 bits, from 18.4.2.1 D-MLE-SYNC
@@ -207,6 +208,7 @@ pub struct CfgCellInfo {
 
 #[derive(Default, Deserialize)]
 pub struct CellInfoDto {
+    pub common_scch_count: Option<u8>,
     pub main_carrier: u16,
     pub freq_band: u8,
     pub freq_offset: i16,
@@ -305,6 +307,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto, dto: RandomAccessDto) -> CfgCellInfo {
         };
 
     CfgCellInfo {
+        common_scch_count: ci.common_scch_count.unwrap_or(0),
         main_carrier: ci.main_carrier,
         freq_band: ci.freq_band,
         freq_offset_hz: ci.freq_offset,

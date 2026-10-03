@@ -1,0 +1,282 @@
+--- a/crates/tetra-swmi-protocol/src/lib.rs
++++ b/crates/tetra-swmi-protocol/src/lib.rs
+@@ -16,7 +16,8 @@
+ 
+ // Call-waiting control and call-state messages require both peers to support
+ // protocol v34. RegistrationAttempt gained its on-air ciphering state in v33.
+-pub const PROTOCOL_VERSION: u8 = 42;
++pub const PROTOCOL_VERSION: u8 = 43;
++pub const V42_PROTOCOL_VERSION: u8 = 42;
+ /// An active group-call replay caused by service-restoration roaming carries
+ /// its restoring ISSI from v39 onwards. The target BS prepares the circuit
+ /// without sending a new group D-SETUP before U-CALL RESTORE arrives.
+@@ -31,7 +32,8 @@
+ const VERSION_30: u8 = 30;
+ const VERSION_31: u8 = 31;
+ const SC3_CELL_CONFIG_PROTOCOL_VERSION: u8 = 30;
+-pub const PREVIOUS_PROTOCOL_VERSION: u8 = 41;
++pub const PREVIOUS_PROTOCOL_VERSION: u8 = 42;
++const V41_PROTOCOL_VERSION: u8 = 41;
+ pub const V40_PROTOCOL_VERSION: u8 = 40;
+ const VERSION_39: u8 = 39;
+ const SC3G_ROLLOVER_PROTOCOL_VERSION: u8 = 40;
+@@ -44,8 +46,9 @@
+ pub const OLDEST_PROTOCOL_VERSION: u8 = 28;
+ pub const ANCIENT_PROTOCOL_VERSION: u8 = 26;
+ pub const ARCHAIC_PROTOCOL_VERSION: u8 = 25;
+-pub const WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v42";
+-pub const PREVIOUS_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v41";
++pub const WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v43";
++pub const PREVIOUS_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v42";
++pub const V41_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v41";
+ pub const V40_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v40";
+ pub const OLDER_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v34";
+ pub const LEGACY_WEBSOCKET_CONTROL_SUBPROTOCOL: &str = "tetra-bs-swmi-control-v25";
+@@ -1231,7 +1234,17 @@
+     },
+     /// Authoritative online-only CA neighbour directory for the receiving BS.
+     NeighbourCellSnapshot(NeighbourCellSnapshot),
++    /// BS-local confirmed SCCH assignment, fenced by the registration command.
++    /// Also used by SwMI to restore this metadata before subscriber state sync.
++    CommonControlReport {
++        itsi: u64,
++        registration_generation: u64,
++        common_scch: Option<bool>,
++        ms_scch: Option<u8>,
++        common_scch_count: u8,
++    },
+     RegistrationAttempt {
++        common_scch: Option<bool>,
+         command_id: u64,
+         itsi: u64,
+         /// Opaque BS air-interface handle. The SwMI echoes it unchanged; only
+@@ -1251,6 +1264,7 @@
+         sc3_retrieval: Option<Sc3RetrievalEvidence>,
+     },
+     RegistrationDecision {
++        common_scch: Option<bool>,
+         command_id: u64,
+         itsi: u64,
+         air_handle: u32,
+@@ -1883,6 +1897,18 @@
+     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+         let mut out = Vec::with_capacity(64);
+         match self {
++            Self::CommonControlReport { itsi, registration_generation, common_scch, ms_scch, common_scch_count } => {
++                if *common_scch_count > 3 || ms_scch.is_some_and(|value| value >= 12) {
++                    return Err(ProtocolError::InvalidField("common SCCH assignment"));
++                }
++                out.extend_from_slice(&[CLASS_DOMAIN, 0x7c, PROTOCOL_VERSION]);
++                put_u64(&mut out, *itsi);
++                put_u64(&mut out, *registration_generation);
++                out.push(common_scch.map_or(0, |value| if value { 2 } else { 1 }));
++                out.push(ms_scch.unwrap_or(255));
++                out.push(*common_scch_count);
++            }
++
+             Self::Capacity(message) => {
+                 out.extend_from_slice(&[CLASS_DOMAIN, 0x71, PROTOCOL_VERSION]);
+                 message.encode(&mut out)?;
+@@ -2163,6 +2189,7 @@
+                 put_neighbour_snapshot(&mut out, snapshot, PROTOCOL_VERSION)?;
+             }
+             Self::RegistrationAttempt {
++                common_scch,
+                 command_id,
+                 itsi,
+                 air_handle,
+@@ -2219,8 +2246,10 @@
+                     }
+                     None => out.push(0),
+                 }
++                out.push(common_scch.map_or(0, |value| if value { 2 } else { 1 }));
+             }
+             Self::RegistrationDecision {
++                common_scch,
+                 command_id,
+                 itsi,
+                 air_handle,
+@@ -2248,6 +2277,7 @@
+                 out.push(u8::from(*rua_requested));
+                 put_optional_handover_allocation(&mut out, *handover_allocation)?;
+                 put_aie_location_update_decision(&mut out, aie)?;
++                out.push(common_scch.map_or(0, |value| if value { 2 } else { 1 }));
+             }
+             Self::AuthenticationChallenge {
+                 command_id,
+@@ -3474,6 +3504,7 @@
+         if !matches!(
+             version,
+             PREVIOUS_PROTOCOL_VERSION
++                | V41_PROTOCOL_VERSION
+                 | V40_PROTOCOL_VERSION
+                 | VERSION_39
+                 | OLDER_PROTOCOL_VERSION
+@@ -3484,6 +3515,13 @@
+             return Err(ProtocolError::UnsupportedVersion);
+         }
+         match self {
++            Self::CommonControlReport { .. } => Err(ProtocolError::InvalidField("common SCCH requires protocol v43")),
++            Self::RegistrationAttempt { .. } | Self::RegistrationDecision { .. } if version >= 33 => {
++                let mut out = self.encode()?;
++                out.pop();
++                out[2] = version;
++                Ok(out)
++            }
+             Self::StationProvisioning { .. } | Self::RadioStatus { .. } if version < 41 => Err(
+                 ProtocolError::InvalidField("station provisioning requires protocol v41"),
+             ),
+@@ -3491,7 +3529,7 @@
+                 let mut out = self.encode()?;
+                 out[2] = version;
+                 // v41 and earlier reports ended at tdma_frame_offset.
+-                out.pop();
++                if version < 42 { out.pop(); }
+                 Ok(out)
+             }
+             Self::NeighbourCellSnapshot(snapshot) => {
+@@ -3575,6 +3613,7 @@
+         let typ = r.u8()?;
+         let version = r.u8()?;
+         if version != PROTOCOL_VERSION
++            && version != V41_PROTOCOL_VERSION
+             && version != PREVIOUS_PROTOCOL_VERSION
+             && version != V40_PROTOCOL_VERSION
+             && version != VERSION_39
+@@ -3824,6 +3863,17 @@
+             },
+             (CLASS_CONTROL, TYPE_NEIGHBOUR_CELL_SNAPSHOT) => {
+                 Self::NeighbourCellSnapshot(r.neighbour_snapshot(version)?)
++            }
++            (CLASS_DOMAIN, 0x7c) if version >= 43 => {
++                let itsi = r.u64()?;
++                let registration_generation = r.u64()?;
++                let common_scch = read_common_scch(&mut r)?;
++                let value = r.u8()?;
++                let ms_scch = if value == 255 { None } else if value < 12 { Some(value) }
++                    else { return Err(ProtocolError::InvalidField("MS_SCCH")); };
++                let common_scch_count = r.u8()?;
++                if common_scch_count > 3 { return Err(ProtocolError::InvalidField("N_SCCH")); }
++                Self::CommonControlReport { itsi, registration_generation, common_scch, ms_scch, common_scch_count }
+             }
+             (CLASS_DOMAIN, TYPE_REGISTRATION_ATTEMPT) => {
+                 let command_id = r.u64()?;
+@@ -3868,6 +3918,7 @@
+                     authentication,
+                     aie,
+                     sc3_retrieval,
++                    common_scch: if version >= 43 { read_common_scch(&mut r)? } else { None },
+                 }
+             }
+             (CLASS_DOMAIN, TYPE_REGISTRATION_DECISION) => Self::RegistrationDecision {
+@@ -3881,6 +3932,7 @@
+                 rua_requested: r.bool()?,
+                 handover_allocation: r.optional_handover_allocation()?,
+                 aie: read_aie_location_update_decision(&mut r, version)?,
++                common_scch: if version >= 43 { read_common_scch(&mut r)? } else { None },
+             },
+             (CLASS_DOMAIN, TYPE_AUTHENTICATION_CHALLENGE) => {
+                 let command_id = r.u64()?;
+@@ -6055,6 +6107,9 @@
+         );
+         let legacy = SwmiMessage::decode(&message.encode_for_version(PREVIOUS_PROTOCOL_VERSION).unwrap()).unwrap();
+         let SwmiMessage::SystemInfoReport { report, .. } = legacy else { panic!("expected SYSINFO report") };
++        assert_eq!(report.access_parameter, Some(7));
++        let legacy = SwmiMessage::decode(&message.encode_for_version(V41_PROTOCOL_VERSION).unwrap()).unwrap();
++        let SwmiMessage::SystemInfoReport { report, .. } = legacy else { panic!("expected v41 report") };
+         assert_eq!(report.access_parameter, None);
+     }
+ 
+@@ -6101,12 +6156,16 @@
+         );
+         let legacy = SwmiMessage::decode(&message.encode_for_version(PREVIOUS_PROTOCOL_VERSION).unwrap()).unwrap();
+         let SwmiMessage::NeighbourCellSnapshot(snapshot) = legacy else { panic!("expected neighbour snapshot") };
++        assert_eq!(snapshot.neighbours[0].report.access_parameter, Some(7));
++        let legacy = SwmiMessage::decode(&message.encode_for_version(V41_PROTOCOL_VERSION).unwrap()).unwrap();
++        let SwmiMessage::NeighbourCellSnapshot(snapshot) = legacy else { panic!("expected v41 snapshot") };
+         assert_eq!(snapshot.neighbours[0].report.access_parameter, None);
+     }
+ 
+     #[test]
+     fn registration_carries_the_bs_air_context() {
+         let message = SwmiMessage::RegistrationAttempt {
++            common_scch: Some(true),
+             command_id: 17,
+             itsi: 1001,
+             air_handle: 44,
+@@ -6129,6 +6188,12 @@
+             SwmiMessage::decode(&message.encode().expect("encode")).expect("decode"),
+             message
+         );
++        for version in [V41_PROTOCOL_VERSION, V42_PROTOCOL_VERSION] {
++            let SwmiMessage::RegistrationAttempt { common_scch, air_handle, .. } =
++                SwmiMessage::decode(&message.encode_for_version(version).unwrap()).unwrap() else { panic!("registration") };
++            assert_eq!(common_scch, None);
++            assert_eq!(air_handle, 44);
++        }
+         let mut legacy = message.encode().expect("encode");
+         legacy.truncate(legacy.len() - 8);
+         assert_eq!(SwmiMessage::decode(&legacy), Err(ProtocolError::Truncated));
+@@ -6137,6 +6202,7 @@
+     #[test]
+     fn registration_decision_carries_a_bit_aligned_authentication_downlink() {
+         let message = SwmiMessage::RegistrationDecision {
++            common_scch: None,
+             command_id: 17,
+             itsi: 1001,
+             air_handle: 44,
+@@ -6159,6 +6225,29 @@
+             SwmiMessage::decode(&message.encode().expect("encode")).expect("decode"),
+             message
+         );
++        for version in [V41_PROTOCOL_VERSION, V42_PROTOCOL_VERSION] {
++            assert_eq!(SwmiMessage::decode(&message.encode_for_version(version).unwrap()).unwrap(), message);
++        }
++    }
++
++    #[test]
++    fn common_control_report_validates_and_roundtrips() {
++        for common_scch in [None, Some(false), Some(true)] {
++            let message = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++                common_scch, ms_scch: Some(11), common_scch_count: 3 };
++            assert_eq!(SwmiMessage::decode(&message.encode().unwrap()).unwrap(), message);
++            assert!(message.encode_for_version(V42_PROTOCOL_VERSION).is_err());
++        }
++        let invalid = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++            common_scch: Some(true), ms_scch: Some(12), common_scch_count: 2 };
++        assert!(invalid.encode().is_err());
++        let invalid_count = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++            common_scch: Some(true), ms_scch: Some(11), common_scch_count: 4 };
++        assert!(invalid_count.encode().is_err());
++        let mut wire = SwmiMessage::CommonControlReport { itsi: 77468, registration_generation: 17,
++            common_scch: Some(true), ms_scch: Some(11), common_scch_count: 3 }.encode().unwrap();
++        *wire.last_mut().unwrap() = 4;
++        assert!(SwmiMessage::decode(&wire).is_err());
+     }
+ 
+     #[test]
+@@ -6249,6 +6338,7 @@
+         };
+         for message in [
+             SwmiMessage::RegistrationDecision {
++                common_scch: None,
+                 command_id: 17,
+                 itsi: 1001,
+                 air_handle: 44,
+@@ -6335,6 +6425,7 @@
+     #[test]
+     fn control_versions_before_v33_cannot_erase_sc1_fallback_decisions() {
+         let decision = SwmiMessage::RegistrationDecision {
++            common_scch: None,
+             command_id: 17,
+             itsi: 1001,
+             air_handle: 44,
+@@ -6968,3 +7059,8 @@
+         }
+     }
+ }
++
++fn read_common_scch(r: &mut Reader<'_>) -> Result<Option<bool>, ProtocolError> {
++    match r.u8()? { 0 => Ok(None), 1 => Ok(Some(false)), 2 => Ok(Some(true)),
++        _ => Err(ProtocolError::InvalidField("common SCCH capability")) }
++}

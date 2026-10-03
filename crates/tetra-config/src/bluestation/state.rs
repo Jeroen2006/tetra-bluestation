@@ -1702,6 +1702,7 @@ pub struct SubscriberRegistry {
     pending_registration_deliveries: HashSet<u32>,
     /// Failed registration deliveries consumed by UMAC once per RA window.
     registration_delivery_failures: u16,
+    common_control: HashMap<u32, super::CommonControlAssignment>,
     /// Set of all GSSIs with at least one local affiliate
     all_attached_groups: HashSet<u32>,
     /// Short-lived MS-initiated MAC-ACCESS contexts. These are deliberately
@@ -1717,9 +1718,58 @@ impl SubscriberRegistry {
             active_subscribers: HashSet::new(),
             pending_registration_deliveries: HashSet::new(),
             registration_delivery_failures: 0,
+            common_control: HashMap::new(),
             all_attached_groups: HashSet::new(),
             direct_response_deadlines: HashMap::new(),
         }
+    }
+
+    pub fn common_control(&self, issi: u32) -> super::CommonControlAssignment {
+        self.common_control.get(&issi).copied().unwrap_or_default()
+    }
+
+    pub fn observe_common_uplink(&mut self, issi: u32, slot: u8) {
+        self.common_control.entry(issi).or_default().last_uplink_slot = Some(slot);
+    }
+
+    pub fn set_common_control(&mut self, issi: u32, assignment: super::CommonControlAssignment) {
+        self.common_control.insert(issi, assignment);
+    }
+
+    pub fn common_control_loads(&self, count: u8) -> [u32; 4] {
+        let mut loads = [0; 4];
+        for &issi in self.active_subscribers.union(&self.pending_registration_deliveries) {
+            loads[usize::from(super::common_control_slot(self.common_control(issi).ms_scch, count) - 1)] += 1;
+        }
+        loads
+    }
+
+    pub fn select_common_control(&mut self, issi: u32, supported: Option<bool>, count: u8, ingress: u8) -> Option<u8> {
+        let previous = self.common_control(issi);
+        let supported = supported.or(previous.supported);
+        let ms_scch = if supported == Some(true) {
+            if self.pending_registration_deliveries.contains(&issi) && previous.registration_slot.is_some()
+                && previous.ms_scch.is_some() { previous.ms_scch }
+            else {
+                let mut loads = self.common_control_loads(count);
+                if self.active_subscribers.contains(&issi) || self.pending_registration_deliveries.contains(&issi) {
+                    let slot = usize::from(super::common_control_slot(previous.ms_scch, count) - 1);
+                    loads[slot] = loads[slot].saturating_sub(1);
+                }
+                let old_slot = super::common_control_slot(previous.ms_scch, count);
+                let slot = (1..=count.min(3) + 1).min_by_key(|slot| (loads[usize::from(*slot - 1)], *slot != old_slot, *slot)).unwrap();
+                (0..12).filter(|value| super::common_control_slot(Some(*value), count) == slot)
+                    .min_by_key(|value| (self.common_control.iter().filter(|(other, a)| **other != issi && a.ms_scch == Some(*value)).count(), *value))
+            }
+        } else { None };
+        self.common_control.insert(issi, super::CommonControlAssignment {
+            supported, ms_scch, registration_slot: Some(ingress), last_uplink_slot: Some(ingress),
+        });
+        ms_scch
+    }
+
+    pub fn finish_common_registration(&mut self, issi: u32) {
+        if let Some(assignment) = self.common_control.get_mut(&issi) { assignment.registration_slot = None; }
     }
 
     pub fn is_registered(&self, issi: u32) -> bool {
@@ -1791,6 +1841,13 @@ impl SubscriberRegistry {
         self.pending_registration_deliveries.contains(&issi)
     }
 
+    pub fn pending_registrations_on_slot(&self, slot: u8, count: u8) -> u16 {
+        self.pending_registration_deliveries.iter().filter(|issi| {
+            let assignment = self.common_control(**issi);
+            assignment.registration_slot.unwrap_or_else(|| super::common_control_slot(assignment.ms_scch, count)) == slot
+        }).count().min(u16::MAX as usize) as u16
+    }
+
     pub fn pending_registration_count(&self) -> u16 {
         self.pending_registration_deliveries.len().min(u16::MAX as usize) as u16
     }
@@ -1805,7 +1862,9 @@ impl SubscriberRegistry {
 
     /// Tolerant registration; if ISSI already registered, we overwrite it with a fresh Subscriber struct
     pub fn register(&mut self, issi: u32) {
-        self.deregister(issi); // Clean up any existing registration to prevent stale affiliations
+        let common_control = self.common_control.get(&issi).copied();
+        self.deregister(issi);
+        if let Some(assignment) = common_control { self.common_control.insert(issi, assignment); } // Clean up any existing registration to prevent stale affiliations
         self.subscribers.insert(
             issi,
             Subscriber {
@@ -1851,6 +1910,7 @@ impl SubscriberRegistry {
 
     /// Deregister an ISSI, removing it from the registry and cleaning up any group affiliations
     pub fn deregister(&mut self, issi: u32) {
+        self.common_control.remove(&issi);
         self.mark_inactive(issi);
         self.direct_response_deadlines.remove(&issi);
         if let Some(subscriber) = self.subscribers.remove(&issi) {
@@ -1980,6 +2040,7 @@ impl SubscriberRegistry {
 #[derive(Debug, Clone)]
 pub struct StackState {
     pub timeslot_alloc: TimeslotAllocator,
+    pub common_control: super::CommonControlChannels,
     /// Backhaul/network connection to SwMI (e.g., Brew/TetraPack). False -> fallback mode.
     pub network_connected: bool,
     /// Current authenticated, complete serving-cell assignment for this run.
@@ -2612,6 +2673,76 @@ mod tests {
     }
 
     #[test]
+    fn common_scch_assignment_fills_the_least_populated_channel_after_departure() {
+        let mut registry = SubscriberRegistry::new();
+        for issi in 1..=6 {
+            registry.select_common_control(issi, Some(true), 2, 1);
+            registry.register(issi);
+            registry.mark_active(issi);
+            registry.finish_common_registration(issi);
+        }
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
+        let departed = (1..=6).find(|issi| super::super::common_control_slot(registry.common_control(*issi).ms_scch, 2) == 2).unwrap();
+        registry.deregister(departed);
+        let allocation = registry.select_common_control(7, Some(true), 2, 1);
+        assert_eq!(super::super::common_control_slot(allocation, 2), 2);
+        registry.set_registration_delivery_pending(7, true);
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
+        assert_eq!(registry.select_common_control(7, Some(true), 2, 1), allocation);
+        assert_eq!(registry.common_control_loads(2), [2, 2, 2, 0]);
+    }
+
+    #[test]
+    fn common_scch_keeps_unsupported_ms_on_mcch_and_counts_pending_once() {
+        let mut registry = SubscriberRegistry::new();
+        for issi in 1..=3 {
+            assert_eq!(registry.select_common_control(issi, Some(false), 2, 1), None);
+            registry.register(issi); registry.mark_active(issi);
+        }
+        registry.select_common_control(4, Some(true), 2, 1);
+        registry.register(4); registry.set_registration_delivery_pending(4, true);
+        assert_eq!(registry.common_control_loads(2), [3, 1, 0, 0]);
+        let value = registry.select_common_control(5, Some(true), 2, 1);
+        assert_eq!(super::super::common_control_slot(value, 2), 3);
+        registry.set_registration_delivery_pending(5, true);
+        assert_eq!(registry.common_control_loads(2), [3, 1, 1, 0]);
+    }
+
+    #[test]
+    fn three_scch_assignments_refill_the_departed_ts4_population() {
+        let mut registry = SubscriberRegistry::new();
+        for issi in 1..=8 {
+            registry.select_common_control(issi, Some(true), 3, 1);
+            registry.register(issi);
+            registry.mark_active(issi);
+            registry.finish_common_registration(issi);
+        }
+        assert_eq!(registry.common_control_loads(3), [2, 2, 2, 2]);
+        let departed = (1..=8).find(|issi| super::super::common_control_slot(registry.common_control(*issi).ms_scch, 3) == 4).unwrap();
+        registry.deregister(departed);
+        let assignment = registry.select_common_control(9, Some(true), 3, 1);
+        registry.set_registration_delivery_pending(9, true);
+        assert_eq!(super::super::common_control_slot(assignment, 3), 4);
+        assert_eq!(registry.common_control_loads(3), [2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn common_scch_zero_count_prepares_even_values_for_later_activation() {
+        let mut registry = SubscriberRegistry::new();
+        for issi in 1..=12 {
+            registry.select_common_control(issi, Some(true), 0, 1);
+            registry.register(issi); registry.mark_active(issi); registry.finish_common_registration(issi);
+        }
+        assert_eq!(registry.common_control_loads(0), [12,0,0,0]);
+        assert_eq!(registry.common_control_loads(1), [6,6,0,0]);
+        assert_eq!(registry.common_control_loads(2), [4,4,4,0]);
+        assert_eq!(registry.common_control_loads(3), [3,3,3,3]);
+        assert_eq!(registry.common_control(1).supported, Some(true));
+        registry.select_common_control(1, None, 2, 2);
+        assert_eq!(registry.common_control(1).supported, Some(true));
+    }
+
+    #[test]
     fn test_register_deregister() {
         let mut reg = SubscriberRegistry::new();
         assert!(!reg.is_registered(1001));
@@ -2886,6 +3017,7 @@ impl Default for StackState {
     fn default() -> Self {
         Self {
             timeslot_alloc: TimeslotAllocator::default(),
+            common_control: super::CommonControlChannels::default(),
             network_connected: false,
             station_provisioning: None,
             advertisement_accepted: false,

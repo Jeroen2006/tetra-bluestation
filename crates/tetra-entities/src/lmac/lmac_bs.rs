@@ -528,7 +528,8 @@ impl LmacBs {
                 self.rx_blk_traffic(queue, prim, lchan, ul_time)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
-                self.rx_blk_control(queue, prim, lchan, ul_time, pchan == PhysicalChannel::Cp && ul_time.t == 1);
+                let common = pchan == PhysicalChannel::Cp && self.config.state_read().common_control.is_common(ul_time.t);
+                self.rx_blk_control(queue, prim, lchan, ul_time, common);
             }
             _ => {
                 panic!()

@@ -63,6 +63,7 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         deregistration: true,
         priority_cell: false,
         no_minimum_mode: false,
+        common_scch_count: 0,
         migration: false,
         system_wide_services: true,
         voice_service: true,

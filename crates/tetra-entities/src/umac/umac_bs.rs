@@ -44,11 +44,11 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_swmi_protocol::{GroupProtection, SwmiMessage, TerminalSecurityClass, UplinkRfStats};
 
 use crate::lmac::components::scrambler;
+use crate::monitoring::{EntitySnapshot, RaLimits, RaParameters, RaSnapshot, RaWindow, RfSnapshot, unix_ms};
 use crate::net_swmi::SwmiRfEndpoint;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, MACSCHED_TX_AHEAD, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::random_access::RandomAccessController;
-use crate::monitoring::{EntitySnapshot, RaLimits, RaParameters, RaSnapshot, RaWindow, RfSnapshot, unix_ms};
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 use super::subcomp::bs_defrag::BsDefrag;
@@ -82,6 +82,7 @@ pub struct UmacBs {
     /// boundary instead of forwarding a synthetic SSI 0.
     traffic_floor_holder: [Option<u32>; 4],
     random_access: RandomAccessController,
+    secondary_random_access: [RandomAccessController; 3],
     operator_settings_version: u64,
 
     /// This MAC's endpoint ID, for addressing by the higher layers
@@ -329,7 +330,10 @@ impl UmacBs {
 
     pub fn new_with_swmi(config: SharedConfig, swmi_rf: Option<SwmiRfEndpoint>) -> Self {
         let c = config.config();
-        let net = config.state_read().station_provisioning.as_ref()
+        let net = config
+            .state_read()
+            .station_provisioning
+            .as_ref()
             .map(|provisioning| (provisioning.cell.mcc, provisioning.cell.mnc))
             .unwrap_or((c.net.mcc, c.net.mnc));
         let scrambling_code = scrambler::tetra_scramb_get_init(net.0, net.1, c.cell.colour_code);
@@ -352,6 +356,7 @@ impl UmacBs {
             system_wide_services,
             authentication_required,
             aie,
+            secondary_random_access: std::array::from_fn(|_| RandomAccessController::new(operator.random_access.clone())),
             random_access,
             operator_settings_version: operator.version,
             endpoint_id: 1,
@@ -451,7 +456,14 @@ impl UmacBs {
     /// TDMA frames; the reception period is one frame longer.
     fn next_energy_economy_mcch(&self, issi: u32) -> Option<TdmaTime> {
         let (mode, frame, multiframe) = self.config.state_read().subscribers.energy_economy(issi)?;
-        self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe)
+        let slot = {
+            let state = self.config.state_read();
+            tetra_config::bluestation::common_control_slot(
+                state.subscribers.common_control(issi).ms_scch,
+                state.common_control.advertised_count,
+            )
+        };
+        self.next_energy_economy_common_for_assignment(mode, frame, multiframe, slot)
     }
 
     fn energy_economy_period_frames(mode: u8) -> Option<i32> {
@@ -468,13 +480,22 @@ impl UmacBs {
     }
 
     fn next_energy_economy_mcch_for_assignment(&self, mode: u8, frame: Option<u8>, multiframe: Option<u8>) -> Option<TdmaTime> {
+        self.next_energy_economy_common_for_assignment(mode, frame, multiframe, 1)
+    }
+
+    fn next_energy_economy_common_for_assignment(&self, mode: u8, frame: Option<u8>, multiframe: Option<u8>, slot: u8) -> Option<TdmaTime> {
         let period = Self::energy_economy_period_frames(mode)?;
         let (Some(frame), Some(multiframe)) = (frame, multiframe) else {
             tracing::warn!(mode, "invalid local EE assignment; falling back to immediate MCCH");
             return None;
         };
         if !(1..=18).contains(&frame) || !(1..=60).contains(&multiframe) {
-            tracing::warn!(mode, frame, multiframe, "invalid local EE start point; falling back to immediate MCCH");
+            tracing::warn!(
+                mode,
+                frame,
+                multiframe,
+                "invalid local EE start point; falling back to immediate MCCH"
+            );
             return None;
         }
         let anchor = (i32::from(multiframe - 1) * 18 + i32::from(frame - 1)).rem_euclid(period);
@@ -485,7 +506,7 @@ impl UmacBs {
         for offset in (MACSCHED_TX_AHEAD as i32 + 1)..=(360 * 4 + 4) {
             let candidate = self.dltime.add_timeslots(offset);
             let hyperframe_frame = i32::from(candidate.m - 1) * 18 + i32::from(candidate.f - 1);
-            if candidate.t == 1 && hyperframe_frame.rem_euclid(period) == anchor {
+            if candidate.t == slot && hyperframe_frame.rem_euclid(period) == anchor {
                 return Some(candidate);
             }
         }
@@ -498,7 +519,10 @@ impl UmacBs {
     pub fn generate_precomps(config: &SharedConfig) -> PrecomputedUmacPdus {
         let c = config.config();
         let operator = config.state_read().operator_settings.clone();
-        let serving = config.state_read().station_provisioning.as_ref()
+        let serving = config
+            .state_read()
+            .station_provisioning
+            .as_ref()
             .map(|provisioning| (provisioning.cell.mcc, provisioning.cell.mnc, provisioning.cell.location_area))
             .unwrap_or((c.net.mcc, c.net.mnc, c.cell.location_area));
         let aie = Self::get_aie_config(config);
@@ -549,7 +573,7 @@ impl UmacBs {
             freq_offset_index: FreqInfo::freq_offset_hz_to_id(c.cell.freq_offset_hz).unwrap(),
             duplex_spacing: c.cell.duplex_spacing_id,
             reverse_operation: c.cell.reverse_operation,
-            num_of_csch: 0, // Common secondary control channels
+            num_of_csch: config.state_read().common_control.advertised_count, // Common secondary control channels
             ms_txpwr_max_cell: operator.ms_txpwr_max_cell,
             rxlev_access_min: operator.rxlev_access_min,
             access_parameter: operator.access_parameter,
@@ -801,11 +825,34 @@ impl UmacBs {
         (downlink, uplink)
     }
 
+    fn random_access_for_slot(&mut self, slot: u8) -> &mut RandomAccessController {
+        if (2..=4).contains(&slot) {
+            &mut self.secondary_random_access[usize::from(slot - 2)]
+        } else {
+            &mut self.random_access
+        }
+    }
+
     fn refresh_random_access_control(&mut self, ts: TdmaTime) {
+        let count = self.config.state_read().common_control.physical_count;
+        for index in 0..usize::from(count) {
+            let pending = self
+                .config
+                .state_read()
+                .subscribers
+                .pending_registrations_on_slot(index as u8 + 2, count);
+            self.secondary_random_access[index].set_pending_registrations(pending);
+            if let Some(update) = self.secondary_random_access[index].maybe_update(ts) {
+                self.channel_scheduler
+                    .set_secondary_random_access_definition(index as u8 + 2, update);
+            }
+        }
         let (pending_registrations, registration_delivery_failures) = {
             let mut state = self.config.state_write();
             (
-                state.subscribers.pending_registration_count(),
+                state
+                    .subscribers
+                    .pending_registrations_on_slot(1, state.common_control.physical_count),
                 state.subscribers.take_registration_delivery_failures(),
             )
         };
@@ -826,6 +873,11 @@ impl UmacBs {
             (state.operator_settings.version != self.operator_settings_version).then(|| state.operator_settings.clone())
         };
         let Some(next) = next else { return };
+        for (index, controller) in self.secondary_random_access.iter_mut().enumerate() {
+            let update = controller.reconfigure(next.random_access.clone());
+            self.channel_scheduler
+                .set_secondary_random_access_definition(index as u8 + 2, update);
+        }
         let current = self.random_access.reconfigure(next.random_access.clone());
         self.channel_scheduler.apply_live_operator_settings(&next, current);
         self.operator_settings_version = next.version;
@@ -909,7 +961,7 @@ impl UmacBs {
             SapMsgInner::TmvCrcInd(ind) => {
                 self.observe_control_rf(None, ind.ul_time, ind.block_num, ind.rf_observation, false);
                 if ind.common_control && ind.logical_channel == LogicalChannel::SchHu {
-                    self.random_access.observe_crc_failure();
+                    self.random_access_for_slot(ind.ul_time.t).observe_crc_failure();
                     tracing::debug!("UmacBs: common random-access CRC failure block={:?}", ind.block_num);
                 }
             }
@@ -1272,6 +1324,11 @@ impl UmacBs {
             AieRequest::clear(AieSubject::Individual { issi: addr.ssi }, AieScope::MacData)
         };
         let decoded_issi = (addr.ssi_type == SsiType::Issi).then_some(addr.ssi);
+        if let Some(issi) = decoded_issi
+            && self.channel_scheduler.is_common_control(msg_dltime.t)
+        {
+            self.config.state_write().subscribers.observe_common_uplink(issi, msg_dltime.t);
+        }
         let rf_observation = prim.rf_observation.take();
         self.observe_control_rf(decoded_issi, msg_dltime, prim.block_num, rf_observation, true);
         if let Some(res_req) = pdu.reservation_req {
@@ -1307,7 +1364,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
-                        endpoint_id: 0,        // TODO FIXME
+                        endpoint_id: u32::from(msg_dltime.t),
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
                         air_interface_encryption: Some(aie_request),
@@ -1344,7 +1401,7 @@ impl UmacBs {
                 pdu
             }
             Err(e) => {
-                self.random_access.observe_invalid_mac_access();
+                self.random_access_for_slot(prim.ul_time.t).observe_invalid_mac_access();
                 tracing::warn!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
                 return;
             }
@@ -1527,9 +1584,15 @@ impl UmacBs {
                 (state.subscribers.is_active(issi), state.subscribers.is_registration_pending(issi))
             })
             .unwrap_or((false, false));
-        self.random_access.observe_access(issi, msg_dltime, active, registration_pending);
+        if self.channel_scheduler.is_common_control(msg_dltime.t) {
+            self.random_access_for_slot(msg_dltime.t)
+                .observe_access(issi, msg_dltime, active, registration_pending);
+        }
 
         if let Some(issi) = issi {
+            if self.channel_scheduler.is_common_control(msg_dltime.t) {
+                self.config.state_write().subscribers.observe_common_uplink(issi, msg_dltime.t);
+            }
             // Preserve this context independently of the queued RA ACK. The
             // ACK itself is normally emitted before CMCE/SwMI has produced
             // D-CALL-PROCEEDING or D-CONNECT, so queue inspection alone is
@@ -1591,7 +1654,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
-                        endpoint_id: 0,        // TODO FIXME
+                        endpoint_id: u32::from(msg_dltime.t),
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
                         air_interface_encryption: Some(aie_request),
@@ -1809,7 +1872,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,        // TODO FIXME
+                endpoint_id: u32::from(msg_dltime.t),
                 new_endpoint_id: None, // TODO FIXME
                 css_endpoint_id: None, // TODO FIXME
                 air_interface_encryption: Some(aie_request),
@@ -1951,7 +2014,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,        // TODO FIXME
+                endpoint_id: u32::from(msg_dltime.t),
                 new_endpoint_id: None, // TODO FIXME
                 css_endpoint_id: None, // TODO FIXME
                 air_interface_encryption: Some(aie_request),
@@ -2214,7 +2277,7 @@ impl UmacBs {
             );
             return;
         }
-        let mut sdu = prim.pdu;
+        let mut sdu = prim.pdu.clone();
         let associated_channel = prim.associated_channel;
         let assigned_channel_frame18_broadcast = prim.assigned_channel_frame18_broadcast;
         let aie_request = prim.air_interface_encryption.unwrap_or_else(|| {
@@ -2442,11 +2505,18 @@ impl UmacBs {
                 // reach sleeping MSs when no SCK rollover is pending.
                 // Respect their negotiated reception pattern, TS 100 392-2
                 // 23.7.6, rather than looking up a fictitious talkgroup.
-                let rollover = all_ms.then(|| {
-                    state.aie.rollover_notification().map(|(_, activation)| activation)
-                        .or_else(|| state.aie.sc3.as_ref()?.gck_rollover_notification()
-                            .map(|(_, _, activation)| activation))
-                }).flatten();
+                let rollover = all_ms
+                    .then(|| {
+                        state.aie.rollover_notification().map(|(_, activation)| activation).or_else(|| {
+                            state
+                                .aie
+                                .sc3
+                                .as_ref()?
+                                .gck_rollover_notification()
+                                .map(|(_, _, activation)| activation)
+                        })
+                    })
+                    .flatten();
                 let assignments = if all_ms_traffic_broadcast {
                     // MM also sends an MCCH copy of these TCH/STCH notices.
                     // Replay that copy once per listening phase, not both.
@@ -2456,17 +2526,20 @@ impl UmacBs {
                 } else {
                     state.subscribers.group_energy_economies(prim.main_address.ssi)
                 };
-                (
-                    assignments,
-                    rollover.flatten(),
-                    rollover.is_some(),
-                )
+                (assignments, rollover.flatten(), rollover.is_some())
             };
             // `(time, copy)` de-duplicates terminals sharing one EE phase,
             // while retaining both independently decodable rollover copies.
             let mut scheduled: Vec<(TdmaTime, usize)> = Vec::new();
             for (issi, mode, frame, multiframe) in assignments {
-                let Some(due) = self.next_energy_economy_mcch_for_assignment(mode, frame, multiframe) else {
+                let common_slot = {
+                    let state = self.config.state_read();
+                    tetra_config::bluestation::common_control_slot(
+                        state.subscribers.common_control(issi).ms_scch,
+                        state.common_control.advertised_count,
+                    )
+                };
+                let Some(due) = self.next_energy_economy_common_for_assignment(mode, frame, multiframe, common_slot) else {
                     continue;
                 };
                 if !Self::ee_replay_is_usable(due, self.dltime, rollover_activation) {
@@ -2538,7 +2611,11 @@ impl UmacBs {
                 );
             }
             if !activation_response && !random_access_response && !direct_response_window {
-                if let Some(due) = self.next_energy_economy_mcch(prim.main_address.ssi) {
+                let slot = self.common_downlink_slot(&prim);
+                let ee = self.config.state_read().subscribers.energy_economy(prim.main_address.ssi);
+                if let Some(due) =
+                    ee.and_then(|(mode, frame, multiframe)| self.next_energy_economy_common_for_assignment(mode, frame, multiframe, slot))
+                {
                     tracing::debug!(issi = prim.main_address.ssi, due = %due, "deferring MCCH resource for EE monitoring occasion");
                     self.deferred_mcch.push_back(DeferredMcch {
                         due,
@@ -2661,14 +2738,125 @@ impl UmacBs {
                 tracing::debug!(?channel, "dropping stale best-effort associated repeat");
             } else {
                 tracing::warn!(?channel, "invalid or stale associated-channel context; using MCCH");
-                self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter, aie_request);
+                self.enqueue_common_downlink(&prim, pdu, sdu, aie_request);
             }
         } else {
-            self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter, aie_request);
+            self.enqueue_common_downlink(&prim, pdu, sdu, aie_request);
         }
 
         // let enqueue_ts = 1;
         // self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
+    }
+
+    fn common_downlink_slot(&self, prim: &tetra_saps::tma::TmaUnitdataReq) -> u8 {
+        let state = self.config.state_read();
+        let assignment = state.subscribers.common_control(prim.main_address.ssi);
+        u8::try_from(prim.endpoint_id)
+            .ok()
+            .filter(|slot| state.common_control.is_common(*slot))
+            .or(assignment.registration_slot.filter(|slot| state.common_control.is_common(*slot)))
+            .unwrap_or_else(|| tetra_config::bluestation::common_control_slot(assignment.ms_scch, state.common_control.advertised_count))
+    }
+
+    fn enqueue_common_downlink(&mut self, prim: &tetra_saps::tma::TmaUnitdataReq, pdu: MacResource, sdu: BitBuffer, aie: AieRequest) {
+        let state = self.config.state_read();
+        let mut slots = vec![1];
+        if prim.main_address.ssi_type == SsiType::Issi {
+            drop(state);
+            let slot = self.common_downlink_slot(prim);
+            self.channel_scheduler
+                .dl_enqueue_common_tma(slot, pdu, sdu, prim.tx_reporter.clone(), aie);
+            return;
+        } else if prim.main_address.ssi_type == SsiType::Gssi {
+            // Keep MCCH, including groups with no local affiliates (CMG/all-MS).
+            slots.extend(state.common_control.advertised_slots().filter(|slot| *slot != 1));
+        }
+        drop(state);
+        let last = slots.len() - 1;
+        for (index, slot) in slots.into_iter().enumerate() {
+            self.channel_scheduler.dl_enqueue_common_tma(
+                slot,
+                pdu.clone(),
+                sdu.clone(),
+                if index == last { prim.tx_reporter.clone() } else { None },
+                aie,
+            );
+        }
+    }
+
+    fn refresh_common_control_channels(&mut self, now: TdmaTime) {
+        use tetra_core::timeslot_alloc::TimeslotOwner;
+        let mut state = self.config.state_write();
+        let previous_count = state.common_control.advertised_count;
+        let desired = state.operator_settings.common_scch_count;
+        state.timeslot_alloc.set_common_control_target(desired);
+        if let Some(deadline) = state.common_control.drain_until {
+            if deadline.age(now) >= 0 && state.common_control.advertised_frame18_slots == 15 {
+                let lower = state.common_control.advertised_count;
+                let physical = state.common_control.physical_count;
+                let drained = ((lower + 2)..=(physical + 1)).all(|slot| self.channel_scheduler.common_slot_is_drained(slot));
+                if drained {
+                    for slot in (lower + 2)..=(physical + 1) {
+                        self.channel_scheduler.retire_common_control_slot(slot, 1);
+                        let _ = state.timeslot_alloc.release(TimeslotOwner::CommonControl, slot);
+                    }
+                    state.common_control.physical_count = lower;
+                    state.common_control.drain_until = None;
+                    tracing::info!(count = lower, "common SCCH decrease completed after SYSINFO and grant drain");
+                }
+            }
+        } else if desired < state.common_control.advertised_count {
+            let ee = state
+                .subscribers
+                .active_energy_economies()
+                .iter()
+                .map(|(_, mode, _, _)| tetra_config::bluestation::ee_period_frames(*mode))
+                .max()
+                .unwrap_or(1);
+            state.common_control.advertised_count = desired;
+            state.common_control.advertised_frame18_slots = 0;
+            state.common_control.drain_until = Some(now.add_timeslots((ee.max(72) * 4 + 16) as i32));
+            tracing::info!(count = desired, "advertising common SCCH decrease before retiring old channels");
+        } else if desired > state.common_control.advertised_count {
+            let slot = state.common_control.physical_count + 2;
+            if state.timeslot_alloc.owner(slot).is_none()
+                && self.channel_scheduler.prepare_free_common_control_slot(slot)
+                && state.timeslot_alloc.reserve(TimeslotOwner::CommonControl, slot).is_ok()
+            {
+                state.common_control.physical_count += 1;
+                state.common_control.advertised_count = state.common_control.physical_count;
+                tracing::info!(
+                    slot,
+                    count = state.common_control.advertised_count,
+                    "physical common SCCH ready; publishing SYSINFO"
+                );
+            } else if now.t == 1 && now.f == 1 && now.m % 5 == 0 {
+                tracing::debug!(slot, owner = ?state.timeslot_alloc.owner(slot), "common SCCH expansion waiting for resource");
+                self.channel_scheduler.trace_common_control_wait(slot);
+            }
+        }
+        let next_count = state.common_control.advertised_count;
+        if previous_count != next_count {
+            // TS 100 392-2 23.4: a label belongs to a physical resource.
+            // Radios on a PDCH retain its label until that bearer changes;
+            // idle radios moving to a different CCCH discard their label.
+            for issi in state.subscribers.active_issis() {
+                let value = state.subscribers.common_control(issi).ms_scch;
+                if tetra_config::bluestation::common_control_slot(value, previous_count)
+                    != tetra_config::bluestation::common_control_slot(value, next_count)
+                    && !state.subscriber_packet_delivery_routes.contains_key(&issi)
+                {
+                    if let Some(label) = self.event_label_store.get_label_by_ssi(issi) {
+                        self.event_label_store.remove(label);
+                    }
+                }
+            }
+        }
+        self.channel_scheduler.set_common_control_channels(
+            state.common_control.physical_count,
+            state.common_control.advertised_count,
+            state.common_control.drain_until.is_some(),
+        );
     }
 
     fn discard_pending_downlink(message: SapMsg) {
@@ -3383,11 +3571,20 @@ impl TetraEntityTrait for UmacBs {
     }
 
     fn monitoring_snapshot(&mut self) -> Option<EntitySnapshot> {
-        if !self.config.config().web.enabled { return None; }
-        let active = self.config.state_read().subscribers.active_issis().into_iter().collect::<HashSet<_>>();
+        if !self.config.config().web.enabled {
+            return None;
+        }
+        let active = self
+            .config
+            .state_read()
+            .subscribers
+            .active_issis()
+            .into_iter()
+            .collect::<HashSet<_>>();
         let cutoff = unix_ms().saturating_sub(120_000);
         self.monitor_last_seen.retain(|issi, seen| active.contains(issi) || *seen >= cutoff);
-        self.monitor_rf_reports.retain(|issi, report| active.contains(issi) || report.measured_at_unix_ms >= cutoff);
+        self.monitor_rf_reports
+            .retain(|issi, report| active.contains(issi) || report.measured_at_unix_ms >= cutoff);
         let operator = self.config.state_read().operator_settings.clone();
         let cfg = &operator.random_access;
         let current = self.channel_scheduler.random_access_definition();
@@ -3396,36 +3593,62 @@ impl TetraEntityTrait for UmacBs {
             dynamic: cfg.enabled,
             load: self.random_access.load().label().to_owned(),
             current: RaParameters {
-                imm: current.parameters.imm, wt: current.parameters.wt, nu: current.parameters.nu,
-                frame_len: current.frame_len, frame_len_factor: current.parameters.frame_len_factor,
-                ts_pointer: current.parameters.ts_pointer, min_pdu_prio: current.parameters.min_pdu_prio,
+                imm: current.parameters.imm,
+                wt: current.parameters.wt,
+                nu: current.parameters.nu,
+                frame_len: current.frame_len,
+                frame_len_factor: current.parameters.frame_len_factor,
+                ts_pointer: current.parameters.ts_pointer,
+                min_pdu_prio: current.parameters.min_pdu_prio,
             },
             limits: RaLimits {
-                imm: [cfg.imm_min, cfg.imm_max], wt: [cfg.wt_min, cfg.wt_max],
-                nu: [cfg.nu_min, cfg.nu_max], frame_len: [cfg.frame_len_min, cfg.frame_len_max],
+                imm: [cfg.imm_min, cfg.imm_max],
+                wt: [cfg.wt_min, cfg.wt_max],
+                nu: [cfg.nu_min, cfg.nu_max],
+                frame_len: [cfg.frame_len_min, cfg.frame_len_max],
             },
             low_threshold: cfg.low_load_threshold,
             high_threshold: cfg.high_load_threshold,
             window: stats.map(|s| RaWindow {
-                first_attempts: s.first_attempts, retry_attempts: s.retry_attempts,
-                followup_attempts: s.followup_attempts, invalid_mac_access: s.invalid_mac_access,
-                crc_failures: s.crc_failures, pending_registrations: s.pending_registrations,
+                first_attempts: s.first_attempts,
+                retry_attempts: s.retry_attempts,
+                followup_attempts: s.followup_attempts,
+                invalid_mac_access: s.invalid_mac_access,
+                crc_failures: s.crc_failures,
+                pending_registrations: s.pending_registrations,
                 registration_delivery_failures: s.registration_delivery_failures,
-                sample_score: s.sample_score, ewma_score: s.ewma_score_hundredths as f64 / 100.0,
+                sample_score: s.sample_score,
+                ewma_score: s.ewma_score_hundredths as f64 / 100.0,
             }),
         };
-        let rf = self.monitor_rf_reports.iter().map(|(&issi, r)| (issi, RfSnapshot {
-            measured_at_ms: r.measured_at_unix_ms,
-            rssi_dbfs: f64::from(r.received_power_dbfs_x100) / 100.0,
-            frequency_offset_hz: f64::from(r.frequency_offset_hz_x100) / 100.0,
-            evm_percent: f64::from(r.training_evm_percent_x100) / 100.0,
-            block_errors: r.block_error_count,
-            block_count: r.block_count,
-        })).collect();
+        let rf = self
+            .monitor_rf_reports
+            .iter()
+            .map(|(&issi, r)| {
+                (
+                    issi,
+                    RfSnapshot {
+                        measured_at_ms: r.measured_at_unix_ms,
+                        rssi_dbfs: f64::from(r.received_power_dbfs_x100) / 100.0,
+                        frequency_offset_hz: f64::from(r.frequency_offset_hz_x100) / 100.0,
+                        evm_percent: f64::from(r.training_evm_percent_x100) / 100.0,
+                        block_errors: r.block_error_count,
+                        block_count: r.block_count,
+                    },
+                )
+            })
+            .collect();
         let cell = crate::monitoring::CellSnapshot::from_broadcast(
-            self.channel_scheduler.broadcast_parameters(), self.dltime, self.config.config().cell.custom_duplex_spacing,
+            self.channel_scheduler.broadcast_parameters(),
+            self.dltime,
+            self.config.config().cell.custom_duplex_spacing,
         );
-        Some(EntitySnapshot::Umac { cell, ra, rf, last_seen: self.monitor_last_seen.clone() })
+        Some(EntitySnapshot::Umac {
+            cell,
+            ra,
+            rf,
+            last_seen: self.monitor_last_seen.clone(),
+        })
     }
 
     fn set_config(&mut self, config: SharedConfig) {
@@ -3464,6 +3687,7 @@ impl TetraEntityTrait for UmacBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
         self.refresh_live_operator_settings();
+        self.refresh_common_control_channels(ts);
         self.refresh_system_wide_services();
         self.refresh_authentication_required();
         self.refresh_aie_config();
@@ -3505,14 +3729,16 @@ impl TetraEntityTrait for UmacBs {
                     }
                 }
                 if retry.in_flight.is_none() && resource.due.age(air_time) >= 0 {
-                    if retry.attempts_left == 0
-                        || retry.cutoff.is_some_and(|cutoff| cutoff.diff(resource.due) <= 0)
-                    {
+                    if retry.attempts_left == 0 || retry.cutoff.is_some_and(|cutoff| cutoff.diff(resource.due) <= 0) {
                         continue;
                     }
                     let reporter = TxReporter::new_unacked();
-                    self.channel_scheduler.dl_enqueue_ee_mcch_tma(
-                        resource.pdu.clone(), resource.sdu.clone(), reporter.clone(), resource.aie_request,
+                    self.channel_scheduler.dl_enqueue_ee_common_tma(
+                        resource.due.t,
+                        resource.pdu.clone(),
+                        resource.sdu.clone(),
+                        reporter.clone(),
+                        resource.aie_request,
                     );
                     retry.in_flight = Some(reporter);
                     retry.attempts_left -= 1;
@@ -3521,8 +3747,13 @@ impl TetraEntityTrait for UmacBs {
                 continue;
             }
             if resource.due.age(air_time) >= 0 {
-                self.channel_scheduler
-                    .dl_enqueue_tma(resource.pdu, resource.sdu, resource.tx_reporter, resource.aie_request);
+                self.channel_scheduler.dl_enqueue_common_tma(
+                    resource.due.t,
+                    resource.pdu,
+                    resource.sdu,
+                    resource.tx_reporter,
+                    resource.aie_request,
+                );
             } else {
                 retained.push_back(resource);
             }
@@ -3568,6 +3799,14 @@ impl TetraEntityTrait for UmacBs {
         // Collect/construct traffic that should be sent down to the LMAC
         // This is basically the _previous_ timeslot
         let elem = self.channel_scheduler.finalize_ts_for_tick();
+        if elem.ts.f == 18
+            && elem
+                .blk2
+                .as_ref()
+                .is_some_and(|block| block.logical_channel == LogicalChannel::Bnch)
+        {
+            self.config.state_write().common_control.advertised_frame18_slots |= 1 << (elem.ts.t - 1);
+        }
         let s = SapMsg {
             sap: Sap::TmvSap,
             src: self.self_component,
@@ -3622,6 +3861,99 @@ mod tests {
             training_bit_count: 22,
             training_evm_percent: 5.0,
             relative_arrival_symbols: 0.25,
+        }
+    }
+
+    #[test]
+    fn common_scch_live_expansion_waits_for_voice_and_decrease_waits_for_sysinfo() {
+        use tetra_core::timeslot_alloc::TimeslotOwner;
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .unwrap();
+        let config = SharedConfig::from_parts(config, None);
+        let mut umac = UmacBs::new(config.clone());
+        let now = TdmaTime::default();
+        config.state_write().timeslot_alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        config.state_write().operator_settings.common_scch_count = 2;
+        umac.refresh_common_control_channels(now);
+        assert_eq!(config.state_read().common_control.advertised_count, 0);
+        assert_eq!(config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert!(!config.state_read().timeslot_alloc.is_free(3));
+        config.state_write().timeslot_alloc.release(TimeslotOwner::Cmce, 2).unwrap();
+        umac.refresh_common_control_channels(now);
+        assert_eq!(config.state_read().common_control.advertised_count, 1);
+        umac.refresh_common_control_channels(now.add_timeslots(1));
+        assert_eq!(config.state_read().common_control.physical_count, 2);
+        config.state_write().operator_settings.common_scch_count = 0;
+        umac.refresh_common_control_channels(now.add_timeslots(2));
+        assert_eq!(config.state_read().common_control.advertised_count, 0);
+        assert_eq!(config.state_read().common_control.physical_count, 2);
+        let later = now.add_timeslots(1500);
+        umac.refresh_common_control_channels(later);
+        assert_eq!(config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::CommonControl));
+        config.state_write().common_control.advertised_frame18_slots = 15;
+        umac.refresh_common_control_channels(later.add_timeslots(1));
+        assert_eq!(config.state_read().common_control.physical_count, 0);
+        assert!(config.state_read().timeslot_alloc.is_free(2));
+        assert!(config.state_read().timeslot_alloc.is_free(3));
+    }
+
+    #[test]
+    fn common_scch_group_signalling_covers_all_common_listener_slots() {
+        let config = tetra_config::bluestation::from_toml_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .unwrap();
+        let config = SharedConfig::from_parts(config, None);
+        let mut umac = UmacBs::new(config.clone());
+        config.state_write().operator_settings.common_scch_count = 3;
+        umac.refresh_common_control_channels(TdmaTime::default());
+        umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(1));
+        umac.refresh_common_control_channels(TdmaTime::default().add_timeslots(2));
+        assert_eq!(config.state_read().common_control.advertised_count, 3);
+        umac.refresh_random_access_control(TdmaTime::default().add_timeslots(3));
+        let ts4_controller = umac.random_access_for_slot(4) as *const RandomAccessController;
+        assert_eq!(ts4_controller, &umac.secondary_random_access[2] as *const RandomAccessController);
+        let address = TetraAddress::new(1502, SsiType::Gssi);
+        let aie = AieRequest::clear(AieSubject::Group { gssi: 1502 }, AieScope::MacResource);
+        let req = tetra_saps::tma::TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr("00000000"),
+            main_address: address,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: Some(aie),
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            associated_channel: None,
+            assigned_channel_frame18_broadcast: false,
+            frame18_rollover_activation: None,
+            tx_reporter: None,
+        };
+        umac.enqueue_common_downlink(
+            &req,
+            MacResource {
+                addr: Some(address),
+                ..MacResource::null_pdu()
+            },
+            req.pdu.clone(),
+            aie,
+        );
+        for slot in 1..=4 {
+            umac.channel_scheduler.cur_dltime = TdmaTime { t: slot, f: 5, m: 1, h: 0 }.add_timeslots(-(MACSCHED_TX_AHEAD as i32));
+            let result = umac.channel_scheduler.finalize_ts_for_tick();
+            assert_eq!(result.blk1.as_ref().unwrap().logical_channel, LogicalChannel::SchF);
+            let mut buffer = result.blk1.unwrap().mac_block;
+            buffer.seek(0);
+            let decoded = MacResource::from_bitbuf(&mut buffer).unwrap().addr.unwrap();
+            assert_eq!(decoded.ssi, address.ssi);
+            // MAC-RESOURCE carries an SSI, not the MLE individual/group type.
+            assert_eq!(decoded.ssi_type, SsiType::Ssi);
         }
     }
 
@@ -3759,74 +4091,115 @@ mod tests {
         use tetra_config::bluestation::{RuntimeSc3Gck, RuntimeSc3TeaAlgorithm};
 
         let parsed = tetra_config::bluestation::from_toml_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml"
-        ))).unwrap();
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../example_config/config.toml"
+        )))
+        .unwrap();
         let config = SharedConfig::from_parts(parsed, None);
         let gssi = 1502;
         let mut sc3 = RuntimeSc3Aie::new(RuntimeSc3TeaAlgorithm::Tea1, 1, [0x35; 10], true, true);
-        sc3.apply_sc3g_snapshot(1, true, 7,
-            vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])], vec![(gssi, 4)]).unwrap();
+        sc3.apply_sc3g_snapshot(1, true, 7, vec![RuntimeSc3Gck::new(4, 7, [0x47; 10])], vec![(gssi, 4)])
+            .unwrap();
         config.state_write().aie = RuntimeAieConfig {
-            enabled: true, sc1_allowed: false, sc2: None, sc3: Some(sc3), rollover: None,
+            enabled: true,
+            sc1_allowed: false,
+            sc2: None,
+            sc3: Some(sc3),
+            rollover: None,
         };
         let mut umac = UmacBs::new(config.clone());
         umac.aie = config.state_read().aie.clone();
         let mut queue = MessageQueue::new();
         let ts = 2;
         deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(11, ts)));
-        deliver_control(&mut umac, &mut queue, CallControl::ConfigureGroupTrafficAie { call_id: 11, gssi, ts });
+        deliver_control(
+            &mut umac,
+            &mut queue,
+            CallControl::ConfigureGroupTrafficAie { call_id: 11, gssi, ts },
+        );
         let request = umac.channel_scheduler.traffic_aie(ts).expect("group traffic request");
         let old_context = umac.aie_provider.resolve(request, AieDirection::Downlink, umac.dltime).unwrap();
-        let tetra_core::AieContext::Sc3 { key: old_key, .. } = old_context else { panic!("SC3 GCK required") };
+        let tetra_core::AieContext::Sc3 { key: old_key, .. } = old_context else {
+            panic!("SC3 GCK required")
+        };
         assert_eq!(u16::from_be_bytes([old_key.context_id[14], old_key.context_id[15]]), 7);
 
-        config.state_write().aie.sc3.as_mut().unwrap().apply_sc3g_snapshot(2, true, 8,
-            vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])], vec![(gssi, 4)]).unwrap();
-        deliver_control(&mut umac, &mut queue, CallControl::FloorGranted {
-            call_id: 11, source_issi: 77_479, dest_gssi: gssi, ts,
-        });
+        config
+            .state_write()
+            .aie
+            .sc3
+            .as_mut()
+            .unwrap()
+            .apply_sc3g_snapshot(2, true, 8, vec![RuntimeSc3Gck::new(4, 8, [0x48; 10])], vec![(gssi, 4)])
+            .unwrap();
+        deliver_control(
+            &mut umac,
+            &mut queue,
+            CallControl::FloorGranted {
+                call_id: 11,
+                source_issi: 77_479,
+                dest_gssi: gssi,
+                ts,
+            },
+        );
         assert_eq!(
             umac.channel_scheduler.traffic_aie(ts),
             Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Traffic))
         );
         let new_context = umac.aie_provider.resolve(request, AieDirection::Downlink, umac.dltime).unwrap();
-        let tetra_core::AieContext::Sc3 { key: new_key, .. } = new_context else { panic!("SC3 GCK required") };
+        let tetra_core::AieContext::Sc3 { key: new_key, .. } = new_context else {
+            panic!("SC3 GCK required")
+        };
         assert_eq!(u16::from_be_bytes([new_key.context_id[14], new_key.context_id[15]]), 8);
         // FACCH must likewise resolve the new generation on the active call.
         let mut timeslots = [false; 4];
         timeslots[ts as usize - 1] = true;
-        umac.rx_ul_tma_unitdata_req(&mut queue, SapMsg::new(
-            Sap::TmaSap, TetraEntity::Llc, TetraEntity::Umac,
-            SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
-                req_handle: 0,
-                pdu: BitBuffer::from_bitstr("0000000000000000"),
-                main_address: TetraAddress::new(gssi, SsiType::Gssi),
-                endpoint_id: 0,
-                stealing_permission: true,
-                subscriber_class: 0,
-                air_interface_encryption: Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource)),
-                stealing_repeats_flag: None,
-                data_category: None,
-                chan_alloc: Some(CmceChanAllocReq {
-                    usage: None, carrier: None, timeslots,
-                    alloc_type: ChanAllocType::Replace, cell_change_flag: false,
-                    ul_dl_assigned: UlDlAssignment::Both,
+        umac.rx_ul_tma_unitdata_req(
+            &mut queue,
+            SapMsg::new(
+                Sap::TmaSap,
+                TetraEntity::Llc,
+                TetraEntity::Umac,
+                SapMsgInner::TmaUnitdataReq(tetra_saps::tma::TmaUnitdataReq {
+                    req_handle: 0,
+                    pdu: BitBuffer::from_bitstr("0000000000000000"),
+                    main_address: TetraAddress::new(gssi, SsiType::Gssi),
+                    endpoint_id: 0,
+                    stealing_permission: true,
+                    subscriber_class: 0,
+                    air_interface_encryption: Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::MacResource)),
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: Some(CmceChanAllocReq {
+                        usage: None,
+                        carrier: None,
+                        timeslots,
+                        alloc_type: ChanAllocType::Replace,
+                        cell_change_flag: false,
+                        ul_dl_assigned: UlDlAssignment::Both,
+                    }),
+                    associated_channel: None,
+                    assigned_channel_frame18_broadcast: false,
+                    frame18_rollover_activation: None,
+                    tx_reporter: None,
                 }),
-                associated_channel: None,
-                assigned_channel_frame18_broadcast: false,
-                frame18_rollover_activation: None,
-                tx_reporter: None,
-            }),
-        ));
+            ),
+        );
         umac.channel_scheduler.cur_dltime = TdmaTime { t: 1, f: 5, m: 1, h: 0 };
         let stch = umac.channel_scheduler.finalize_ts_for_tick().blk1.expect("group FACCH");
         assert_eq!(stch.logical_channel, LogicalChannel::Stch);
-        assert_eq!(stch.air_interface_encryption,
-            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Facch)));
+        assert_eq!(
+            stch.air_interface_encryption,
+            Some(AieRequest::sc3(AieSubject::Group { gssi }, AieScope::Facch))
+        );
 
         deliver_control(&mut umac, &mut queue, CallControl::CallEnded { call_id: 11, ts });
         deliver_control(&mut umac, &mut queue, CallControl::Open(test_circuit(12, ts)));
-        deliver_control(&mut umac, &mut queue, CallControl::ConfigureGroupTrafficAie { call_id: 12, gssi, ts });
+        deliver_control(
+            &mut umac,
+            &mut queue,
+            CallControl::ConfigureGroupTrafficAie { call_id: 12, gssi, ts },
+        );
         assert_eq!(umac.channel_scheduler.traffic_aie(ts), Some(request));
     }
 
@@ -4211,11 +4584,7 @@ mod tests {
         let due = TdmaTime { t: 1, f: 5, m: 2, h: 0 };
         umac.deferred_mcch.push_back(DeferredMcch {
             due,
-            pdu: BsChannelScheduler::dl_make_minimal_resource(
-                &TetraAddress::new(0x00ff_ffff, SsiType::Gssi),
-                None,
-                false,
-            ),
+            pdu: BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::new(0x00ff_ffff, SsiType::Gssi), None, false),
             sdu: BitBuffer::from_bitstr("00100010010000100000000000000100111"),
             tx_reporter: None,
             aie_request: AieRequest::clear(AieSubject::System, AieScope::MacResource),
@@ -4231,7 +4600,9 @@ mod tests {
         umac.tick_start(&mut queue, due.add_timeslots(-1));
         assert!(umac.deferred_mcch.is_empty());
         let output = queue.pop_front().expect("reception slot is finalized");
-        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else { panic!("expected downlink slot") };
+        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else {
+            panic!("expected downlink slot")
+        };
         assert_eq!(slot.ts, due);
         let mut bits = slot.blk1.expect("GCK broadcast on SCH/F").mac_block;
         bits.seek(0);
@@ -4291,7 +4662,10 @@ mod tests {
 
         umac.channel_scheduler.cur_dltime = due;
         umac.tick_start(&mut MessageQueue::new(), due.add_timeslots(1));
-        assert!(missed.is_discarded(), "stale copy must never be emitted in a frame the MS does not hear");
+        assert!(
+            missed.is_discarded(),
+            "stale copy must never be emitted in a frame the MS does not hear"
+        );
         let next = due.add_timeslots(4 * 18);
         assert_eq!(umac.deferred_mcch.front().expect("retry retained").due, next);
 
@@ -4299,9 +4673,20 @@ mod tests {
         let mut queue = MessageQueue::new();
         umac.tick_start(&mut queue, next.add_timeslots(-1));
         let retry = umac.deferred_mcch.front().expect("retry receipt retained");
-        assert!(retry.ee_retry.as_ref().expect("EE state").in_flight.as_ref().expect("sent copy").is_transmitted());
+        assert!(
+            retry
+                .ee_retry
+                .as_ref()
+                .expect("EE state")
+                .in_flight
+                .as_ref()
+                .expect("sent copy")
+                .is_transmitted()
+        );
         let output = queue.pop_front().expect("reception slot finalized");
-        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else { panic!("expected downlink slot") };
+        let SapMsgInner::TmvUnitdataReq(slot) = output.msg else {
+            panic!("expected downlink slot")
+        };
         assert_eq!(slot.ts, next);
     }
 
